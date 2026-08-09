@@ -18,6 +18,7 @@ async function withServer(application: ScholarApplication, run: (base: string) =
     await server.closeGracefully();
   }
 }
+function sameOriginHeaders(base: string, headers: Record<string, string> = {}): Record<string, string> { return { ...headers, Origin: base }; }
 
 const issue = {
   issueId: "11111111-1111-4111-8111-111111111111",
@@ -67,6 +68,14 @@ describe("server browser boundary", () => {
         body: JSON.stringify({ kind: "contradiction", description: "attack" }),
       });
       assert.equal(response.status, 403);
+      const wrongPort = new URL(base);
+      wrongPort.port = String(Number(wrongPort.port) + 1);
+      const sameSiteWrongPort = await fetch(`${base}/api/v1/wiki/issues`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Origin": wrongPort.origin, "Sec-Fetch-Site": "same-site", "X-Pi-Scholar-Request": "1" },
+        body: JSON.stringify({ kind: "contradiction", description: "wrong port" }),
+      });
+      assert.equal(sameSiteWrongPort.status, 403);
       assert.equal(calls, 0);
     });
   });
@@ -84,7 +93,7 @@ describe("server browser boundary", () => {
       for (const status of ["open", "reopened", "resolved"]) {
         const response = await fetch(`${base}/api/v1/wiki/issues/${issue.issueId}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" },
+          headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
           body: JSON.stringify({ status }),
         });
         assert.equal(response.status, status === "open" ? 400 : 200);
@@ -139,16 +148,16 @@ describe("server browser boundary", () => {
     await withServer(application, async (base) => {
       const textResponse = await fetch(`${base}/api/v1/wiki/issues`, {
         method: "POST",
-        headers: { "Content-Type": "text/plain", "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" },
-        body: JSON.stringify({ kind: "contradiction", description: "wrong type" }),
+        headers: sameOriginHeaders(base, { "Content-Type": "text/plain", "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ kind: "incorrect", description: "wrong type" }),
       });
       assert.equal(textResponse.status, 415);
       assert.equal(issueCalls, 0);
 
       const jsonResponse = await fetch(`${base}/api/v1/wiki/issues`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" },
-        body: JSON.stringify({ kind: "contradiction", description: "valid" }),
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ kind: "incorrect", description: "valid" }),
       });
       assert.equal(jsonResponse.status, 200);
       assert.equal(issueCalls, 1);
@@ -163,7 +172,7 @@ describe("server browser boundary", () => {
       form.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
       const multipartResponse = await fetch(`${base}/api/v1/sources`, {
         method: "POST",
-        headers: { "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" },
+        headers: sameOriginHeaders(base, { "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
         body: form,
       });
       assert.equal(multipartResponse.status, 200);
@@ -188,7 +197,7 @@ describe("server browser boundary", () => {
       ]) {
         const response = await fetch(`${base}/api/v1/sources`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" },
+          headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
           body: JSON.stringify(body),
         });
         assert.equal(response.status, 400);
@@ -210,7 +219,7 @@ describe("server browser boundary", () => {
     await withServer(application, async (base) => {
       const response = await fetch(`${base}/api/v1/sources/${sourceId}/removal-preview`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" },
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
         body: JSON.stringify({ sourceId }),
       });
       assert.equal(response.status, 200);

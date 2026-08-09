@@ -149,6 +149,9 @@ export class WikiService {
   readonly adapters: WikiAdapters;
   constructor(db: ScholarDatabase, paths: Partial<VaultPaths> & { root?: string }, adapters: WikiAdapters = {}) { this.db = db; this.paths = paths; this.adapters = adapters }
   private root(): string { return vaultRoot(this.paths) }
+  private async refreshQmd(): Promise<void> {
+    try { if (typeof this.adapters.qmd?.index === 'function') await this.adapters.qmd.index(); } catch { /* application maintenance checks enforce qmd */ }
+  }
   private async atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
     await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
     const temp = join(dirname(path), `.${randomUUID()}.tmp`);
@@ -257,6 +260,7 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, content);
       await this.writeCatalog(page, content);
       await this.refreshProjections();
+      await this.refreshQmd();
     } catch (error) {
       try { await rollback(); } catch (rollbackError) {
         throw new Error(`wiki create failed and rollback failed: ${error instanceof Error ? error.message : String(error)}; ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`, { cause: rollbackError });
@@ -324,6 +328,7 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, next.content);
       await this.writeCatalog(next.page, next.content);
       await this.refreshProjections();
+      await this.refreshQmd();
     } catch (error) {
       try { await rollback(); } catch (rollbackError) {
         throw new Error(`wiki update failed and rollback failed: ${error instanceof Error ? error.message : String(error)}; ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`, { cause: rollbackError });
@@ -379,6 +384,7 @@ export class WikiService {
     try {
       await this.writeCatalog(updated, content, page.relativePath);
       await this.refreshProjections();
+      await this.refreshQmd();
     } catch (error) {
       try { await rollback(); } catch (rollbackError) {
         throw new Error(`wiki rename failed and rollback failed: ${error instanceof Error ? error.message : String(error)}; ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`, { cause: rollbackError });
@@ -511,7 +517,7 @@ export class WikiService {
       ? {
           issueId: randomUUID(),
           pageId,
-          pageDigest: report.currentDigest,
+          pageDigest: snapshot.digest,
           kind: 'incorrect' as const,
           description: `Unsupported direct edit restored as issue evidence:\n\n${report.diff}`,
           status: 'open' as const,
@@ -555,6 +561,7 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, snapshot.content);
       await this.writeCatalog(updated, snapshot.content);
       await this.refreshProjections();
+      await this.refreshQmd();
       if (issue) {
         transaction(this.db, () => dbRun(this.db, 'INSERT INTO wiki_issues (issue_id, page_id, heading, card_id, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [issue.issueId, issue.pageId, null, null, issue.pageDigest, issue.kind, issue.description, issue.status, issue.createdAt, issue.updatedAt]));
       }

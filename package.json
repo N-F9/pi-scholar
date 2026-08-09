@@ -2,6 +2,7 @@
   "name": "pi-scholar",
   "version": "0.1.0",
   "description": "Local-first sourced Markdown wiki and daily review for Pi",
+  "keywords": ["pi-package"],
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,17 +19,31 @@
     "dist",
     "apps/web/dist",
     "skills",
-    "pi"
+    "pi",
+    "README.md",
+    "THIRD_PARTY_NOTICES"
   ],
+  "pi": {
+    "extensions": ["./pi/extension.ts"],
+    "skills": [
+      "./skills/source-admission",
+      "./skills/wiki-maintenance",
+      "./skills/daily-quiz",
+      "./skills/quiz-grader"
+    ]
+  },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
+    "clean": "node -e \"const { rmSync } = require('node:fs'); for (const path of ['dist', 'apps/web/dist']) rmSync(path, { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json",
     "build:web": "vite build --config apps/web/vite.config.ts",
+    "prepack": "npm run clean && npm run build && npm run build:web",
+    "typecheck": "tsc -p apps/web/tsconfig.json && tsc -p tsconfig.pi.json",
     "dev": "vite --config apps/web/vite.config.ts",
     "test": "vitest run",
-    "verify": "npm run build && npm run build:web && npm test"
+    "verify": "npm run build && npm run typecheck && npm run build:web && npm test"
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
@@ -38,6 +53,10 @@
     "react-router-dom": "7.18.2",
     "remark-gfm": "4.0.1",
     "ts-fsrs": "5.4.1"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "0.73.1",

@@ -339,8 +339,8 @@ function statIdentity(stat: Stats): PhysicalIdentity {
   const mtimeNs = 'mtimeNs' in stat && typeof stat.mtimeNs === 'bigint' ? stat.mtimeNs.toString() : String(Math.round(stat.mtimeMs * 1_000_000));
   return { device: String(stat.dev), inode: String(stat.ino), mode: stat.mode, size: stat.size, mtimeNs };
 }
-function pathFor(paths: VaultPathsLike, name: 'inbox' | 'sources' | 'work'): string {
-  const explicit = name === 'inbox' ? paths.inbox ?? paths.inboxRoot : name === 'sources' ? paths.sources ?? paths.sourcesRoot : paths.work ?? paths.workRoot;
+function pathFor(paths: VaultPathsLike, name: 'inbox' | 'sources' | 'work' | 'quizzes'): string {
+  const explicit = name === 'inbox' ? paths.inbox ?? paths.inboxRoot : name === 'sources' ? paths.sources ?? paths.sourcesRoot : name === 'work' ? paths.work ?? paths.workRoot : paths.quizzesRoot;
   if (typeof explicit === 'string') return explicit;
   const root = paths.root ?? paths.vaultRoot;
   if (typeof root !== 'string') throw new Error('vault root is required');
@@ -504,8 +504,15 @@ function parseMetadata(raw: string): StageMetadata {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid staged source metadata');
   const record = value as Record<string, unknown>;
   if (record.version !== 1 || typeof record.requestedKind !== 'string' || !INPUT_KINDS.includes(record.requestedKind as InputKind) || typeof record.kind !== 'string' || !SOURCE_KINDS.includes(record.kind as SourceKind) || typeof record.displayName !== 'string' || !record.displayName || /[\u0000-\u001f\u007f]/u.test(record.displayName) || record.payload !== 'payload') throw new Error('invalid staged source metadata');
-  if (record.kind === 'repository' && (typeof record.repositoryRevision !== 'string' || !record.repositoryRevision || /[\u0000-\u001f\u007f]/u.test(record.repositoryRevision))) throw new Error('invalid staged repository revision');
-  const metadata: StageMetadata = { version: 1, requestedKind: record.requestedKind as InputKind, kind: record.kind as SourceKind, displayName: record.displayName, payload: 'payload' };
+  const requestedKind = record.requestedKind as InputKind;
+  const kind = record.kind as SourceKind;
+  const originalName = typeof record.originalName === 'string' ? record.originalName : undefined;
+  if (originalName !== undefined) validRelativePath(originalName);
+  if ((requestedKind === 'url' && kind !== 'url') || ((requestedKind === 'text' || requestedKind === 'pasted') && kind !== 'text') || (requestedKind === 'upload' && kind !== inferKind(originalName ?? record.displayName)) || (requestedKind === 'repository' && kind !== 'repository') || (requestedKind !== 'url' && requestedKind !== 'text' && requestedKind !== 'pasted' && requestedKind !== 'upload' && requestedKind !== 'repository')) throw new Error('staged source metadata kind is inconsistent');
+  if (requestedKind === 'url' && typeof record.sourceUri !== 'string') throw new Error('staged URL source metadata is missing sourceUri');
+  if (requestedKind === 'upload' && originalName === undefined) throw new Error('staged upload metadata is missing originalName');
+  if (kind === 'repository' && (typeof record.repositoryRevision !== 'string' || !record.repositoryRevision || /[\u0000-\u001f\u007f]/u.test(record.repositoryRevision))) throw new Error('invalid staged repository revision');
+  const metadata: StageMetadata = { version: 1, requestedKind, kind, displayName: record.displayName, payload: 'payload' };
   for (const key of ['originalName', 'sourceUri', 'mediaType', 'repositoryRevision'] as const) {
     const item = record[key];
     if (item !== undefined) {
@@ -621,6 +628,8 @@ function parseManifestValue(raw: unknown): SourceManifest {
   requiredString(record, 'sourceId');
   requiredString(record, 'originalDigest');
   if (!Array.isArray(record.files) || !Array.isArray(record.chunks)) throw new Error('invalid source manifest files');
+  if (record.attachments === undefined) record.attachments = [];
+  if (!Array.isArray(record.attachments)) throw new Error('invalid source manifest attachments');
   for (const key of ['sourceUri', 'originalUrl'] as const) {
     if (typeof record[key] !== 'string') continue;
     const sanitized = sanitizedSourceUri(record[key]);
@@ -652,6 +661,20 @@ function manifestDigest(value: unknown, key: string): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/iu.test(value)) throw new Error(`invalid source manifest ${key}`);
   return value;
 }
+function manifestAttachments(value: unknown): Array<{ path: string; byteLength: number; digest: string }> {
+  if (!Array.isArray(value)) throw new Error('invalid source manifest attachments');
+  return value.map((item, index) => {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error(`invalid source manifest attachment ${index}`);
+    const record = item as Record<string, unknown>;
+    const path = record.path;
+    const relativePath = record.relativePath;
+    if (typeof path !== 'string' || relativePath !== path) throw new Error(`invalid source manifest attachment ${index}`);
+    const normalizedPath = validRelativePath(path);
+    const byteLength = manifestInteger(record.byteLength, `attachments[${index}].byteLength`);
+    if (manifestInteger(record.bytes, `attachments[${index}].bytes`) !== byteLength) throw new Error(`source manifest attachment length mismatch: ${path}`);
+    return { path: normalizedPath, byteLength, digest: manifestDigest(record.digest, `attachments[${index}].digest`) };
+  }).sort((left, right) => left.path.localeCompare(right.path));
+}
 async function verifyRetainedPacket(packet: string, expected: { sourceId: string; originalDigest: string }): Promise<SourceManifest> {
   await rejectSymlinkAncestors(packet);
   const packetStat = await lstatNoFollow(packet);
@@ -668,11 +691,14 @@ async function verifyRetainedPacket(packet: string, expected: { sourceId: string
   const originalRoot = await requiredDirectory('original');
   const chunksRoot = await requiredDirectory('chunks');
   const attachmentsRoot = await requiredDirectory('attachments');
-  await walkFiles(attachmentsRoot, '', false);
   const manifestPath = join(packet, 'manifest.json');
   const manifestStat = await lstatNoFollow(manifestPath);
   if (!manifestStat.isFile()) throw new Error('source manifest must be a regular file');
   const manifest = parseManifestValue(JSON.parse((await readNoFollow(manifestPath)).toString('utf8')) as unknown);
+  const attachmentFiles = await walkFiles(attachmentsRoot, '', false);
+  const expectedAttachments = manifestAttachments(manifest.attachments);
+  const actualAttachments = attachmentFiles.map((file) => ({ path: file.path, byteLength: file.size, digest: file.digest }));
+  if (canonical(expectedAttachments) !== canonical(actualAttachments)) throw new Error('retained source attachments mismatch');
   if (manifest.id !== manifest.sourceId || manifest.sourceId !== expected.sourceId || manifest.originalDigest !== expected.originalDigest) throw new Error('retained source packet identity mismatch');
   manifestDigest(manifest.originalDigest, 'originalDigest');
   const originalFiles = await walkFiles(originalRoot, '', false);
@@ -987,6 +1013,8 @@ export class SourceService {
     await rejectSymlinkAncestors(source);
     const stat = await lstatNoFollow(source);
     const repository = stat.isDirectory() && await this.isRepository(source);
+    const kind: SourceKind = repository ? 'repository' : inferKind(source, stat);
+    if (!repository && inferKind(name, stat) !== kind) throw new Error(`staging name kind must be ${kind}`);
     let initialRevision: string | undefined;
     let verifiedGitRevision = false;
     if (repository) {
@@ -1005,7 +1033,6 @@ export class SourceService {
     }
     if (repository && !initialRevision) throw new Error('repository revision is unavailable');
     if (!repository) await measurePath(source);
-    const kind: SourceKind = repository ? 'repository' : inferKind(source, stat);
     if (request.kind !== undefined && request.kind !== kind) throw new Error(`path source kind must be ${kind}`);
     const revision = repository ? this.adapters.gitRevision ? await this.revision(source) : initialRevision : undefined;
     const metadata = repository ? (() => {
@@ -1052,7 +1079,7 @@ export class SourceService {
         entries.push({ relativePath: name.replaceAll('\\', '/'), absolutePath: path, kind: 'text', identity: { device: '', inode: '', mode: 0, size: 0, mtimeNs: '' }, digest: `error:${error instanceof Error ? error.message : String(error)}`, error: error instanceof Error ? error.message : String(error) });
       }
     }
-    return [...entries.filter((entry) => !entry.error), ...entries.filter((entry) => Boolean(entry.error))];
+    return entries.sort((left, right) => Number(Boolean(left.error)) - Number(Boolean(right.error)) || left.relativePath.localeCompare(right.relativePath));
   }
   private async snapshotForEntry(entry: InboxEntry, revision?: string): Promise<TreeSnapshot> {
     const root = entry.metadata ? join(entry.absolutePath, entry.metadata.payload) : entry.absolutePath;
@@ -1062,18 +1089,24 @@ export class SourceService {
     if (entry.error) throw new Error(entry.error);
     const current = await lstatNoFollow(entry.absolutePath);
     if (!sameIdentity(statIdentity(current), entry.identity)) throw new Error('inbox entry changed before claim');
-    const repository = current.isDirectory() && !entry.metadata && await this.isRepository(entry.absolutePath);
-    const stagedRepository = current.isDirectory() && entry.metadata?.kind === 'repository';
-    const revision = repository ? await this.revision(entry.absolutePath) : stagedRepository ? entry.metadata?.repositoryRevision : undefined;
+    const metadata = current.isDirectory() ? await stagedMetadata(entry.absolutePath) : undefined;
+    if (canonical(metadata ?? null) !== canonical(entry.metadata ?? null)) throw new Error('inbox entry metadata changed before claim');
+    const kind = metadata ? metadata.requestedKind === 'upload' ? inferKind(metadata.originalName ?? metadata.displayName) : metadata.kind : entry.kind;
+    const validatedEntry = { ...entry, kind, metadata };
+    const repository = current.isDirectory() && !metadata && await this.isRepository(entry.absolutePath);
+    const stagedRepository = current.isDirectory() && metadata?.kind === 'repository';
+    const revision = repository ? await this.revision(entry.absolutePath) : stagedRepository ? metadata?.repositoryRevision : undefined;
     if ((repository || stagedRepository) && !revision) throw new Error('repository revision is unavailable');
-    const snapshot = await this.snapshotForEntry(entry, revision);
+    const snapshot = await this.snapshotForEntry(validatedEntry, revision);
     const afterEntry = await lstatNoFollow(entry.absolutePath);
-    const afterRevision = repository ? await this.revision(entry.absolutePath) : stagedRepository ? entry.metadata?.repositoryRevision : undefined;
+    const afterMetadata = afterEntry.isDirectory() ? await stagedMetadata(entry.absolutePath) : undefined;
+    const afterValidatedEntry = { ...validatedEntry, metadata: afterMetadata };
+    const afterRevision = repository ? await this.revision(entry.absolutePath) : stagedRepository ? afterMetadata?.repositoryRevision : undefined;
     if (repository && afterRevision !== revision) throw new Error('repository changed during snapshot');
-    const after = await this.snapshotForEntry(entry, afterRevision);
-    if (!sameIdentity(statIdentity(afterEntry), entry.identity) || snapshot.digest !== after.digest || !sameIdentity(snapshot.identity, after.identity)) throw new Error('inbox entry changed during snapshot');
+    const after = await this.snapshotForEntry(afterValidatedEntry, afterRevision);
+    if (!sameIdentity(statIdentity(afterEntry), entry.identity) || canonical(afterMetadata ?? null) !== canonical(metadata ?? null) || snapshot.digest !== after.digest || !sameIdentity(snapshot.identity, after.identity)) throw new Error('inbox entry changed during snapshot');
     const claimId = deterministicUuid(canonical({ scope: 'claim', digest: snapshot.digest, identity: snapshot.identity, revision, kind: snapshot.kind, metadata: snapshot.metadata }));
-    return { claimId, entry, snapshot, claimedAt: new Date().toISOString() };
+    return { claimId, entry: validatedEntry, snapshot, claimedAt: new Date().toISOString() };
   }
   async prepareClaim(input: SourceClaim | InboxEntry): Promise<PreparedAdmission> {
     const supplied = 'snapshot' in input ? input : await this.claim(input);
@@ -1240,7 +1273,7 @@ export class SourceService {
     const existing = await this.normalizeExistingPacket(claim, {});
     if (existing) {
       this.completedPrepared.set(prepared.preparedId, { prepared: input.prepared, result: existing });
-      await this.cleanupPrepared(prepared.preparedId);
+      try { await this.cleanupPrepared(prepared.preparedId); } catch { /* Retain the idempotent result; transient work cleanup can be retried. */ }
       return existing;
     }
     const sourceId = this.sourceIdFor(claim, {});
@@ -1282,6 +1315,7 @@ export class SourceService {
         extractionDigest: prepared.extractedDigest,
         extractedDigest: prepared.extractedDigest,
         files: claim.snapshot.files.map(({ path, size, digest }) => ({ path, relativePath: path, bytes: size, byteLength: size, digest, mediaType })),
+        attachments: preparedAttachmentFiles.map(({ path, size, digest }) => ({ path, relativePath: path, bytes: size, byteLength: size, digest, mediaType })),
         chunks: chunks.map(({ index, startAtom, endAtom, startByte, endByte, digest }) => ({ index, chunkId: `${sourceId}:${index}`, sourceId, ordinal: index, relativePath: 'extracted.md', byteLength: endByte - startByte, atomStart: startAtom, atomEnd: endAtom, startAtom, endAtom, startByte, endByte, digest })),
       };
       await fs.writeFile(join(temporary, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
@@ -1293,7 +1327,7 @@ export class SourceService {
     const published = await this.publishPacket(manifest, temporary, packet, claim);
     const result = { sourceId: published.manifest.sourceId, manifest: published.manifest, packetPath: packet, removedInbox: published.removedInbox, claim };
     this.completedPrepared.set(prepared.preparedId, { prepared: input.prepared, result });
-    await this.cleanupPrepared(prepared.preparedId);
+    try { await this.cleanupPrepared(prepared.preparedId); } catch { /* Retain the idempotent result; transient work cleanup can be retried. */ }
     return result;
   }
 
@@ -1324,9 +1358,9 @@ export class SourceService {
       if (snapshot.digest !== claim.snapshot.digest || !sameIdentity(snapshot.identity, claim.snapshot.identity)) return false;
       await fs.rm(claim.entry.absolutePath, { recursive: true, force: false });
       return true;
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && ['ENOENT', 'ENOTDIR'].includes(String((error as NodeJS.ErrnoException).code))) return false;
-      throw error;
+    } catch {
+      // Publication is durable; stale or inaccessible inbox cleanup stays pending for retry.
+      return false;
     }
   }
   private async normalizeExistingPacket(claim: SourceClaim, options: { mediaType?: string; originalName?: string; url?: string }): Promise<AdmissionResult | undefined> {
@@ -1346,6 +1380,13 @@ export class SourceService {
   async admitClaim(claim: SourceClaim, options: { endpoints?: Array<number | ChunkPlanEndpoint>; mediaType?: string; originalName?: string; url?: string } = {}): Promise<AdmissionResult> {
     const existing = await this.normalizeExistingPacket(claim, options);
     if (existing) return existing;
+    try {
+      claim = await this.revalidateClaim(claim);
+    } catch (error) {
+      const sourceId = this.sourceIdFor(claim, options);
+      const row = dbGet<Row>(this.db, 'SELECT status FROM sources WHERE source_id = ?', [sourceId]);
+      if (String(row?.status ?? '') !== 'removed') throw error;
+    }
     const sourceId = this.sourceIdFor(claim, options);
     const packet = join(this.sources(), sourceId);
     const temporary = join(this.work(), `packet-${sourceId}-${randomUUID()}`);
@@ -1380,14 +1421,17 @@ export class SourceService {
     if (extracted.byteLength > MAX_SOURCE_BYTES) throw new Error('extraction exceeds 100 MiB limit');
     const chunks = validateChunkEndpoints(extracted, options.endpoints);
     await fs.writeFile(join(temporary, 'extracted.md'), extracted, { flag: 'wx', mode: 0o600 });
+    let attachmentBytes = 0;
     for (const attachment of attachments) {
       const target = ensureWithin(join(temporary, 'attachments'), join(join(temporary, 'attachments'), validRelativePath(attachment.path)));
       const bytes = Buffer.from(attachment.bytes);
-      if (bytes.byteLength > MAX_SOURCE_BYTES) throw new Error('attachment exceeds 100 MiB limit');
+      attachmentBytes += bytes.byteLength;
+      if (bytes.byteLength > MAX_SOURCE_BYTES || attachmentBytes > MAX_SOURCE_BYTES) throw new Error('attachment exceeds 100 MiB limit');
       await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
       await fs.writeFile(target, bytes, { flag: 'wx', mode: 0o600 });
     }
     for (const chunk of chunks) await fs.writeFile(join(temporary, 'chunks', `${String(chunk.index + 1).padStart(4, '0')}.md`), chunk.body, { flag: 'wx', mode: 0o600 });
+    const attachmentFiles = await walkFiles(join(temporary, 'attachments'), '', false);
     const originalName = validRelativePath(options.originalName ?? claim.snapshot.metadata?.originalName ?? claim.entry.relativePath);
     const displayName = options.originalName ?? claim.snapshot.metadata?.displayName ?? originalName;
     const sourceUri = options.url === undefined ? claim.snapshot.metadata?.sourceUri : sanitizedSourceUri(options.url);
@@ -1415,6 +1459,7 @@ export class SourceService {
       extractionDigest: digestBytes(extracted),
       extractedDigest: digestBytes(extracted),
       files: claim.snapshot.files.map(({ path, size, digest }) => ({ path, relativePath: path, bytes: size, byteLength: size, digest, mediaType })),
+      attachments: attachmentFiles.map(({ path, size, digest }) => ({ path, relativePath: path, bytes: size, byteLength: size, digest, mediaType })),
       chunks: chunks.map(({ index, startAtom, endAtom, startByte, endByte, digest }) => ({ index, chunkId: `${sourceId}:${index}`, sourceId, ordinal: index, relativePath: 'extracted.md', byteLength: endByte - startByte, atomStart: startAtom, atomEnd: endAtom, startAtom, endAtom, startByte, endByte, digest })),
     };
     await fs.writeFile(join(temporary, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
@@ -1469,10 +1514,13 @@ export class SourceService {
         if (!found) dbRun(this.db, 'INSERT INTO source_files (source_id, relative_path, byte_length, digest, media_type) VALUES (?, ?, ?, ?, ?)', [manifest.sourceId, file.relativePath, file.byteLength, file.digest, file.mediaType ?? manifest.mediaType ?? null]);
         else if (String(found.digest) !== file.digest || Number(found.byte_length) !== file.byteLength) throw new Error('source file identity conflicts with existing database record');
       }
+      const expectedChunks = new Map(manifest.chunks.map((chunk) => [chunk.chunkId, chunk]));
+      const existingChunks = dbAll<Row>(this.db, 'SELECT * FROM source_chunks WHERE source_id = ?', [manifest.sourceId]);
+      if (existingChunks.length > manifest.chunks.length || existingChunks.some((row) => !expectedChunks.has(String(row.chunk_id)))) throw new Error('source chunk catalog set conflicts with retained packet');
       for (const chunk of manifest.chunks) {
         const found = dbGet<Row>(this.db, 'SELECT * FROM source_chunks WHERE chunk_id = ?', [chunk.chunkId]);
         if (!found) dbRun(this.db, 'INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [chunk.chunkId, manifest.sourceId, chunk.ordinal, chunk.relativePath, chunk.byteLength, chunk.digest, chunk.atomStart, chunk.atomEnd]);
-        else if (String(found.digest) !== chunk.digest || String(found.source_id) !== manifest.sourceId) throw new Error('source chunk identity conflicts with existing database record');
+        else if (String(found.source_id) !== manifest.sourceId || Number(found.ordinal) !== chunk.ordinal || String(found.relative_path) !== chunk.relativePath || Number(found.byte_length) !== chunk.byteLength || String(found.digest) !== chunk.digest || Number(found.atom_start) !== chunk.atomStart || Number(found.atom_end) !== chunk.atomEnd) throw new Error('source chunk identity conflicts with existing database record');
       }
     });
   }
@@ -1621,6 +1669,17 @@ export class SourceService {
     const preview = this.removalPreview(sourceId);
     const token = typeof confirmation === 'string' ? confirmation : confirmation.confirmationId;
     if (token !== preview.confirmationId) throw new Error('stale removal confirmation');
+    const affectedQuizIds = [...new Set(preview.dependents.flatMap((dependent) => typeof dependent.quiz_id === 'string' ? [dependent.quiz_id] : []))];
+    const quizSheetSnapshots: Array<{ sheetPath: string; previous?: Buffer }> = affectedQuizIds.flatMap((quizId): Array<{ sheetPath: string; previous?: Buffer }> => {
+      const row = dbGet<Row>(this.db, 'SELECT date, sheet_path FROM quizzes WHERE quiz_id = ?', [quizId]);
+      if (!row) return [];
+      const date = String(row.date ?? '');
+      const sheetPath = String(row.sheet_path ?? join(pathFor(this.paths, 'quizzes'), date.slice(0, 4), date.slice(5, 7), `${date}.md`));
+      try { return [{ sheetPath, previous: readFileSync(sheetPath) }]; } catch (error) {
+        if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') return [{ sheetPath }];
+        throw error;
+      }
+    });
     await fs.mkdir(locations.quarantineRoot, { recursive: true, mode: 0o700 });
     await fs.rename(preview.packetPath, locations.quarantine);
     try {
@@ -1636,8 +1695,10 @@ export class SourceService {
           if (typeof dependent.quiz_id === 'string') quizIds.add(dependent.quiz_id);
         }
         for (const pageId of pageIds) {
+          const page = dbGet<Row>(this.db, 'SELECT digest FROM pages WHERE page_id = ?', [pageId]);
+          if (!page) throw new Error(`dependent page is missing: ${pageId}`);
           dbRun(this.db, 'UPDATE pages SET status = ?, revision = revision + 1, updated_at = ? WHERE page_id = ?', ['drifted', now, pageId]);
-          for (const binding of dbAll<Row>(this.db, 'SELECT card_id FROM card_bindings WHERE page_id = ?', [pageId])) if (typeof binding.card_id === 'string') cardIds.add(binding.card_id);
+          dbRun(this.db, 'INSERT INTO wiki_issues (issue_id, page_id, heading, card_id, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)', [randomUUID(), pageId, page.digest, 'missing', `Source ${sourceId} was removed; revise this page and its review evidence against the remaining admitted sources.`, 'open', now, now]);
           dbRun(this.db, 'UPDATE card_bindings SET active = 0 WHERE page_id = ?', [pageId]);
         }
         for (const cardId of cardIds) dbRun(this.db, 'UPDATE review_cards SET status = ?, updated_at = ? WHERE card_id = ?', ['retired', now, cardId]);
@@ -1645,7 +1706,20 @@ export class SourceService {
         dbRun(this.db, 'DELETE FROM source_dependencies WHERE source_id = ?', [sourceId]);
       });
     } catch (error) {
-      try { await fs.rename(locations.quarantine, preview.packetPath) } catch (restoreError) { throw new Error(`source removal transaction failed and packet restore failed: ${error instanceof Error ? error.message : String(error)}; ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`, { cause: restoreError }); }
+      const restoreErrors: unknown[] = [];
+      for (const sheet of quizSheetSnapshots) {
+        try {
+          if (sheet.previous === undefined) await fs.rm(sheet.sheetPath, { force: true });
+          else await fs.writeFile(sheet.sheetPath, sheet.previous, { mode: 0o600 });
+        } catch (restoreError) {
+          restoreErrors.push(restoreError);
+        }
+      }
+      try { await fs.rename(locations.quarantine, preview.packetPath); } catch (restoreError) { restoreErrors.push(restoreError); }
+      if (restoreErrors.length) {
+        const detail = restoreErrors.map((restoreError) => restoreError instanceof Error ? restoreError.message : String(restoreError)).join("; ");
+        throw new Error(`source removal transaction failed and rollback failed: ${error instanceof Error ? error.message : String(error)}; ${detail}`, { cause: restoreErrors[0] });
+      }
       throw error;
     }
     try {

@@ -53,6 +53,7 @@ describe("Pi package lifecycle", () => {
       "scholar_add",
       "scholar_admit_source",
       "scholar_apply_maintenance",
+      "scholar_finish_maintenance",
       "scholar_get_admission_context",
       "scholar_get_grading_context",
       "scholar_get_maintenance_context",

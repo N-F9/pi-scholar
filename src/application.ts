@@ -201,7 +201,7 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
       const result = await qmdSearch(paths, query, options?.limit);
       if (result.timedOut || result.signal || result.code !== 0) throw new Error(`qmd search failed: ${(result.stderr.trim() || result.stdout.trim() || result.signal || "unknown error").slice(0, 500)}`);
       const text = result.stdout.trim();
-      if (!text) return [];
+      if (!text) throw new Error("qmd search returned malformed JSON");
       let parsed: unknown;
       try { parsed = JSON.parse(text); } catch { throw new Error("qmd search returned malformed JSON"); }
       if (Array.isArray(parsed)) return parsed;
@@ -621,7 +621,7 @@ export class ScholarApplication {
       return this.wikiResult(resolved.page.pageId);
     }, "wiki:drift"));
   }
-  async createNote(input: WikiNoteInput, context?: ApplicationMutationContext): Promise<WikiPageResult> { return this.mutate(context, () => this.durableDirect(async () => { const created = await this.wiki.create(input); return this.wikiResult(created.page.pageId); }, "wiki:create")); }
+  async createNote(input: WikiNoteInput, context?: ApplicationMutationContext): Promise<WikiPageResult> { if (input.quizWorthiness === "eligible") throw new ValidationError("eligible notes require a maintenance card proposal"); return this.mutate(context, () => this.durableDirect(async () => { const created = await this.wiki.create(input); return this.wikiResult(created.page.pageId); }, "wiki:create")); }
   private async prepareMaintenanceCardBindings(card: MaintenanceIssueCardInput, corrected?: { readonly issue: WikiIssueRecord; readonly prepared: WikiPreparedUpdate }): Promise<MaintenanceIssueCardInput> {
     const groups = maintenanceCardBindingGroups(card);
     const correctedSections = corrected ? new Map(parseWikiSections(corrected.prepared.content, corrected.prepared.page.pageId).map((section) => [section.anchor, section])) : undefined;
@@ -698,13 +698,12 @@ export class ScholarApplication {
   private assertPageMutationBindings(pageId: string, replacementCardIds: readonly string[] = []): void {
     const replacements = new Set(replacementCardIds);
     const leavesStaleBindings = this.db.all<Record<string, unknown>>(
-      "SELECT DISTINCT card_id FROM card_bindings WHERE page_id = ? AND active = 1",
+      "SELECT DISTINCT bindings.card_id FROM card_bindings AS bindings JOIN review_cards AS cards ON cards.card_id = bindings.card_id WHERE bindings.page_id = ? AND bindings.active = 1 AND cards.status = 'active'",
       [pageId],
     ).some((row) => !replacements.has(String(row.card_id)));
     if (leavesStaleBindings) throw new ValidationError("page mutation would leave active card bindings stale");
   }
-
-  async updateNote(pageId: string, input: WikiNoteUpdateInput, context?: ApplicationMutationContext): Promise<WikiPageResult> { return this.mutate(context, () => this.durableDirect(async () => { this.assertPageMutationBindings(pageId); const updated = await this.wiki.update(pageId, input); return this.wikiResult(updated.page.pageId); }, "wiki:update")); }
+  async updateNote(pageId: string, input: WikiNoteUpdateInput, context?: ApplicationMutationContext): Promise<WikiPageResult> { if (input.quizWorthiness === "eligible") throw new ValidationError("eligible notes require a maintenance card proposal"); return this.mutate(context, () => this.durableDirect(async () => { this.assertPageMutationBindings(pageId); const updated = await this.wiki.update(pageId, input); return this.wikiResult(updated.page.pageId); }, "wiki:update")); }
   async renameNote(pageId: string, requestedPath: string, context?: ApplicationMutationContext): Promise<WikiPageResult> { return this.mutate(context, () => this.durableDirect(async () => { const updated = await this.wiki.rename(pageId, requestedPath); return this.wikiResult(updated.pageId); }, "wiki:rename")); }
 
   async listQuizzes(): Promise<{ readonly quizzes: readonly PublicQuizRecord[] }> { return { quizzes: this.quiz.list().map(publicQuiz) }; }
@@ -713,9 +712,7 @@ export class ScholarApplication {
     return this.mutate(context, () => withWriterLock(this.paths, async () => {
       const answers = asAnswers(input.answers);
       if (answers.length !== input.answers.length || new Set(answers.map((answer) => answer.questionId)).size !== answers.length) throw new ValidationError("answers must contain each question at most once");
-      const result = context?.origin === "browser"
-        ? this.quiz.saveBrowserDraft({ date, revision: input.expectedRevision, answers: answersObject(answers) })
-        : this.quiz.saveDraft({ date, revision: input.expectedRevision, answers: answersObject(answers) });
+      const result = this.quiz.saveDraft({ date, revision: input.expectedRevision, answers: answersObject(answers) });
       const savedAt = this.db.get<Record<string, unknown>>("SELECT saved_at FROM quiz_answers WHERE quiz_id = ? ORDER BY saved_at DESC LIMIT 1", [result.quizId])?.saved_at;
       return { revision: result.revision, savedAt: String(savedAt ?? new Date().toISOString()), answers };
     }));
@@ -734,40 +731,35 @@ export class ScholarApplication {
     }, "quiz:seal"));
   }
   async beginWorkflow(kind: WorkflowKind, idempotencyKey?: string): Promise<{ readonly workflow: WorkflowRecord }> {
-    return { workflow: this.workflows.beginWorkflow(kind, idempotencyKey) };
+    return this.durableDirect(async () => {
+      const workflow = this.workflows.beginWorkflow(kind, idempotencyKey);
+      return { workflow };
+    }, `workflow:${kind}:begin`, {
+      capture: () => this.db.all<Record<string, unknown>>("SELECT request_id, kind, status, started_at, finished_at, progress, message, error_code, error_message, idempotency_key FROM workflows ORDER BY request_id"),
+      restore: (rows) => transaction(this.db, () => {
+        this.db.run("DELETE FROM workflows");
+        for (const row of rows) this.db.run(
+          "INSERT INTO workflows (request_id, kind, status, started_at, finished_at, progress, message, error_code, error_message, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [row.request_id, row.kind, row.status, row.started_at ?? null, row.finished_at ?? null, row.progress, row.message ?? null, row.error_code ?? null, row.error_message ?? null, row.idempotency_key ?? null],
+        );
+      }),
+    });
   }
   async updateWorkflow(requestId: string, input: WorkflowUpdateInput = {}): Promise<{ readonly workflow: WorkflowRecord }> {
-    return { workflow: this.workflows.updateWorkflow(requestId, input) };
+    return this.durableDirect(() => ({ workflow: this.workflows.updateWorkflow(requestId, input) }), `workflow:${requestId}:update`);
   }
   async finishWorkflow(requestId: string, status: "succeeded" | "failed", options: WorkflowFinishOptions = {}): Promise<{ readonly workflow: WorkflowRecord }> {
-    return { workflow: this.workflows.finishWorkflow(requestId, status, options) };
+    return this.durableDirect(() => ({ workflow: this.workflows.finishWorkflow(requestId, status, options) }), `workflow:${requestId}:${status}`);
   }
 
   async listWorkflows(): Promise<{ readonly workflows: readonly PublicWorkflowRecord[] }> { return { workflows: this.workflows.list().map(publicWorkflow) }; }
   async getWorkflow(requestId: string): Promise<PublicWorkflowRecord> { const workflow = this.workflows.get(requestId); if (!workflow) throw new Error("workflow not found"); return publicWorkflow(workflow); }
-  async getSettings(): Promise<{ readonly settings: SettingsRecord }> { const initializationEnabled = await this.readSetting("initializationEnabled", true); const timezone = await this.readSetting("timezone", "local"); const port = await this.readSetting("port", 4816); const host = await this.readSetting("host", "127.0.0.1"); const pendingInboxCount = (await this.sources.discover()).length; const openIssueCount = Number(this.db.get<Record<string, unknown>>("SELECT COUNT(*) AS count FROM wiki_issues WHERE status IN ('open','reopened')")?.count ?? 0); const maintenance = this.db.get<Record<string, unknown>>("SELECT finished_at, message FROM workflows WHERE kind = 'wiki-maintenance' AND status = 'succeeded' ORDER BY finished_at DESC LIMIT 1"); let git: SettingsFacts["git"] = { clean: false, ahead: 0, behind: 0, diverged: false, message: "Git state unavailable" }; try { const status = (await import("./external/git.js")).gitStatus(this.paths); git = { branch: status.branch, clean: status.clean, ahead: status.ahead, behind: status.behind, diverged: status.diverged }; } catch (error) { git = { ...git, message: errorMessage(error) }; } const facts: SettingsFacts = { localDate: await this.currentLocalDate(), pendingInboxCount, openIssueCount, ...(maintenance?.finished_at ? { lastMaintenanceAt: String(maintenance.finished_at) } : {}), ...(maintenance?.message ? { lastMaintenanceResult: String(maintenance.message) } : {}), recentChanges: [], git }; return { settings: { initializationEnabled: Boolean(initializationEnabled), timezone: String(timezone), port: Number(port), host: String(host), updatedAt: String(this.db.get<Record<string, unknown>>("SELECT MAX(updated_at) AS updated_at FROM settings")?.updated_at ?? new Date().toISOString()), facts } }; }
+  async getSettings(): Promise<{ readonly settings: SettingsRecord }> { const initializationEnabled = await this.readSetting("initializationEnabled", true); const timezone = await this.readSetting("timezone", "local"); const port = await this.readSetting("port", 4816); const host = await this.readSetting("host", "127.0.0.1"); const pendingInboxCount = (await this.sources.discover()).length; const openIssueCount = Number(this.db.get<Record<string, unknown>>("SELECT COUNT(*) AS count FROM wiki_issues WHERE status IN ('open','reopened')")?.count ?? 0); const maintenance = this.db.get<Record<string, unknown>>("SELECT finished_at, message FROM workflows WHERE kind = 'wiki-maintenance' AND status = 'succeeded' ORDER BY finished_at DESC LIMIT 1"); let git: SettingsFacts["git"] = { clean: false, ahead: 0, behind: 0, diverged: false, message: "Git state unavailable" }; try { const status = (await import("./external/git.js")).gitStatus(this.paths); git = { branch: status.branch, upstream: status.upstream, clean: status.clean, ahead: status.ahead, behind: status.behind, diverged: status.diverged }; } catch (error) { git = { ...git, message: errorMessage(error) }; } const facts: SettingsFacts = { localDate: await this.currentLocalDate(), pendingInboxCount, openIssueCount, ...(maintenance?.finished_at ? { lastMaintenanceAt: String(maintenance.finished_at) } : {}), ...(maintenance?.message ? { lastMaintenanceResult: String(maintenance.message) } : {}), recentChanges: [], git }; return { settings: { initializationEnabled: Boolean(initializationEnabled), timezone: String(timezone), port: Number(port), host: String(host), updatedAt: String(this.db.get<Record<string, unknown>>("SELECT MAX(updated_at) AS updated_at FROM settings")?.updated_at ?? new Date().toISOString()), facts } }; }
   async updateSettings(input: SettingsUpdateRequest, context?: ApplicationMutationContext): Promise<{ readonly settings: SettingsRecord }> { return this.mutate(context, () => this.durableDirect(async () => { const now = new Date().toISOString(); const updates: [string, unknown][] = []; if (input.initializationEnabled !== undefined) { if (typeof input.initializationEnabled !== "boolean") throw new ValidationError("initializationEnabled must be boolean"); updates.push(["initializationEnabled", input.initializationEnabled]); } if (input.timezone !== undefined) { if (typeof input.timezone !== "string" || !input.timezone.trim() || input.timezone.length > 100) throw new ValidationError("timezone is invalid"); if (input.timezone !== "local") { try { new Intl.DateTimeFormat("en-CA", { timeZone: input.timezone }).format(); } catch { throw new ValidationError("timezone is invalid"); } } updates.push(["timezone", input.timezone]); } if (input.port !== undefined) { if (!Number.isInteger(input.port) || input.port < 1 || input.port > 65_535) throw new ValidationError("port is invalid"); updates.push(["port", input.port]); } if (input.host !== undefined && input.host !== "127.0.0.1") throw new ValidationError("host must be 127.0.0.1"); if (input.host !== undefined) updates.push(["host", input.host]); transaction(this.db, () => { for (const [key, value] of updates) this.db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at", [key, JSON.stringify(value), now]); }); return this.getSettings(); }, "settings:update")); }
   async status(): Promise<ApplicationStatus> { const settings = await this.getSettings(); const health = await this.health(); return { ...health, settings: settings.settings, workflows: this.workflows.list().map(publicWorkflow) }; }
   async health(): Promise<HealthResult> { try { const report = this.doctorFn(this.paths.vaultRoot); this.lastDoctorReport = report; return { status: report.ok ? "ok" : "degraded", version: this.version, vaultId: this.paths.vaultId, doctor: report.ok ? "pass" : "fail" }; } catch { return { status: "failed", version: this.version, vaultId: this.paths.vaultId, doctor: "fail" }; } }
   async sync(): Promise<GitPushResult> {
-    return withWriterLock(this.paths, () => {
-      const workflow = this.workflows.beginWorkflow("sync");
-      const finish = (status: "succeeded" | "failed", options: WorkflowFinishOptions): void => {
-        try { this.workflows.finishWorkflow(workflow.requestId, status, options); } catch { /* preserve the push result */ }
-      };
-      try {
-        const result = this.pushFn(this.paths);
-        if (result.ok) finish("succeeded", { progress: 1, message: "Git push completed" });
-        else finish("failed", { errorCode: result.error ?? "PUSH_FAILED", errorMessage: result.output || result.error || "git push failed" });
-        return result;
-      } catch (error) {
-        finish("failed", {
-          errorCode: error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "SYNC_FAILED",
-          errorMessage: errorMessage(error),
-        });
-        throw error;
-      }
-    });
+    return withWriterLock(this.paths, () => this.pushFn(this.paths));
   }
   async close(): Promise<void> { let closeError: unknown; try { await this.workflows.close({ drain: true }); } catch (error) { closeError = error; } try { await this.clearAdmissionClaims(); } catch (error) { closeError ??= error; } this.completedAdmissions.clear(); if (this.ownsDatabase) this.db.close(); if (closeError) throw closeError; }
   async getMaintenanceContext(): Promise<MaintenanceContext> {
@@ -793,14 +785,15 @@ export class ScholarApplication {
     const coverage = this.scheduler.validateCoverage(pages);
     if (!coverage.ok) throw new ValidationError(`Eligible wiki pages have no active card bindings: ${coverage.missingPageIds.join(", ")}`);
   }
-  private async maintenancePreflight(): Promise<void> {
-    await this.assertNoLiveWikiDrift();
+  private async maintenancePreflight(allowDrift = false): Promise<void> {
+    if (!allowDrift) await this.assertNoLiveWikiDrift();
     const pages = await this.wiki.list();
     const projection = await this.wiki.refreshProjections(false);
     const lint = this.wiki.lintSync(pages, projection.backlinks);
     if (lint.length) throw new ValidationError(`wiki lint failed: ${lint.join("; ")}`);
     const qmd = this.wiki.adapters.qmd;
-    if (qmd && typeof qmd.index === "function") await qmd.index();
+    if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
+    await qmd.index();
   }
   private async captureMaintenanceRollback(proposal: MaintenanceInput): Promise<MaintenanceRollbackSnapshot> {
     const destinations = new Set<string>([
@@ -916,7 +909,11 @@ export class ScholarApplication {
         if (!expectedSnapshots.has(entry)) await fs.rm(join(snapshot.snapshotRoot, entry), { recursive: true, force: true });
       }
       const qmd = this.wiki.adapters.qmd;
-      if (qmd && typeof qmd.index === "function") await qmd.index();
+      try {
+        if (qmd && typeof qmd.index === "function") await qmd.index();
+      } finally {
+        this.db.checkpoint();
+      }
     } finally {
       await fs.rm(snapshot.workRoot, { recursive: true, force: true });
     }
@@ -929,7 +926,8 @@ export class ScholarApplication {
     if (lint.length) throw new ValidationError(`wiki lint failed: ${lint.join("; ")}`);
     this.assertMaintenanceCoverage();
     const qmd = this.wiki.adapters.qmd;
-    if (qmd && typeof qmd.index === "function") await qmd.index();
+    if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
+    await qmd.index();
     const doctor = this.doctorFn(this.paths.vaultRoot);
     if (!doctor.ok) throw new ValidationError("doctor checks failed");
     return { lint, doctor };
@@ -942,7 +940,7 @@ export class ScholarApplication {
       dispose: (snapshot: MaintenanceRollbackSnapshot) => fs.rm(snapshot.workRoot, { recursive: true, force: true }),
     };
     return this.durableDirect(async () => {
-      await this.maintenancePreflight();
+      await this.maintenancePreflight(proposal.kind === "update-page" || proposal.kind === "resolve-issue");
       switch (proposal.kind) {
         case "create-page": {
           if (proposal.quizWorthiness === "eligible") throw new ValidationError("Eligible pages require a card before creation");

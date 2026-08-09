@@ -65,6 +65,7 @@ export interface SourceManifest {
   readonly originalDigest: string;
   readonly extractedDigest: string;
   readonly files: readonly SourceFileEntry[];
+  readonly attachments: readonly SourceFileEntry[];
   readonly chunks: readonly SourceChunk[];
 }
 

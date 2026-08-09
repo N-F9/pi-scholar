@@ -369,6 +369,7 @@ function seedDefaultSettings(paths: VaultPaths): void {
       ];
       for (const [key, value] of defaults) db.run("INSERT OR IGNORE INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [key, value, now]);
     });
+    db.checkpoint();
   } finally {
     db.close();
   }

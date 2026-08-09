@@ -223,7 +223,7 @@ function transaction<T>(source: SqlDatabaseSource, operation: () => T): T {
 }
 
 function cleanMarkdown(value: string): string {
-  return value.replace(/\r/g, "").replace(/<!--/g, "< !--").trim();
+  return value.replace(/\r/g, "").replace(/<!--/g, "< !--").replace(/^(#{1,6})(?=\s)/gmu, "\\$1").trim();
 }
 function anchorFragment(anchor: string): string {
   return anchor.replace(/^#+/u, "");
@@ -459,33 +459,6 @@ export class QuizService {
     return result;
   }
 
-  saveBrowserDraft(input: QuizDraftInput): QuizRecord {
-    const date = localDate(input.date);
-    const quiz = this.requireQuiz(date);
-    if (quiz.revision !== input.revision + 1) return this.saveDraft(input);
-    if (quiz.status !== "open") throw new QuizConflictError("Only an open quiz accepts drafts");
-    const questionIds = new Set(quiz.questions.map((question) => question.questionId));
-    if (Object.keys(input.answers).some((questionId) => !questionIds.has(questionId))) throw new ValidationError("Draft contains an unknown question");
-    for (const answer of Object.values(input.answers)) this.validateAnswerText(answer);
-    const answers = { ...this.answerMap(quiz.quizId), ...input.answers };
-    const rendered = this.renderSheet(quiz, answers);
-    this.validateRenderedSheet(rendered);
-    return this.replaceSheet(quiz.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
-      transaction(this.source, () => {
-        for (const [questionId, answer] of Object.entries(input.answers)) {
-          this.db.run(
-            "INSERT INTO quiz_answers (quiz_id, question_id, revision, answer_json, saved_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (quiz_id, question_id) DO UPDATE SET revision = excluded.revision, answer_json = excluded.answer_json, saved_at = excluded.saved_at",
-            quiz.quizId,
-            questionId,
-            quiz.revision,
-            json(normalizedAnswer(answer)),
-            nowIso(),
-          );
-        }
-      });
-      return this.requireQuiz(date);
-    });
-  }
 
   sealSubmission(input: QuizDraftInput): QuizRecord;
   sealSubmission(date: string | Date, revision: number, answers?: Readonly<Record<string, string | readonly string[]>>): QuizRecord;
@@ -1104,7 +1077,8 @@ export class QuizService {
 
 
   private validateAnswerText(answer: string | readonly string[]): void {
-    if (FORBIDDEN_SHEET_TEXT.test(answerText(answer))) throw new ValidationError("Answers may not contain private grading material");
+    const text = answerText(answer);
+    if (FORBIDDEN_SHEET_TEXT.test(text) || /^#{1,6}\s/mu.test(text)) throw new ValidationError("Answers may not contain private grading material or structural Markdown");
   }
 
   private validateFeedback(feedback: string): void {

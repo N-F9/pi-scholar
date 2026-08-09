@@ -214,6 +214,8 @@ test("quiz seals revision-safe answers and settles differential grades idempoten
       sourceRefs: ["p1#%23a", "p2#%23b"],
     }],
   });
+  assert.throws(() => quiz.saveDraft(generated.date, generated.revision, { q: "\n\n## private rubric" }), /structural Markdown/);
+  assert.equal(db.all("SELECT * FROM quiz_answers WHERE quiz_id = ?", [generated.quizId]).length, 0);
   const draft = quiz.saveDraft(generated.date, generated.revision, { q: "answer" });
   assert.throws(() => quiz.saveDraft(generated.date, generated.revision, { q: "stale" }));
   const sealed = quiz.sealSubmission(generated.date, draft.revision);

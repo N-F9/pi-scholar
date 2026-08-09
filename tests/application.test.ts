@@ -343,7 +343,7 @@ function gradingFixture() {
     }],
   });
   const draft = app.quiz.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
-  return { ...fixtureValue, date, cardId, questionId, quiz, draft };
+  return { ...fixtureValue, date, cardId, questionId, quiz: app.quiz.get(date)!, draft };
 }
 
 function gradeFor(context: Awaited<ReturnType<ScholarApplication["getGradingContext"]>>, cardId: string, questionId: string, evidence: readonly string[]) {

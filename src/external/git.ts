@@ -1,4 +1,4 @@
-import { existsSync, lstatSync } from "node:fs";
+import { lstatSync, type Stats } from "node:fs";
 import { runChild, runChildSync, type ChildResult, type ChildRunOptions } from "./process.js";
 import type { VaultPaths } from "../vault.js";
 
@@ -13,6 +13,7 @@ const SAFE_GIT_COMMIT_CONFIG = [...SAFE_GIT_CONFIG, "-c", "user.name=Pi Scholar"
 
 export interface GitStatus {
   readonly branch?: string;
+  readonly upstream?: string;
   readonly ahead: number;
   readonly behind: number;
   readonly clean: boolean;
@@ -42,12 +43,23 @@ function gitOptions(cwd: string, timeoutMs = GIT_TIMEOUT_MS): ChildRunOptions {
 }
 
 function assertGitDirectory(paths: VaultPaths, allowMissing = false): void {
-  if (!existsSync(`${paths.vaultRoot}/.git`)) {
-    if (allowMissing) return;
-    throw new Error("vault Git repository is missing");
+  const gitPath = `${paths.vaultRoot}/.git`;
+  let stat: Stats;
+  try {
+    stat = lstatSync(gitPath);
+  } catch (error) {
+    if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("vault Git repository is missing");
+    throw error;
   }
-  const stat = lstatSync(`${paths.vaultRoot}/.git`);
-  if (!stat.isDirectory()) throw new Error(".git must be a real directory");
+  if (stat.isSymbolicLink()) throw new Error(".git must not be a symbolic link");
+  if (stat.isDirectory()) return;
+  if (stat.isFile()) {
+    const result = runChildSync("git", ["-C", paths.vaultRoot, ...SAFE_GIT_CONFIG, "rev-parse", "--git-dir"], { ...gitOptions(paths.vaultRoot, GIT_REVISION_TIMEOUT_MS), maxOutputBytes: GIT_REVISION_OUTPUT_BYTES });
+    if (result.code !== 0 || result.timedOut || result.signal || !result.stdout.trim()) throw new Error("vault Git linked-worktree metadata is invalid");
+    return;
+  }
+  throw new Error(".git must be a real directory or linked-worktree file");
 }
 
 function commandFailure(result: ChildResult, command: string): Error {
@@ -91,10 +103,12 @@ export function runGitSync(paths: VaultPaths, args: readonly string[], timeoutMs
 
 export function parseGitStatus(raw: string): GitStatus {
   let branch: string | undefined;
+  let upstream: string | undefined;
   let ahead = 0;
   let behind = 0;
   for (const line of raw.split(/\r?\n/u)) {
     if (line.startsWith("# branch.head ")) branch = line.slice("# branch.head ".length).trim();
+    if (line.startsWith("# branch.upstream ")) upstream = line.slice("# branch.upstream ".length).trim();
     if (line.startsWith("# branch.ab ")) {
       const match = /^# branch\.ab \+([0-9]+) -([0-9]+)$/u.exec(line);
       if (match) {
@@ -104,7 +118,7 @@ export function parseGitStatus(raw: string): GitStatus {
     }
   }
   const entries = raw.split(/\r?\n/u).filter((line) => line.length > 0 && !line.startsWith("#"));
-  return { branch, ahead, behind, clean: entries.length === 0, diverged: ahead > 0 && behind > 0, raw };
+  return { branch, upstream, ahead, behind, clean: entries.length === 0, diverged: ahead > 0 && behind > 0, raw };
 }
 
 export function gitStatus(paths: VaultPaths): GitStatus {
@@ -149,7 +163,23 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
   const output = `${result.stdout}${result.stderr}`.trim();
   if (result.code !== 0) {
     const noUpstream = /no configured push destination|has no upstream branch|src refspec .* does not match any|set the remote as upstream/iu.test(output);
-    return { ok: false, status: gitStatus(paths), output, error: noUpstream ? "NO_UPSTREAM" : result.timedOut ? "TIMEOUT" : "PUSH_FAILED" };
+    let reconciled = false;
+    try {
+      const fetch = runGitSync(paths, ["fetch", "--prune", remote]);
+      if (fetch.code === 0) {
+        const local = runGitSync(paths, ["rev-parse", "HEAD"]);
+        const upstreamRef = branch ? `refs/remotes/${remote}/${branch}` : "@{upstream}";
+        const upstream = runGitSync(paths, ["rev-parse", upstreamRef]);
+        const localId = local.code === 0 ? local.stdout.trim() : "";
+        const upstreamId = upstream.code === 0 ? upstream.stdout.trim() : "";
+        reconciled = /^[0-9a-f]{40,64}$/iu.test(localId) && localId === upstreamId;
+      }
+    } catch {
+      // Preserve the original push failure when reconciliation cannot run.
+    }
+    const reconciledStatus = gitStatus(paths);
+    if (reconciled) return { ok: true, status: reconciledStatus, output: `${output}\nPush status reconciled after remote update` };
+    return { ok: false, status: reconciledStatus, output, error: noUpstream ? "NO_UPSTREAM" : result.timedOut ? "TIMEOUT" : "PUSH_FAILED" };
   }
   return { ok: true, status: gitStatus(paths), output };
 }

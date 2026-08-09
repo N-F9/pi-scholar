@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { doclingDependencyIdentity } from "./external/docling.js";
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { delimiter, join, resolve } from "node:path";
+import { atomizeExtraction } from "./sources.js";
 import { gitDependencyIdentity, gitStatus } from "./external/git.js";
+import { doclingDependencyIdentity } from "./external/docling.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import { openDatabase, SCHEMA_VERSION, validateSchema, type ScholarDatabase } from "./database.js";
 import { QuizService } from "./quiz.js";
-import { SchedulerService } from "./scheduler.js";
+import { localDate, SchedulerService } from "./scheduler.js";
 import type { DoctorCheck, DoctorReport, JsonValue } from "./contracts.js";
 import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
 
@@ -17,9 +18,25 @@ function check(name: string, status: DoctorCheck["status"], message: string, det
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-const dependencyCheckCache = new Map<string, DoctorCheck>();
+type DependencyCache = { readonly fingerprint: string; readonly check: DoctorCheck };
+const dependencyCheckCache = new Map<string, DependencyCache>();
 
-
+function dependencyFingerprint(name: string): string {
+  const pathValue = process.env.PATH ?? "";
+  for (const directory of pathValue.split(delimiter)) {
+    if (!directory || !directory.startsWith("/")) continue;
+    const candidate = join(directory, name);
+    try {
+      const executable = realpathSync(candidate);
+      const stat = statSync(executable);
+      if (!stat.isFile() || (stat.mode & 0o111) === 0) continue;
+      return `${pathValue}\u0000${executable}\u0000${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return `${pathValue}\u0000missing`;
+}
 function collectFiles(root: string, suffix: string, output: string[] = [], prefix = ""): string[] {
   const entries = readdirSync(root, { withFileTypes: true });
   for (const entry of entries) {
@@ -99,7 +116,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
   try {
     entries = readdirSync(paths.sourcesRoot, { withFileTypes: true });
   } catch (error) {
-    return check("source-packets", "fail", errorMessage(error));
+    return check("source-packets", "fail", `Cannot inspect source packets: ${errorMessage(error)}`);
   }
   let db: ScholarDatabase | undefined;
   try {
@@ -125,50 +142,137 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         if (shouldBeDirectory ? !stat.isDirectory() : !stat.isFile()) throw new Error(`Packet artifact has wrong type: ${entry.name}/${required}`);
       }
       const manifest = JSON.parse(readRegular(join(packet, "manifest.json")).toString("utf8")) as Record<string, unknown>;
-      const chunks = Array.isArray(manifest.chunks) ? manifest.chunks.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object") : [];
-      const files = Array.isArray(manifest.files) ? manifest.files.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object") : [];
-      if (manifest.sourceId !== entry.name || chunks.length !== (Array.isArray(manifest.chunks) ? manifest.chunks.length : -1) || files.length !== (Array.isArray(manifest.files) ? manifest.files.length : -1)) throw new Error(`Manifest identity/files/chunks are invalid: ${entry.name}`);
-      const assertExactFiles = (root: string, expected: string[], label: string): void => {
-        const actual = collectFiles(root, "");
-        const expectedSet = new Set(expected);
-        if (expectedSet.size !== expected.length || actual.length !== expected.length || actual.some((file) => !expectedSet.has(file))) throw new Error(`${label} mismatch: ${entry.name}`);
+      if (manifest.id !== entry.name || manifest.sourceId !== entry.name) throw new Error(`Manifest id/sourceId mismatch: ${entry.name}`);
+      const records = (value: unknown, label: string): Record<string, unknown>[] => {
+        if (!Array.isArray(value)) throw new Error(`Manifest ${label} is not an array: ${entry.name}`);
+        return value.map((item, index) => {
+          if (item === null || typeof item !== "object" || Array.isArray(item)) throw new Error(`Manifest ${label}[${index}] is not an object: ${entry.name}`);
+          return item as Record<string, unknown>;
+        });
       };
-      const originalNames = files.map((file) => {
-        const filePath = String(file.relativePath ?? file.path ?? "");
-        safeRelativePath(join(packet, "original"), filePath);
-        return filePath;
+      const files = records(manifest.files, "files");
+      const chunks = records(manifest.chunks, "chunks");
+      const attachments = manifest.attachments === undefined ? [] : records(manifest.attachments, "attachments");
+      const integer = (value: unknown, label: string): number => {
+        if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ${label}: ${entry.name}`);
+        return value;
+      };
+      const aliasedInteger = (record: Record<string, unknown>, keys: readonly string[], label: string): number => {
+        const values = keys.filter((key) => record[key] !== undefined).map((key) => integer(record[key], `${label}.${key}`));
+        if (values.length === 0) throw new Error(`Missing ${label}: ${entry.name}`);
+        if (values.some((value) => value !== values[0])) throw new Error(`Conflicting ${label}: ${entry.name}`);
+        return values[0]!;
+      };
+      const digest = (value: unknown, label: string): string => {
+        if (typeof value !== "string" || !/^[0-9a-f]{64}$/iu.test(value)) throw new Error(`Invalid ${label}: ${entry.name}`);
+        return value;
+      };
+      const aliasedDigest = (record: Record<string, unknown>, keys: readonly string[], label: string): string => {
+        const values = keys.filter((key) => record[key] !== undefined).map((key) => digest(record[key], `${label}.${key}`));
+        if (values.length === 0) throw new Error(`Missing ${label}: ${entry.name}`);
+        if (values.some((value) => value !== values[0])) throw new Error(`Conflicting ${label}: ${entry.name}`);
+        return values[0]!;
+      };
+      const relativePath = (record: Record<string, unknown>, label: string): string => {
+        const values = ["relativePath", "path"].filter((key) => record[key] !== undefined).map((key) => {
+          if (typeof record[key] !== "string" || !record[key]) throw new Error(`Invalid ${label}.${key}: ${entry.name}`);
+          return record[key] as string;
+        });
+        if (values.length === 0) throw new Error(`Missing ${label}.relativePath: ${entry.name}`);
+        if (values.some((value) => value !== values[0])) throw new Error(`Conflicting ${label} path identity: ${entry.name}`);
+        return values[0]!;
+      };
+      const fileRecords = files.map((record, index) => {
+        const path = relativePath(record, `files[${index}]`);
+        safeRelativePath(join(packet, "original"), path);
+        return { path, byteLength: aliasedInteger(record, ["byteLength", "bytes"], `files[${index}].byteLength`), digest: digest(record.digest, `files[${index}].digest`) };
       });
-      assertExactFiles(join(packet, "original"), originalNames, "Original file set");
-      assertExactFiles(join(packet, "chunks"), chunks.map((_chunk, index) => `${String(index + 1).padStart(4, "0")}.md`), "Chunk file set");
+      const attachmentRecords = attachments.map((record, index) => {
+        const path = relativePath(record, `attachments[${index}]`);
+        safeRelativePath(join(packet, "attachments"), path);
+        return { path, byteLength: aliasedInteger(record, ["byteLength", "bytes"], `attachments[${index}].byteLength`), digest: digest(record.digest, `attachments[${index}].digest`) };
+      });
+      const checkFiles = (root: string, expected: readonly { readonly path: string; readonly byteLength: number; readonly digest: string }[], label: string): number => {
+        const inspectTree = (current: string, prefix = ""): void => {
+          for (const child of readdirSync(current, { withFileTypes: true })) {
+            const childPath = prefix ? `${prefix}/${child.name}` : child.name;
+            const target = join(current, child.name);
+            if (child.isSymbolicLink()) throw new Error(`${label} tree contains symlink: ${entry.name}/${childPath}`);
+            if (child.isDirectory()) inspectTree(target, childPath);
+            else if (!child.isFile()) throw new Error(`${label} tree contains a non-regular entry: ${entry.name}/${childPath}`);
+          }
+        };
+        inspectTree(root);
+        const pathsOnDisk = collectFiles(root, "");
+        const expectedPaths = new Set(expected.map((file) => file.path));
+        if (expectedPaths.size !== expected.length || pathsOnDisk.length !== expected.length || pathsOnDisk.some((path) => !expectedPaths.has(path))) throw new Error(`${label} file set mismatch: ${entry.name}`);
+        let total = 0;
+        for (const file of expected) {
+          const body = readRegular(safeRelativePath(root, file.path));
+          total += body.byteLength;
+          if (body.byteLength !== file.byteLength || createHash("sha256").update(body).digest("hex") !== file.digest) throw new Error(`${label} identity/digest mismatch: ${entry.name}/${file.path}`);
+        }
+        return total;
+      };
+      const originalTotal = checkFiles(join(packet, "original"), fileRecords, "Original");
+      checkFiles(join(packet, "attachments"), attachmentRecords, "Attachment");
+      const declaredOriginalTotal = aliasedInteger(manifest, ["originalByteLength", "originalBytes"], "manifest original byte length");
+      if (declaredOriginalTotal !== originalTotal || declaredOriginalTotal !== fileRecords.reduce((sum, file) => sum + file.byteLength, 0)) throw new Error(`Original aggregate byte length mismatch: ${entry.name} (declared ${declaredOriginalTotal}, actual ${originalTotal})`);
+      const originalDigest = digest(manifest.originalDigest, "manifest originalDigest");
       const extracted = readRegular(join(packet, "extracted.md"));
-      const extractedDigest = createHash("sha256").update(extracted).digest("hex");
-      if (manifest.extractedDigest !== extractedDigest || manifest.extractionDigest !== extractedDigest || Number(manifest.extractedByteLength ?? manifest.extractionBytes) !== extracted.byteLength) throw new Error(`Extracted artifact digest/length mismatch: ${entry.name}`);
-      let atomCount = 0;
-      for (const byte of extracted) if (byte === 10) atomCount += 1;
-      if (extracted.length === 0 || extracted[extracted.length - 1] !== 10) atomCount += 1;
+      const declaredExtractionTotal = aliasedInteger(manifest, ["extractedByteLength", "extractionBytes"], "manifest extracted byte length");
+      if (declaredExtractionTotal !== extracted.byteLength) throw new Error(`Extracted aggregate byte length mismatch: ${entry.name} (declared ${declaredExtractionTotal}, actual ${extracted.byteLength})`);
+      const extractedDigest = aliasedDigest(manifest, ["extractedDigest", "extractionDigest"], "manifest extracted digest");
+      if (createHash("sha256").update(extracted).digest("hex") !== extractedDigest) throw new Error(`Extracted digest mismatch: ${entry.name}`);
+      const atoms = atomizeExtraction(extracted);
+      const chunkNames = readdirSync(join(packet, "chunks")).sort((left, right) => left.localeCompare(right));
+      if (chunks.length === 0 || chunkNames.length !== chunks.length) throw new Error(`Chunk file set is incomplete: ${entry.name}`);
+      const chunkBodies: Buffer[] = [];
       let atomCursor = 0;
-      const chunkBytes: Buffer[] = [];
-      for (const [index, chunk] of chunks.entries()) {
-        if (Number(chunk.ordinal) !== index || Number(chunk.atomStart) !== atomCursor || Number(chunk.atomEnd) <= atomCursor) throw new Error(`Chunk order/atom coverage is invalid: ${entry.name}`);
-        const body = readRegular(join(packet, "chunks", `${String(index + 1).padStart(4, "0")}.md`));
-        const digest = createHash("sha256").update(body).digest("hex");
-        if (chunk.digest !== digest || Number(chunk.byteLength) !== body.byteLength) throw new Error(`Chunk digest/length mismatch: ${entry.name}/${index + 1}`);
-        atomCursor = Number(chunk.atomEnd);
-        chunkBytes.push(body);
+      let byteCursor = 0;
+      let chunkByteTotal = 0;
+      for (const [index, record] of chunks.entries()) {
+        const expectedName = `${String(index + 1).padStart(4, "0")}.md`;
+        if (chunkNames[index] !== expectedName) throw new Error(`Chunk file order is invalid: ${entry.name}/${expectedName}`);
+        const body = readRegular(join(packet, "chunks", expectedName));
+        const chunkIndex = aliasedInteger(record, ["index", "ordinal"], `chunks[${index}].index`);
+        const ordinal = aliasedInteger(record, ["ordinal", "index"], `chunks[${index}].ordinal`);
+        const chunkId = record.chunkId;
+        const chunkSourceId = record.sourceId;
+        const chunkPath = record.relativePath;
+        if (chunkIndex !== index || ordinal !== index || chunkSourceId !== entry.name || chunkId !== `${entry.name}:${index}` || chunkPath !== "extracted.md") throw new Error(`Chunk source/chunk id or relative path mismatch: ${entry.name}/${index}`);
+        const startAtom = aliasedInteger(record, ["startAtom", "atomStart"], `chunks[${index}].startAtom`);
+        const endAtom = aliasedInteger(record, ["endAtom", "atomEnd"], `chunks[${index}].endAtom`);
+        const startByte = integer(record.startByte, `chunks[${index}].startByte`);
+        const endByte = integer(record.endByte, `chunks[${index}].endByte`);
+        const byteLength = aliasedInteger(record, ["byteLength", "bytes"], `chunks[${index}].byteLength`);
+        if (startAtom !== atomCursor || endAtom <= startAtom || endAtom > atoms.length || startByte !== byteCursor || endByte < startByte || endByte - startByte !== body.byteLength || endByte - startByte !== byteLength) throw new Error(`Chunk atom/byte range is not contiguous: ${entry.name}/${index}`);
+        const firstAtom = atoms[startAtom];
+        const lastAtom = atoms[endAtom - 1];
+        if (!firstAtom || !lastAtom || firstAtom.startByte !== startByte || lastAtom.endByte !== endByte || !body.equals(extracted.subarray(startByte, endByte))) throw new Error(`Chunk atom/byte range does not match extraction: ${entry.name}/${index}`);
+        if (createHash("sha256").update(body).digest("hex") !== digest(record.digest, `chunks[${index}].digest`)) throw new Error(`Chunk digest mismatch: ${entry.name}/${index}`);
+        chunkBodies.push(body);
+        atomCursor = endAtom;
+        byteCursor = endByte;
+        chunkByteTotal += body.byteLength;
       }
-      if (atomCursor !== atomCount || !Buffer.concat(chunkBytes).equals(extracted)) throw new Error(`Chunk reconstruction mismatch: ${entry.name}`);
-      for (const file of files) {
-        const filePath = String(file.relativePath ?? file.path ?? "");
-        const body = readRegular(safeRelativePath(join(packet, "original"), filePath));
-        const digest = createHash("sha256").update(body).digest("hex");
-        if (file.digest !== digest || Number(file.byteLength ?? file.bytes) !== body.byteLength) throw new Error(`Original file digest/length mismatch: ${entry.name}/${filePath}`);
-      }
-      const source = db.get<{ source_id: string; status: string; digest: string | null; manifest_path: string | null }>("SELECT source_id, status, digest, manifest_path FROM sources WHERE source_id = ?", [entry.name]);
-      if (!source || source.status !== "published" || source.digest !== manifest.originalDigest || !source.manifest_path || resolve(source.manifest_path) !== resolve(packet)) throw new Error(`Source catalog linkage is invalid: ${entry.name}`);
+      if (atomCursor !== atoms.length || byteCursor !== extracted.byteLength || chunkByteTotal !== extracted.byteLength || !Buffer.concat(chunkBodies, chunkByteTotal).equals(extracted)) throw new Error(`Chunk final totals/reconstruction mismatch: ${entry.name}`);
+      const source = db.get<{ source_id: string; kind: string; status: string; repository_revision: string | null; digest: string | null; manifest_path: string | null }>("SELECT source_id, kind, status, repository_revision, digest, manifest_path FROM sources WHERE source_id = ?", [entry.name]);
+      const manifestRevision = manifest.repositoryRevision ?? manifest.revision;
+      const repositoryRevisionValid = source?.kind !== "repository"
+        || (typeof source.repository_revision === "string" && source.repository_revision.length > 0 && typeof manifestRevision === "string" && manifestRevision === source.repository_revision);
+      if (!source || source.status !== "published" || source.kind !== manifest.kind || !repositoryRevisionValid || (source.repository_revision !== null && manifestRevision !== source.repository_revision) || (source.repository_revision === null && manifest.repositoryRevision !== undefined) || source.digest !== originalDigest || !source.manifest_path || resolve(source.manifest_path) !== resolve(packet)) throw new Error(`Source catalog provenance/linkage is invalid: ${entry.name}`);
       const dbFiles = db.all<{ relative_path: string; byte_length: number; digest: string }>("SELECT relative_path, byte_length, digest FROM source_files WHERE source_id = ? ORDER BY relative_path", [entry.name]);
-      if (dbFiles.length !== files.length || files.some((file) => !dbFiles.some((row) => row.relative_path === String(file.relativePath ?? file.path) && row.byte_length === Number(file.byteLength ?? file.bytes) && row.digest === file.digest))) throw new Error(`Source file catalog linkage is invalid: ${entry.name}`);
-      const dbChunks = db.all<{ ordinal: number; relative_path: string; byte_length: number; digest: string; atom_start: number; atom_end: number }>("SELECT ordinal, relative_path, byte_length, digest, atom_start, atom_end FROM source_chunks WHERE source_id = ? ORDER BY ordinal", [entry.name]);
-      if (dbChunks.length !== chunks.length || chunks.some((chunk, index) => dbChunks[index]?.ordinal !== Number(chunk.ordinal) || dbChunks[index]?.byte_length !== Number(chunk.byteLength) || dbChunks[index]?.digest !== chunk.digest || dbChunks[index]?.atom_start !== Number(chunk.atomStart) || dbChunks[index]?.atom_end !== Number(chunk.atomEnd))) throw new Error(`Source chunk catalog linkage is invalid: ${entry.name}`);
+      const filesByPath = new Map(fileRecords.map((file) => [file.path, file]));
+      if (dbFiles.length !== fileRecords.length || dbFiles.some((row) => {
+        const expected = filesByPath.get(row.relative_path);
+        return !expected || row.byte_length !== expected.byteLength || row.digest !== expected.digest;
+      })) throw new Error(`Source file catalog identity/digest mismatch: ${entry.name}`);
+      const dbChunks = db.all<{ chunk_id: string; source_id: string; ordinal: number; relative_path: string; byte_length: number; digest: string; atom_start: number; atom_end: number }>("SELECT chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end FROM source_chunks WHERE source_id = ? ORDER BY ordinal", [entry.name]);
+      if (dbChunks.length !== chunks.length || chunks.some((record, index) => {
+        const row = dbChunks[index];
+        return !row || row.chunk_id !== `${entry.name}:${index}` || row.source_id !== entry.name || row.ordinal !== index || row.relative_path !== "extracted.md" || row.byte_length !== aliasedInteger(record, ["byteLength", "bytes"], `chunks[${index}].byteLength`) || row.digest !== record.digest || row.atom_start !== aliasedInteger(record, ["startAtom", "atomStart"], `chunks[${index}].startAtom`) || row.atom_end !== aliasedInteger(record, ["endAtom", "atomEnd"], `chunks[${index}].atomEnd`);
+      })) throw new Error(`Source chunk catalog identity/digest mismatch: ${entry.name}`);
     }
     const sources = db.all<{ source_id: string; status: string; digest: string | null; manifest_path: string | null }>("SELECT source_id, status, digest, manifest_path FROM sources WHERE status != 'removed' ORDER BY source_id");
     for (const source of sources) {
@@ -184,11 +288,91 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       const manifestStat = lstatSync(manifestPath);
       if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) throw new Error(`Source catalog manifest is not a regular file: ${source.source_id}`);
       const manifest = JSON.parse(readFileNoFollow(manifestPath).toString("utf8")) as Record<string, unknown>;
-      if (manifest.sourceId !== source.source_id || manifest.originalDigest !== source.digest) throw new Error(`Source catalog reverse linkage is invalid: ${source.source_id}`);
+      if (manifest.id !== source.source_id || manifest.sourceId !== source.source_id || manifest.originalDigest !== source.digest) throw new Error(`Source catalog reverse linkage is invalid: ${source.source_id}`);
     }
-    return check("source-packets", "pass", `${entries.length} source packet(s) have valid immutable artifacts, reconstruction, and bidirectional catalog linkage`);
+    return check("source-packets", "pass", `${entries.length} source packet(s) have valid immutable artifacts, aggregate lengths, reconstruction, and bidirectional catalog linkage`);
   } catch (error) {
     return check("source-packets", "fail", errorMessage(error));
+  } finally {
+    db?.close();
+  }
+}
+const WORKFLOW_KINDS = new Set(["source-admission", "wiki-maintenance", "daily-quiz", "quiz-grader", "sync"]);
+const WORKFLOW_STATUSES = new Set(["queued", "running", "succeeded", "failed", "cancelled"]);
+const WORKFLOW_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const QUIZ_GRADER_BINDING_PREFIX = "quiz-grader:v1:";
+
+function checkWorkflows(paths: VaultPaths): DoctorCheck {
+  let db: ScholarDatabase | undefined;
+  try {
+    db = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    const running: { requestId: string; kind: string; startedAt: string }[] = [];
+    const rows = db.all<Record<string, unknown>>("SELECT request_id, kind, status, started_at, finished_at, progress, message, error_code, error_message, idempotency_key FROM workflows ORDER BY request_id");
+    for (const row of rows) {
+      const requestId = row.request_id;
+      if (typeof requestId !== "string" || !WORKFLOW_ID.test(requestId)) throw new Error(`Workflow request_id is malformed: ${String(requestId)}`);
+      if (typeof row.kind !== "string" || !WORKFLOW_KINDS.has(row.kind)) throw new Error(`Workflow kind is malformed: ${requestId}`);
+      if (typeof row.status !== "string" || !WORKFLOW_STATUSES.has(row.status)) throw new Error(`Workflow status is malformed: ${requestId}`);
+      if (typeof row.progress !== "number" || !Number.isFinite(row.progress) || row.progress < 0 || row.progress > 1) throw new Error(`Workflow progress is malformed: ${requestId}`);
+      const boundedText = (key: string, maxBytes: number): void => {
+        const value = row[key];
+        if (value === null || (typeof value === "string" && Buffer.byteLength(value, "utf8") <= maxBytes)) return;
+        throw new Error(`Workflow ${key} metadata is malformed: ${requestId}`);
+      };
+      boundedText("message", 500);
+      boundedText("error_code", 100);
+      boundedText("error_message", 500);
+      const idempotencyKey = row.idempotency_key;
+      if (idempotencyKey !== null && (typeof idempotencyKey !== "string" || !idempotencyKey || idempotencyKey.length > 200 || /[\u0000-\u001f\u007f]/u.test(idempotencyKey))) throw new Error(`Workflow idempotency_key metadata is malformed: ${requestId}`);
+      const timestamp = (key: string): number | undefined => {
+        const value = row[key];
+        if (value === null) return undefined;
+        if (typeof value !== "string" || !value || Number.isNaN(Date.parse(value)) || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`Workflow ${key} metadata is malformed: ${requestId}`);
+        return Date.parse(value);
+      };
+      const startedAt = timestamp("started_at");
+      const finishedAt = timestamp("finished_at");
+      if (startedAt !== undefined && finishedAt !== undefined && finishedAt < startedAt) throw new Error(`Workflow timestamps are out of order: ${requestId}`);
+      if (row.kind === "quiz-grader" && (row.status === "queued" || row.status === "running")) {
+        if (typeof row.message !== "string" || !row.message) throw new Error(`Quiz grader workflow binding is missing: ${requestId}`);
+        if (row.status === "queued") {
+          let payload: unknown;
+          try { payload = JSON.parse(row.message); } catch { throw new Error(`Quiz grader workflow payload is malformed: ${requestId}`); }
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload) || Object.keys(payload).length !== 3 || !Object.keys(payload).every((key) => ["date", "revision", "submissionId"].includes(key))) throw new Error(`Quiz grader workflow payload is malformed: ${requestId}`);
+          const value = payload as Record<string, unknown>;
+          if (typeof value.date !== "string" || value.date !== localDate(value.date) || typeof value.revision !== "number" || !Number.isInteger(value.revision) || value.revision < 1 || typeof value.submissionId !== "string" || !value.submissionId) throw new Error(`Quiz grader workflow payload is malformed: ${requestId}`);
+          const quiz = db.get<{ quiz_id: string; date: string; revision: number; status: string }>("SELECT quiz_id, date, revision, status FROM quizzes WHERE date = ?", [value.date]);
+          const expectedSubmissionId = quiz ? `${quiz.quiz_id}:r${quiz.revision}` : undefined;
+          const validRetryKey = expectedSubmissionId ? `${expectedSubmissionId}:retry:${requestId}` : undefined;
+          if (!quiz || quiz.status !== "submitted" || quiz.revision !== value.revision || value.submissionId !== expectedSubmissionId || (idempotencyKey !== expectedSubmissionId && idempotencyKey !== validRetryKey)) throw new Error(`Quiz grader workflow payload is not linked to a submitted quiz: ${requestId}`);
+        } else {
+          if (!row.message.startsWith(QUIZ_GRADER_BINDING_PREFIX)) throw new Error(`Quiz grader workflow binding is malformed: ${requestId}`);
+          let binding: unknown;
+          try { binding = JSON.parse(row.message.slice(QUIZ_GRADER_BINDING_PREFIX.length)); } catch { throw new Error(`Quiz grader workflow binding is malformed: ${requestId}`); }
+          if (typeof binding !== "object" || binding === null || Array.isArray(binding) || Object.keys(binding).length !== 2 || !Object.keys(binding).every((key) => ["quizId", "ownerHash"].includes(key))) throw new Error(`Quiz grader workflow binding is malformed: ${requestId}`);
+          const value = binding as Record<string, unknown>;
+          if (typeof value.quizId !== "string" || !value.quizId || typeof value.ownerHash !== "string" || !/^[0-9a-f]{64}$/u.test(value.ownerHash)) throw new Error(`Quiz grader workflow binding is malformed: ${requestId}`);
+          const quiz = db.get<{ quiz_id: string; status: string }>("SELECT quiz_id, status FROM quizzes WHERE quiz_id = ?", [value.quizId]);
+          if (!quiz || quiz.status !== "submitted") throw new Error(`Quiz grader workflow binding is not linked to a submitted quiz: ${requestId}`);
+        }
+      }
+      if (row.status === "queued") {
+        if (startedAt !== undefined || finishedAt !== undefined || row.progress !== 0 || row.error_code !== null || row.error_message !== null) throw new Error(`Queued workflow metadata is inconsistent: ${requestId}`);
+      } else if (row.status === "running") {
+        if (startedAt === undefined || finishedAt !== undefined || row.error_code !== null || row.error_message !== null) throw new Error(`Running workflow metadata is inconsistent: ${requestId}`);
+        running.push({ requestId, kind: row.kind, startedAt: String(row.started_at) });
+      } else {
+        if (startedAt === undefined || finishedAt === undefined) throw new Error(`Finished workflow metadata is incomplete: ${requestId}`);
+        if (row.status === "succeeded" && (row.progress !== 1 || row.error_code !== null || row.error_message !== null)) throw new Error(`Succeeded workflow metadata is inconsistent: ${requestId}`);
+      }
+    }
+    if (running.length > 0) {
+      const listed = running.map((row) => `${row.requestId} (${row.kind})`).join(", ");
+      return check("workflows", "warn", `Running workflow row(s) require operation-specific retry; no recovery performed: ${listed}`, { running: running.map((row) => ({ requestId: row.requestId, kind: row.kind, startedAt: row.startedAt })) });
+    }
+    return check("workflows", "pass", `${rows.length} workflow row(s) have valid status and metadata`);
+  } catch (error) {
+    return check("workflows", "fail", errorMessage(error));
   } finally {
     db?.close();
   }
@@ -392,27 +576,35 @@ function checkDependencies(paths: VaultPaths): DoctorCheck[] {
     ["docling", () => doclingDependencyIdentity(paths)],
   ];
   for (const [name, probe] of probes) {
+    const fingerprint = dependencyFingerprint(name);
     const cached = dependencyCheckCache.get(name);
-    if (cached) {
-      checks.push(cached);
+    if (cached?.fingerprint === fingerprint) {
+      checks.push(cached.check);
       continue;
     }
+    const required = name === "git";
     try {
       const identity = probe();
-      const result = identity.version ? check(name, "pass", identity.version) : check(name, "fail", `${name} version could not be determined`);
-      if (result.status === "pass") dependencyCheckCache.set(name, result);
+      const result = identity.version ? check(name, "pass", identity.version) : check(name, required ? "fail" : "warn", `${name} version could not be determined`);
+      dependencyCheckCache.set(name, { fingerprint: dependencyFingerprint(name), check: result });
       checks.push(result);
     } catch (error) {
-      checks.push(check(name, "fail", `${name} unavailable: ${errorMessage(error)}`));
+      const result = check(name, required ? "fail" : "warn", `${name} unavailable: ${errorMessage(error)}`);
+      dependencyCheckCache.set(name, { fingerprint: dependencyFingerprint(name), check: result });
+      checks.push(result);
     }
   }
   return checks;
 }
 
-function checkExternalState(paths: VaultPaths): DoctorCheck[] {
+function checkExternalState(paths: VaultPaths, qmdDependency: DoctorCheck | undefined): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
-  const qmdScope = qmdScopeCheck(paths);
-  checks.push(qmdScope.ok ? check("qmd-scope", "pass", qmdScope.message) : check("qmd-scope", "fail", qmdScope.message));
+  if (qmdDependency?.status !== "pass") {
+    checks.push(check("qmd-scope", "warn", `qmd semantic ranking unavailable; exact and lexical navigation remain usable${qmdDependency ? `: ${qmdDependency.message}` : ""}`));
+  } else {
+    const qmdScope = qmdScopeCheck(paths);
+    checks.push(qmdScope.ok ? check("qmd-scope", "pass", qmdScope.message) : check("qmd-scope", "warn", `qmd semantic ranking unavailable; exact and lexical navigation remain usable: ${qmdScope.message}`));
+  }
   try {
     const status = gitStatus(paths);
     checks.push(status.diverged ? check("git-state", "fail", "Git history is diverged") : check("git-state", "pass", status.clean ? "Git worktree is clean" : "Git worktree has uncommitted changes"));
@@ -421,6 +613,7 @@ function checkExternalState(paths: VaultPaths): DoctorCheck[] {
   }
   return checks;
 }
+
 
 export function doctor(explicitPath?: string): DoctorReport {
   const checkedAt = new Date().toISOString();
@@ -432,7 +625,8 @@ export function doctor(explicitPath?: string): DoctorReport {
   }
   const roots = checkRoots(paths);
   if (roots.status === "fail") return { ok: false, checkedAt, checks: [roots] };
-  const checks = [roots, ...checkDatabase(paths), checkPackets(paths), checkPages(paths), checkScheduler(paths), checkQuizzes(paths), ...checkDependencies(paths), ...checkExternalState(paths)];
+  const dependencyChecks = checkDependencies(paths);
+  const checks = [roots, ...checkDatabase(paths), checkPackets(paths), checkWorkflows(paths), checkPages(paths), checkScheduler(paths), checkQuizzes(paths), ...dependencyChecks, ...checkExternalState(paths, dependencyChecks.find((item) => item.name === "qmd"))];
   return { ok: checks.every((item) => item.status !== "fail"), checkedAt, checks };
 }
 

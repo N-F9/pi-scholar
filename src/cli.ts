@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { initVault, NoVaultError, resolveVault } from "./vault.js";
 import { ensureQmdCollection } from "./external/qmd.js";
 import { localCheckpointCommit } from "./external/git.js";
+import { openDatabase } from "./database.js";
 import type { ChildResult } from "./external/process.js";
 
 export interface CliArgs {
@@ -132,16 +133,20 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     } catch (error) {
       qmdError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
     }
+    const db = openDatabase(paths);
+    try { db.checkpoint(); } finally { db.close(); }
     const report = doctor(paths.vaultRoot);
     const qmdFailure = qmdResult ? qmdInitializationFailure(qmdResult) : undefined;
-    const failures = [
+    const qmdCheckNames: Record<string, true> = { qmd: true, "qmd-scope": true };
+    const warnings = [
       ...(qmdError ? [`qmd: ${qmdError}`] : []),
       ...(qmdFailure ? [`qmd: ${qmdFailure}`] : []),
-      ...report.checks.filter((item) => item.status === "fail").map((item) => `${item.name}: ${item.message}`),
+      ...report.checks.filter((item) => qmdCheckNames[item.name] === true && item.status !== "pass").map((item) => `${item.name}: ${item.message}`),
     ];
+    const failures = report.checks.filter((item) => item.status === "fail" && qmdCheckNames[item.name] !== true).map((item) => `${item.name}: ${item.message}`);
     if (failures.length > 0) throw new Error(`Initialization failed: ${failures.join("; ")}`);
     localCheckpointCommit(paths, "scholar: initialize vault");
-    print({ ok: true, vaultRoot: paths.vaultRoot, vaultId: paths.vaultId });
+    print({ ok: true, vaultRoot: paths.vaultRoot, vaultId: paths.vaultId, ...(warnings.length ? { warnings: [...new Set(warnings)] } : {}) });
     return 0;
   }
   if (parsed.command === "doctor") return reportDoctor(parsed.positional[0]);

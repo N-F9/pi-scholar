@@ -1,0 +1,26 @@
+Pi Scholar — third-party attribution
+
+The following projects informed Pi Scholar's product policies and acceptance
+fixtures. The references below are pinned for provenance; they are not runtime
+dependencies and their repositories are not read at runtime.
+
+- pi-llm-wiki, https://github.com/zosmaai/pi-llm-wiki, revision
+  a4c9da4b4694: Pi-native knowledge interaction, strict OKF parsing, Markdown
+  links, deterministic projections, and guardrails.
+- Engram, https://github.com/nagisanzenin/engram, revision d0a61cd67130:
+  retrieval practice, distributed practice, topic interleaving, isolated
+  assessment, and FSRS/evidence policies.
+- Cribrum, https://github.com/N-F9/cribrum-lite, revision f54da48676c7:
+  safe admission, lossless atomization, bounded wiki-to-quiz workflows,
+  process containment, locks, cadence, and Git synchronization semantics.
+
+Pi Scholar does not ship those projects, their data, or their storage/runtime
+homes. This file records design and behavioral attribution only; no donor source
+file is copied into this package. Any future adapted donor code must retain the
+corresponding upstream license and attribution text here before release.
+
+Direct runtime dependencies used by this package include:
+
+- @mariozechner/pi-coding-agent — MIT, loaded as a Pi peer package.
+- typebox — MIT, loaded as a Pi peer package.
+- ts-fsrs — see its installed package LICENSE and upstream notices.
