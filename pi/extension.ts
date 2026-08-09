@@ -120,8 +120,18 @@ const noteInput = Type.Object({
   pageId: Type.Optional(Type.String({ minLength: 1 })),
   path: Type.Optional(Type.String()),
   title: Type.Optional(Type.String()),
-  body: Type.Optional(Type.String()),
-  content: Type.Optional(Type.String()),
+  body: Type.Optional(
+    Type.String({
+      description:
+        "Complete Markdown body. Preserve user-authored prose; model-authored source notes must be self-contained textbook-style exposition with nearby source-chunk citations.",
+    }),
+  ),
+  content: Type.Optional(
+    Type.String({
+      description:
+        "Alias for body. Preserve user-authored prose; model-authored source notes must teach the topic in depth rather than summarize it.",
+    }),
+  ),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
 });
 const removalInput = Type.Object({
@@ -210,7 +220,10 @@ const maintenanceInput = Type.Union([
     kind: Type.Literal("create-page"),
     path: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
-    body: Type.String(),
+    body: Type.String({
+      description:
+        "Complete Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks.",
+    }),
     quizWorthiness: Type.Optional(
       Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")]),
     ),
@@ -220,7 +233,12 @@ const maintenanceInput = Type.Union([
     pageId: Type.String({ minLength: 1 }),
     expectedDigest: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
-    body: Type.Optional(Type.String()),
+    body: Type.Optional(
+      Type.String({
+        description:
+          "Complete replacement Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks.",
+      }),
+    ),
     quizWorthiness: Type.Optional(
       Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")]),
     ),
@@ -661,7 +679,8 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_note",
     label: "scholar_note",
-    description: "Create a guarded product-authored wiki note.",
+    description:
+      "Create or update a guarded wiki note. Preserve user prose; model-authored source notes must teach at textbook depth, not merely summarize.",
     executionMode: "sequential",
     parameters: noteInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -757,7 +776,8 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_apply_maintenance",
     label: "scholar_apply_maintenance",
     executionMode: "sequential",
-    description: "Apply one guarded wiki/card maintenance proposal.",
+    description:
+      "Apply one guarded wiki/card proposal; model-authored source pages must be self-contained textbook-style exposition.",
     parameters: maintenanceInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded maintenance", "wiki-maintenance", (app) =>
