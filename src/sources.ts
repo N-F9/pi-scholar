@@ -2600,6 +2600,13 @@ export class SourceService {
       [sourceId],
     ).map((row) => row.quiz_id);
   }
+  private affectedSubmittedQuizIds(sourceId: string): string[] {
+    return dbAll<{ quiz_id: string }>(
+      this.db,
+      "SELECT DISTINCT q.quiz_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_pages qp ON qp.question_id = qq.question_id JOIN quiz_evidence qe ON qe.quiz_id = q.quiz_id AND qe.page_id = qp.page_id JOIN source_dependencies sd ON sd.source_id = ? AND sd.page_id = qp.page_id AND sd.relation = 'citation' JOIN pages p ON p.page_id = qp.page_id WHERE q.status = 'submitted' AND NOT EXISTS (SELECT 1 FROM page_results pr WHERE pr.quiz_id = q.quiz_id AND pr.page_id = qp.page_id) AND p.status != 'retired' ORDER BY q.quiz_id",
+      [sourceId],
+    ).map((row) => row.quiz_id);
+  }
   private sourceDependencyRows(sourceId: string): Row[] {
     return dbAll<Row>(
       this.db,
@@ -2616,6 +2623,7 @@ export class SourceService {
           dependentPageIds,
           sourceDependencies: this.sourceDependencyRows(sourceId),
           affectedOpenQuizIds: this.affectedOpenQuizIds(sourceId),
+          affectedSubmittedQuizIds: this.affectedSubmittedQuizIds(sourceId),
         }),
       ),
     );
@@ -2709,6 +2717,11 @@ export class SourceService {
     const preview = this.removalPreview(sourceId);
     const token = typeof confirmation === "string" ? confirmation : confirmation.confirmationId;
     if (token !== preview.confirmationId) throw new Error("stale removal confirmation");
+    const affectedSubmittedQuizIds = this.affectedSubmittedQuizIds(sourceId);
+    if (affectedSubmittedQuizIds.length)
+      throw new Error(
+        `source removal conflict: submitted quizzes without page settlement: ${affectedSubmittedQuizIds.join(", ")}`,
+      );
     const affectedQuizIds = this.affectedOpenQuizIds(sourceId);
     const quizSheetSnapshots: Array<{ sheetPath: string; previous?: Buffer }> = affectedQuizIds.flatMap(
       (quizId): Array<{ sheetPath: string; previous?: Buffer }> => {
