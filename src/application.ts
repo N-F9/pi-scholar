@@ -799,6 +799,27 @@ export class ScholarApplication {
   ): Promise<T> {
     return context?.origin === "browser" ? this.worker.enqueue(operation) : await operation();
   }
+  private assertPageMutationAllowed(pageId: string): void {
+    const unresolved = this.db.get<{ readonly quiz_id: string }>(
+      `SELECT q.quiz_id
+       FROM quizzes q
+       JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id
+       JOIN question_pages qp ON qp.question_id = qq.question_id
+       WHERE qp.page_id = ?
+         AND (
+           q.status = 'open'
+           OR (
+             q.status = 'submitted'
+             AND NOT EXISTS (
+               SELECT 1 FROM page_results pr WHERE pr.quiz_id = q.quiz_id AND pr.page_id = qp.page_id
+             )
+           )
+         )
+       LIMIT 1`,
+      [pageId],
+    );
+    if (unresolved) throw new QuizConflictError(`Page ${pageId} is covered by an unresolved quiz`);
+  }
   private async readSetting<T>(key: string, fallback: T): Promise<T> {
     const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
     if (!row) return fallback;
@@ -1174,6 +1195,7 @@ export class ScholarApplication {
   ): Promise<WikiPageResult> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        this.assertPageMutationAllowed(pageId);
         const before = await this.wiki.inspectDrift(pageId);
         if (before.currentDigest !== input.expectedDigest)
           throw new RevisionConflictError("The wiki page digest is stale");
@@ -1198,6 +1220,7 @@ export class ScholarApplication {
   ): Promise<WikiPageResult> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        this.assertPageMutationAllowed(pageId);
         const updated = await this.wiki.update(pageId, input);
         if (updated.page.quizWorthiness === "eligible") this.scheduler.ensurePageLearning(updated.page.pageId);
         return this.wikiResult(updated.page.pageId);
@@ -1211,6 +1234,7 @@ export class ScholarApplication {
   ): Promise<WikiPageResult> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        this.assertPageMutationAllowed(pageId);
         const updated = await this.wiki.rename(pageId, requestedPath);
         return this.wikiResult(updated.pageId);
       }, "wiki:rename"),
@@ -1751,6 +1775,7 @@ export class ScholarApplication {
             };
           }
           case "update-page": {
+            this.assertPageMutationAllowed(proposal.pageId);
             const current = await this.wiki.get(proposal.pageId);
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
@@ -1768,6 +1793,7 @@ export class ScholarApplication {
             };
           }
           case "rename-page": {
+            this.assertPageMutationAllowed(proposal.pageId);
             const current = await this.wiki.get(proposal.pageId);
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
@@ -1808,6 +1834,7 @@ export class ScholarApplication {
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
               (proposal.page.quizWorthiness !== undefined && proposal.page.quizWorthiness !== current.quizWorthiness);
             if (!pageChanged) throw new ValidationError("resolve-issue requires an actual page correction");
+            this.assertPageMutationAllowed(proposal.page.pageId);
             const prepared = await this.wiki.prepareUpdate(issue.pageId, {
               expectedDigest: proposal.page.expectedDigest,
               ...(proposal.page.body === undefined ? {} : { body: proposal.page.body }),

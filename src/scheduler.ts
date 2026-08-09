@@ -300,17 +300,25 @@ export class SchedulerService {
     expectedRevision?: number,
   ): PrerequisiteResult {
     const id = pageId.trim();
-    const page = this.db.get<Record<string, unknown>>("SELECT status FROM pages WHERE page_id = ?", id);
+    const page = this.db.get<Record<string, unknown>>(
+      "SELECT status, quiz_worthiness FROM pages WHERE page_id = ?",
+      id,
+    );
     if (!page) throw new ValidationError(`Unknown wiki page: ${id}`);
     if (page.status !== "active") throw new ValidationError("Inactive pages cannot receive prerequisites");
+    if (page.quiz_worthiness !== "eligible") throw new ValidationError("Ineligible pages cannot receive prerequisites");
     const ids = prerequisitePageIds.map((value) => value.trim());
     if (ids.some((value) => !value)) throw new ValidationError("Prerequisite page IDs must be nonempty");
     const uniqueIds = [...new Set(ids)];
     if (uniqueIds.includes(id)) throw new ValidationError("A page cannot prerequisite itself");
-    const pages = this.db.all<Record<string, unknown>>("SELECT page_id, status FROM pages");
-    const activeIds = new Set(pages.filter((row) => row.status === "active").map((row) => String(row.page_id)));
-    if (uniqueIds.some((value) => !activeIds.has(value)))
-      throw new ValidationError("Prerequisite references an unknown or inactive page");
+    const pages = this.db.all<Record<string, unknown>>("SELECT page_id, status, quiz_worthiness FROM pages");
+    const eligibleIds = new Set(
+      pages
+        .filter((row) => row.status === "active" && row.quiz_worthiness === "eligible")
+        .map((row) => String(row.page_id)),
+    );
+    if (uniqueIds.some((value) => !eligibleIds.has(value)))
+      throw new ValidationError("Prerequisite references an unknown, inactive, or ineligible page");
     const edges = new Map<string, Set<string>>();
     for (const row of this.db.all<Record<string, unknown>>(
       "SELECT page_id, prerequisite_page_id FROM page_prerequisites",

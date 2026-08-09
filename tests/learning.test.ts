@@ -79,6 +79,41 @@ test("page prerequisites gate due selection until every prerequisite is in Revie
   db.close();
 });
 
+test("setPrerequisites rejects skipped or unknown endpoints without creating state", () => {
+  {
+    const { db, scheduler } = setup();
+    db.run("UPDATE pages SET quiz_worthiness = 'skip' WHERE page_id = ?", ["p2"]);
+    assert.throws(() => scheduler.setPrerequisites("p2", ["p1"]), ValidationError);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_learning")?.count, 0);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_prerequisites")?.count, 0);
+    db.close();
+  }
+  {
+    const { db, scheduler } = setup();
+    db.run("UPDATE pages SET quiz_worthiness = 'unknown' WHERE page_id = ?", ["p2"]);
+    assert.throws(() => scheduler.setPrerequisites("p2", ["p1"]), ValidationError);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_learning")?.count, 0);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_prerequisites")?.count, 0);
+    db.close();
+  }
+  {
+    const { db, scheduler } = setup();
+    db.run("UPDATE pages SET quiz_worthiness = 'skip' WHERE page_id = ?", ["p1"]);
+    assert.throws(() => scheduler.setPrerequisites("p2", ["p1"]), ValidationError);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_learning")?.count, 0);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_prerequisites")?.count, 0);
+    db.close();
+  }
+  {
+    const { db, scheduler } = setup();
+    db.run("UPDATE pages SET quiz_worthiness = 'unknown' WHERE page_id = ?", ["p1"]);
+    assert.throws(() => scheduler.setPrerequisites("p2", ["p1"]), ValidationError);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_learning")?.count, 0);
+    assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM page_prerequisites")?.count, 0);
+    db.close();
+  }
+});
+
 test("page learning is created on demand, keeps stable IDs, and excludes drifted or retired pages", () => {
   const { db, scheduler, date } = setup();
   const first = scheduler.ensurePageLearning("p1", `${date}T00:00:00.000Z`);
