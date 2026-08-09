@@ -29,7 +29,6 @@ export function NotesPage() {
   const [searchText, setSearchText] = useState(params.get("q") ?? "");
   const [search, setSearch] = useState(params.get("q") ?? "");
   const [reporting, setReporting] = useState(false);
-  const [issueCardId, setIssueCardId] = useState<string>();
   const pageId = params.get("pageId") ?? undefined;
   const path = params.get("path") ?? undefined;
   const heading = params.get("heading") ?? undefined;
@@ -118,7 +117,6 @@ export function NotesPage() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: Changing the selected page must dismiss the issue form.
   useEffect(() => {
     setReporting(false);
-    setIssueCardId(undefined);
   }, [pageId, path]);
 
   function submitSearch(event: FormEvent<HTMLFormElement>) {
@@ -134,10 +132,10 @@ export function NotesPage() {
         <p className="eyebrow">Read-only wiki</p>
         <h1 className="page-heading mt-2">Notes</h1>
         <p className="mt-3 max-w-2xl text-muted">
-          Browse maintained knowledge, inspect its learning bindings, and report what needs correction.
+          Browse maintained knowledge, inspect its learning schedule and prerequisites, and report what needs
+          correction.
         </p>
       </header>
-
       <div className="grid gap-6 xl:grid-cols-3">
         <aside
           className="self-start rounded-lg border border-line bg-paper p-4 xl:sticky xl:top-8"
@@ -238,13 +236,7 @@ export function NotesPage() {
                     revision {page.data.page.revision}
                   </p>
                 </div>
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    setIssueCardId(undefined);
-                    setReporting(true);
-                  }}
-                >
+                <Button variant="secondary" onClick={() => setReporting(true)}>
                   Report issue
                 </Button>
               </div>
@@ -291,21 +283,12 @@ export function NotesPage() {
                   <Badge tone="caution">Maintenance correction required</Badge>
                   <p className="mt-3 text-sm text-muted">
                     This page is semantically stale and needs a guarded Pi maintenance correction before its learning
-                    cards can return.
+                    schedule can return.
                   </p>
                 </Card>
               ) : null}
 
-              {reporting ? (
-                <IssueForm
-                  page={page.data}
-                  cardId={issueCardId}
-                  onClose={() => {
-                    setReporting(false);
-                    setIssueCardId(undefined);
-                  }}
-                />
-              ) : null}
+              {reporting ? <IssueForm page={page.data} onClose={() => setReporting(false)} /> : null}
               <Card className="px-5 py-7 sm:px-8 sm:py-10">
                 <Markdown
                   source={page.data.markdown}
@@ -319,7 +302,9 @@ export function NotesPage() {
                   <span>
                     Learning{" "}
                     <span className="ml-2 font-normal text-muted">
-                      {page.data.learning.cards.length} bound {page.data.learning.cards.length === 1 ? "card" : "cards"}
+                      {page.data.learning.schedule?.fsrsState ?? "Not scheduled"} ·{" "}
+                      {page.data.learning.prerequisites.length}{" "}
+                      {page.data.learning.prerequisites.length === 1 ? "prerequisite" : "prerequisites"}
                     </span>
                   </span>
                   <span
@@ -330,97 +315,66 @@ export function NotesPage() {
                   </span>
                 </summary>
                 <div className="space-y-6 border-t border-line p-5">
-                  {page.data.learning.cards.length === 0 ? (
-                    <p className="text-sm text-muted">This page has no current learning-card bindings.</p>
-                  ) : null}
-                  {page.data.learning.cards.map((card) => {
-                    const bindings = page.data.learning.bindings.filter((binding) => binding.cardId === card.cardId);
-                    const prerequisites = page.data.learning.prerequisites.filter(
-                      (edge) => edge.cardId === card.cardId,
-                    );
-                    const lineage = page.data.learning.lineage.filter(
-                      (event) => event.parentCardIds.includes(card.cardId) || event.childCardIds.includes(card.cardId),
-                    );
-                    return (
-                      <section className="rounded-md border border-line bg-canvas p-4" key={card.cardId}>
-                        <div className="flex flex-wrap items-start justify-between gap-3">
-                          <div>
-                            <p className="font-mono text-xs text-muted">{card.cardId}</p>
-                            <h3 className="mt-1 font-bold">{card.prompt ?? "Review card"}</h3>
-                          </div>
-                          <div className="flex gap-2">
-                            <Badge tone={card.status === "active" ? "positive" : "neutral"}>{card.status}</Badge>
-                            <Badge>{card.fsrsState}</Badge>
-                          </div>
+                  <section>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <h3 className="font-serif text-2xl font-semibold">Page schedule</h3>
+                      {page.data.learning.schedule ? (
+                        <Badge tone="neutral">{page.data.learning.schedule.fsrsState}</Badge>
+                      ) : null}
+                    </div>
+                    {page.data.learning.schedule ? (
+                      <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
+                        <div>
+                          <dt className="text-muted">Next due</dt>
+                          <dd className="mt-1 font-bold">{formatDate(page.data.learning.schedule.dueAt)}</dd>
                         </div>
-                        <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
-                          <div>
-                            <dt className="text-muted">Next due</dt>
-                            <dd className="mt-1 font-bold">{formatDate(card.dueAt)}</dd>
-                          </div>
-                          <div>
-                            <dt className="text-muted">Revision</dt>
-                            <dd className="mt-1 font-bold">{card.revision}</dd>
-                          </div>
-                          <div>
-                            <dt className="text-muted">Reviews</dt>
-                            <dd className="mt-1 font-bold">{card.reps}</dd>
-                          </div>
-                        </dl>
-                        <div className="mt-4 grid gap-3 text-sm">
-                          <div>
-                            <h4 className="font-bold">Bindings</h4>
-                            <ul className="mt-1 list-disc pl-5 text-muted">
-                              {bindings.length ? (
-                                bindings.map((binding) => (
-                                  <li key={binding.bindingId}>
-                                    {binding.pageId === page.data.page.pageId ? "This page" : `Page ${binding.pageId}`}
-                                    {binding.heading ? ` — ${binding.heading}` : ""} · revision {binding.revision}
-                                    {binding.active ? "" : " · retired"}
-                                  </li>
-                                ))
-                              ) : (
-                                <li>None</li>
-                              )}
-                            </ul>
-                          </div>
-                          <div>
-                            <h4 className="font-bold">Prerequisites</h4>
-                            <p className="mt-1 text-muted">
-                              {prerequisites.length
-                                ? prerequisites.map((edge) => edge.prerequisiteCardId).join(", ")
-                                : "None"}
-                            </p>
-                          </div>
-                          <div>
-                            <h4 className="font-bold">Lineage</h4>
-                            <ul className="mt-1 list-disc pl-5 text-muted">
-                              {lineage.length ? (
-                                lineage.map((event) => (
-                                  <li key={event.lineageId}>
-                                    {event.event} · {event.parentCardIds.join(", ") || "none"} →{" "}
-                                    {event.childCardIds.join(", ") || "none"} · {formatDate(event.occurredAt)}
-                                  </li>
-                                ))
-                              ) : (
-                                <li>No split or merge lineage</li>
-                              )}
-                            </ul>
-                          </div>
+                        <div>
+                          <dt className="text-muted">Revision</dt>
+                          <dd className="mt-1 font-bold">{page.data.learning.schedule.revision}</dd>
                         </div>
-                        <Button
-                          className="mt-4"
-                          variant="quiet"
-                          onClick={() => {
-                            setIssueCardId(card.cardId);
-                            setReporting(true);
-                          }}
-                        >
-                          Report issue with this card
-                        </Button>
-                      </section>
-                    );
-                  })}
+                        <div>
+                          <dt className="text-muted">Reviews</dt>
+                          <dd className="mt-1 font-bold">{page.data.learning.schedule.reps}</dd>
+                        </div>
+                      </dl>
+                    ) : (
+                      <p className="mt-2 text-sm text-muted">This page has no learning schedule yet.</p>
+                    )}
+                  </section>
+                  <section>
+                    <h3 className="font-bold">Prerequisite pages</h3>
+                    {page.data.learning.prerequisites.length ? (
+                      <ul className="mt-2 grid gap-2">
+                        {page.data.learning.prerequisites.map((edge, index) => {
+                          const prerequisite = pages.data?.pages.find(
+                            (item) => item.pageId === edge.prerequisitePageId,
+                          );
+                          return (
+                            <li key={edge.prerequisitePageId}>
+                              {prerequisite ? (
+                                <Link
+                                  className="block rounded-md border border-line bg-canvas px-3 py-2 hover:border-ink"
+                                  to={`/notes?pageId=${encodeURIComponent(prerequisite.pageId)}#note-content`}
+                                >
+                                  <span className="block font-bold">{prerequisite.title}</span>
+                                  <span className="mt-0.5 block text-xs text-muted">{prerequisite.relativePath}</span>
+                                </Link>
+                              ) : (
+                                <Link
+                                  className="block rounded-md border border-line bg-canvas px-3 py-2 font-bold hover:border-ink"
+                                  to={`/notes?pageId=${encodeURIComponent(edge.prerequisitePageId)}#note-content`}
+                                >
+                                  Prerequisite page {index + 1}
+                                </Link>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : (
+                      <p className="mt-2 text-sm text-muted">This page has no prerequisites.</p>
+                    )}
+                  </section>
                 </div>
               </details>
 
@@ -485,7 +439,7 @@ export function NotesPage() {
   );
 }
 
-function IssueForm({ page, cardId, onClose }: { page: WikiPageResult; cardId?: string; onClose: () => void }) {
+function IssueForm({ page, onClose }: { page: WikiPageResult; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [params] = useSearchParams();
   const create = useMutation({
@@ -507,7 +461,6 @@ function IssueForm({ page, cardId, onClose }: { page: WikiPageResult; cardId?: s
       pageId: page.page.pageId,
       pageDigest: page.drift?.actualDigest ?? page.page.digest,
       heading: params.get("heading") ?? undefined,
-      cardId,
       kind: String(values.get("kind")) as WikiIssueKind,
       description: String(values.get("description") ?? ""),
     });
@@ -518,10 +471,7 @@ function IssueForm({ page, cardId, onClose }: { page: WikiPageResult; cardId?: s
       <h3 className="font-serif text-2xl font-semibold" id="report-issue-heading">
         Report an issue
       </h3>
-      <p className="mt-2 text-sm text-muted">
-        The report stays linked to this exact page revision{cardId ? " and review card" : ""}.
-      </p>
-      {cardId ? <p className="mt-3 font-mono text-xs text-muted">Card: {cardId}</p> : null}
+      <p className="mt-2 text-sm text-muted">The report stays linked to this exact page revision.</p>
       <form className="mt-5 grid gap-4" onSubmit={submit}>
         <Field label="What is wrong?">
           <select className="control" name="kind" defaultValue="incorrect">

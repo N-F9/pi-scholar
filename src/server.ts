@@ -145,7 +145,7 @@ function errorStatus(error: unknown): number {
     /stale|conflict|already submitted|only the current/iu.test(errorText(error))
   )
     return 409;
-  if (/not found|unknown review card|no quiz for/iu.test(errorText(error))) return 404;
+  if (/not found|unknown page|no quiz for/iu.test(errorText(error))) return 404;
   if (error instanceof ValidationError) return 400;
   return 400;
 }
@@ -625,12 +625,11 @@ async function apiRoute(
     }
     if (method === "POST") {
       const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-      if (!keysExactly(value, ["pageId", "heading", "cardId", "pageDigest", "kind", "description"]))
+      if (!keysExactly(value, ["pageId", "heading", "pageDigest", "kind", "description"]))
         throw new ValidationError("issue request has unsupported fields");
       const input: WikiIssueCreateRequest = {
         ...(value.pageId === undefined ? {} : { pageId: stringField(value, "pageId") }),
         ...(value.heading === undefined ? {} : { heading: stringField(value, "heading") }),
-        ...(value.cardId === undefined ? {} : { cardId: stringField(value, "cardId") }),
         ...(value.pageDigest === undefined ? {} : { pageDigest: stringField(value, "pageDigest") }),
         kind: issueKindField(value),
         description: stringField(value, "description", true)!,

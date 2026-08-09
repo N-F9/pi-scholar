@@ -109,7 +109,7 @@ export interface SourceRemovalPreview {
   sourceId: string;
   packetPath: string;
   currentDigest: string;
-  dependents: Array<Record<string, unknown>>;
+  dependentPageIds: string[];
   confirmationId: string;
 }
 export interface SourceRemovalResult extends SourceRemovalPreview {
@@ -2517,23 +2517,9 @@ export class SourceService {
   list(): Array<Record<string, unknown>> {
     return dbAll<Row>(this.db, "SELECT * FROM sources ORDER BY captured_at, source_id").map((row) => sourceRecord(row));
   }
-  private sourceRefs(value: unknown): string[] {
-    if (typeof value !== "string") return [];
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      return Array.isArray(parsed)
-        ? parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-        : [];
-    } catch {
-      return [];
-    }
-  }
   private refreshDependencies(): void {
     transaction(this.db, () => {
-      dbRun(
-        this.db,
-        "DELETE FROM source_dependencies WHERE relation IN ('claim', 'question') OR (relation = 'citation' AND page_id IS NOT NULL)",
-      );
+      dbRun(this.db, "DELETE FROM source_dependencies WHERE page_id IS NOT NULL OR relation <> 'citation'");
       const sources = dbAll<{ source_id: string }>(
         this.db,
         "SELECT source_id FROM sources WHERE status != 'removed' ORDER BY source_id",
@@ -2583,125 +2569,56 @@ export class SourceService {
           }
         }
       }
-      dbRun(
+      const coveredPages = dbAll<{ page_id: string }>(
         this.db,
-        "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) SELECT sd.source_id, sd.page_id, sd.chunk_id, 'claim' FROM source_dependencies sd JOIN card_bindings cb ON cb.page_id = sd.page_id AND cb.active = 1 JOIN review_cards rc ON rc.card_id = cb.card_id AND rc.status = 'active' WHERE sd.relation = 'citation' AND sd.page_id IS NOT NULL",
+        "SELECT DISTINCT qp.page_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_pages qp ON qp.question_id = qq.question_id JOIN quiz_evidence qe ON qe.quiz_id = q.quiz_id AND qe.page_id = qp.page_id WHERE q.status = 'open' ORDER BY qp.page_id",
       );
-      const questions = dbAll<Row>(
-        this.db,
-        "SELECT q.quiz_id, qq.question_id, qq.source_refs_json, qc.card_id, cb.page_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_cards qc ON qc.question_id = qq.question_id JOIN card_bindings cb ON cb.card_id = qc.card_id AND cb.active = 1 JOIN review_cards rc ON rc.card_id = cb.card_id AND rc.status = 'active' WHERE q.status = 'open' ORDER BY q.quiz_id, qq.question_id, cb.page_id",
-      );
-      for (const question of questions) {
-        const refs = this.sourceRefs(question.source_refs_json);
-        if (!refs.length) continue;
-        const pageId = typeof question.page_id === "string" ? question.page_id : undefined;
-        if (pageId && refs.some((reference) => reference.split("#", 1)[0] === pageId)) {
-          for (const dependency of dbAll<Row>(
-            this.db,
-            "SELECT source_id, page_id, chunk_id FROM source_dependencies WHERE relation = 'citation' AND page_id = ? ORDER BY source_id, chunk_id",
-            [pageId],
-          )) {
-            dbRun(
-              this.db,
-              "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, ?)",
-              [dependency.source_id, dependency.page_id, dependency.chunk_id ?? null, "question"],
-            );
-          }
-        }
-        for (const source of sources) {
-          const sourceId = String(source.source_id);
-          if (refs.includes(sourceId) && pageId)
-            dbRun(
-              this.db,
-              "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, ?)",
-              [sourceId, pageId, null, "question"],
-            );
-          for (const chunkId of chunksBySource.get(sourceId) ?? [])
-            if (refs.includes(chunkId))
-              dbRun(
-                this.db,
-                "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, ?)",
-                [sourceId, pageId ?? null, chunkId, "question"],
-              );
-        }
+      for (const page of coveredPages) {
+        dbRun(
+          this.db,
+          "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) SELECT source_id, page_id, chunk_id, 'question' FROM source_dependencies WHERE relation = 'citation' AND page_id = ?",
+          [page.page_id],
+        );
       }
     });
   }
-  private currentDependents(sourceId: string): Array<Record<string, unknown>> {
-    const rows: Array<Record<string, unknown>> = dbAll<Row>(
-      this.db,
-      "SELECT sd.*, p.relative_path AS artifact_path, p.digest AS artifact_digest FROM source_dependencies sd LEFT JOIN pages p ON p.page_id = sd.page_id WHERE sd.source_id = ? AND sd.relation = 'citation' AND (p.page_id IS NULL OR p.status != 'retired') ORDER BY sd.page_id, sd.chunk_id, sd.relation",
-      [sourceId],
-    ).map((row) => ({ ...row, ...(row.artifact_digest ? { digest: row.artifact_digest } : {}), kind: "citation" }));
-    const cards = dbAll<Row>(
-      this.db,
-      "SELECT DISTINCT sd.source_id, sd.page_id, sd.chunk_id, sd.relation, cb.card_id, p.relative_path AS artifact_path, p.digest AS artifact_digest FROM source_dependencies sd JOIN card_bindings cb ON cb.page_id = sd.page_id AND cb.active = 1 JOIN review_cards rc ON rc.card_id = cb.card_id AND rc.status = 'active' LEFT JOIN pages p ON p.page_id = sd.page_id WHERE sd.source_id = ? AND sd.relation = 'citation' AND p.status != 'retired' ORDER BY cb.card_id, sd.page_id, sd.chunk_id",
-      [sourceId],
-    );
-    rows.push(
-      ...cards.map((row) => ({
-        ...row,
-        relation: "claim",
-        ...(row.artifact_digest ? { digest: row.artifact_digest } : {}),
-        kind: "card",
-      })),
-    );
-    const chunks = dbAll<{ chunk_id: string }>(
-      this.db,
-      "SELECT chunk_id FROM source_chunks WHERE source_id = ? ORDER BY chunk_id",
-      [sourceId],
-    ).map((row) => row.chunk_id);
-    const questions = dbAll<Row>(
-      this.db,
-      "SELECT q.quiz_id, qq.question_id, qq.source_refs_json, qc.card_id, cb.page_id, q.date FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_cards qc ON qc.question_id = qq.question_id JOIN card_bindings cb ON cb.card_id = qc.card_id AND cb.active = 1 JOIN review_cards rc ON rc.card_id = cb.card_id AND rc.status = 'active' JOIN pages p ON p.page_id = cb.page_id AND p.status != 'retired' WHERE q.status = 'open' ORDER BY q.quiz_id, qq.question_id, qc.card_id, cb.page_id",
-    );
-    for (const question of questions) {
-      const refs = this.sourceRefs(question.source_refs_json);
-      if (!refs.length) continue;
-      const pageId = typeof question.page_id === "string" ? question.page_id : undefined;
-      if (pageId && refs.some((reference) => reference.split("#", 1)[0] === pageId)) {
-        for (const dependency of dbAll<Row>(
+  private currentDependentPageIds(sourceId: string): string[] {
+    return [
+      ...new Set(
+        dbAll<{ page_id: string }>(
           this.db,
-          "SELECT source_id, page_id, chunk_id FROM source_dependencies WHERE source_id = ? AND relation = 'citation' AND page_id = ?",
-          [sourceId, pageId],
-        ))
-          rows.push({
-            ...dependency,
-            quiz_id: question.quiz_id,
-            date: question.date,
-            question_id: question.question_id,
-            card_id: question.card_id,
-            relation: "question",
-            kind: "quiz",
-          });
-      }
-      if (refs.includes(sourceId))
-        rows.push({
-          source_id: sourceId,
-          page_id: pageId ?? null,
-          chunk_id: null,
-          quiz_id: question.quiz_id,
-          date: question.date,
-          question_id: question.question_id,
-          card_id: question.card_id,
-          relation: "question",
-          kind: "quiz",
-        });
-      for (const chunkId of chunks)
-        if (refs.includes(chunkId))
-          rows.push({
-            source_id: sourceId,
-            page_id: pageId ?? null,
-            chunk_id: chunkId,
-            quiz_id: question.quiz_id,
-            date: question.date,
-            question_id: question.question_id,
-            card_id: question.card_id,
-            relation: "question",
-            kind: "quiz",
-          });
-    }
-    return rows;
+          "SELECT DISTINCT sd.page_id FROM source_dependencies sd JOIN pages p ON p.page_id = sd.page_id WHERE sd.source_id = ? AND sd.relation = 'citation' AND p.status != 'retired' AND sd.page_id IS NOT NULL ORDER BY sd.page_id",
+          [sourceId],
+        ).map((row) => row.page_id),
+      ),
+    ];
+  }
+  private affectedOpenQuizIds(sourceId: string): string[] {
+    return dbAll<{ quiz_id: string }>(
+      this.db,
+      "SELECT DISTINCT q.quiz_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_pages qp ON qp.question_id = qq.question_id JOIN quiz_evidence qe ON qe.quiz_id = q.quiz_id AND qe.page_id = qp.page_id JOIN source_dependencies sd ON sd.source_id = ? AND sd.page_id = qp.page_id AND sd.relation = 'citation' JOIN pages p ON p.page_id = qp.page_id WHERE q.status = 'open' AND p.status != 'retired' ORDER BY q.quiz_id",
+      [sourceId],
+    ).map((row) => row.quiz_id);
+  }
+  private sourceDependencyRows(sourceId: string): Row[] {
+    return dbAll<Row>(
+      this.db,
+      "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies WHERE source_id = ? ORDER BY source_id, page_id IS NOT NULL, page_id, chunk_id IS NOT NULL, chunk_id, relation",
+      [sourceId],
+    );
+  }
+  private removalConfirmationId(sourceId: string, currentDigest: string, dependentPageIds: string[]): string {
+    return digestBytes(
+      Buffer.from(
+        canonical({
+          sourceId,
+          currentDigest,
+          dependentPageIds,
+          sourceDependencies: this.sourceDependencyRows(sourceId),
+          affectedOpenQuizIds: this.affectedOpenQuizIds(sourceId),
+        }),
+      ),
+    );
   }
   private removalLocations(
     sourceId: string,
@@ -2748,13 +2665,13 @@ export class SourceService {
       } catch (error) {
         throw this.removalCleanupPending(sourceId, error);
       }
-      const dependents: Array<Record<string, unknown>> = [];
+      const dependentPageIds: string[] = [];
       return {
         sourceId,
         packetPath: locations.packetPath,
         currentDigest: locations.digest,
-        dependents,
-        confirmationId: digestBytes(Buffer.from(canonical({ sourceId, currentDigest: locations.digest, dependents }))),
+        dependentPageIds,
+        confirmationId: this.removalConfirmationId(sourceId, locations.digest, dependentPageIds),
         removed: true,
       };
     }
@@ -2775,10 +2692,10 @@ export class SourceService {
     if (manifest.sourceId !== sourceId || manifest.originalDigest !== locations.digest)
       throw new Error("source packet identity mismatch");
     this.refreshDependencies();
-    const dependents = this.currentDependents(sourceId);
+    const dependentPageIds = this.currentDependentPageIds(sourceId);
     const currentDigest = manifest.originalDigest;
-    const confirmationId = digestBytes(Buffer.from(canonical({ sourceId, currentDigest, dependents })));
-    return { sourceId, packetPath: locations.packetPath, currentDigest, dependents, confirmationId };
+    const confirmationId = this.removalConfirmationId(sourceId, currentDigest, dependentPageIds);
+    return { sourceId, packetPath: locations.packetPath, currentDigest, dependentPageIds, confirmationId };
   }
   async removeConfirmed(
     sourceId: string,
@@ -2792,11 +2709,7 @@ export class SourceService {
     const preview = this.removalPreview(sourceId);
     const token = typeof confirmation === "string" ? confirmation : confirmation.confirmationId;
     if (token !== preview.confirmationId) throw new Error("stale removal confirmation");
-    const affectedQuizIds = [
-      ...new Set(
-        preview.dependents.flatMap((dependent) => (typeof dependent.quiz_id === "string" ? [dependent.quiz_id] : [])),
-      ),
-    ];
+    const affectedQuizIds = this.affectedOpenQuizIds(sourceId);
     const quizSheetSnapshots: Array<{ sheetPath: string; previous?: Buffer }> = affectedQuizIds.flatMap(
       (quizId): Array<{ sheetPath: string; previous?: Buffer }> => {
         const row = dbGet<Row>(this.db, "SELECT date, sheet_path FROM quizzes WHERE quiz_id = ?", [quizId]);
@@ -2820,15 +2733,7 @@ export class SourceService {
       transaction(this.db, () => {
         const now = new Date().toISOString();
         dbRun(this.db, "UPDATE sources SET status = ?, updated_at = ? WHERE source_id = ?", ["removed", now, sourceId]);
-        const pageIds = new Set<string>();
-        const cardIds = new Set<string>();
-        const quizIds = new Set<string>();
-        for (const dependent of preview.dependents) {
-          if (typeof dependent.page_id === "string") pageIds.add(dependent.page_id);
-          if (typeof dependent.card_id === "string") cardIds.add(dependent.card_id);
-          if (typeof dependent.quiz_id === "string") quizIds.add(dependent.quiz_id);
-        }
-        for (const pageId of pageIds) {
+        for (const pageId of preview.dependentPageIds) {
           const page = dbGet<Row>(this.db, "SELECT digest FROM pages WHERE page_id = ?", [pageId]);
           if (!page) throw new Error(`dependent page is missing: ${pageId}`);
           dbRun(this.db, "UPDATE pages SET status = ?, revision = revision + 1, updated_at = ? WHERE page_id = ?", [
@@ -2838,7 +2743,7 @@ export class SourceService {
           ]);
           dbRun(
             this.db,
-            "INSERT INTO wiki_issues (issue_id, page_id, heading, card_id, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO wiki_issues (issue_id, page_id, heading, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             [
               randomUUID(),
               pageId,
@@ -2850,15 +2755,8 @@ export class SourceService {
               now,
             ],
           );
-          dbRun(this.db, "UPDATE card_bindings SET active = 0 WHERE page_id = ?", [pageId]);
         }
-        for (const cardId of cardIds)
-          dbRun(this.db, "UPDATE review_cards SET status = ?, updated_at = ? WHERE card_id = ?", [
-            "retired",
-            now,
-            cardId,
-          ]);
-        new QuizService(this.db, this.paths).expireOpenQuizIds([...quizIds]);
+        new QuizService(this.db, this.paths).expireOpenQuizIds(affectedQuizIds);
         dbRun(this.db, "DELETE FROM source_dependencies WHERE source_id = ?", [sourceId]);
       });
     } catch (error) {

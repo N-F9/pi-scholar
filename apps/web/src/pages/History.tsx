@@ -134,7 +134,7 @@ export function HistoryDetailPage() {
             query.data.outcome === "maintenance-day"
               ? "Quiz publishing blocked"
               : query.data.outcome === "skipped"
-                ? "No eligible cards"
+                ? "No eligible pages"
                 : query.data.outcome === "failed"
                   ? "Quiz generation failed"
                   : "No quiz sheet"
@@ -158,6 +158,7 @@ export function HistoryDetailPage() {
           <QuizResults
             questions={query.data.quiz.questions}
             questionResults={query.data.quiz.questionResults}
+            pageResults={query.data.quiz.pageResults}
             grades={query.data.grades.length ? query.data.grades : query.data.quiz.grades}
             readings={query.data.readings.length ? query.data.readings : query.data.quiz.readings}
           />

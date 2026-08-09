@@ -31,7 +31,7 @@ const quietOutcomes: Record<
 > = {
   skipped: {
     title: "Nothing is due today",
-    body: "No prerequisite-unblocked review cards are due. Pi Scholar does not generate filler questions.",
+    body: "No prerequisite-unblocked pages are due. Pi Scholar does not generate filler questions.",
   },
   "not-yet-run": {
     title: "No quiz invocation yet",
@@ -247,7 +247,8 @@ function QuizAnswerForm({
             <li key={question.questionId}>
               <Card className="shadow-none">
                 <p className="eyebrow">
-                  Question {question.ordinal} of {quiz.questions.length}
+                  Question {question.ordinal} of {quiz.questions.length} ·{" "}
+                  {question.kind === "multiple-choice" ? "Multiple choice" : "Short answer"}
                 </p>
                 <div className="mt-3">
                   <Markdown source={question.prompt} />
@@ -386,15 +387,16 @@ function TodayContent({ result }: { result: QuizResult }) {
 
   const grades = result.grades.length ? result.grades : result.quiz.grades;
   const readings = result.readings.length ? result.readings : result.quiz.readings;
+  const settled = result.quiz.pageResults.length > 0 || grades.length > 0;
   return (
     <div className="space-y-8">
-      <StateView title={grades.length ? "Review complete" : "Answers submitted"}>
+      <StateView title={settled ? "Review complete" : "Answers submitted"}>
         <p>
-          {grades.length
+          {settled
             ? "Your results are settled below."
             : "Your sealed answers are being graded. This page updates when grading finishes."}
         </p>
-        {!grades.length ? (
+        {!settled ? (
           <Link
             className="mt-4 inline-block font-bold underline decoration-accent decoration-2 underline-offset-4"
             to="/workflows"
@@ -410,6 +412,7 @@ function TodayContent({ result }: { result: QuizResult }) {
       <QuizResults
         questions={result.quiz.questions}
         questionResults={result.quiz.questionResults}
+        pageResults={result.quiz.pageResults}
         grades={grades}
         readings={readings}
       />
@@ -430,7 +433,8 @@ export function TodayPage() {
     enabled: Boolean(date),
     refetchOnWindowFocus: true,
     refetchInterval: ({ state }) =>
-      state.data?.outcome === "submitted" && !(state.data.grades.length || state.data.quiz?.grades.length)
+      state.data?.outcome === "submitted" &&
+      !(state.data.quiz?.pageResults.length || state.data.grades.length || state.data.quiz?.grades.length)
         ? 5_000
         : false,
   });

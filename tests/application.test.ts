@@ -1,14 +1,14 @@
 import { strict as assert } from "node:assert";
-import { createHash, randomUUID } from "node:crypto";
-import { promises as fs, mkdtempSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { promises as fs, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application.js";
+import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
-import { parseWikiSections } from "../src/wiki-sections.js";
 
 type DurableApplication = ScholarApplication & {
   durableDirect<T>(operation: () => T | PromiseLike<T>, subject: string): Promise<T>;
@@ -170,7 +170,7 @@ describe("durable application writes", () => {
       db.close();
     }
   });
-  it("restores a composite issue exactly when commit fails", async () => {
+  it("restores a page issue exactly when commit fails", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
@@ -187,10 +187,11 @@ describe("durable application writes", () => {
       "pages",
       "authored_snapshots",
       "wiki_issues",
-      "review_cards",
-      "card_bindings",
-      "card_lineage",
-      "card_prerequisites",
+      "page_learning",
+      "page_prerequisites",
+      "page_reviews",
+      "question_pages",
+      "page_results",
     ];
     const rows = (name: string) =>
       db
@@ -218,24 +219,6 @@ describe("durable application writes", () => {
           kind: "resolve-issue",
           issueId: issue.issueId,
           page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body: correctedBody },
-          card: {
-            kind: "create-card",
-            cardId: "rollback-card",
-            dueAt: "2030-01-01T00:00:00.000Z",
-            bindings: [
-              {
-                pageId: page.page.pageId,
-                heading: "Section",
-                anchor: "#section",
-                startOffset: 900,
-                endOffset: 901,
-                textDigest: "ignored",
-                pageDigest: "ignored",
-                pageRevision: 99,
-                sectionText: correctedBody,
-              },
-            ],
-          },
           resolution: "Corrected the section.",
         }),
         /injected commit failure/u,
@@ -331,7 +314,7 @@ describe("application quiz date guards", () => {
     }
   });
   it("does not expire prior open quizzes when current publication is rejected", async () => {
-    const { app, db, date, cardId } = gradingFixture();
+    const { app, db, date, pageId } = await gradingFixture();
     const previous = new Date(`${date}T00:00:00.000Z`);
     previous.setUTCDate(previous.getUTCDate() - 1);
     const oldDate = previous.toISOString().slice(0, 10);
@@ -349,8 +332,7 @@ describe("application quiz date guards", () => {
             {
               kind: "short-answer",
               prompt: "Explain",
-              cardIds: [cardId],
-              cards: [{ cardId, criterion: "Explain", weight: 1 }],
+              pages: [{ pageId, criterion: "Explain", weight: 1 }],
               sourceRefs: ["not-authorized"],
             },
           ],
@@ -369,7 +351,7 @@ describe("application quiz date guards", () => {
 
 describe("browser quiz drafts", () => {
   it("saves through the browser queue without checkpointing or committing", async () => {
-    const { app, db, calls, date, questionId, quiz } = gradingFixture();
+    const { app, db, calls, date, questionId, quiz } = await gradingFixture();
     try {
       calls.length = 0;
       const saved = await app.saveAnswers(
@@ -388,84 +370,50 @@ describe("browser quiz drafts", () => {
     }
   });
 });
-function gradingFixture() {
+async function gradingFixture() {
   const fixtureValue = fixture();
-  const { app, db } = fixtureValue;
+  const { app } = fixtureValue;
   const date = localDate(new Date());
-  const now = new Date().toISOString();
-  const pageContent = `---\nid: "page-1"\ntitle: "Page 1"\ntype: note\ncreated: "${now}"\nupdated: "${now}"\nquiz-worthiness: "eligible"\n---\n# Section\n\nSection text\n`;
-  writeFileSync(join(fixtureValue.app.paths.wikiRoot, "page-1.md"), pageContent);
-  const pageDigest = createHash("sha256").update(pageContent).digest("hex");
-  const section = parseWikiSections(pageContent, "page-1").find((candidate) => candidate.anchor === "#section");
-  if (!section) throw new Error("grading fixture section missing");
-  const sectionText = pageContent.slice(section.startOffset, section.endOffset);
-  const boundText = "Section text";
-  const startOffset = sectionText.indexOf(boundText);
-  if (startOffset < 0) throw new Error("grading fixture bytes missing");
-  const endOffset = startOffset + boundText.length;
-  db.run(
-    "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
-    ["page-1", "page-1.md", "Page 1", pageDigest, now, now],
-  );
-  const cardId = "card-1";
-  app.scheduler.createCard({
-    cardId,
-    initialDueAt: `${date}T00:00:00.000Z`,
-    bindings: [
-      {
-        pageId: "page-1",
-        heading: section.heading,
-        anchor: section.anchor,
-        startOffset,
-        endOffset,
-        textDigest: createHash("sha256").update(boundText).digest("hex"),
-        pageDigest,
-        pageRevision: 1,
-        sectionText,
-      },
-    ],
+  const page = await app.wiki.create({
+    path: "page-1.md",
+    title: "Page 1",
+    body: "# Section\n\nSection text\n",
+    quizWorthiness: "eligible",
   });
-  const questionId = "question-1";
+  const pageId = page.page.pageId;
+  app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
   const quiz = app.quiz.createDailyQuiz({
     date,
-    questions: [
+    selectedPageIds: [pageId],
+    questionSpecs: [
       {
-        questionId,
         kind: "short-answer",
         prompt: "Explain the section",
-        cardIds: [cardId],
-        cards: [{ cardId, criterion: "Explain the section", weight: 1 }],
+        pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
         sourceRefs: [],
       },
     ],
   });
+  const questionId = quiz.questions[0]?.questionId;
+  if (!questionId) throw new Error("grading fixture question missing");
   const draft = app.quiz.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
-  return { ...fixtureValue, date, cardId, questionId, quiz: app.quiz.get(date)!, draft };
+  return { ...fixtureValue, date, pageId, questionId, quiz: app.quiz.get(date)!, draft };
 }
 
-function gradeFor(
-  context: Awaited<ReturnType<ScholarApplication["getGradingContext"]>>,
-  cardId: string,
-  questionId: string,
-  evidence: readonly string[],
-) {
+function gradeFor(context: GradingContext, pageId: string, questionId: string, evidence: readonly string[]) {
   assert.ok(context.quiz);
   return {
     requestId: context.requestId!,
     date: context.date,
     revision: context.revision!,
     submissionId: context.submissionId!,
-    questions: [
+    questions: [{ questionId, feedback: "Explained the page." }],
+    pages: [
       {
-        questionId,
-        cards: [
-          {
-            cardId,
-            rating: "Good" as const,
-            evidence: [...evidence],
-            readings: [{ pageId: "page-1", anchor: "#section" }],
-          },
-        ],
+        pageId,
+        rating: "Good" as const,
+        evidence: [...evidence],
+        readings: [{ pageId, anchor: "#section" }],
       },
     ],
   };
@@ -473,7 +421,7 @@ function gradeFor(
 
 describe("quiz grading workflow lifecycle", () => {
   it("atomically queues, claims, validates ownership, and settles one sealed submission", async () => {
-    const { app, db, date, cardId, questionId, draft } = gradingFixture();
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const owner = randomUUID();
     const staleRequestId = randomUUID();
     db.run(
@@ -489,22 +437,24 @@ describe("quiz grading workflow lifecycle", () => {
       assert.equal(context.submissionId, `${sealed.quiz.quizId}:r${sealed.quiz.revision}`);
       assert.equal((await app.getWorkflow(context.requestId!)).status, "running");
       assert.equal((await app.getWorkflow(staleRequestId)).status, "queued");
-      const evidence = context.evidence?.find((item) => item.cardId === cardId)?.reference;
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
       await assert.rejects(
-        app.settleGrade({ ...gradeFor(context, cardId, questionId, [evidence]), requestId: "wrong-request" }, owner),
+        app.settleGrade({ ...gradeFor(context, pageId, questionId, [evidence]), requestId: "wrong-request" }, owner),
         /unknown/u,
       );
       assert.equal((await app.getWorkflow(context.requestId!)).status, "running");
-      const grade = gradeFor(context, cardId, questionId, [evidence]);
+      const grade = gradeFor(context, pageId, questionId, [evidence]);
       const settled = await app.settleGrade(grade, owner);
       assert.equal(settled.quiz.status, "submitted");
       assert.equal((await app.getWorkflow(context.requestId!)).status, "succeeded");
-      assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
       const replay = await app.settleGrade(grade, owner);
       assert.equal(replay.quiz.quizId, settled.quiz.quizId);
       await assert.rejects(app.settleGrade({ ...grade, questions: [] }, owner), /replay|committed result/u);
-      assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
     } finally {
       await app.close();
       db.close();
@@ -512,7 +462,7 @@ describe("quiz grading workflow lifecycle", () => {
   });
 
   it("keeps running grading claims exclusive while allowing the same owner to retry", async () => {
-    const { app, db, date, cardId, questionId, draft } = gradingFixture();
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const ownerA = randomUUID();
     const ownerB = randomUUID();
     try {
@@ -524,10 +474,10 @@ describe("quiz grading workflow lifecycle", () => {
       const retry = await app.getGradingContext({ date }, ownerA);
       assert.equal(retry.requestId, first.requestId);
       assert.equal(retry.submissionId, first.submissionId);
-      const evidence = retry.evidence?.find((item) => item.cardId === cardId)?.reference;
+      const evidence = retry.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
-      await assert.rejects(app.settleGrade(gradeFor(retry, cardId, questionId, [evidence]), ownerB), /another grader/u);
-      await app.settleGrade(gradeFor(retry, cardId, questionId, [evidence]), ownerA);
+      await assert.rejects(app.settleGrade(gradeFor(retry, pageId, questionId, [evidence]), ownerB), /another grader/u);
+      await app.settleGrade(gradeFor(retry, pageId, questionId, [evidence]), ownerA);
       assert.equal((await app.getWorkflow(first.requestId!)).status, "succeeded");
     } finally {
       await app.close();
@@ -536,22 +486,23 @@ describe("quiz grading workflow lifecycle", () => {
   });
 
   it("fails an invalid owned request and creates a new retry request for the sealed quiz", async () => {
-    const { app, db, date, cardId, questionId, draft } = gradingFixture();
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const firstOwner = randomUUID();
     const retryOwner = randomUUID();
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
       const first = await app.getGradingContext({ date }, firstOwner);
       const firstWorkflow = first.requestId!;
-      await assert.rejects(app.settleGrade(gradeFor(first, cardId, questionId, ["not-authorized"]), firstOwner));
+      await assert.rejects(app.settleGrade(gradeFor(first, pageId, questionId, ["not-authorized"]), firstOwner));
       assert.equal((await app.getWorkflow(firstWorkflow)).status, "failed");
-      assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       const retry = await app.getGradingContext({ date }, retryOwner);
       assert.notEqual(retry.requestId, firstWorkflow);
       assert.equal(retry.submissionId, first.submissionId);
-      const evidence = retry.evidence?.find((item) => item.cardId === cardId)?.reference;
+      const evidence = retry.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
-      await app.settleGrade(gradeFor(retry, cardId, questionId, [evidence]), retryOwner);
+      await app.settleGrade(gradeFor(retry, pageId, questionId, [evidence]), retryOwner);
       assert.equal((await app.getWorkflow(retry.requestId!)).status, "succeeded");
     } finally {
       await app.close();
@@ -559,7 +510,7 @@ describe("quiz grading workflow lifecycle", () => {
     }
   });
   it("hides private quiz-grader messages from public workflow reads", async () => {
-    const { app, db, date, draft } = gradingFixture();
+    const { app, db, date, draft } = await gradingFixture();
     const owner = randomUUID();
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });

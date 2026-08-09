@@ -46,9 +46,6 @@ function hasStrings(value: Record<string, unknown>, fields: readonly string[]): 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
-function isRecordArray(value: unknown): value is Record<string, unknown>[] {
-  return Array.isArray(value) && value.every(isRecord);
-}
 const QUESTION_KINDS = ["short-answer", "multiple-choice"] as const;
 const SOURCE_KINDS = ["document", "url", "text", "note", "code", "directory", "repository"] as const;
 const SOURCE_STATUSES = ["pending", "claimed", "processing", "published", "failed", "removed"] as const;
@@ -57,6 +54,8 @@ const QUIZ_WORTHINESS = ["eligible", "skip", "unknown"] as const;
 const QUIZ_STATUSES = ["open", "submitted", "expired", "skipped", "failed"] as const;
 const ISSUE_KINDS = ["incorrect", "unclear", "missing", "bad-boundary"] as const;
 const ISSUE_STATUSES = ["open", "resolved", "reopened"] as const;
+const FSRS_STATES = ["New", "Learning", "Review", "Relearning"] as const;
+const REVIEW_RATINGS = ["Again", "Hard", "Good", "Easy"] as const;
 const WORKFLOW_KINDS = ["source-admission", "wiki-maintenance", "daily-quiz", "quiz-grader", "sync"] as const;
 const WORKFLOW_STATUSES = ["queued", "running", "succeeded", "failed", "cancelled"] as const;
 function isEnum(value: unknown, values: readonly string[]): boolean {
@@ -66,6 +65,7 @@ function isEnum(value: unknown, values: readonly string[]): boolean {
 function isAnswer(value: unknown): boolean {
   return (
     isRecord(value) &&
+    Object.keys(value).every((field) => ["questionId", "answer"].includes(field)) &&
     typeof value.questionId === "string" &&
     (typeof value.answer === "string" || isStringArray(value.answer))
   );
@@ -86,19 +86,88 @@ function isQuestion(value: unknown): value is PublicQuizQuestionRecord {
 function isReading(value: unknown): boolean {
   return (
     isRecord(value) &&
+    Object.keys(value).every((field) => ["pageId", "path", "heading", "href"].includes(field)) &&
     hasStrings(value, ["pageId", "path", "href"]) &&
     (value.heading === undefined || typeof value.heading === "string")
   );
 }
 
-function isLearning(value: unknown): value is WikiPageResult["learning"] {
-  if (!isRecord(value)) return false;
+function isQuestionResult(value: unknown): boolean {
   return (
-    ["cards", "bindings", "prerequisites"].every((field) => isRecordArray(value[field])) &&
-    Array.isArray(value.lineage) &&
-    value.lineage.every(
-      (item) => isRecord(item) && isStringArray(item.parentCardIds) && isStringArray(item.childCardIds),
+    isRecord(value) &&
+    Object.keys(value).every((field) =>
+      ["resultId", "quizId", "questionId", "answerRevision", "feedback", "gradedAt"].includes(field),
+    ) &&
+    hasStrings(value, ["resultId", "quizId", "questionId", "feedback", "gradedAt"]) &&
+    typeof value.answerRevision === "number"
+  );
+}
+
+function isPageResult(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((field) =>
+      ["resultId", "quizId", "pageId", "rating", "feedback", "reviewId", "evidence", "readings"].includes(field),
+    ) &&
+    hasStrings(value, ["resultId", "quizId", "pageId", "rating", "feedback", "reviewId"]) &&
+    isEnum(value.rating, REVIEW_RATINGS) &&
+    isStringArray(value.evidence) &&
+    Array.isArray(value.readings) &&
+    value.readings.every(isReading)
+  );
+}
+
+function isGrade(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((field) =>
+      ["gradeId", "quizId", "pageId", "rating", "feedback", "gradedAt", "reviewId"].includes(field),
+    ) &&
+    hasStrings(value, ["gradeId", "quizId", "pageId", "rating", "feedback", "gradedAt"]) &&
+    isEnum(value.rating, REVIEW_RATINGS) &&
+    (value.reviewId === undefined || typeof value.reviewId === "string")
+  );
+}
+
+function isLearning(value: unknown): value is WikiPageResult["learning"] {
+  if (
+    !isRecord(value) ||
+    !Object.keys(value).every((field) => ["schedule", "prerequisites"].includes(field)) ||
+    !Array.isArray(value.prerequisites) ||
+    !value.prerequisites.every(
+      (edge) =>
+        isRecord(edge) &&
+        Object.keys(edge).every((field) => ["pageId", "prerequisitePageId"].includes(field)) &&
+        hasStrings(edge, ["pageId", "prerequisitePageId"]),
     )
+  )
+    return false;
+  if (value.schedule === undefined) return true;
+  return (
+    isRecord(value.schedule) &&
+    Object.keys(value.schedule).every((field) =>
+      [
+        "pageId",
+        "initialDueAt",
+        "dueAt",
+        "fsrsState",
+        "stability",
+        "difficulty",
+        "reps",
+        "lapses",
+        "scheduledDays",
+        "lastReviewAt",
+        "revision",
+        "createdAt",
+        "updatedAt",
+      ].includes(field),
+    ) &&
+    hasStrings(value.schedule, ["pageId", "initialDueAt", "dueAt", "fsrsState", "createdAt", "updatedAt"]) &&
+    isEnum(value.schedule.fsrsState, FSRS_STATES) &&
+    ["stability", "difficulty", "reps", "lapses", "scheduledDays", "revision"].every(
+      (field) => typeof (value.schedule as Record<string, unknown>)[field] === "number",
+    ) &&
+    (value.schedule.lastReviewAt === undefined || typeof value.schedule.lastReviewAt === "string")
   );
 }
 
@@ -138,6 +207,11 @@ function isSource(value: unknown): value is PublicSourceRecord {
 function isPage(value: unknown): boolean {
   return (
     isRecord(value) &&
+    Object.keys(value).every((field) =>
+      ["pageId", "relativePath", "title", "digest", "revision", "status", "quizWorthiness", "updatedAt"].includes(
+        field,
+      ),
+    ) &&
     hasStrings(value, ["pageId", "relativePath", "title", "digest", "status", "quizWorthiness", "updatedAt"]) &&
     isEnum(value.status, PAGE_STATUSES) &&
     isEnum(value.quizWorthiness, QUIZ_WORTHINESS) &&
@@ -158,7 +232,7 @@ function isQuiz(value: unknown): value is PublicQuizRecord {
         "answers",
         "draft",
         "questionResults",
-        "cardResults",
+        "pageResults",
         "grades",
         "readings",
         "generatedAt",
@@ -171,12 +245,14 @@ function isQuiz(value: unknown): value is PublicQuizRecord {
     Array.isArray(value.questions) &&
     value.questions.every(isQuestion) &&
     (value.answers === undefined || (Array.isArray(value.answers) && value.answers.every(isAnswer))) &&
-    ["questionResults", "cardResults", "grades"].every(
-      (field) => value[field] === undefined || isRecordArray(value[field]),
-    ) &&
+    (value.questionResults === undefined ||
+      (Array.isArray(value.questionResults) && value.questionResults.every(isQuestionResult))) &&
+    (value.pageResults === undefined || (Array.isArray(value.pageResults) && value.pageResults.every(isPageResult))) &&
+    (value.grades === undefined || (Array.isArray(value.grades) && value.grades.every(isGrade))) &&
     (value.readings === undefined || (Array.isArray(value.readings) && value.readings.every(isReading))) &&
     (value.draft === undefined ||
       (isRecord(value.draft) &&
+        Object.keys(value.draft).every((field) => ["revision", "savedAt", "answers"].includes(field)) &&
         typeof value.draft.revision === "number" &&
         typeof value.draft.savedAt === "string" &&
         Array.isArray(value.draft.answers) &&
@@ -189,9 +265,12 @@ function isQuizDetail(value: unknown): value is PublicQuizDetailRecord {
     isQuiz(value) &&
     Array.isArray(value.answers) &&
     value.answers.every(isAnswer) &&
-    isRecordArray(value.questionResults) &&
-    isRecordArray(value.cardResults) &&
-    isRecordArray(value.grades) &&
+    Array.isArray(value.questionResults) &&
+    value.questionResults.every(isQuestionResult) &&
+    Array.isArray(value.pageResults) &&
+    value.pageResults.every(isPageResult) &&
+    Array.isArray(value.grades) &&
+    value.grades.every(isGrade) &&
     Array.isArray(value.readings) &&
     value.readings.every(isReading)
   );
@@ -222,23 +301,24 @@ export const isSourceRemovalPreviewResult: ResultGuard<SourceRemovalPreviewResul
   value,
 ): value is SourceRemovalPreviewResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) => ["source", "dependentPageIds", "confirmationId"].includes(field)) &&
   isSource(value.source) &&
   typeof value.confirmationId === "string" &&
-  isStringArray(value.dependentPageIds) &&
-  isStringArray(value.dependentCardIds);
+  isStringArray(value.dependentPageIds);
 
 export const isSourceRemovalResult: ResultGuard<SourceRemovalResult> = (value): value is SourceRemovalResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) => ["sourceId", "status", "dependentPageIds"].includes(field)) &&
   hasStrings(value, ["sourceId", "status"]) &&
   value.status === "removed" &&
-  isStringArray(value.dependentPageIds) &&
-  isStringArray(value.dependentCardIds);
+  isStringArray(value.dependentPageIds);
 
 export const isWikiListResult: ResultGuard<WikiListResult> = (value): value is WikiListResult =>
   isRecord(value) && Array.isArray(value.pages) && value.pages.every(isPage);
 
 export const isWikiPageResult: ResultGuard<WikiPageResult> = (value): value is WikiPageResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) => ["page", "markdown", "sections", "learning", "drift"].includes(field)) &&
   isPage(value.page) &&
   typeof value.markdown === "string" &&
   Array.isArray(value.sections) &&
@@ -258,6 +338,20 @@ export const isWikiIssueListResult: ResultGuard<WikiIssueListResult> = (value): 
   value.issues.every(
     (issue) =>
       isRecord(issue) &&
+      Object.keys(issue).every((field) =>
+        [
+          "issueId",
+          "pageId",
+          "heading",
+          "pageDigest",
+          "kind",
+          "description",
+          "status",
+          "createdAt",
+          "updatedAt",
+          "resolution",
+        ].includes(field),
+      ) &&
       hasStrings(issue, ["issueId", "kind", "description", "status", "createdAt", "updatedAt"]) &&
       isEnum(issue.kind, ISSUE_KINDS) &&
       isEnum(issue.status, ISSUE_STATUSES),
@@ -268,19 +362,24 @@ export const isQuizListResult: ResultGuard<QuizListResult> = (value): value is Q
 
 export const isQuizResult: ResultGuard<QuizResult> = (value): value is QuizResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) =>
+    ["quiz", "outcome", "answers", "grades", "readings", "message"].includes(field),
+  ) &&
   typeof value.outcome === "string" &&
   ["available", "submitted", "expired", "skipped", "failed", "not-yet-run", "maintenance-day"].includes(
     value.outcome,
   ) &&
   Array.isArray(value.answers) &&
   value.answers.every(isAnswer) &&
-  isRecordArray(value.grades) &&
+  Array.isArray(value.grades) &&
+  value.grades.every(isGrade) &&
   Array.isArray(value.readings) &&
   value.readings.every(isReading) &&
   (value.quiz === undefined || isQuizDetail(value.quiz));
 
 export const isQuizAnswersResult: ResultGuard<QuizAnswersResult> = (value): value is QuizAnswersResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) => ["revision", "savedAt", "answers"].includes(field)) &&
   typeof value.revision === "number" &&
   typeof value.savedAt === "string" &&
   Array.isArray(value.answers) &&
@@ -288,10 +387,12 @@ export const isQuizAnswersResult: ResultGuard<QuizAnswersResult> = (value): valu
 
 export const isQuizSubmissionResult: ResultGuard<QuizSubmissionResult> = (value): value is QuizSubmissionResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) => ["status", "workflow", "quiz", "grades", "readings"].includes(field)) &&
   value.status === "sealed" &&
   isWorkflow(value.workflow) &&
   isQuizDetail(value.quiz) &&
-  isRecordArray(value.grades) &&
+  Array.isArray(value.grades) &&
+  value.grades.every(isGrade) &&
   Array.isArray(value.readings) &&
   value.readings.every(isReading);
 

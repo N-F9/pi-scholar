@@ -175,7 +175,6 @@ function rowToIssue(row: IssueRow): WikiIssue {
     issueId: String(row.issue_id),
     pageId: typeof row.page_id === "string" ? row.page_id : undefined,
     heading: typeof row.heading === "string" ? row.heading : undefined,
-    cardId: typeof row.card_id === "string" ? row.card_id : undefined,
     pageDigest: typeof row.page_digest === "string" ? row.page_digest : undefined,
     kind: row.kind as WikiIssueKind,
     description: String(row.description),
@@ -819,7 +818,6 @@ export class WikiService {
   async report(input: {
     pageId?: string;
     heading?: string;
-    cardId?: string;
     pageDigest?: string;
     kind?: WikiIssueKind;
     description: string;
@@ -834,7 +832,6 @@ export class WikiService {
       issueId: randomUUID(),
       pageId: input.pageId,
       heading: input.heading,
-      cardId: input.cardId,
       pageDigest: input.pageDigest ?? (page ? String(page.digest) : undefined),
       kind: input.kind ?? "incorrect",
       description: input.description,
@@ -845,12 +842,11 @@ export class WikiService {
     transaction(this.db, () =>
       dbRun(
         this.db,
-        "INSERT INTO wiki_issues (issue_id, page_id, heading, card_id, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO wiki_issues (issue_id, page_id, heading, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           issue.issueId,
           issue.pageId ?? null,
           issue.heading ?? null,
-          issue.cardId ?? null,
           issue.pageDigest ?? null,
           issue.kind,
           issue.description,
@@ -1006,11 +1002,10 @@ export class WikiService {
         transaction(this.db, () =>
           dbRun(
             this.db,
-            "INSERT INTO wiki_issues (issue_id, page_id, heading, card_id, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO wiki_issues (issue_id, page_id, heading, page_digest, kind, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
               issue.issueId,
               issue.pageId,
-              null,
               null,
               issue.pageDigest,
               issue.kind,

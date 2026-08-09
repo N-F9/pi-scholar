@@ -177,7 +177,6 @@ export interface WikiIssueRecord {
   readonly issueId: string;
   readonly pageId?: string;
   readonly heading?: string;
-  readonly cardId?: string;
   readonly pageDigest?: string;
   readonly kind: WikiIssueKind;
   readonly description: string;
@@ -187,14 +186,11 @@ export interface WikiIssueRecord {
   readonly resolution?: string;
 }
 
-export type ReviewCardStatus = "active" | "retired";
+export type ReviewRating = "Again" | "Hard" | "Good" | "Easy";
 export type FsrsState = "New" | "Learning" | "Review" | "Relearning";
-export type CardRating = "Again" | "Hard" | "Good" | "Easy";
 
-export interface ReviewCardRecord {
-  readonly cardId: string;
-  readonly status: ReviewCardStatus;
-  readonly prompt?: string;
+export interface PageLearningRecord {
+  readonly pageId: string;
   readonly initialDueAt: IsoDateTime;
   readonly dueAt: IsoDateTime;
   readonly fsrsState: FsrsState;
@@ -209,45 +205,22 @@ export interface ReviewCardRecord {
   readonly updatedAt: IsoDateTime;
 }
 
-export interface CardBindingRecord {
-  readonly bindingId: string;
-  readonly cardId: string;
+export interface PagePrerequisiteRecord {
   readonly pageId: string;
-  readonly heading?: string;
-  readonly anchor: string;
-  readonly startOffset: number;
-  readonly endOffset: number;
-  readonly textDigest: string;
+  readonly prerequisitePageId: string;
+}
+
+export interface PageReviewRecord {
+  readonly reviewId: string;
+  readonly pageId: string;
+  readonly quizId: string;
+  readonly submissionId: string;
   readonly revision: number;
-  readonly active: boolean;
-}
-
-export type ReviewBinding = CardBindingRecord;
-
-export interface CardPrerequisiteRecord {
-  readonly cardId: string;
-  readonly prerequisiteCardId: string;
-}
-
-export type PrerequisiteRecord = CardPrerequisiteRecord;
-export interface MaintenanceBindingInput {
-  readonly pageId: string;
-  readonly heading?: string;
-  readonly anchor: string;
-  readonly startOffset?: number;
-  readonly endOffset?: number;
-  readonly start?: number;
-  readonly end?: number;
-  readonly textDigest: string;
-  readonly pageDigest: string;
-  readonly pageRevision: number;
-  readonly sectionText: string;
-}
-
-export interface MaintenanceSplitChildInput {
-  readonly cardId?: string;
-  readonly prompt?: string;
-  readonly bindings: readonly MaintenanceBindingInput[];
+  readonly rating: ReviewRating;
+  readonly reviewedAt: IsoDateTime;
+  readonly stateBefore: JsonValue;
+  readonly stateAfter: JsonValue;
+  readonly settlementId: string;
 }
 
 export interface MaintenanceIssuePageInput {
@@ -257,38 +230,6 @@ export interface MaintenanceIssuePageInput {
   readonly body?: string;
   readonly quizWorthiness?: PageRecord["quizWorthiness"];
 }
-
-export type MaintenanceIssueCardInput =
-  | {
-      readonly kind: "create-card";
-      readonly cardId?: string;
-      readonly prompt?: string;
-      readonly initialDueAt?: IsoDateTime;
-      readonly dueAt?: IsoDateTime;
-      readonly bindings: readonly MaintenanceBindingInput[];
-    }
-  | {
-      readonly kind: "revise-card";
-      readonly cardId: string;
-      readonly expectedRevision: number;
-      readonly prompt?: string;
-      readonly bindings: readonly MaintenanceBindingInput[];
-    }
-  | { readonly kind: "retire-card"; readonly cardId: string; readonly expectedRevision: number }
-  | {
-      readonly kind: "split-card";
-      readonly cardId: string;
-      readonly expectedRevision: number;
-      readonly children: readonly MaintenanceSplitChildInput[];
-    }
-  | {
-      readonly kind: "merge-card";
-      readonly parentCardIds: readonly string[];
-      readonly expectedRevisions: Readonly<Record<string, number>>;
-      readonly cardId?: string;
-      readonly prompt?: string;
-      readonly bindings: readonly MaintenanceBindingInput[];
-    };
 
 export type MaintenanceInput =
   | {
@@ -308,96 +249,38 @@ export type MaintenanceInput =
     }
   | { readonly kind: "rename-page"; readonly pageId: string; readonly expectedDigest: string; readonly path: string }
   | {
-      readonly kind: "create-card";
-      readonly cardId?: string;
-      readonly prompt?: string;
-      readonly initialDueAt?: IsoDateTime;
-      readonly dueAt?: IsoDateTime;
-      readonly bindings: readonly MaintenanceBindingInput[];
-    }
-  | {
-      readonly kind: "revise-card";
-      readonly cardId: string;
-      readonly expectedRevision: number;
-      readonly prompt?: string;
-      readonly bindings: readonly MaintenanceBindingInput[];
-    }
-  | { readonly kind: "retire-card"; readonly cardId: string; readonly expectedRevision: number }
-  | {
-      readonly kind: "split-card";
-      readonly cardId: string;
-      readonly expectedRevision: number;
-      readonly children: readonly MaintenanceSplitChildInput[];
-    }
-  | {
-      readonly kind: "merge-card";
-      readonly parentCardIds: readonly string[];
-      readonly expectedRevisions: Readonly<Record<string, number>>;
-      readonly cardId?: string;
-      readonly prompt?: string;
-      readonly bindings: readonly MaintenanceBindingInput[];
-    }
-  | {
       readonly kind: "prerequisites";
-      readonly cardId: string;
-      readonly expectedRevision: number;
-      readonly prerequisiteCardIds: readonly string[];
+      readonly pageId: string;
+      readonly expectedRevision?: number;
+      readonly prerequisitePageIds: readonly string[];
     }
   | {
       readonly kind: "resolve-issue";
       readonly issueId: string;
       readonly page: MaintenanceIssuePageInput;
-      readonly card: MaintenanceIssueCardInput;
       readonly resolution: string;
     };
 
 export interface MaintenanceContext {
   readonly pages: readonly WikiPageResult[];
   readonly issues: readonly WikiIssueRecord[];
-  readonly cards: readonly ReviewCardRecord[];
-  readonly bindings: readonly CardBindingRecord[];
-  readonly prerequisites: readonly CardPrerequisiteRecord[];
   readonly sources: readonly SourceRecord[];
 }
 
 export interface MaintenanceResult {
   readonly kind: MaintenanceInput["kind"];
   readonly page?: PageRecord;
-  readonly cards?: readonly ReviewCardRecord[];
-  readonly prerequisites?: readonly CardPrerequisiteRecord[];
+  readonly pageLearning?: PageLearningRecord;
+  readonly prerequisites?: readonly PagePrerequisiteRecord[];
   readonly issue?: WikiIssueRecord;
   readonly checks?: { readonly lint: readonly string[]; readonly doctor: DoctorReport };
-}
-
-export type CardLineageEvent = "split" | "merge" | "retire" | "successor";
-
-export interface CardLineageRecord {
-  readonly lineageId: string;
-  readonly event: CardLineageEvent;
-  readonly parentCardIds: readonly string[];
-  readonly childCardIds: readonly string[];
-  readonly occurredAt: IsoDateTime;
-  readonly metadata?: JsonValue;
-}
-
-export interface RawReviewRecord {
-  readonly reviewId: string;
-  readonly cardId: string;
-  readonly quizId: string;
-  readonly questionId: string;
-  readonly answerRevision: number;
-  readonly rating: CardRating;
-  readonly reviewedAt: IsoDateTime;
-  readonly stateBefore: JsonValue;
-  readonly stateAfter: JsonValue;
-  readonly settlementId: string;
 }
 
 export type QuizStatus = "open" | "submitted" | "expired" | "skipped" | "failed";
 export type QuizQuestionKind = "short-answer" | "multiple-choice";
 
-export interface QuizQuestionCardRecord {
-  readonly cardId: string;
+export interface QuizQuestionPageRecord {
+  readonly pageId: string;
   readonly criterion: string;
   readonly weight: number;
 }
@@ -409,8 +292,7 @@ export interface QuizQuestionRecord {
   readonly kind: QuizQuestionKind;
   readonly prompt: string;
   readonly choices?: readonly string[];
-  readonly cardIds: readonly string[];
-  readonly cards: readonly QuizQuestionCardRecord[];
+  readonly pages: readonly QuizQuestionPageRecord[];
   readonly sourceRefs: readonly string[];
 }
 
@@ -436,20 +318,22 @@ export interface QuizQuestionResultRecord {
   readonly gradedAt: IsoDateTime;
 }
 
-export interface QuizCardResultRecord {
-  readonly resultId: string;
-  readonly quizId: string;
-  readonly questionId: string;
-  readonly cardId: string;
-  readonly rating: CardRating;
-  readonly reviewId: string;
-}
-
 export interface QuizReadingRecord {
   readonly pageId: string;
   readonly path: string;
   readonly heading?: string;
   readonly href: string;
+}
+
+export interface QuizPageResultRecord {
+  readonly resultId: string;
+  readonly quizId: string;
+  readonly pageId: string;
+  readonly rating: ReviewRating;
+  readonly feedback: string;
+  readonly reviewId: string;
+  readonly evidence: readonly string[];
+  readonly readings: readonly QuizReadingRecord[];
 }
 
 export interface QuizDraftRecord {
@@ -461,9 +345,8 @@ export interface QuizDraftRecord {
 export interface QuizGradeRecord {
   readonly gradeId: string;
   readonly quizId: string;
-  readonly questionId: string;
-  readonly cardId: string;
-  readonly rating: CardRating;
+  readonly pageId: string;
+  readonly rating: ReviewRating;
   readonly feedback: string;
   readonly gradedAt: IsoDateTime;
   readonly reviewId?: string;
@@ -478,7 +361,7 @@ export interface QuizRecord {
   readonly answers?: readonly QuizAnswerInput[];
   readonly draft?: QuizDraftRecord;
   readonly questionResults?: readonly QuizQuestionResultRecord[];
-  readonly cardResults?: readonly QuizCardResultRecord[];
+  readonly pageResults?: readonly QuizPageResultRecord[];
   readonly grades?: readonly QuizGradeRecord[];
   readonly readings?: readonly QuizReadingRecord[];
   readonly sheetPath?: string;
@@ -489,10 +372,11 @@ export interface QuizRecord {
 export interface QuizDetailRecord extends QuizRecord {
   readonly answers: readonly QuizAnswerInput[];
   readonly questionResults: readonly QuizQuestionResultRecord[];
-  readonly cardResults: readonly QuizCardResultRecord[];
+  readonly pageResults: readonly QuizPageResultRecord[];
   readonly grades: readonly QuizGradeRecord[];
   readonly readings: readonly QuizReadingRecord[];
 }
+
 export interface PublicQuizQuestionRecord {
   readonly questionId: string;
   readonly quizId: string;
@@ -509,9 +393,9 @@ export type PublicQuizRecord = Omit<QuizRecord, "questions" | "sheetPath"> & {
 export type PublicQuizDetailRecord = Omit<QuizDetailRecord, "questions" | "sheetPath"> & {
   readonly questions: readonly PublicQuizQuestionRecord[];
 };
+
 export interface QuizEvidenceRecord {
   readonly reference: string;
-  readonly cardId: string;
   readonly pageId: string;
   readonly path: string;
   readonly anchor: string;
@@ -523,12 +407,10 @@ export interface QuizEvidenceRecord {
 }
 
 export interface QuizQuestionProposal {
-  readonly questionId?: string;
   readonly kind: QuizQuestionKind;
   readonly prompt: string;
   readonly choices?: readonly string[];
-  readonly cardIds: readonly string[];
-  readonly cards: readonly QuizQuestionCardRecord[];
+  readonly pages: readonly QuizQuestionPageRecord[];
   readonly sourceRefs: readonly string[];
   readonly answerKey?: JsonValue;
 }
@@ -541,7 +423,7 @@ export interface QuizContext {
   readonly date: LocalDate;
   readonly initializationEnabled: boolean;
   readonly expiredCount: number;
-  readonly eligibleCards: readonly ReviewCardRecord[];
+  readonly eligiblePages: readonly PageLearningRecord[];
   readonly evidence: readonly QuizEvidenceRecord[];
   readonly quiz?: QuizDetailRecord;
   readonly message?: string;
@@ -553,9 +435,9 @@ export interface GradeReadingInput {
   readonly heading?: string;
 }
 
-export interface GradeCardInput {
-  readonly cardId: string;
-  readonly rating: CardRating;
+export interface GradePageInput {
+  readonly pageId: string;
+  readonly rating: ReviewRating;
   readonly feedback?: string;
   readonly evidence: readonly string[];
   readonly readings?: readonly GradeReadingInput[];
@@ -564,8 +446,6 @@ export interface GradeCardInput {
 export interface GradeQuestionInput {
   readonly questionId: string;
   readonly feedback?: string;
-  readonly cards: readonly GradeCardInput[];
-  readonly readings?: readonly GradeReadingInput[];
 }
 
 export interface GradeSettlementInput {
@@ -574,6 +454,7 @@ export interface GradeSettlementInput {
   readonly revision: number;
   readonly submissionId: string;
   readonly questions: readonly GradeQuestionInput[];
+  readonly pages: readonly GradePageInput[];
 }
 
 export interface GradingContext {
@@ -590,12 +471,11 @@ export interface GradingResult {
   readonly questions: readonly {
     readonly questionId: string;
     readonly feedback: string;
-    readonly cards: readonly (QuizGradeRecord & {
-      readonly evidence: readonly string[];
-      readonly readings: readonly GradeReadingInput[];
-    })[];
-    readonly readings: readonly GradeReadingInput[];
   }[];
+  readonly pages: readonly (QuizGradeRecord & {
+    readonly evidence: readonly string[];
+    readonly readings: readonly GradeReadingInput[];
+  })[];
 }
 
 export interface WorkflowRecord {
@@ -687,7 +567,6 @@ export interface SourceRemovalRequest {
 export interface SourceRemovalPreviewResult {
   readonly source: PublicSourceRecord;
   readonly dependentPageIds: readonly string[];
-  readonly dependentCardIds: readonly string[];
   readonly confirmationId: string;
 }
 
@@ -695,7 +574,6 @@ export interface SourceRemovalResult {
   readonly sourceId: string;
   readonly status: "removed";
   readonly dependentPageIds: readonly string[];
-  readonly dependentCardIds: readonly string[];
 }
 
 export interface WikiListResult {
@@ -703,10 +581,8 @@ export interface WikiListResult {
 }
 
 export interface WikiPageLearningProjection {
-  readonly cards: readonly ReviewCardRecord[];
-  readonly bindings: readonly CardBindingRecord[];
-  readonly prerequisites: readonly CardPrerequisiteRecord[];
-  readonly lineage: readonly CardLineageRecord[];
+  readonly schedule?: PageLearningRecord;
+  readonly prerequisites: readonly PagePrerequisiteRecord[];
 }
 
 export interface WikiDriftResult {
@@ -726,7 +602,6 @@ export interface WikiPageResult {
 export interface WikiIssueCreateRequest {
   readonly pageId?: string;
   readonly heading?: string;
-  readonly cardId?: string;
   readonly pageDigest?: string;
   readonly kind: WikiIssueKind;
   readonly description: string;

@@ -11,10 +11,10 @@ Pi Scholar is one standalone Pi package for collecting knowledge into a sourced 
 The product centers the proven Cribrum loop:
 
 1. maintain the wiki from admitted sources;
-2. derive stable review cards from bounded sections of the eligible wiki;
-3. select prerequisite-unblocked cards due today for one bounded daily quiz, or skip the quiz when none are eligible;
+2. ensure one page-level FSRS learning record for every eligible wiki page and retain the page prerequisite DAG;
+3. select prerequisite-unblocked pages due today, then generate one bounded daily quiz from ephemeral questions;
 4. collect and grade answers;
-5. update every affected card's SQLite FSRS state independently and transactionally;
+5. apply one bundled page rating and one page review transition per covered page, transactionally;
 6. show the exact wiki pages and headings worth rereading;
 7. commit each completed mutation locally, then push accumulated commits only when the user schedules or invokes `pi-scholar sync`.
 
@@ -84,7 +84,7 @@ SQLite, files, qmd, Git, Pi, and the web client have distinct ownership. None is
 4. Let the model choose coherent source boundaries while the host proves lossless reconstruction and provenance.
 5. Preserve direct human prose and keep model-authored knowledge as self-contained, textbook-depth OKF-compatible Markdown under `wiki/`, not abstract-only summaries.
 6. Let Pi use native exact and lexical operations in addition to qmd semantic ranking.
-7. Cover the quiz-worthy knowledge in the whole eligible stable wiki through bounded review cards and one small daily quiz.
+7. Cover quiz-worthy knowledge in the whole eligible stable wiki through page-level learning and one small daily quiz.
 8. Apply retrieval practice, spacing, and topic interleaving without exposing a tutoring or curriculum product.
 9. Keep questions, grading, historical results, and recommended readings traceable to wiki pages and immutable source chunks.
 10. Provide a responsive browser interface for quizzes and note reading on desktop and phone.
@@ -106,7 +106,7 @@ SQLite, files, qmd, Git, Pi, and the web client have distinct ownership. None is
 - Index source packets or quizzes in qmd.
 - Treat generated projections, qmd data, or rendered Markdown as another state authority.
 - Execute instructions, HTML, JavaScript, shell fragments, or Mermaid actions selected by imported content.
-- Expose arbitrary shell, Git, qmd administration, SQLite, scheduler cards, or source bytes over HTTP.
+- Expose arbitrary shell, Git, qmd administration, SQLite, scheduler internals, or source bytes over HTTP.
 - Silently switch from source-grounded work to unrecorded web research.
 
 ## Donor cutover
@@ -182,7 +182,7 @@ Git adds `.git/`. Pi Scholar adds no other product content root.
 ```
 
 - `vault.json` owns the vault ID and format version.
-- `state.sqlite` owns source-admission and removal status, the page catalog and stable page IDs, wiki issue reports, review cards, page-section bindings and lineage events, prerequisite metadata, FSRS cards/history, daily quiz outcomes, quiz identity and revisions, grades, workflow progress/errors, and initialization mode.
+- `state.sqlite` owns source-admission and removal status, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and initialization mode.
 - `qmd/` is derived external-command state and may be rebuilt.
 - `work/` contains bounded transient request files and child-process output.
 
@@ -219,7 +219,7 @@ sources/<source-id>/
 - `chunks/` contains contiguous, ordered, semantically coherent slices.
 - `attachments/` retains local assets exported by a converter.
 
-Packets are immutable while retained. Recapturing changed material creates a new packet. A user may request removal of an obsolete or unwanted packet through a confirmation-bound workflow: Pi Scholar first shows every dependent wiki claim, card binding, and current artifact, then removes or revises them atomically with the packet. Historical review and lineage records remain, and ordinary removal does not erase bytes from existing Git history; a true privacy purge requires explicit operator-run Git history rewriting outside Pi Scholar.
+Packets are immutable while retained. Recapturing changed material creates a new packet. A user may request removal of an obsolete or unwanted packet through a confirmation-bound workflow: Pi Scholar first shows every dependent wiki claim, page evidence, and current artifact, then removes or revises them atomically with the packet. Historical page review records remain, and ordinary removal does not erase bytes from existing Git history; a true privacy purge requires explicit operator-run Git history rewriting outside Pi Scholar.
 
 ### `wiki/`: notes and maintained knowledge
 
@@ -235,9 +235,9 @@ Packets are immutable while retained. Recapturing changed material creates a new
 
 Model-authored source pages teach their bounded topic without requiring the source to be open. They define terminology and symbols, explain central mechanisms step by step, retain relevant equations, algorithms, architecture, examples, and empirical values, and discuss supported assumptions, tradeoffs, and limitations. Depth follows the source rather than a fixed word count. Claims cite the nearest relevant immutable source chunks; direct human-authored prose is not expanded or rewritten without a bounded request.
 
-Every admitted page receives a host-minted immutable page ID in frontmatter. The catalog maps that ID to the current path; review cards bind to page IDs and validated sections rather than using paths as scheduler identity. Moving or renaming a page therefore preserves its card bindings and review history. Duplicate or missing IDs fail doctor. Folder hierarchy remains organization, not a type system.
+Every admitted page receives a host-minted immutable page ID in frontmatter. The catalog maps that ID to the current path, and page learning is keyed by that stable ID rather than by path or heading. Moving or renaming a page therefore preserves its learning state and review history. Duplicate or missing IDs fail doctor. Folder hierarchy remains organization, not a type system.
 
-For the first iteration, users do not edit `wiki/` directly. They create notes through Pi and report incorrect, unclear, missing, or badly bounded material through `/issue` or the Notes UI. The report records a page ID, optional heading or review-card ID, page digest, and user description in SQLite. Each user-scheduled `wiki-maintenance` invocation resolves reports against authorized evidence. A report closes automatically only after the guarded edit, card-binding update, qmd refresh, lint, and doctor all succeed; the resolution log links the resulting page/card revisions and Git commit, and the user may reopen it.
+For the first iteration, users do not edit `wiki/` directly. They create notes through Pi and report incorrect, unclear, missing, or badly bounded material through `/issue` or the Notes UI. The report records a page ID, optional heading, page digest, and user description in SQLite. Each user-scheduled `wiki-maintenance` invocation resolves reports against authorized evidence. A report closes automatically only after the guarded page edit, prerequisite/learning coverage update, qmd refresh, lint, and doctor all succeed; the resolution log links the resulting page revision and Git commit, and the user may reopen it.
 
 ### `quizzes/`: dated quiz sheets
 
@@ -245,9 +245,9 @@ For the first iteration, users do not edit `wiki/` directly. They create notes t
 quizzes/YYYY/MM/YYYY-MM-DD.md
 ```
 
-Each file is the human-readable projection and transport for one date's quiz, answers, results, and source-linked corrections. It contains no private answer key. SQLite remains authoritative for the daily outcome, quiz identity, revision, expiration, grade settlement, and scheduling history.
+Each file is the human-readable projection and transport for one date's quiz, answers, page results, and source-linked corrections. It contains no private answer key. SQLite remains authoritative for the daily outcome, quiz identity and revision, expiration, question/page records, grade settlement, and page scheduling history.
 
-There are no curriculum projections, visible question banks, coach reports, capstones, transfer artifacts, explorables, or generated learning diagrams.
+Questions are generated for a quiz and are not a durable question bank. There are no curriculum projections, coach reports, capstones, transfer artifacts, explorables, or generated learning diagrams.
 
 ## Durable authorities
 
@@ -256,7 +256,7 @@ There are no curriculum projections, visible question banks, coach reports, caps
 | Original bytes, extraction, repository manifest, chunks, attachments, and provenance | Immutable `sources/<source-id>/` packet |
 | Notes and maintained knowledge | Markdown under `wiki/` plus the SQLite page-ID catalog |
 | Human-readable quiz, answers, results, and corrections | Dated Markdown under `quizzes/` |
-| Source admission/removal, page identity, wiki issues, review cards, page-section bindings and lineage, prerequisites, FSRS, daily quiz outcomes and revisions, grades, and workflows | `.pi-scholar/state.sqlite` |
+| Source admission/removal, page identity, wiki issues, page learning, prerequisites, page review history, daily quiz outcomes and revisions, question/page records, page results, and workflows | `.pi-scholar/state.sqlite` |
 | Semantic ranking | qmd collection rooted at `wiki/` |
 | Exact and lexical navigation | Validated physical files plus Pi native tools |
 | Version history and remote synchronization | Git and optional Git LFS |
@@ -312,9 +312,9 @@ Pi's built-in `read`, `grep`, `find`, and bounded shell tool remain available fo
 Semantic workflows are inspectable Pi skills under `skills/*/SKILL.md`. The initial set is deliberately small:
 
 - `source-admission`: read the current stable inbox snapshot, process entries sequentially in canonical order, choose coherent semantic chunk boundaries with complete lossless coverage, use host claims and per-source idempotency, isolate failures, reconcile complete coverage, and publish immutable packets;
-- `wiki-maintenance`: consume admitted packets and open issue reports, create or revise self-contained textbook-depth source pages, preserve direct human prose, derive or revise review-card bindings, refresh qmd, and lint through guarded proposals;
-- `daily-quiz`: expire earlier unsubmitted quizzes, refuse generation while initialization is enabled, and otherwise select prerequisite-unblocked review cards due today and generate the dated grounded quiz or record an explicit skip;
-- `quiz-grader`: inspect sealed pending submissions, grade each in an isolated context, settle FSRS, write Results, and select wiki readings through the facade.
+- `wiki-maintenance`: consume admitted packets and open issue reports, create or revise self-contained textbook-depth source pages, preserve direct human prose, maintain page learning coverage and prerequisites, refresh qmd, and lint through guarded proposals;
+- `daily-quiz`: expire earlier unsubmitted quizzes, refuse generation while initialization is enabled, and otherwise select prerequisite-unblocked pages due today and generate the dated grounded quiz or record an explicit skip;
+- `quiz-grader`: inspect sealed pending submissions, preserve question feedback, settle one bundled page grade per covered page, and select wiki readings through the facade.
 
 Users can inspect these Markdown files and invoke them through Pi's `/skill:<name>` interface where appropriate. Skills describe semantic workflow; they do not own durable state or bypass host validation.
 
@@ -331,7 +331,7 @@ The prompt is static. Source text, learner text, credentials, and arbitrary mode
 The four jobs are independent:
 
 1. `source-admission` snapshots stable entries once, then processes that snapshot sequentially. The host claims each physical identity and digest, publishes or records a source-specific failure, and continues with the next entry.
-2. `wiki-maintenance` reads the current maintenance context and submits guarded proposals; the host validates page identity, evidence, links, card bindings, qmd refresh, lint, and doctor.
+2. `wiki-maintenance` reads the current maintenance context and submits guarded proposals; the host validates page identity, direct page evidence, prerequisite DAG changes, qmd refresh, lint, and doctor.
 3. `daily-quiz` expires earlier unsubmitted quizzes before checking initialization, then publishes today's eligible quiz or a typed no-eligible/initialization outcome. Initialization blocks generation but does not schedule or suppress maintenance.
 4. `quiz-grader` reads sealed pending browser submissions and settles them. Browser submission only seals and queues; it never starts Pi or grades directly.
 
@@ -345,9 +345,9 @@ The core owns:
 - safe reads, guarded writes, exact Markdown edits, and source admission;
 - source packet manifests and lossless chunk reconstruction;
 - OKF parsing, links, index, log, and catalog validation;
-- SQLite schema, transactions, workflow rows, source removals, wiki issues, review cards, page-section bindings and lineage, daily quiz outcomes and revisions, expiration, and grades;
-- FSRS v6 state per active review card plus immutable raw review and lineage logs through `ts-fsrs`;
-- review-card coverage, initial-due assignment, prerequisite, and quiz-eligibility predicates;
+- SQLite schema, transactions, workflow rows, source removals, wiki issues, page learning, prerequisites, page review history, daily quiz outcomes and revisions, expiration, question records, and page results;
+- FSRS v6 state per eligible page plus immutable page review transitions through `ts-fsrs`;
+- page coverage, page creation/eligibility, prerequisite, and quiz-selection predicates;
 - quiz sheet parsing/rendering and answer revision checks;
 - doctor, short lock scopes, operation-level idempotency, interrupted-write detection, and Git synchronization;
 - strict request, result, progress, report, and error contracts.
@@ -427,38 +427,37 @@ Rules:
 
 ## Daily quiz model
 
-### Learning scope and review cards
+### Page-level learning and schema v3
 
-The scheduler unit is a **review card**, not a whole page. Each active review card has one stable card ID and one `ts-fsrs` state. It binds many-to-many with wiki sections:
+The scheduler unit is a **wiki page**. Every eligible page has one `page_learning` row keyed by its stable `page_id` and one `ts-fsrs` state. Page creation and eligibility ensure that row exists. A page rename keeps the same ID and learning history. Drifted or retired pages are excluded from selection while their page learning and review history remain available for inspection.
 
-- one page may contribute several independently scheduled cards;
-- one card may combine bounded sections from several pages;
-- each binding names a stable page ID, heading or structural anchor, host-validated text bounds, and content digest;
-- the maintenance agent proposes card and binding boundaries, but the host validates containment, nonempty evidence, source authorization, and revision identity;
-- new cards receive explicit initial due dates, allowing maintenance to stagger their introduction without the quiz generator inventing filler work.
+Schema v3 is the clean pre-release page-oriented cutover. `.pi-scholar/state.sqlite` stores:
 
-“Learn the whole wiki” does not mean every Markdown file becomes one card. A stable knowledge-bearing page must either contribute at least one active review card or be explicitly marked `quiz-worthiness: skip`. Draft, historical, deprecated, navigation, index, log, and other control pages are excluded. Missing coverage on an otherwise eligible page is a maintenance/doctor issue, not an automatic page-sized card.
+- `page_learning`: one FSRS schedule/state per `page_id`;
+- `page_prerequisites`: directed `(page_id, prerequisite_page_id)` edges;
+- `page_reviews`: one immutable transition per quiz, page, and sealed submission revision;
+- `question_pages`: `(question_id, page_id, criterion_json, weight)` coverage and grading criteria;
+- `page_results`: one rating, feedback, evidence, and readings record per quiz/page;
+- `quiz_evidence`: keyed by quiz/reference and containing direct page/section snapshots only;
+- quiz identity/revisions, ephemeral question records, wiki issues, workflows, and initialization state.
 
-### Curriculum prerequisites
+`wiki_issues` is page-oriented. There are no compatibility aliases, views, migrations, deprecated review paths, or parallel legacy review schema. `SchedulerService` remains the file/class name but is page-oriented: `ensurePageLearning`, `getPageLearning`, `listPageLearning`, `setPrerequisites(pageId, ids, expectedRevision?)`, `listPrerequisites(pageId)`, `validateCoverage`, `eligiblePages`, `selectDuePages`, `pageHistory`, and `transitionPage`/`transitionPageInTransaction`.
 
-Wiki maintenance may propose directed prerequisite edges between active review cards. The host validates that every endpoint exists, rejects self-edges, cycles, and dangling references, and stores accepted edges in SQLite.
+The exported page contracts are `ReviewRating`, `PageLearningRecord` (`pageId`, `initialDueAt`, `dueAt`, `fsrsState`, `stability`, `difficulty`, `reps`, `lapses`, `scheduledDays`, optional `lastReviewAt`, `revision`, `createdAt`, `updatedAt`), `PagePrerequisiteRecord` (`pageId`, `prerequisitePageId`), `PageReviewRecord` (`reviewId`, `pageId`, `quizId`, `submissionId`, `revision`, `rating`, `reviewedAt`, `stateBefore`, `stateAfter`, `settlementId`), `QuizQuestionPageRecord` (`pageId`, `criterion`, `weight`), `QuizPageResultRecord` (`resultId`, `quizId`, `pageId`, `rating`, `feedback`, `reviewId`, `evidence`, `readings`), page-oriented `QuizGradeRecord` (`gradeId`, `quizId`, `pageId`, `rating`, `feedback`, `gradedAt`, optional `reviewId`), and `GradePageInput` (`pageId`, `rating`, optional `feedback`, `evidence`, optional `readings`).
 
-Prerequisites gate both new and due cards. A card is quiz-eligible only when every active prerequisite is in FSRS `Review` (`state == 2`); `New`, `Learning`, and `Relearning` prerequisites keep it blocked. Maintenance revises edges when cards split, merge, or retire. `quiz-worthiness: skip` remains an independent exclusion rather than a substitute for prerequisite state.
+### Page prerequisites
 
-### Card revision and lineage
+Maintenance may propose directed prerequisite edges between pages. The host validates that every endpoint is an existing stable page, rejects self-edges, cycles, and dangling references, and stores accepted edges in `page_prerequisites`. A due page is blocked until every prerequisite page is in FSRS `Review` (`state == 2`); `New`, `Learning`, and `Relearning` prerequisites keep it blocked. Drifted and retired pages are not selected, and page prerequisite history remains inspectable.
 
-A boundary change that preserves one semantic unit keeps the card ID and records a binding revision. A semantic split or merge creates new card IDs, retires the replaced cards, and appends an immutable lineage event to the scheduler log:
+### Selection and page evidence
 
-- on **split**, every child history view links to the parent's raw reviews; each child starts as a fresh FSRS `New` card due immediately for its own first measurement;
-- on **merge**, the new card history view is the chronological union of all parent histories with their original card IDs; the merged card starts as a fresh FSRS `New` card due immediately;
-- raw review rows are never duplicated, reassigned, or rewritten; lineage projections make parent history visible without pretending an old answer measured a semantic boundary that did not yet exist;
-- every split, merge, retirement, successor, and subsequent independent review appears in History and the durable audit log.
+Whenever the user-scheduled `daily-quiz` skill runs, it first expires every earlier unsubmitted quiz as a read-only artifact without changing FSRS. It then refuses quiz generation while initialization is enabled. Otherwise it selects only pages whose `page_learning` due date is today or earlier and whose prerequisites are all in FSRS `Review`. It interleaves eligible pages and follows the bounded shape: at most four questions total and no more than two synthesis questions. If no page is eligible, it creates no quiz sheet and records an explicit no-eligible-pages outcome; it never generates filler questions for blocked, drifted, retired, or unscheduled pages.
 
-Review cards, prerequisite edges, and FSRS states are scheduler mechanics rather than a second authored curriculum tree. For transparency, the Notes page exposes a collapsed **Learning** panel for the current page or heading. It shows bound cards, prerequisites, cross-page bindings, next due dates, revisions, and split/merge lineage, with “Report issue” actions but no direct scheduler editor.
+The host snapshots all relevant wiki sections directly for each covered page and authorizes source references for those snapshots. `quiz_evidence` stores these page/section snapshots keyed by quiz/reference; the Markdown sheet never carries page, source, evidence, rubric, answer-key, or FSRS metadata. Page evidence is direct and host-authorized rather than a many-to-many section artifact.
 
-### Selection and interleaving
+### Ephemeral questions
 
-Whenever the user-scheduled `daily-quiz` skill runs, it first expires every earlier unsubmitted quiz as a read-only artifact without changing FSRS. It then refuses quiz generation while initialization is enabled. Otherwise it selects only cards whose due date is today or earlier and whose prerequisites are all in FSRS `Review`. It mixes topics when several are eligible and follows Cribrum's bounded shape: at most four question specifications, complete coverage of selected cards, and no more than two cross-card synthesis questions. If no card is eligible, it creates no quiz sheet and records a `skipped-no-eligible-cards` outcome; it never generates filler questions merely because blocked or unscheduled cards exist.
+Questions are generated for one quiz and are not a durable question bank. Each selected page must occur in exactly one single-page question. The generator may add bounded synthesis questions covering related pages within the existing four-question and two-synthesis limits; synthesis does not create another schedule or rating for a page.
 
 Questions may be:
 
@@ -466,37 +465,44 @@ Questions may be:
 - short free recall;
 - long explanation;
 - procedure or worked application;
-- bounded synthesis across related cards.
+- bounded synthesis across related pages.
 
-Each question specification lists the review cards it tests and a separate evidence-backed grading criterion and display weight for each card. The agent reads the exact bound wiki sections and authorized source chunks before proposing questions. The host validates card eligibility, bindings, weights, source references, question identity, mode, budget, and answer-hiding constraints before publishing the sheet.
+`QuizQuestionRecord` and `QuizQuestionProposal` carry `pages: QuizQuestionPageRecord[]` plus internal `sourceRefs`; they contain no review-artifact fields. Each page entry supplies an evidence-backed criterion and display weight. Proposals do not provide question IDs. The host mints opaque UUID question IDs and validates page eligibility, direct evidence, criteria, weights, mode, budget, revision, and answer-hiding constraints.
 
 ### Quiz sheet and submission
 
 The dated sheet under `quizzes/` is the primary inspectable learning artifact, not a secondary export. The web client renders the same canonical question and revision data.
 
-- A quiz contains stable question IDs, review-card IDs, bound page sections, prompts, blank answer regions, and a managed Results section.
-- It contains no answer key, private rubric, or source excerpt that reveals the answer.
+- A quiz contains ephemeral prompts, blank answer regions, and numeric visible headings only.
+- The only generated identity comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`.
+- Those comments contain no page, source, evidence, rubric, answer-key, or FSRS metadata.
 - Browser autosaves are revision-checked local state, not separate Git commits.
 - Final submission validates every displayed question, distinctness, expected revision, and answer visibility.
 - A dated quiz is generated once and reused during that scheduled day; missed dates do not synthesize retroactive quizzes.
 - At the next scheduled invocation, every earlier unsubmitted quiz becomes an expired read-only artifact. Expiration records no grade and changes no FSRS state.
+- Results and readings are absent until grading has committed them.
+
+`QuizContext.eligiblePages` contains page learning records. `QuizDetailRecord` exposes `pageResults`, never a second per-artifact result collection.
 
 ### Grading and scheduling
 
 Final submission of the current open quiz validates the displayed questions, distinctness, expected revision, and answer visibility, then seals the exact answer revision and queues it for grading through the application facade. Browser submission never launches Pi and never mutates FSRS.
 
-The user-scheduled `quiz-grader` skill reads sealed pending submissions in a fresh Pi context. It sees the exact question, learner answer, per-card grading criteria, and authorized wiki/source evidence, but no question-generation transcript or future answers. The skill makes the semantic judgment and returns one of `Again`, `Hard`, `Good`, or `Easy` with evidence-backed reasoning for every card tested by the question; there is no deterministic score formula pretending to replace that judgment. A learner may therefore receive `Good` for the card they explained correctly and `Again` for a different card they missed in the same answer. Question weights affect only the displayed aggregate result; each card receives the grader's own FSRS rating.
+The user-scheduled `quiz-grader` skill reads sealed pending submissions in a fresh Pi context. It sees the exact ephemeral questions, learner answers, per-page criteria, and authorized direct page/source evidence, but no question-generation transcript or future answers. It preserves question-level feedback while returning exactly one `ReviewRating` (`Again`, `Hard`, `Good`, or `Easy`) for every covered page. The rating is a bundled judgment for the page, regardless of how many questions mention that page.
 
-The host validates the enum, authorized evidence, bindings, and completeness but does not override the opinion. One identity-bearing SQLite transaction records the question result, every per-card result, feedback, history, and all `ts-fsrs` transitions atomically. Repeated grader invocations reuse the sealed submission identity and cannot settle it twice. A grader failure preserves the sealed answer and leaves FSRS unchanged.
+`GradeSettlementInput` contains the exact `questions` list (question ID plus feedback only) and exact `pages` list (one `GradePageInput` per covered page). `GradingResult` keeps `questions` and `pages` separate. The host validates workflow ownership, authorized evidence, criteria, coverage, ratings, revision, and sealed-submission identity without substituting a deterministic score formula.
+
+One identity-bearing SQLite transaction writes question feedback, one `page_results` row per quiz/page with rating, feedback, evidence, and readings, one `page_reviews` transition per quiz/page/submission revision, and the corresponding `page_learning` FSRS transition. Repeated grader invocations reuse the sealed submission identity and cannot settle it twice. A grader failure preserves the sealed answer and leaves every page schedule unchanged.
 
 After grading, the web application shows:
 
-- the result for each question;
+- the result for each ephemeral question;
+- one bundled result for each covered page;
 - concise source-grounded corrections;
 - the exact relevant wiki pages and headings;
 - a small reading list for immediate review.
 
-A miss schedules future retrieval through FSRS. There is no tutor conversation, confidence workflow, capstone, transfer claim, coaching report, or separate same-day learning product.
+A miss schedules future retrieval for that page through FSRS. There is no tutor conversation, confidence workflow, capstone, transfer claim, coaching report, or separate same-day learning product.
 
 ## Web application
 
@@ -506,8 +512,8 @@ Primary navigation:
 
 | Page | Behavior |
 |---|---|
-| **Today** | Current quiz with proper controls, autosave, explicit final submission, Results, and linked readings; otherwise a textual status explaining no eligible cards, quiz blocked by initialization, not yet run, or generation failure |
-| **Notes** | Browse and search read-only wiki pages, inspect the collapsed Learning/card-lineage panel, raise issues, and resolve detected direct-edit drift through the two bounded restore choices |
+| **Today** | Current quiz with proper controls, autosave, explicit final submission, Results, and linked readings; otherwise a textual status explaining no eligible pages, quiz blocked by initialization, not yet run, or generation failure |
+| **Notes** | Browse and search read-only wiki pages, inspect the collapsed page-learning/prerequisites panel, raise issues, and resolve detected direct-edit drift through the two bounded restore choices |
 | **Add** | Upload or inspect sources, submit URLs or pasted text, preview source-removal impact, and explicitly confirm or cancel removal |
 | **History** | Browse dated quiz sheets and Results; expired unsubmitted sheets reopen read-only |
 
@@ -526,8 +532,8 @@ Users normally speak to Pi. The extension exposes a small interface:
 | Surface | Behavior |
 |---|---|
 | `/add` | Convenience picker for URLs, pasted text, or files and repositories outside the inbox; existing inbox entries need no command |
-| `/issue` | Report an incorrect, unclear, missing, or badly bounded wiki page, heading, or visible review card for agent resolution |
-| `/scholar-status` | Show vault, workflow, open issues, initialization mode, due cards, recent maintenance, doctor, and Git state |
+| `/issue` | Report an incorrect, unclear, missing, or badly bounded wiki page or heading for agent resolution |
+| `/scholar-status` | Show vault, workflow, open issues, initialization mode, due pages, recent maintenance, doctor, and Git state |
 | `scholar_add` tool | Materialize a typed external input in the automatic inbox queue |
 | `scholar_note` tool | Create or update a guarded product-authored wiki note |
 | `scholar_remove_source` tool | Prepare a dependency impact preview; the extension executes removal only after the user accepts its confirmation UI |
@@ -541,7 +547,7 @@ Pi's native tools remain available for exact reads and lexical navigation. Packa
 | Command | Behavior |
 |---|---|
 | `pi-scholar init [path]` | Create the five-root vault, SQLite schema, qmd collection, Git repository, ignore rules, and user-controlled initialization mode |
-| `pi-scholar doctor [path]` | Run the sole read-only structural, dependency, integrity, source, wiki, quiz, review-card, qmd, workflow, and Git check |
+| `pi-scholar doctor [path]` | Run the sole read-only structural, dependency, integrity, source, wiki, quiz, page-learning, qmd, workflow, and Git check |
 | `pi-scholar serve` | Start the loopback API, static web application, and small in-process browser-job worker |
 | `pi-scholar sync` | Push accumulated local commits without running semantic work |
 
@@ -613,7 +619,7 @@ The entries are independent:
 | Entry | Work |
 |---|---|
 | `source-admission` | Snapshot the current stable inbox queue and process it sequentially with per-source host idempotency and failure isolation |
-| `wiki-maintenance` | Apply validated wiki and review-card proposals against the current maintenance context |
+| `wiki-maintenance` | Apply validated page and prerequisite proposals against the current maintenance context |
 | `daily-quiz` | Expire earlier unsubmitted quizzes, enforce initialization, then publish today's eligible quiz or an explicit skip |
 | `quiz-grader` | Settle sealed pending browser submissions with one identity-bearing transaction per submission |
 | `pi-scholar sync` | Push accumulated local commits and perform no semantic work |
@@ -622,7 +628,7 @@ If an entry is not scheduled, that workflow does not run. New inbox entries arri
 
 ### Initialization mode
 
-Initialization starts enabled. Only an explicit user action through Settings may disable it. Every `daily-quiz` invocation expires earlier unsubmitted quizzes, then checks the mode and refuses quiz generation while it remains enabled. Initialization does not choose, delay, or suppress `source-admission`, `wiki-maintenance`, `quiz-grader`, or `sync` schedules. Pi Scholar does not compute or display a “ready” state. Settings and status expose only facts—pending inbox entries, open issues, the last maintenance result, card-coverage gaps, lint, doctor, qmd, and Git state—so the user makes the judgment.
+Initialization starts enabled. Only an explicit user action through Settings may disable it. Every `daily-quiz` invocation expires earlier unsubmitted quizzes, then checks the mode and refuses quiz generation while it remains enabled. Initialization does not choose, delay, or suppress `source-admission`, `wiki-maintenance`, `quiz-grader`, or `sync` schedules. Pi Scholar does not compute or display a “ready” state. Settings and status expose only facts—pending inbox entries, open issues, the last maintenance result, page-coverage gaps, lint, doctor, qmd, and Git state—so the user makes the judgment.
 
 ## Git synchronization and recovery
 
@@ -663,12 +669,12 @@ Recovery stays operation-specific and idempotent: source publication reuses its 
 9. Source packets are immutable and chunks reconstruct the complete accepted extraction.
 10. qmd supplies ranking but never path or write authority.
 11. Native exact and lexical tools do not silently become semantic ranking.
-12. Stable page IDs own section bindings; stable review-card IDs own scheduler identity and FSRS history.
-13. Wiki or quiz Markdown cannot directly advance a card or grade.
-14. Browser submission seals an exact answer revision and queues it; grading runs later in a fresh Pi context bound to the exact question and answer revision.
-15. One SQLite transaction is the only path that records a question grade and independently advances every affected review card.
-16. Historical grades retain their prompt, answer, per-card results, page/source references, feedback, and schedule transitions.
-17. Raw review rows are immutable; card split/merge lineage changes active scheduling without rewriting what historical answers originally tested.
+12. Stable page IDs own direct page evidence and page learning; `page_reviews` owns immutable page transitions.
+13. Wiki or quiz Markdown cannot directly advance page learning or grade a quiz.
+14. Browser submission seals an exact answer revision and queues it; grading runs later in a fresh Pi context bound to the exact questions, pages, and answer revision.
+15. One SQLite transaction is the only path that records question feedback, one bundled page result per covered page, and one FSRS transition per covered page.
+16. Historical grades retain their prompts, answers, question feedback, page results, direct page/source references, readings, and schedule transitions.
+17. A page review transition is never duplicated or rewritten; settlement identity and page revision make retries idempotent.
 18. Read-only doctor and status paths never repair, quarantine, index, or self-heal corrupt state.
 19. No domain writer runs after an independently scheduled `pi-scholar sync` push begins.
 20. The web server evaluates no raw HTML, scripts, imported actions, or source-selected Mermaid directives.
@@ -684,12 +690,12 @@ Recovery stays operation-specific and idempotent: source publication reuses its 
 - **qmd unavailable or malformed:** semantic search fails visibly; native exact and lexical navigation remains available.
 - **No relevant evidence:** offer capture/discovery or cancel; never disguise generic model knowledge as grounded material.
 - **Page missing or duplicate stable ID:** exclude it from scheduling and report it through doctor/maintenance.
-- **Unsupported direct wiki edit:** mark the page and its review cards as drifted and ineligible, remove the page from semantic refresh, preserve the bytes, and block Git checkpointing rather than overwrite or commit them. Notes shows the diff against the last product-authored commit and asks the user to either store that exact diff as issue evidence and restore the product version, or discard the diff and restore it directly. Direct acceptance as canonical wiki content does not exist in the first iteration.
+- **Unsupported direct wiki edit:** mark the page as drifted and ineligible, remove it from semantic refresh, preserve the bytes, and block Git checkpointing rather than overwrite or commit them. Notes shows the diff against the last product-authored commit and asks the user to either store that exact diff as issue evidence and restore the product version, or discard the diff and restore it directly. Direct acceptance as canonical wiki content does not exist in the first iteration.
 - **Source packet missing or corrupt:** block dependent regeneration and identify every affected page or quiz.
 - **Quiz generation failure:** publish no partial dated sheet, change no schedule, and record a visible failed outcome.
 - **Grader failure:** preserve the sealed submitted answer revision and leave FSRS unchanged; a later `quiz-grader` invocation may retry it by identity.
 - **Indeterminate SQLite outcome:** reread the idempotency identity before deciding whether any retry may write.
-- **Results projection failure:** keep the committed grade and retry only the managed Results projection.
+- **Results projection failure:** keep the committed page grade and retry only the managed page-results projection.
 - **Duplicate submission:** reject before a second grade or FSRS write.
 - **Expired quiz submission:** preserve the sheet as read-only History, reject grading, and leave FSRS unchanged.
 - **Push unavailable:** keep the local commit and report synchronization pending; a later `pi-scholar sync` retries.
@@ -732,7 +738,7 @@ pi-scholar/
 - The Pi extension and server call one `ScholarApplication` facade.
 - Semantic workflows are packaged Markdown skills started by interactive Pi or user-owned direct Pi cron entries.
 - Deterministic mechanics and contracts are framework-independent TypeScript.
-- `scheduler.ts` owns FSRS review-card state, due predicates, and prerequisite eligibility only; it is not a cron, process, or job scheduler.
+- `scheduler.ts` owns page-learning state, due predicates, page prerequisite eligibility, and page transitions only; it is not a cron, process, or job scheduler.
 - `ts-fsrs` owns FSRS v6 math; Pi Scholar owns eligibility, persistence, and product policy.
 - `node:sqlite` is isolated behind the persistence boundary.
 - External adapters own validated Docling, qmd, Git, and Git-LFS commands and no domain facts.
@@ -770,13 +776,13 @@ Every stage ends in a runnable vertical path.
 
 ### Stage 3: complete daily quiz path
 
-- Add `ts-fsrs`, many-to-many review-card/page-section bindings, prerequisite gating, split/merge lineage with fresh due successors, explicit initial due dates, due-only interleaved selection, expiring unsubmitted quizzes, initialization blocking, canonical dated sheets, per-card grading criteria, revision-safe drafts and sealed final submission, fresh grader-owned ratings, transactional Results, and linked wiki readings.
-- Prove prerequisite blocking/unblocking, split/merge history without inherited FSRS state, empty-due-day skipping, prior-quiz expiration, differential ratings for one multi-card answer, sealed-submission grading retry, independent FSRS transitions, miss rescheduling, and no duplicate settlement.
+- Add `ts-fsrs`, one `page_learning` record per eligible page, the page prerequisite DAG, direct page evidence snapshots, due-page selection, ephemeral questions, expiring unsubmitted quizzes, initialization blocking, minimal opaque quiz comments, revision-safe drafts and sealed final submission, one bundled page rating per covered page, transactional page results, immutable page reviews, and linked wiki readings.
+- Prove prerequisite blocking/unblocking, page rename stability, drift/retirement exclusion with preserved history, empty-due-day skipping, prior-quiz expiration, one single-page question per selected page, synthesis limits, sealed-submission grading retry, one FSRS transition per covered page, miss rescheduling, and no duplicate settlement.
 
 ### Stage 4: responsive web application
 
-- Add the Vite/React/shadcn interface for Today with typed quiz outcomes and explicit final submission, read-only Notes with Learning/card-lineage, issue, and drift-resolution controls, Add with source-removal preview/confirmation, History, Workflows, Settings, and Health.
-- Exercise the built application on desktop and mobile viewports, including multiple-choice controls, no-quiz statuses, card transparency and prerequisites, draft versus sealed submission, Notes issue creation and auto-resolution, both drift choices, source-removal confirmation, expired read-only quizzes, and user-only initialization disablement without a readiness label.
+- Add the Vite/React/shadcn interface for Today with typed quiz outcomes and explicit final submission, read-only Notes with page learning/prerequisite details, issue, and drift-resolution controls, Add with source-removal preview/confirmation, History, Workflows, Settings, and Health.
+- Exercise the built application on desktop and mobile viewports, including multiple-choice controls, no-quiz statuses, page learning and prerequisites, draft versus sealed submission, Notes issue creation and auto-resolution, both drift choices, source-removal confirmation, expired read-only quizzes, and user-only initialization disablement without a readiness label.
 
 ### Stage 5: direct skills and lifecycle
 
@@ -795,13 +801,13 @@ Every stage ends in a runnable vertical path.
 6. Source packets retain original bytes, complete extraction, attachments, provenance, and ordered chunks.
 7. Chunks reconstruct the complete extraction; long sources are never truncated to fit one model call.
 8. User-confirmed source removal previews and updates all current dependents atomically while stating that ordinary deletion does not purge Git history.
-9. Every wiki page has one stable host-minted ID, and moving its path preserves section bindings and review history.
+9. Every wiki page has one stable host-minted ID, and moving its path preserves page learning, direct evidence references, and review history.
 10. Notes remain inspectable, product-authored Markdown; issue reporting and explicit drift recovery replace direct first-iteration editing.
 11. qmd indexes only trusted `wiki/**/*.md`; Pi native read, grep, find, shell, and Markdown navigation remain available as exact/lexical paths.
-12. Every stable knowledge-bearing wiki page contributes at least one active review card or is explicitly skipped; control pages never become cards automatically.
-13. Review cards bind many-to-many to validated page sections, each owns one independent `ts-fsrs` state, and both new and due cards remain blocked until every prerequisite is in FSRS `Review`.
-14. Card revisions preserve identity when semantics remain stable; splits and merges create fresh due cards plus immutable visible lineage without inheriting scheduler state or rewriting raw reviews.
-15. Maintenance assigns initial due dates; `daily-quiz` expires earlier unsubmitted quizzes, refuses generation during initialization, creates no sheet when no card is eligible, and never invents filler questions.
+12. Every eligible stable knowledge-bearing page has one `page_learning` FSRS record; control pages and explicitly skipped pages are not selected.
+13. Page prerequisites form a validated DAG, and both new and due pages remain blocked until every prerequisite is in FSRS `Review`.
+14. Page creation/rename preserves the stable page ID; drift and retirement exclude selection while preserving page learning and review history.
+15. `daily-quiz` expires earlier unsubmitted quizzes, refuses generation during initialization, creates no sheet when no page is eligible, and never invents filler questions. Every selected page occurs in exactly one single-page question; synthesis stays within the four-question/two-synthesis limits.
 16. A user-scheduled `source-admission` invocation processes its current stable queue sequentially in canonical order, and host claims, idempotency, and per-source failure isolation ensure one malformed entry does not block its siblings.
 17. `wiki-maintenance`, `daily-quiz`, `quiz-grader`, and `source-admission` have independent user-owned cron entries; no weekday/time policy, ordering rule, process planner, or package-launched Pi process exists.
 18. Initialization starts enabled, only the user can disable it, and it blocks quiz generation without selecting or changing maintenance, admission, grading, or sync schedules.
@@ -809,11 +815,11 @@ Every stage ends in a runnable vertical path.
 20. Quiz sheets are canonical human-readable artifacts under `quizzes/YYYY/MM/` and contain no answer key.
 21. Multiple-choice questions render as selectable controls rather than requiring typed option letters.
 22. Draft autosave and explicit final submission are distinct; only the current open quiz can be submitted, its revision-safe identity cannot be graded twice, and submission seals and queues grading without starting Pi.
-23. The separately scheduled `quiz-grader` skill owns each per-card semantic rating; host mechanics validate the contract but apply no fake deterministic scoring formula.
-24. One identity-bearing SQLite transaction settles every card tested by an answer with differential ratings and no duplicate application.
+23. The separately scheduled `quiz-grader` skill owns one bundled `ReviewRating` per covered page; host mechanics validate the contract but apply no fake deterministic scoring formula.
+24. One identity-bearing SQLite transaction settles one `page_results` row and one `page_reviews` transition per covered page, preserves separate question feedback, and cannot apply a duplicate settlement.
 25. Results show concise corrections and direct links to exact wiki pages and headings.
-26. Issues raised through Pi or Notes close automatically only after the guarded correction, card update, qmd, lint, doctor, log, and local commit succeed; users may reopen them.
-27. The Vite/React/shadcn web application displays typed Today outcomes, Notes with collapsed card lineage, prerequisites, issue and drift controls, Add with removal preview/confirmation, and read-only expired History responsively.
+26. Issues raised through Pi or Notes close automatically only after the guarded page correction, prerequisite/learning update, qmd, lint, doctor, log, and local commit succeed; users may reopen them.
+27. The Vite/React/shadcn web application displays typed Today outcomes, Notes with page learning and prerequisites, issue and drift controls, Add with removal preview/confirmation, and read-only expired History responsively.
 28. The server remains loopback and same-origin; a private tunnel owns phone access without creating a Pi Scholar user system.
 29. Every completed high-level durable mutation that changes durable bytes creates one local commit; ignored inbox staging and browser drafts do not. `pi-scholar sync` is separately schedulable and pushes accumulated commits without semantic work.
 30. Doctor is the sole read-only integrity and dependency check and does not mutate corrupt state.
@@ -827,7 +833,7 @@ These choices do not change the architecture:
 2. Default loopback port and the private tunnel's same-origin proxy configuration.
 3. Source admission size limits and the Git-LFS threshold for retained originals.
 4. Initial enabled document formats beyond PDF, EPUB, Markdown, text, HTML, XML, JSON, and DOCX.
-5. Initial card-release policy, maximum quiz length, and default `ts-fsrs` parameters.
+5. Initial page selection policy, maximum quiz length, and default `ts-fsrs` parameters.
 6. qmd collection name, cron timezone, absolute install/vault paths, provider environment, and log-retention policy chosen by the user.
 
 Resolve these from executable spikes and fixtures, not generic configuration or compatibility layers.

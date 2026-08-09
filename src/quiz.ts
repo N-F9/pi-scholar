@@ -2,14 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type {
-  CardRating,
+  PageLearningRecord,
   QuizEvidenceRecord,
   QuizGradeRecord,
-  QuizQuestionCardRecord,
   QuizQuestionKind,
+  QuizQuestionPageRecord,
   QuizQuestionRecord,
   QuizRecord,
-  ReviewCardRecord,
+  ReviewRating,
   WorkflowRecord,
 } from "./contracts.js";
 import { transaction as databaseTransaction } from "./database.js";
@@ -25,12 +25,10 @@ import {
 import { atomicWriteFile, readFileNoFollow, safeRelativePath } from "./vault.js";
 import { parseWikiSections } from "./wiki-sections.js";
 export interface QuestionSpecInput {
-  readonly questionId?: string;
   readonly kind: QuizQuestionKind;
   readonly prompt: string;
   readonly choices?: readonly string[];
-  readonly cardIds: readonly string[];
-  readonly cards: readonly QuizQuestionCardRecord[];
+  readonly pages: readonly QuizQuestionPageRecord[];
   readonly sourceRefs?: readonly string[];
   readonly answerKey?: unknown;
 }
@@ -52,9 +50,9 @@ export interface QuizSubmissionInput {
   readonly answers?: Readonly<Record<string, string | readonly string[]>>;
 }
 
-export interface CardGradeInput {
-  readonly cardId: string;
-  readonly rating: CardRating;
+export interface PageGradeInput {
+  readonly pageId: string;
+  readonly rating: ReviewRating;
   readonly feedback?: string;
   readonly evidence: readonly string[];
   readonly readings?: readonly ReadingLink[];
@@ -63,40 +61,40 @@ export interface CardGradeInput {
 export interface QuestionGradeInput {
   readonly questionId: string;
   readonly feedback?: string;
-  readonly cards: readonly CardGradeInput[];
-  readonly readings?: readonly ReadingLink[];
 }
+
+export type GradePageInput = PageGradeInput;
+export type GradeQuestionInput = QuestionGradeInput;
 
 export interface GradeSubmissionInput {
   readonly date: string | Date;
   readonly revision?: number;
   readonly submissionId?: string;
   readonly questions: readonly QuestionGradeInput[];
+  readonly pages: readonly PageGradeInput[];
 }
 
 export interface QuizGenerationInput {
   readonly date: string | Date;
-  readonly questions?: readonly QuestionSpecInput[];
-  readonly selectedCardIds?: readonly string[];
-}
-
-export interface SettledCardResult extends QuizGradeRecord {
-  readonly evidence: readonly string[];
-  readonly readings: readonly ReadingLink[];
-  readonly dueAt?: string;
-  readonly fsrsState?: string;
+  readonly questionSpecs?: readonly QuestionSpecInput[];
+  readonly selectedPageIds?: readonly string[];
 }
 
 export interface SettledQuestionResult {
   readonly questionId: string;
   readonly feedback: string;
-  readonly cards: readonly SettledCardResult[];
+}
+
+export interface SettledPageResult extends QuizGradeRecord {
+  readonly reviewId: string;
+  readonly evidence: readonly string[];
   readonly readings: readonly ReadingLink[];
 }
 
 export interface SettledQuizResult {
   readonly quiz: QuizRecord;
   readonly questions: readonly SettledQuestionResult[];
+  readonly pages: readonly SettledPageResult[];
 }
 
 export class QuizConflictError extends Error {
@@ -134,39 +132,8 @@ function requireDatabaseChange(result: unknown, message: string): void {
   if (changedRows(result) !== 1) throw new RevisionConflictError(message);
 }
 
-interface PersistedCardFeedback {
-  readonly cardId: string;
-  readonly feedback: string;
-  readonly evidence: readonly string[];
-  readonly readings: readonly ReadingLink[];
-}
-
-interface PersistedResultEnvelope {
-  readonly version: 1;
-  readonly settlementId: string;
-  readonly answerRevision: number;
-  readonly feedback: string;
-  readonly readings: readonly ReadingLink[];
-  readonly cards: readonly PersistedCardFeedback[];
-}
-
-function encodeResultEnvelope(value: PersistedResultEnvelope): string {
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
-}
-
-function validReading(value: unknown): value is ReadingLink {
-  if (!value || typeof value !== "object") return false;
-  const reading = value as { pageId?: unknown; anchor?: unknown; heading?: unknown };
-  return (
-    typeof reading.pageId === "string" &&
-    Boolean(reading.pageId) &&
-    typeof reading.anchor === "string" &&
-    Boolean(reading.anchor) &&
-    (reading.heading === undefined || typeof reading.heading === "string")
-  );
-}
-interface PreparedCardGrade {
-  readonly input: CardGradeInput;
+interface PreparedPageGrade {
+  readonly input: PageGradeInput;
   readonly evidence: readonly string[];
   readonly evidenceRecords: readonly QuizEvidenceRecord[];
   readonly readings: readonly ReadingLink[];
@@ -177,46 +144,11 @@ interface PreparedQuestionGrade {
   readonly input: QuestionGradeInput;
   readonly question: QuizQuestionRecord;
   readonly feedback: string;
-  readonly readings: readonly ReadingLink[];
-  readonly cards: readonly PreparedCardGrade[];
 }
 
-function validPersistedCard(value: unknown): value is PersistedCardFeedback {
-  if (!value || typeof value !== "object") return false;
-  const card = value as { cardId?: unknown; feedback?: unknown; evidence?: unknown; readings?: unknown };
-  return (
-    typeof card.cardId === "string" &&
-    Boolean(card.cardId) &&
-    typeof card.feedback === "string" &&
-    Array.isArray(card.evidence) &&
-    card.evidence.every((item) => typeof item === "string") &&
-    Array.isArray(card.readings) &&
-    card.readings.every(validReading)
-  );
-}
-
-function decodeResultEnvelope(value: string): PersistedResultEnvelope | undefined {
-  const marker = /^<!-- pi-scholar-result ([A-Za-z0-9_-]+) -->(?:\n|$)/u.exec(value);
-  const encoded = marker?.[1];
-  if (!encoded) return undefined;
-  try {
-    const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Partial<PersistedResultEnvelope>;
-    if (
-      parsed.version !== 1 ||
-      typeof parsed.settlementId !== "string" ||
-      typeof parsed.answerRevision !== "number" ||
-      !Number.isInteger(parsed.answerRevision) ||
-      typeof parsed.feedback !== "string" ||
-      !Array.isArray(parsed.readings) ||
-      !parsed.readings.every(validReading) ||
-      !Array.isArray(parsed.cards) ||
-      !parsed.cards.every(validPersistedCard)
-    )
-      return undefined;
-    return parsed as PersistedResultEnvelope;
-  } catch {
-    return undefined;
-  }
+interface PreparedGradeSubmission {
+  readonly questions: readonly PreparedQuestionGrade[];
+  readonly pages: readonly PreparedPageGrade[];
 }
 interface PreparedSeal {
   readonly date: string;
@@ -260,7 +192,6 @@ function normalizedAnswer(value: string | readonly string[]): string | readonly 
   return String(value);
 }
 export function evidenceReference(
-  cardId: string,
   pageId: string,
   anchor: string,
   pageDigest: string,
@@ -268,7 +199,7 @@ export function evidenceReference(
   textDigest: string,
 ): string {
   return createHash("sha256")
-    .update(JSON.stringify([cardId, pageId, anchor, pageDigest, pageRevision, textDigest]))
+    .update(JSON.stringify([pageId, anchor, pageDigest, pageRevision, textDigest]))
     .digest("hex");
 }
 function validWikiPath(value: string): boolean {
@@ -281,6 +212,18 @@ function validWikiPath(value: string): boolean {
     !/^[A-Za-z]:/u.test(value)
   );
 }
+function validReading(value: unknown): value is ReadingLink {
+  if (!value || typeof value !== "object") return false;
+  const reading = value as { pageId?: unknown; anchor?: unknown; heading?: unknown };
+  return (
+    typeof reading.pageId === "string" &&
+    Boolean(reading.pageId) &&
+    typeof reading.anchor === "string" &&
+    Boolean(reading.anchor) &&
+    (reading.heading === undefined || typeof reading.heading === "string")
+  );
+}
+
 function encodeHrefComponent(value: string): string {
   return encodeURIComponent(value).replace(
     /[!'()*]/gu,
@@ -334,27 +277,50 @@ export class QuizService {
       .all<Record<string, unknown>>("SELECT * FROM quizzes ORDER BY date DESC")
       .map((row) => this.mapQuiz(row));
   }
-  /** Snapshot current binding/page metadata for internal graders; never expose this through browser DTOs. */
+  /** Snapshot the sealed page evidence; this is internal and never part of browser DTOs. */
   gradingEvidence(quizOrDate: QuizRecord | string | Date): QuizEvidenceRecord[] {
     const quiz = typeof quizOrDate === "object" && !(quizOrDate instanceof Date) ? quizOrDate : this.get(quizOrDate);
     if (!quiz) throw new ValidationError("No quiz for grading evidence");
-    if (this.paths?.wiki)
-      return this.uniqueEvidence(
-        quiz.questions.flatMap((question) => question.cardIds.flatMap((cardId) => this.evidenceForCard(cardId))),
-      );
-    return this.snapshotEvidence(quiz);
+    const snapshot = this.snapshotEvidence(quiz);
+    const wikiRoot =
+      this.paths?.wiki ??
+      (this.paths as { readonly wikiRoot?: string } | undefined)?.wikiRoot ??
+      (this.paths?.root ? join(this.paths.root, "wiki") : undefined) ??
+      (this.paths?.vaultRoot ? join(this.paths.vaultRoot, "wiki") : undefined);
+    if (!wikiRoot) return snapshot;
+    const expectedPages = [...new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)))];
+    const current = this.uniqueEvidence(expectedPages.flatMap((pageId) => this.evidenceForPage(pageId)));
+    if (
+      current.length !== snapshot.length ||
+      snapshot.some((record) => {
+        const latest = current.find((candidate) => candidate.reference === record.reference);
+        return (
+          !latest ||
+          latest.pageId !== record.pageId ||
+          latest.path !== record.path ||
+          latest.anchor !== record.anchor ||
+          latest.heading !== record.heading ||
+          latest.pageDigest !== record.pageDigest ||
+          latest.pageRevision !== record.pageRevision ||
+          latest.textDigest !== record.textDigest ||
+          latest.excerpt !== record.excerpt
+        );
+      })
+    )
+      throw new ValidationError("Quiz evidence snapshot is stale");
+    return snapshot;
   }
 
-  private selectedCardsFor(date: string, selectedCardIds?: readonly string[]): ReviewCardRecord[] {
-    const due = this.scheduler.selectDueCards(date);
-    if (selectedCardIds === undefined) return due;
-    const ids = selectedCardIds.map((cardId) => cardId.trim());
-    if (new Set(ids).size !== ids.length || ids.some((cardId) => !cardId))
-      throw new ValidationError("Quiz card selection contains duplicate or empty IDs");
-    const byId = new Map(due.map((card) => [card.cardId, card]));
-    if (ids.some((cardId) => !byId.has(cardId)))
-      throw new ValidationError("Quiz card selection is not due and eligible");
-    return ids.map((cardId) => byId.get(cardId)!);
+  private selectedPagesFor(date: string, selectedPageIds?: readonly string[]): PageLearningRecord[] {
+    const due = this.scheduler.selectDuePages(date);
+    if (selectedPageIds === undefined) return due;
+    const ids = selectedPageIds.map((pageId) => pageId.trim());
+    if (new Set(ids).size !== ids.length || ids.some((pageId) => !pageId))
+      throw new ValidationError("Quiz page selection contains duplicate or empty IDs");
+    const byId = new Map(due.map((page) => [page.pageId, page]));
+    if (ids.some((pageId) => !byId.has(pageId)))
+      throw new ValidationError("Quiz page selection is not due and eligible");
+    return ids.map((pageId) => byId.get(pageId)!);
   }
 
   createDailyQuiz(
@@ -364,46 +330,45 @@ export class QuizService {
     const date = localDate(typeof input === "object" && !(input instanceof Date) ? input.date : input);
     const existing = this.get(date);
     if (existing) return existing;
-    const selectedCardIds = typeof input === "object" && !(input instanceof Date) ? input.selectedCardIds : undefined;
-    const selectedCards = this.selectedCardsFor(date, selectedCardIds);
+    const selectedPageIds = typeof input === "object" && !(input instanceof Date) ? input.selectedPageIds : undefined;
+    const selectedPages = this.selectedPagesFor(date, selectedPageIds);
     const quizId = randomUUID();
     const sheetPath = pathForSheet(this.paths, date);
-    const specs = typeof input === "object" && !(input instanceof Date) ? input.questions : questionSpecs;
-    if (!selectedCards.length) {
+    const specs = typeof input === "object" && !(input instanceof Date) ? input.questionSpecs : questionSpecs;
+    if (!selectedPages.length) {
       transaction(this.source, () => {
         this.db.run(
           "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'skipped', NULL, ?, NULL, ?, NULL)",
           quizId,
           date,
           nowIso(),
-          "skipped-no-eligible-cards",
+          "skipped-no-eligible-pages",
         );
       });
       return this.get(date)!;
     }
     const validated = this.validateQuestionSpecs(
       specs ?? [],
-      selectedCards.map((card) => card.cardId),
+      selectedPages.map((page) => page.pageId),
     );
     const questions = validated.map(
       (question, ordinal) =>
         ({
-          questionId: question.questionId?.trim() || randomUUID(),
+          questionId: randomUUID(),
           quizId,
           ordinal,
           kind: question.kind,
           prompt: cleanMarkdown(question.prompt),
-          choices: question.choices,
-          cardIds: [...question.cardIds],
-          cards: question.cards.map((card) => ({
-            cardId: card.cardId,
-            criterion: card.criterion.trim(),
-            weight: card.weight,
+          choices: question.choices?.map(cleanMarkdown),
+          pages: question.pages.map((page) => ({
+            pageId: page.pageId,
+            criterion: page.criterion.trim(),
+            weight: page.weight,
           })),
           sourceRefs: [...(question.sourceRefs ?? [])],
         }) satisfies QuizQuestionRecord,
     );
-    const evidence = this.uniqueEvidence(selectedCards.flatMap((card) => this.evidenceForCard(card.cardId)));
+    const evidence = this.uniqueEvidence(selectedPages.flatMap((page) => this.evidenceForPage(page.pageId)));
     const preview: QuizRecord = { quizId, date, revision: 1, status: "open", questions };
     const rendered = this.renderSheet(preview);
     this.validateRenderedSheet(rendered);
@@ -419,9 +384,8 @@ export class QuizService {
           );
           for (const item of evidence) {
             this.db.run(
-              "INSERT INTO quiz_evidence (quiz_id, card_id, reference, page_id, relative_path, anchor, heading, page_digest, page_revision, text_digest, excerpt, excerpt_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO quiz_evidence (quiz_id, reference, page_id, relative_path, anchor, heading, page_digest, page_revision, text_digest, excerpt, excerpt_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
               quizId,
-              item.cardId,
               item.reference,
               item.pageId,
               item.path,
@@ -435,25 +399,26 @@ export class QuizService {
             );
           }
           for (const question of questions) {
+            const sourceRefs = question.sourceRefs;
+            const spec = validated[question.ordinal]!;
             this.db.run(
-              "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, grading_criteria_json, source_refs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
               question.questionId,
               quizId,
               question.ordinal,
               question.kind,
               question.prompt,
               question.choices ? json(question.choices) : null,
-              null,
-              json(question.cards),
-              json(question.sourceRefs),
+              spec.answerKey === undefined ? null : json(spec.answerKey),
+              json(sourceRefs),
             );
-            for (const card of question.cards) {
+            for (const page of question.pages) {
               this.db.run(
-                "INSERT INTO question_cards (question_id, card_id, criterion_json, weight) VALUES (?, ?, ?, ?)",
+                "INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)",
                 question.questionId,
-                card.cardId,
-                json(card.criterion),
-                card.weight,
+                page.pageId,
+                json(page.criterion),
+                page.weight,
               );
             }
           }
@@ -595,10 +560,11 @@ export class QuizService {
       const sheetPath = quiz.sheetPath ?? pathForSheet(this.paths, quiz.date);
       const previous = sheetPath && existsSync(sheetPath) ? readFileNoFollow(sheetPath) : undefined;
       const expired = { ...quiz, status: "expired" as const };
+      const settled = this.readSettledResults(quiz);
       return {
         sheetPath,
         previous,
-        rendered: this.renderSheet(expired, this.answerMap(quiz.quizId), this.readSettledResults(quiz)?.questions),
+        rendered: this.renderSheet(expired, this.answerMap(quiz.quizId), settled?.questions, settled?.pages),
       };
     });
     try {
@@ -646,23 +612,25 @@ export class QuizService {
     const input =
       typeof inputOrDate === "object" && !(inputOrDate instanceof Date)
         ? inputOrDate
-        : { ...(submission ?? { questions: [] }), date: inputOrDate };
+        : { ...(submission ?? { questions: [], pages: [] }), date: inputOrDate };
     const date = localDate(input.date);
     const quiz = this.requireQuiz(date);
     if (quiz.status === "expired") throw new QuizConflictError("Expired quizzes cannot be graded");
     if (quiz.status !== "submitted") throw new QuizConflictError("Only submitted quizzes can be graded");
     if (input.revision !== undefined && input.revision !== quiz.revision)
       throw new RevisionConflictError("The quiz grade revision is stale");
-    const settlementId = input.submissionId?.trim() || randomUUID();
+    const requestedSettlementId = input.submissionId?.trim();
+    const settlementId = requestedSettlementId || randomUUID();
+    const submissionId = requestedSettlementId || settlementId;
     const prior = this.readSettledResults(quiz);
 
     if (prior) {
       const persistedSettlement = this.readSettlementIdentity(quiz);
-      if (persistedSettlement && persistedSettlement !== settlementId)
+      if (persistedSettlement && requestedSettlementId && persistedSettlement !== requestedSettlementId)
         throw new QuizConflictError("The quiz already has a different committed settlement");
       if (callback) transaction(this.source, () => callback(prior));
       try {
-        this.writeSheet(prior.quiz, this.answerMap(prior.quiz.quizId), prior.questions);
+        this.writeSheet(prior.quiz, this.answerMap(prior.quiz.quizId), prior.questions, prior.pages);
       } catch {
         // A committed grade remains authoritative when a repair write cannot replace its sheet.
       }
@@ -679,92 +647,66 @@ export class QuizService {
       throw new ValidationError("The sealed quiz answers do not match the committed revision");
     }
     const prepared = this.prepareGradeSubmission(quiz, input);
-    const previewResults: SettledQuestionResult[] = prepared.map((questionGrade) => ({
+    const settledAt = nowIso();
+    const previewResults: SettledQuestionResult[] = prepared.questions.map((questionGrade) => ({
       questionId: questionGrade.question.questionId,
       feedback: questionGrade.feedback,
-      cards: questionGrade.cards.map((card) => ({
-        gradeId: "preview",
-        quizId: quiz.quizId,
-        questionId: questionGrade.question.questionId,
-        cardId: card.input.cardId,
-        rating: card.input.rating,
-        feedback: card.feedback,
-        gradedAt: nowIso(),
-        evidence: card.evidence,
-        readings: card.readings,
-      })),
-      readings: this.uniqueReadings(questionGrade.cards.flatMap((card) => card.readings)),
     }));
-    const rendered = this.renderSheet(quiz, this.answerMap(quiz.quizId), previewResults);
+    const previewPages: SettledPageResult[] = prepared.pages.map((page) => ({
+      gradeId: "preview",
+      quizId: quiz.quizId,
+      pageId: page.input.pageId,
+      rating: page.input.rating,
+      feedback: page.feedback,
+      gradedAt: settledAt,
+      reviewId: "preview",
+      evidence: page.evidence,
+      readings: page.readings,
+    }));
+    const rendered = this.renderSheet(quiz, this.answerMap(quiz.quizId), previewResults, previewPages);
     this.validateRenderedSheet(rendered);
-    const settledAt = nowIso();
     const settled = this.replaceSheet(quiz.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
-      const results: SettledQuestionResult[] = [];
       let committed: SettledQuizResult | undefined;
       transaction(this.source, () => {
         this.revalidatePreparedGrades(quiz, prepared);
-        for (const questionGrade of prepared) {
-          const cardResults: SettledCardResult[] = [];
-          for (const card of questionGrade.cards) {
-            const raw = this.scheduler.transitionCardInTransaction(card.input.cardId, card.input.rating, settledAt, {
-              quizId: quiz.quizId,
-              questionId: questionGrade.question.questionId,
-              answerRevision: quiz.revision,
-              settlementId,
-              authorization: SEALED_QUIZ_REVIEW,
-            });
-            this.db.run(
-              "INSERT INTO card_results (result_id, quiz_id, question_id, card_id, rating, review_id) VALUES (?, ?, ?, ?, ?, ?)",
-              randomUUID(),
-              quiz.quizId,
-              questionGrade.question.questionId,
-              card.input.cardId,
-              card.input.rating,
-              raw.reviewId,
-            );
-            const after = this.scheduler.getCard(card.input.cardId);
-            cardResults.push({
-              gradeId: raw.reviewId,
-              quizId: quiz.quizId,
-              questionId: questionGrade.question.questionId,
-              cardId: card.input.cardId,
-              rating: card.input.rating,
-              feedback: card.feedback,
-              gradedAt: settledAt,
-              evidence: card.evidence,
-              readings: card.readings,
-              dueAt: after.dueAt,
-              fsrsState: after.fsrsState,
-            });
-          }
-          const persistedCards = questionGrade.cards.map((card) => ({
-            ...card.input,
-            evidence: card.evidence,
-            readings: card.readings,
-          }));
+        for (const questionGrade of prepared.questions) {
           this.db.run(
             "INSERT INTO question_results (result_id, quiz_id, question_id, answer_revision, feedback, graded_at) VALUES (?, ?, ?, ?, ?, ?)",
             randomUUID(),
             quiz.quizId,
             questionGrade.question.questionId,
             quiz.revision,
-            this.persistFeedback(
-              questionGrade.feedback,
-              questionGrade.readings,
-              persistedCards,
-              settlementId,
-              quiz.revision,
-            ),
+            questionGrade.feedback,
             settledAt,
           );
-          results.push({
-            questionId: questionGrade.question.questionId,
-            feedback: questionGrade.feedback,
-            cards: cardResults,
-            readings: this.uniqueReadings(cardResults.flatMap((card) => card.readings)),
-          });
         }
-        committed = { quiz: this.requireQuiz(date), questions: results };
+        for (const pageGrade of prepared.pages) {
+          const review = this.scheduler.transitionPageInTransaction(
+            pageGrade.input.pageId,
+            pageGrade.input.rating,
+            settledAt,
+            {
+              quizId: quiz.quizId,
+              submissionId,
+              revision: quiz.revision,
+              settlementId,
+              authorization: SEALED_QUIZ_REVIEW,
+            },
+          );
+          this.db.run(
+            "INSERT INTO page_results (result_id, quiz_id, page_id, rating, feedback, evidence_json, readings_json, review_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            randomUUID(),
+            quiz.quizId,
+            pageGrade.input.pageId,
+            pageGrade.input.rating,
+            pageGrade.feedback,
+            json(pageGrade.evidence),
+            json(pageGrade.readings),
+            review.reviewId,
+          );
+        }
+        committed = this.readSettledResults(this.requireQuiz(date));
+        if (!committed) throw new Error("Quiz grade transaction did not commit");
         if (callback) callback(committed);
       });
       if (!committed) throw new Error("Quiz grade transaction did not commit");
@@ -789,16 +731,19 @@ export class QuizService {
     quiz: QuizRecord,
     answers?: Readonly<Record<string, string | readonly string[]>>,
     results?: readonly SettledQuestionResult[],
+    pageResults?: readonly SettledPageResult[],
   ): string {
     const lines = [
-      `# Pi Scholar Quiz — ${quiz.date}`,
+      `# 1. Pi Scholar Quiz — ${quiz.date}`,
       "",
-      `<!-- pi-scholar quiz-id=${quiz.quizId} revision=${quiz.revision} -->`,
+      `<!-- pi-scholar:quiz format=1 id=${quiz.quizId} revision=${quiz.revision} -->`,
       "",
     ];
     for (const [index, question] of quiz.questions.entries()) {
       lines.push(
-        `## ${index + 1}. ${question.questionId}`,
+        `## ${index + 1}. Question`,
+        "",
+        `<!-- pi-scholar:question id=${question.questionId} -->`,
         "",
         `**Mode:** ${question.kind}`,
         "",
@@ -806,25 +751,28 @@ export class QuizService {
         "",
       );
       if (question.choices?.length) for (const choice of question.choices) lines.push(`- [ ] ${cleanMarkdown(choice)}`);
-      lines.push("", "### Your answer", cleanMarkdown(answerText(answers?.[question.questionId] ?? "")), "");
+      lines.push(
+        "",
+        `### ${index + 1}. Your answer`,
+        cleanMarkdown(answerText(answers?.[question.questionId] ?? "")),
+        "",
+      );
       if (results) {
         const result = results.find((entry) => entry.questionId === question.questionId);
         if (result) {
-          lines.push("### Results", cleanMarkdown(result.feedback || "No feedback."));
-          if (result.readings.length)
-            lines.push(
-              "",
-              "Readings:",
-              ...result.readings.map(
-                (reading) => `- [${reading.heading ?? reading.anchor}](${this.readingHref(reading)})`,
-              ),
-            );
-
+          lines.push(`### ${index + 1}. Results`, cleanMarkdown(result.feedback || "No feedback."));
           lines.push("");
         }
       }
     }
-    if (!results) lines.push("## Results", "", "_Not graded yet._", "");
+    if (pageResults?.length) {
+      lines.push(
+        `## ${quiz.questions.length + 1}. Page review`,
+        "",
+        ...pageResults.map((page) => cleanMarkdown(page.feedback || "No page feedback.")),
+        "",
+      );
+    }
     return `${lines
       .join("\n")
       .replace(/\n{3,}/g, "\n\n")
@@ -833,8 +781,8 @@ export class QuizService {
 
   parseSheet(markdown: string): QuizRecord {
     this.validateRenderedSheet(markdown);
-    const header = /^# Pi Scholar Quiz — (\d{4}-\d{2}-\d{2})\s*$/m.exec(markdown);
-    const identity = /<!--\s*pi-scholar quiz-id=([^\s]+) revision=(\d+)\s*-->/m.exec(markdown);
+    const header = /^# \d+\. Pi Scholar Quiz — (\d{4}-\d{2}-\d{2})\s*$/m.exec(markdown);
+    const identity = /<!--\s*pi-scholar:quiz format=1 id=([^\s]+) revision=(\d+)\s*-->/m.exec(markdown);
     const date = header?.[1];
     const quizId = identity?.[1];
     const revisionText = identity?.[2];
@@ -857,7 +805,7 @@ export class QuizService {
       throw new ValidationError("Quiz sheet answers are incomplete");
     const sections = [
       ...markdown.matchAll(
-        /^## (\d+)\. ([^\n]+)\n\n\*\*Mode:\*\* (short-answer|multiple-choice)\n\n([\s\S]*?)(?=^## |(?![\s\S]))/gim,
+        /^## (\d+)\. Question\n\n<!--\s*pi-scholar:question id=([^\s]+)\s*-->\n\n\*\*Mode:\*\* (short-answer|multiple-choice)\n\n([\s\S]*?)(?=^## |(?![\s\S]))/gim,
       ),
     ];
     if (sections.length !== stored.questions.length)
@@ -878,7 +826,7 @@ export class QuizService {
       )
         throw new ValidationError("Quiz sheet question identity is invalid");
       const prompt = body
-        .replace(/\n### Your answer[\s\S]*$/i, "")
+        .replace(/\n### \d+\. Your answer[\s\S]*$/i, "")
         .replace(/^- \[ \] .*$/gim, "")
         .trim();
       const choices = [...body.matchAll(/^- \[ \] (.+)$/gim)]
@@ -893,7 +841,7 @@ export class QuizService {
         throw new ValidationError("Quiz sheet question content does not match SQLite");
     }
     const settled = this.readSettledResults(stored);
-    const canonical = this.renderSheet(stored, this.answerMap(stored.quizId), settled?.questions);
+    const canonical = this.renderSheet(stored, this.answerMap(stored.quizId), settled?.questions, settled?.pages);
     if (cleanMarkdown(markdown) !== cleanMarkdown(canonical))
       throw new ValidationError("Quiz sheet answers or Results do not match SQLite");
     return stored;
@@ -911,32 +859,25 @@ export class QuizService {
       .all<Record<string, unknown>>("SELECT * FROM quiz_questions WHERE quiz_id = ? ORDER BY ordinal", quizId)
       .map((question) => {
         const questionId = String(question.question_id);
-        const cardRows = this.db.all<Record<string, unknown>>(
-          "SELECT card_id, criterion_json, weight FROM question_cards WHERE question_id = ? ORDER BY card_id",
-          questionId,
-        );
-        const criteriaById = new Map<string, { criterion?: unknown; weight?: unknown }>();
-        const persistedCriteria = parseJson<unknown>(question.grading_criteria_json, []);
-        if (Array.isArray(persistedCriteria)) {
-          for (const value of persistedCriteria) {
-            if (!value || typeof value !== "object") continue;
-            const item = value as { cardId?: unknown; criterion?: unknown; weight?: unknown };
-            if (typeof item.cardId === "string")
-              criteriaById.set(item.cardId, { criterion: item.criterion, weight: item.weight });
-          }
-        }
-        for (const card of cardRows)
-          criteriaById.set(String(card.card_id), { criterion: card.criterion_json, weight: card.weight });
-        const cards = [...criteriaById.entries()].map(([cardId, criterionData]) => {
-          const parsed = parseJson<unknown>(criterionData.criterion, "");
-          const criterion =
-            typeof parsed === "string"
-              ? parsed
-              : parsed && typeof parsed === "object" && "criterion" in parsed
-                ? String((parsed as { criterion?: unknown }).criterion ?? "")
-                : String(parsed ?? "");
-          return { cardId, criterion, weight: Number(criterionData.weight ?? 0) } satisfies QuizQuestionCardRecord;
-        });
+        const pages = this.db
+          .all<Record<string, unknown>>(
+            "SELECT page_id, criterion_json, weight FROM question_pages WHERE question_id = ? ORDER BY page_id",
+            questionId,
+          )
+          .map((page) => {
+            const parsed = parseJson<unknown>(page.criterion_json, "");
+            const criterion =
+              typeof parsed === "string"
+                ? parsed
+                : parsed && typeof parsed === "object" && "criterion" in parsed
+                  ? String((parsed as { criterion?: unknown }).criterion ?? "")
+                  : String(parsed ?? "");
+            return {
+              pageId: String(page.page_id),
+              criterion,
+              weight: Number(page.weight),
+            } satisfies QuizQuestionPageRecord;
+          });
         return {
           questionId,
           quizId,
@@ -944,8 +885,7 @@ export class QuizService {
           kind: String(question.kind) as QuizQuestionKind,
           prompt: String(question.prompt),
           choices: parseJson<string[] | undefined>(question.choices_json, undefined),
-          cardIds: cards.map((card) => card.cardId),
-          cards,
+          pages,
           sourceRefs: parseJson<string[]>(question.source_refs_json, []),
         } satisfies QuizQuestionRecord;
       });
@@ -999,17 +939,16 @@ export class QuizService {
     return this.requireQuiz(quiz.date);
   }
   private snapshotEvidence(quiz: QuizRecord): QuizEvidenceRecord[] {
-    const expectedCards = new Set(quiz.questions.flatMap((question) => question.cardIds));
+    const expectedPages = new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)));
     const rows = this.db.all<Record<string, unknown>>(
-      "SELECT * FROM quiz_evidence WHERE quiz_id = ? ORDER BY card_id, reference",
+      "SELECT * FROM quiz_evidence WHERE quiz_id = ? ORDER BY page_id, reference",
       quiz.quizId,
     );
-    if (!rows.length || !expectedCards.size) throw new ValidationError("Quiz evidence snapshot is missing");
+    if (!rows.length || !expectedPages.size) throw new ValidationError("Quiz evidence snapshot is missing");
     const seen = new Set<string>();
     const evidence: QuizEvidenceRecord[] = [];
     for (const row of rows) {
       const quizId = String(row.quiz_id ?? "");
-      const cardId = String(row.card_id ?? "");
       const reference = String(row.reference ?? "");
       const pageId = String(row.page_id ?? "");
       const path = String(row.relative_path ?? "");
@@ -1022,11 +961,10 @@ export class QuizService {
       const heading = row.heading === null || row.heading === undefined ? undefined : String(row.heading);
       if (
         quizId !== quiz.quizId ||
-        !expectedCards.has(cardId) ||
+        !expectedPages.has(pageId) ||
         !reference ||
         !/^[0-9a-f]{64}$/u.test(reference) ||
-        seen.has(`${cardId}:${reference}`) ||
-        !pageId ||
+        seen.has(reference) ||
         !validWikiPath(path) ||
         !anchor.startsWith("#") ||
         !/^[0-9a-f]{64}$/u.test(pageDigest) ||
@@ -1037,13 +975,12 @@ export class QuizService {
         Buffer.byteLength(excerpt, "utf8") > 8192 ||
         !/^[0-9a-f]{64}$/u.test(excerptDigest) ||
         createHash("sha256").update(excerpt).digest("hex") !== excerptDigest ||
-        evidenceReference(cardId, pageId, anchor, pageDigest, pageRevision, textDigest) !== reference
+        evidenceReference(pageId, anchor, pageDigest, pageRevision, textDigest) !== reference
       )
         throw new ValidationError("Quiz evidence snapshot is malformed");
-      seen.add(`${cardId}:${reference}`);
+      seen.add(reference);
       evidence.push({
         reference,
-        cardId,
         pageId,
         path,
         anchor,
@@ -1054,145 +991,113 @@ export class QuizService {
         excerpt,
       });
     }
-    if (seen.size !== rows.length || expectedCards.size !== new Set(evidence.map((item) => item.cardId)).size)
+    if (seen.size !== rows.length || expectedPages.size !== new Set(evidence.map((item) => item.pageId)).size)
       throw new ValidationError("Quiz evidence snapshot is incomplete");
     return evidence;
   }
 
-  private evidenceForCard(cardId: string): QuizEvidenceRecord[] {
-    const evidence: QuizEvidenceRecord[] = [];
-    for (const binding of this.scheduler.bindings(cardId)) {
-      const page = this.db.get<Record<string, unknown>>(
-        "SELECT status, quiz_worthiness, relative_path, digest, revision FROM pages WHERE page_id = ?",
-        binding.pageId,
-      );
-      if (page?.status !== "active" || page.quiz_worthiness !== "eligible")
-        throw new ValidationError(`Binding references unavailable evidence page: ${binding.pageId}`);
-      const path = String(page.relative_path ?? "");
-      const pageDigest = String(page.digest ?? "");
-      const pageRevision = Number(page.revision ?? 0);
-      if (!validWikiPath(path) || !pageDigest || !Number.isInteger(pageRevision) || pageRevision < 1)
-        throw new ValidationError(`Binding evidence metadata is invalid: ${binding.pageId}`);
-      const wikiRoot =
-        this.paths?.wiki ??
-        (this.paths as { readonly wikiRoot?: string } | undefined)?.wikiRoot ??
-        (this.paths?.root ? join(this.paths.root, "wiki") : undefined);
-      if (!wikiRoot) throw new ValidationError(`Binding evidence page is unavailable: ${binding.pageId}`);
-      let content: string;
-      let bytes: Buffer;
-      try {
-        const pagePath = safeRelativePath(wikiRoot, path);
-        bytes = readFileNoFollow(pagePath);
-        content = bytes.toString("utf8");
-      } catch {
-        throw new ValidationError(`Binding evidence page is unavailable: ${binding.pageId}`);
-      }
-      const actualDigest = createHash("sha256").update(bytes).digest("hex");
-      if (actualDigest !== pageDigest) throw new ValidationError(`Binding evidence page is stale: ${binding.pageId}`);
-      const section = parseWikiSections(content, binding.pageId).find(
-        (candidate) => candidate.anchor === binding.anchor,
-      );
-      if (!section || (binding.heading !== undefined && binding.heading !== section.heading))
-        throw new ValidationError(`Binding evidence section is unavailable: ${binding.pageId}${binding.anchor}`);
+  private evidenceForPage(pageId: string): QuizEvidenceRecord[] {
+    const page = this.db.get<Record<string, unknown>>(
+      "SELECT status, quiz_worthiness, relative_path, digest, revision FROM pages WHERE page_id = ?",
+      pageId,
+    );
+    if (page?.status !== "active" || page.quiz_worthiness !== "eligible")
+      throw new ValidationError(`Evidence page is unavailable: ${pageId}`);
+    const path = String(page.relative_path ?? "");
+    const pageDigest = String(page.digest ?? "");
+    const pageRevision = Number(page.revision ?? 0);
+    if (
+      !validWikiPath(path) ||
+      !/^[0-9a-f]{64}$/u.test(pageDigest) ||
+      !Number.isInteger(pageRevision) ||
+      pageRevision < 1
+    )
+      throw new ValidationError(`Evidence page metadata is invalid: ${pageId}`);
+    const wikiRoot =
+      this.paths?.wiki ??
+      (this.paths as { readonly wikiRoot?: string } | undefined)?.wikiRoot ??
+      (this.paths?.root ? join(this.paths.root, "wiki") : undefined) ??
+      (this.paths?.vaultRoot ? join(this.paths.vaultRoot, "wiki") : undefined);
+    if (!wikiRoot) throw new ValidationError(`Evidence page is unavailable: ${pageId}`);
+    let bytes: Buffer;
+    try {
+      bytes = readFileNoFollow(safeRelativePath(wikiRoot, path));
+    } catch {
+      throw new ValidationError(`Evidence page is unavailable: ${pageId}`);
+    }
+    if (createHash("sha256").update(bytes).digest("hex") !== pageDigest)
+      throw new ValidationError(`Evidence page is stale: ${pageId}`);
+    const content = bytes.toString("utf8");
+    const sections = parseWikiSections(content, pageId);
+    return sections.map((section) => {
       const sectionText = content.slice(section.startOffset, section.endOffset);
-      const startOffset = binding.startOffset;
-      const endOffset = binding.endOffset;
-      if (
-        !Number.isInteger(startOffset) ||
-        !Number.isInteger(endOffset) ||
-        startOffset < 0 ||
-        endOffset <= startOffset ||
-        endOffset > sectionText.length
-      )
-        throw new ValidationError(`Binding evidence bounds are invalid: ${binding.pageId}${binding.anchor}`);
-      const boundText = sectionText.slice(startOffset, endOffset);
-      const textDigest = createHash("sha256").update(boundText).digest("hex");
-      if (!boundText || textDigest !== binding.textDigest)
-        throw new ValidationError(`Binding evidence bytes are stale: ${binding.pageId}${binding.anchor}`);
-      evidence.push({
-        reference: evidenceReference(
-          cardId,
-          binding.pageId,
-          binding.anchor,
-          pageDigest,
-          pageRevision,
-          binding.textDigest,
-        ),
-        cardId,
-        pageId: binding.pageId,
+      if (!sectionText || createHash("sha256").update(sectionText).digest("hex") !== section.textDigest)
+        throw new ValidationError(`Evidence section is stale: ${pageId}${section.anchor}`);
+      return {
+        reference: evidenceReference(pageId, section.anchor, pageDigest, pageRevision, section.textDigest),
+        pageId,
         path,
-        anchor: binding.anchor,
-        ...(binding.heading === undefined ? {} : { heading: binding.heading }),
+        anchor: section.anchor,
+        ...(section.heading === undefined ? {} : { heading: section.heading }),
         pageDigest,
         pageRevision,
-        textDigest: binding.textDigest,
-        excerpt: boundedUtf8(boundText, 8192),
-      });
-    }
-    if (!evidence.length) throw new ValidationError(`Review card has no authorized evidence: ${cardId}`);
-    return evidence;
+        textDigest: section.textDigest,
+        excerpt: boundedUtf8(sectionText, 8192),
+      };
+    });
   }
 
   private uniqueEvidence(evidence: readonly QuizEvidenceRecord[]): QuizEvidenceRecord[] {
     const seen = new Set<string>();
     const unique: QuizEvidenceRecord[] = [];
     for (const item of evidence) {
-      const key = `${item.cardId}:${item.reference}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(item);
-      }
+      if (seen.has(item.reference)) continue;
+      seen.add(item.reference);
+      unique.push(item);
     }
     return unique;
   }
 
   private validateQuestionSpecs(
     specs: readonly QuestionSpecInput[],
-    selectedCardIds: readonly string[],
+    selectedPageIds: readonly string[],
   ): readonly QuestionSpecInput[] {
     if (!specs.length) throw new ValidationError("Quiz generation produced no question specifications");
     if (specs.length > 4) throw new ValidationError("A daily quiz may contain at most four questions");
-    if (specs.filter((question) => question.cardIds.length > 1).length > 2)
+    if (specs.filter((question) => Array.isArray(question?.pages) && question.pages.length > 1).length > 2)
       throw new ValidationError("A daily quiz may contain at most two synthesis questions");
-    const selected = new Set(selectedCardIds);
+    const selected = new Set(selectedPageIds);
     const covered = new Set<string>();
-    const assigned = new Set<string>();
-    const questionIds = new Set<string>();
+    const singlePageCoverage = new Set<string>();
     for (const question of specs) {
       if (!question || (question.kind !== "short-answer" && question.kind !== "multiple-choice"))
         throw new ValidationError("Question kind is invalid");
       const prompt = question.prompt.trim();
       if (!prompt || FORBIDDEN_SHEET_TEXT.test(prompt))
         throw new ValidationError("Question prompts must be nonempty and answer-key-free");
-      if (!question.cardIds.length || new Set(question.cardIds).size !== question.cardIds.length)
-        throw new ValidationError("Question card bindings must be distinct and nonempty");
-      if (!Array.isArray(question.cards) || question.cards.length !== question.cardIds.length)
-        throw new ValidationError("Every question card requires a grading criterion and weight");
-      for (const [index, card] of question.cards.entries()) {
+      if (!Array.isArray(question.pages) || !question.pages.length)
+        throw new ValidationError("Every question must cover at least one wiki page");
+      const pageIds = question.pages.map((page) => (page && typeof page.pageId === "string" ? page.pageId.trim() : ""));
+      if (new Set(pageIds).size !== pageIds.length || pageIds.some((pageId) => !pageId))
+        throw new ValidationError("Question page bindings must be distinct and nonempty");
+      for (const [index, page] of question.pages.entries()) {
         if (
-          !card ||
-          card.cardId !== question.cardIds[index] ||
-          !card.criterion.trim() ||
-          !Number.isFinite(card.weight) ||
-          card.weight <= 0
-        ) {
-          throw new ValidationError("Every question card requires a nonempty criterion and positive weight");
-        }
+          !page ||
+          pageIds[index] !== page.pageId.trim() ||
+          !page.criterion.trim() ||
+          !Number.isFinite(page.weight) ||
+          page.weight <= 0
+        )
+          throw new ValidationError("Every question page requires a nonempty criterion and positive weight");
+        covered.add(page.pageId);
+        if (!selected.has(page.pageId)) throw new ValidationError("Question references an ineligible wiki page");
       }
-      if (question.cardIds.some((cardId) => !selected.has(cardId)))
-        throw new ValidationError("Question references a card outside today's eligible selection");
-      if (question.cardIds.some((cardId) => assigned.has(cardId)))
-        throw new ValidationError("A card cannot be tested by more than one question");
-      for (const cardId of question.cardIds) {
-        covered.add(cardId);
-        assigned.add(cardId);
-      }
+      if (question.pages.length === 1) singlePageCoverage.add(pageIds[0]!);
       if (
-        question.questionId !== undefined &&
-        (!question.questionId.trim() || questionIds.has(question.questionId.trim()))
+        question.sourceRefs !== undefined &&
+        (!Array.isArray(question.sourceRefs) || question.sourceRefs.some((reference) => typeof reference !== "string"))
       )
-        throw new ValidationError("Question IDs must be distinct and nonempty");
-      if (question.questionId) questionIds.add(question.questionId.trim());
+        throw new ValidationError("Question source references must be strings");
       if (
         question.choices !== undefined &&
         (!Array.isArray(question.choices) || question.choices.some((choice) => typeof choice !== "string"))
@@ -1206,13 +1111,11 @@ export class QuizService {
       if (question.choices?.some((choice) => !choice.trim() || FORBIDDEN_SHEET_TEXT.test(choice)))
         throw new ValidationError("Question options must be nonempty and answer-key-free");
     }
-    if (covered.size !== selected.size)
-      throw new ValidationError("Daily quiz questions must cover every selected card");
-    for (const cardId of selected)
-      if (!covered.has(cardId)) throw new ValidationError("Daily quiz questions must cover every selected card");
+    if (covered.size !== selected.size || [...selected].some((pageId) => !singlePageCoverage.has(pageId)))
+      throw new ValidationError("Daily quiz questions must cover every selected page with a single-page question");
     return specs;
   }
-  private prepareGradeSubmission(quiz: QuizRecord, input: GradeSubmissionInput): PreparedQuestionGrade[] {
+  private prepareGradeSubmission(quiz: QuizRecord, input: GradeSubmissionInput): PreparedGradeSubmission {
     const questionById = new Map(quiz.questions.map((question) => [question.questionId, question]));
     if (
       input.questions.length !== quiz.questions.length ||
@@ -1220,104 +1123,96 @@ export class QuizService {
     ) {
       throw new ValidationError("Grading must cover every displayed question exactly once");
     }
-    const evidenceByCard = new Map<string, Map<string, QuizEvidenceRecord>>();
+    const expectedPageIds = new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)));
+    if (input.pages.length !== expectedPageIds.size || input.pages.some((page) => !expectedPageIds.has(page.pageId))) {
+      throw new ValidationError("Grading must cover every covered page exactly once");
+    }
+    const evidenceByPage = new Map<string, Map<string, QuizEvidenceRecord>>();
     for (const item of this.gradingEvidence(quiz)) {
-      const byReference = evidenceByCard.get(item.cardId) ?? new Map<string, QuizEvidenceRecord>();
+      const byReference = evidenceByPage.get(item.pageId) ?? new Map<string, QuizEvidenceRecord>();
       byReference.set(item.reference, item);
-      evidenceByCard.set(item.cardId, byReference);
+      evidenceByPage.set(item.pageId, byReference);
     }
     const seenQuestions = new Set<string>();
-    const seenCardsOverall = new Set<string>();
-    const prepared: PreparedQuestionGrade[] = [];
+    const questions: PreparedQuestionGrade[] = [];
     for (const questionGrade of input.questions) {
       if (seenQuestions.has(questionGrade.questionId))
         throw new ValidationError("A question was graded more than once");
       seenQuestions.add(questionGrade.questionId);
       const question = questionById.get(questionGrade.questionId);
       if (!question) throw new ValidationError("Grading references an unknown question");
-      const expectedCards = new Set(question.cardIds);
-      if (
-        questionGrade.cards.length !== expectedCards.size ||
-        questionGrade.cards.some((card) => !expectedCards.has(card.cardId))
-      )
-        throw new ValidationError("Every card tested by a question requires one grade");
-      const questionFeedback = questionGrade.feedback?.trim() || "";
-      this.validateFeedback(questionFeedback);
-      const questionReadings = this.uniqueReadings(questionGrade.readings ?? []);
-      this.validateQuestionReadings(evidenceByCard, question.cardIds, questionReadings);
-      const seenCards = new Set<string>();
-      const cards: PreparedCardGrade[] = [];
-      for (const card of questionGrade.cards) {
-        if (seenCards.has(card.cardId)) throw new ValidationError("A card was graded more than once in one question");
-        seenCards.add(card.cardId);
-        if (seenCardsOverall.has(card.cardId))
-          throw new ValidationError("A card cannot be graded by more than one question");
-        seenCardsOverall.add(card.cardId);
-        if (!RATINGS.includes(card.rating)) throw new ValidationError(`Unsupported FSRS rating: ${card.rating}`);
-        const evidence = card.evidence.map((item) => (typeof item === "string" ? item.trim() : ""));
-        if (!evidence.length || evidence.some(Boolean) === false || evidence.some((item) => !item))
-          throw new ValidationError(`Every card grade requires authorized evidence IDs: ${card.cardId}`);
-        if (new Set(evidence).size !== evidence.length)
-          throw new ValidationError(`Card grade repeats evidence IDs: ${card.cardId}`);
-        const records = evidence
-          .map((reference) => evidenceByCard.get(card.cardId)?.get(reference))
-          .filter((item): item is QuizEvidenceRecord => Boolean(item));
-        if (records.length !== evidence.length)
-          throw new ValidationError(`Card grade cites unauthorized evidence: ${card.cardId}`);
-        const readings = this.uniqueReadings([...(card.readings ?? []), ...questionReadings]);
-        if (!readings.length) throw new ValidationError(`Every card grade requires exact readings: ${card.cardId}`);
-        this.validateReadings(
-          evidenceByCard.get(card.cardId) ?? new Map<string, QuizEvidenceRecord>(),
-          card.cardId,
-          readings,
-        );
-        if (
-          readings.some(
-            (reading) =>
-              !records.some((record) => record.pageId === reading.pageId && record.anchor === reading.anchor),
-          )
-        )
-          throw new ValidationError(`Card grade readings are not covered by authorized evidence: ${card.cardId}`);
-        const feedback = card.feedback?.trim() || questionFeedback;
-        this.validateFeedback(feedback);
-        cards.push({ input: card, evidence, evidenceRecords: records, readings, feedback });
-      }
-      prepared.push({ input: questionGrade, question, feedback: questionFeedback, readings: questionReadings, cards });
+      const feedback = questionGrade.feedback?.trim() || "";
+      this.validateFeedback(feedback);
+      questions.push({ input: questionGrade, question, feedback });
     }
-    if (seenCardsOverall.size !== quiz.questions.flatMap((question) => question.cardIds).length)
-      throw new ValidationError("Grading must cover every selected card exactly once");
-    return prepared;
+
+    const seenPages = new Set<string>();
+    const pages: PreparedPageGrade[] = [];
+    for (const pageGrade of input.pages) {
+      if (seenPages.has(pageGrade.pageId)) throw new ValidationError("A page was graded more than once");
+      seenPages.add(pageGrade.pageId);
+      if (!expectedPageIds.has(pageGrade.pageId))
+        throw new ValidationError(`Grading references an uncovered page: ${pageGrade.pageId}`);
+      if (!RATINGS.includes(pageGrade.rating))
+        throw new ValidationError(`Unsupported FSRS rating: ${pageGrade.rating}`);
+      const feedback = pageGrade.feedback?.trim() || "";
+
+      const evidence = pageGrade.evidence.map((item) => (typeof item === "string" ? item.trim() : ""));
+      if (!evidence.length || evidence.some((item) => !item))
+        throw new ValidationError(`Every page grade requires authorized evidence IDs: ${pageGrade.pageId}`);
+      if (new Set(evidence).size !== evidence.length)
+        throw new ValidationError(`Page grade repeats evidence IDs: ${pageGrade.pageId}`);
+      const byReference = evidenceByPage.get(pageGrade.pageId) ?? new Map<string, QuizEvidenceRecord>();
+      const evidenceRecords = evidence
+        .map((reference) => byReference.get(reference))
+        .filter((item): item is QuizEvidenceRecord => Boolean(item));
+      if (evidenceRecords.length !== evidence.length)
+        throw new ValidationError(`Page grade cites unauthorized evidence: ${pageGrade.pageId}`);
+      const readings = this.uniqueReadings(pageGrade.readings ?? []);
+      this.validateReadings(byReference, pageGrade.pageId, readings);
+      if (
+        readings.some(
+          (reading) =>
+            !evidenceRecords.some(
+              (record) =>
+                record.pageId === reading.pageId &&
+                record.anchor === reading.anchor &&
+                (reading.heading === undefined || reading.heading === record.heading),
+            ),
+        )
+      )
+        throw new ValidationError(`Page grade readings are not covered by cited evidence: ${pageGrade.pageId}`);
+      this.validateFeedback(feedback);
+      pages.push({ input: pageGrade, evidence, evidenceRecords, readings, feedback });
+    }
+    return { questions, pages };
   }
 
-  private revalidatePreparedGrades(quiz: QuizRecord, prepared: readonly PreparedQuestionGrade[]): void {
-    const evidenceByCard = new Map<string, Map<string, QuizEvidenceRecord>>();
+  private revalidatePreparedGrades(quiz: QuizRecord, prepared: PreparedGradeSubmission): void {
+    const evidenceByPage = new Map<string, Map<string, QuizEvidenceRecord>>();
     for (const item of this.gradingEvidence(quiz)) {
-      const byReference = evidenceByCard.get(item.cardId) ?? new Map<string, QuizEvidenceRecord>();
+      const byReference = evidenceByPage.get(item.pageId) ?? new Map<string, QuizEvidenceRecord>();
       byReference.set(item.reference, item);
-      evidenceByCard.set(item.cardId, byReference);
+      evidenceByPage.set(item.pageId, byReference);
     }
-    for (const question of prepared) {
-      this.validateQuestionReadings(evidenceByCard, question.question.cardIds, question.readings);
-      for (const card of question.cards) {
-        const current = evidenceByCard.get(card.input.cardId) ?? new Map<string, QuizEvidenceRecord>();
-        for (const record of card.evidenceRecords) {
-          const latest = current.get(record.reference);
-          if (
-            !latest ||
-            latest.cardId !== record.cardId ||
-            latest.pageId !== record.pageId ||
-            latest.path !== record.path ||
-            latest.anchor !== record.anchor ||
-            latest.heading !== record.heading ||
-            latest.pageDigest !== record.pageDigest ||
-            latest.pageRevision !== record.pageRevision ||
-            latest.textDigest !== record.textDigest ||
-            latest.excerpt !== record.excerpt
-          )
-            throw new RevisionConflictError(`Grading evidence is stale: ${record.reference}`);
-        }
-        this.validateReadings(current, card.input.cardId, card.readings);
+    for (const page of prepared.pages) {
+      const current = evidenceByPage.get(page.input.pageId) ?? new Map<string, QuizEvidenceRecord>();
+      for (const record of page.evidenceRecords) {
+        const latest = current.get(record.reference);
+        if (
+          !latest ||
+          latest.pageId !== record.pageId ||
+          latest.path !== record.path ||
+          latest.anchor !== record.anchor ||
+          latest.heading !== record.heading ||
+          latest.pageDigest !== record.pageDigest ||
+          latest.pageRevision !== record.pageRevision ||
+          latest.textDigest !== record.textDigest ||
+          latest.excerpt !== record.excerpt
+        )
+          throw new RevisionConflictError(`Grading evidence is stale: ${record.reference}`);
       }
+      this.validateReadings(current, page.input.pageId, page.readings);
     }
   }
 
@@ -1361,41 +1256,22 @@ export class QuizService {
 
   private validateReadings(
     evidence: ReadonlyMap<string, QuizEvidenceRecord>,
-    cardId: string,
+    pageId: string,
     readings: readonly ReadingLink[],
   ): void {
     for (const reading of readings) {
-      if (!validReading(reading)) throw new ValidationError(`Reading is malformed for ${cardId}`);
+      if (!validReading(reading) || reading.pageId !== pageId)
+        throw new ValidationError(`Reading is malformed or outside the graded page: ${pageId}`);
       const record = [...evidence.values()].find(
         (candidate) =>
           candidate.pageId === reading.pageId &&
           candidate.anchor === reading.anchor &&
           (reading.heading === undefined || reading.heading === candidate.heading),
       );
-      if (!record) throw new ValidationError(`Reading is not an authorized sealed evidence section for ${cardId}`);
+      if (!record) throw new ValidationError(`Reading is not an authorized sealed evidence section for ${pageId}`);
     }
   }
 
-  private validateQuestionReadings(
-    evidenceByCard: ReadonlyMap<string, ReadonlyMap<string, QuizEvidenceRecord>>,
-    cardIds: readonly string[],
-    readings: readonly ReadingLink[],
-  ): void {
-    const evidence = cardIds.flatMap((cardId) => [...(evidenceByCard.get(cardId)?.values() ?? [])]);
-    for (const reading of readings) {
-      if (
-        !validReading(reading) ||
-        !evidence.some(
-          (candidate) =>
-            candidate.pageId === reading.pageId &&
-            candidate.anchor === reading.anchor &&
-            (reading.heading === undefined || reading.heading === candidate.heading),
-        )
-      ) {
-        throw new ValidationError("Reading is not an exact sealed evidence section");
-      }
-    }
-  }
   private uniqueReadings(readings: readonly ReadingLink[]): ReadingLink[] {
     const seen = new Set<string>();
     const unique: ReadingLink[] = [];
@@ -1409,47 +1285,12 @@ export class QuizService {
     return unique;
   }
 
-  private persistFeedback(
-    feedback: string,
-    readings: readonly ReadingLink[],
-    cards: readonly CardGradeInput[],
-    settlementId: string,
-    answerRevision: number,
-  ): string {
-    const envelope: PersistedResultEnvelope = {
-      version: 1,
-      settlementId,
-      answerRevision,
-      feedback,
-      readings,
-      cards: cards.map((card) => ({
-        cardId: card.cardId,
-        feedback: card.feedback?.trim() || feedback,
-        evidence: (card.evidence ?? []).map((item) => item.trim()).filter(Boolean),
-        readings: card.readings ?? [],
-      })),
-    };
-    const cardFeedback = cards
-      .filter((card) => card.feedback?.trim() || card.evidence?.some((item) => item.trim()))
-      .map((card) => {
-        const details = [`${card.cardId}: ${card.feedback?.trim() || feedback}`];
-        const evidence = (card.evidence ?? []).map((item) => item.trim()).filter(Boolean);
-        if (evidence.length) details.push(`Evidence: ${evidence.join("; ")}`);
-        return details.join("\n");
-      });
-    const links = readings.map((reading) => `[${reading.heading ?? reading.anchor}](${this.readingHref(reading)})`);
-    const human =
-      [feedback, ...cardFeedback, links.length ? `Readings: ${links.join(", ")}` : ""].filter(Boolean).join("\n\n") ||
-      "No feedback.";
-    return `<!-- pi-scholar-result ${encodeResultEnvelope(envelope)} -->\n${human}`;
-  }
-
   private readSettlementIdentity(quiz: QuizRecord): string | undefined {
     const row = this.db.get<Record<string, unknown>>(
-      "SELECT feedback FROM question_results WHERE quiz_id = ? ORDER BY graded_at, question_id LIMIT 1",
+      "SELECT settlement_id FROM page_reviews WHERE quiz_id = ? ORDER BY reviewed_at, page_id LIMIT 1",
       quiz.quizId,
     );
-    return row ? decodeResultEnvelope(String(row.feedback))?.settlementId : undefined;
+    return row ? String(row.settlement_id ?? "") || undefined : undefined;
   }
 
   readSettledResult(quiz: QuizRecord): SettledQuizResult | undefined {
@@ -1457,80 +1298,110 @@ export class QuizService {
   }
 
   private readSettledResults(quiz: QuizRecord): SettledQuizResult | undefined {
-    const rows = this.db.all<Record<string, unknown>>(
+    const questionRows = this.db.all<Record<string, unknown>>(
       "SELECT * FROM question_results WHERE quiz_id = ? ORDER BY graded_at, question_id",
       quiz.quizId,
     );
-    const cardCount = this.db.get<Record<string, unknown>>(
-      "SELECT COUNT(*) AS count FROM card_results WHERE quiz_id = ?",
+    const pageRows = this.db.all<Record<string, unknown>>(
+      "SELECT * FROM page_results WHERE quiz_id = ? ORDER BY page_id",
       quiz.quizId,
     );
-    if (!rows.length) {
-      if (Number(cardCount?.count ?? 0) !== 0) throw new ValidationError("Committed grade is missing question Results");
-      return undefined;
-    }
-    if (rows.length !== quiz.questions.length) throw new ValidationError("Committed grade is incomplete");
-    const rowByQuestion = new Map<string, Record<string, unknown>>();
-    for (const row of rows) {
-      const questionId = String(row.question_id);
-      if (rowByQuestion.has(questionId))
+    const reviewRows = this.db.all<Record<string, unknown>>(
+      "SELECT * FROM page_reviews WHERE quiz_id = ? ORDER BY reviewed_at, page_id",
+      quiz.quizId,
+    );
+    if (!questionRows.length && !pageRows.length && !reviewRows.length) return undefined;
+    if (
+      questionRows.length !== quiz.questions.length ||
+      pageRows.length !==
+        new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId))).size ||
+      reviewRows.length !== pageRows.length
+    )
+      throw new ValidationError("Committed grade is incomplete");
+
+    const questionById = new Map<string, Record<string, unknown>>();
+    for (const row of questionRows) {
+      const questionId = String(row.question_id ?? "");
+      if (!questionId || questionById.has(questionId))
         throw new ValidationError("Committed grade contains duplicate question Results");
-      rowByQuestion.set(questionId, row);
-    }
-    const questions: SettledQuestionResult[] = [];
-    const seenCards = new Set<string>();
-    let settlementId: string | undefined;
-    for (const question of quiz.questions) {
-      const row = rowByQuestion.get(question.questionId);
-      if (!row) throw new ValidationError("Committed grade is missing a question Result");
+      if (!quiz.questions.some((question) => question.questionId === questionId))
+        throw new ValidationError("Committed grade contains an unexpected question Result");
       if (Number(row.answer_revision) !== quiz.revision)
         throw new ValidationError("Committed grade revision does not match the sealed submission");
-      const envelope = decodeResultEnvelope(String(row.feedback));
-      if (!envelope || envelope.answerRevision !== quiz.revision)
-        throw new ValidationError("Committed grade feedback is not durable");
-      if (settlementId === undefined) settlementId = envelope.settlementId;
-      if (settlementId !== envelope.settlementId)
-        throw new ValidationError("Committed grade settlement identity is inconsistent");
-      const cardRows = this.db.all<Record<string, unknown>>(
-        "SELECT * FROM card_results WHERE quiz_id = ? AND question_id = ? ORDER BY card_id",
-        quiz.quizId,
-        question.questionId,
-      );
-      if (cardRows.length !== question.cardIds.length)
-        throw new ValidationError("Committed grade is missing a card Result");
-      const expectedCards = new Set(question.cardIds);
-      const cards: SettledCardResult[] = [];
-      for (const cardRow of cardRows) {
-        const cardId = String(cardRow.card_id);
-        if (!expectedCards.has(cardId) || seenCards.has(cardId))
-          throw new ValidationError("Committed grade contains an unexpected or duplicate card Result");
-        seenCards.add(cardId);
-        const persistedCard = envelope.cards.find((card) => card.cardId === cardId);
-        if (!persistedCard) throw new ValidationError("Committed grade is missing per-card feedback");
-        const current = this.scheduler.getCard(cardId);
-        const cardReadings = this.uniqueReadings([...(envelope.readings ?? []), ...(persistedCard.readings ?? [])]);
-        cards.push({
-          gradeId: String(cardRow.review_id),
-          quizId: quiz.quizId,
-          questionId: question.questionId,
-          cardId,
-          rating: String(cardRow.rating) as CardRating,
-          feedback: persistedCard.feedback,
-          gradedAt: String(row.graded_at),
-          evidence: persistedCard.evidence,
-          readings: cardReadings,
-          dueAt: current.dueAt,
-          fsrsState: current.fsrsState,
-        });
-      }
-      if (envelope.cards.length !== question.cardIds.length)
-        throw new ValidationError("Committed grade has incomplete per-card feedback");
-      const readings = this.uniqueReadings([...(envelope.readings ?? []), ...cards.flatMap((card) => card.readings)]);
-      questions.push({ questionId: question.questionId, feedback: envelope.feedback, cards, readings });
+      const feedback = String(row.feedback ?? "");
+      this.validateFeedback(feedback);
+      questionById.set(questionId, row);
     }
-    if (seenCards.size !== quiz.questions.flatMap((question) => question.cardIds).length)
-      throw new ValidationError("Committed grade has incomplete card Results");
-    return { quiz, questions };
+    const questions: SettledQuestionResult[] = [];
+    for (const question of quiz.questions) {
+      const row = questionById.get(question.questionId);
+      if (!row) throw new ValidationError("Committed grade is missing a question Result");
+      questions.push({ questionId: question.questionId, feedback: String(row.feedback ?? "") });
+    }
+
+    const expectedPageIds = new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)));
+    const reviewByPage = new Map<string, Record<string, unknown>>();
+    const reviewById = new Map<string, Record<string, unknown>>();
+    let settlementId: string | undefined;
+    for (const row of reviewRows) {
+      const pageId = String(row.page_id ?? "");
+      const reviewId = String(row.review_id ?? "");
+      const currentSettlement = String(row.settlement_id ?? "");
+      if (!expectedPageIds.has(pageId) || !reviewId || reviewByPage.has(pageId) || reviewById.has(reviewId))
+        throw new ValidationError("Committed grade contains an unexpected or duplicate page review");
+      if (!currentSettlement) throw new ValidationError("Committed grade page review has no settlement identity");
+      if (settlementId === undefined) settlementId = currentSettlement;
+      if (settlementId !== currentSettlement)
+        throw new ValidationError("Committed grade settlement identity is inconsistent");
+      if (!RATINGS.includes(String(row.rating) as ReviewRating))
+        throw new ValidationError("Committed grade page review has an invalid rating");
+      reviewByPage.set(pageId, row);
+      reviewById.set(reviewId, row);
+    }
+
+    const pages: SettledPageResult[] = [];
+    const resultByPage = new Map<string, Record<string, unknown>>();
+    for (const row of pageRows) {
+      const pageId = String(row.page_id ?? "");
+      const reviewId = String(row.review_id ?? "");
+      if (!expectedPageIds.has(pageId) || resultByPage.has(pageId))
+        throw new ValidationError("Committed grade contains an unexpected or duplicate page Result");
+      const review = reviewById.get(reviewId);
+      if (!review || String(review.page_id) !== pageId)
+        throw new ValidationError("Committed grade page Result is missing its page review");
+      const evidenceValue = parseJson<unknown>(row.evidence_json, undefined);
+      const readingsValue = parseJson<unknown>(row.readings_json, undefined);
+      if (
+        !Array.isArray(evidenceValue) ||
+        evidenceValue.some((item) => typeof item !== "string" || !item) ||
+        new Set(evidenceValue).size !== evidenceValue.length ||
+        !Array.isArray(readingsValue) ||
+        !readingsValue.every(validReading)
+      )
+        throw new ValidationError("Committed grade page evidence or readings are malformed");
+      const rating = String(row.rating) as ReviewRating;
+      if (!RATINGS.includes(rating) || String(review.rating) !== rating)
+        throw new ValidationError("Committed grade page rating is inconsistent");
+      const feedback = String(row.feedback ?? "");
+      this.validateFeedback(feedback);
+      resultByPage.set(pageId, row);
+      pages.push({
+        gradeId: reviewId,
+        quizId: quiz.quizId,
+        pageId,
+        rating,
+        feedback,
+        gradedAt: String(review.reviewed_at ?? ""),
+        reviewId,
+        evidence: evidenceValue,
+        readings: readingsValue,
+      });
+    }
+    for (const pageId of expectedPageIds) {
+      if (!resultByPage.has(pageId) || !reviewByPage.has(pageId))
+        throw new ValidationError("Committed grade is missing a page Result");
+    }
+    return { quiz, questions, pages };
   }
 
   private validateRenderedSheet(markdown: string): void {
@@ -1542,11 +1413,24 @@ export class QuizService {
       throw new ValidationError("Rendered quiz sheet contains forbidden controlled content");
     }
     if (
-      !/^# Pi Scholar Quiz — \d{4}-\d{2}-\d{2}\s*$/mu.test(markdown) ||
-      !/<!--\s*pi-scholar quiz-id=[^\s]+ revision=\d+\s*-->/u.test(markdown)
+      !/^# \d+\. Pi Scholar Quiz — \d{4}-\d{2}-\d{2}\s*$/mu.test(markdown) ||
+      !/<!--\s*pi-scholar:quiz format=1 id=[^\s]+ revision=\d+\s*-->/u.test(markdown)
     ) {
       throw new ValidationError("Rendered quiz sheet header is invalid");
     }
+    const headings = [...markdown.matchAll(/^#{1,6}\s+(.+)$/gmu)].map((match) => match[1]!.trim());
+    if (!headings.length || headings.some((heading) => !/^\d+(?:[.)]|\s)/u.test(heading)))
+      throw new ValidationError("Rendered quiz sheet headings must be numeric");
+    const comments = [...markdown.matchAll(/<!--[\s\S]*?-->/gu)].map((match) => match[0]);
+    if (
+      comments.length < 1 ||
+      comments.some(
+        (comment) =>
+          !/^<!--\s*pi-scholar:(?:quiz format=1 id=[^\s]+ revision=\d+|question id=[^\s]+)\s*-->$/u.test(comment),
+      ) ||
+      comments.filter((comment) => /^<!--\s*pi-scholar:quiz\b/u.test(comment)).length !== 1
+    )
+      throw new ValidationError("Rendered quiz sheet comments are invalid");
   }
 
   private replaceSheet<T>(sheetPath: string | undefined, rendered: string, operation: () => T): T {
@@ -1571,10 +1455,11 @@ export class QuizService {
     quiz: QuizRecord,
     answers?: Readonly<Record<string, string | readonly string[]>>,
     results?: readonly SettledQuestionResult[],
+    pageResults?: readonly SettledPageResult[],
   ): void {
     const sheetPath = quiz.sheetPath ?? pathForSheet(this.paths, quiz.date);
     if (!sheetPath) return;
-    const rendered = this.renderSheet(quiz, answers, results);
+    const rendered = this.renderSheet(quiz, answers, results, pageResults);
     this.validateRenderedSheet(rendered);
     this.replaceSheet(sheetPath, rendered, () => undefined);
   }

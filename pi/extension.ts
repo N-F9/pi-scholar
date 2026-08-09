@@ -153,25 +153,6 @@ const admissionInput = Type.Object({
   endpoints: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))),
 });
 
-const maintenanceBindingInput = Type.Object({
-  pageId: Type.String({ minLength: 1 }),
-  heading: Type.Optional(Type.String()),
-  anchor: Type.String({ minLength: 1 }),
-  startOffset: Type.Optional(Type.Integer({ minimum: 0 })),
-  endOffset: Type.Optional(Type.Integer({ minimum: 0 })),
-  start: Type.Optional(Type.Integer({ minimum: 0 })),
-  end: Type.Optional(Type.Integer({ minimum: 0 })),
-  textDigest: Type.String({ minLength: 1 }),
-  pageDigest: Type.String({ minLength: 1 }),
-  pageRevision: Type.Integer({ minimum: 1 }),
-  sectionText: Type.String(),
-});
-const maintenanceBindings = Type.Array(maintenanceBindingInput);
-const maintenanceSplitChildInput = Type.Object({
-  cardId: Type.Optional(Type.String()),
-  prompt: Type.Optional(Type.String()),
-  bindings: maintenanceBindings,
-});
 const maintenanceIssuePageInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
   expectedDigest: Type.String({ minLength: 1 }),
@@ -179,42 +160,7 @@ const maintenanceIssuePageInput = Type.Object({
   body: Type.Optional(Type.String()),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
 });
-const maintenanceIssueCardInput = Type.Union([
-  Type.Object({
-    kind: Type.Literal("create-card"),
-    cardId: Type.Optional(Type.String()),
-    prompt: Type.Optional(Type.String()),
-    initialDueAt: Type.Optional(Type.String()),
-    dueAt: Type.Optional(Type.String()),
-    bindings: maintenanceBindings,
-  }),
-  Type.Object({
-    kind: Type.Literal("revise-card"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-    prompt: Type.Optional(Type.String()),
-    bindings: maintenanceBindings,
-  }),
-  Type.Object({
-    kind: Type.Literal("retire-card"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-  }),
-  Type.Object({
-    kind: Type.Literal("split-card"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-    children: Type.Array(maintenanceSplitChildInput),
-  }),
-  Type.Object({
-    kind: Type.Literal("merge-card"),
-    parentCardIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-    expectedRevisions: Type.Record(Type.String(), Type.Integer({ minimum: 1 })),
-    cardId: Type.Optional(Type.String()),
-    prompt: Type.Optional(Type.String()),
-    bindings: maintenanceBindings,
-  }),
-]);
+
 const maintenanceInput = Type.Union([
   Type.Object({
     kind: Type.Literal("create-page"),
@@ -250,68 +196,30 @@ const maintenanceInput = Type.Union([
     path: Type.String({ minLength: 1 }),
   }),
   Type.Object({
-    kind: Type.Literal("create-card"),
-    cardId: Type.Optional(Type.String()),
-    prompt: Type.Optional(Type.String()),
-    initialDueAt: Type.Optional(Type.String()),
-    dueAt: Type.Optional(Type.String()),
-    bindings: maintenanceBindings,
-  }),
-  Type.Object({
-    kind: Type.Literal("revise-card"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-    prompt: Type.Optional(Type.String()),
-    bindings: maintenanceBindings,
-  }),
-  Type.Object({
-    kind: Type.Literal("retire-card"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-  }),
-  Type.Object({
-    kind: Type.Literal("split-card"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-    children: Type.Array(maintenanceSplitChildInput),
-  }),
-  Type.Object({
-    kind: Type.Literal("merge-card"),
-    parentCardIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-    expectedRevisions: Type.Record(Type.String(), Type.Integer({ minimum: 1 })),
-    cardId: Type.Optional(Type.String()),
-    prompt: Type.Optional(Type.String()),
-    bindings: maintenanceBindings,
-  }),
-  Type.Object({
     kind: Type.Literal("prerequisites"),
-    cardId: Type.String({ minLength: 1 }),
-    expectedRevision: Type.Integer({ minimum: 1 }),
-    prerequisiteCardIds: Type.Array(Type.String({ minLength: 1 })),
+    pageId: Type.String({ minLength: 1 }),
+    prerequisitePageIds: Type.Array(Type.String({ minLength: 1 })),
+    expectedRevision: Type.Optional(Type.Integer({ minimum: 1 })),
   }),
   Type.Object({
     kind: Type.Literal("resolve-issue"),
     issueId: Type.String({ minLength: 1 }),
     page: maintenanceIssuePageInput,
-    card: maintenanceIssueCardInput,
     resolution: Type.String({ minLength: 1 }),
   }),
 ]);
 
+const quizQuestionPageInput = Type.Object({
+  pageId: Type.String({ minLength: 1 }),
+  criterion: Type.String({ minLength: 1 }),
+  weight: Type.Number({ exclusiveMinimum: 0 }),
+});
+
 const quizQuestionProposal = Type.Object({
-  questionId: Type.Optional(Type.String()),
   kind: Type.Union([Type.Literal("short-answer"), Type.Literal("multiple-choice")]),
   prompt: Type.String({ minLength: 1 }),
   choices: Type.Optional(Type.Array(Type.String())),
-  cardIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-  cards: Type.Array(
-    Type.Object({
-      cardId: Type.String({ minLength: 1 }),
-      criterion: Type.String({ minLength: 1 }),
-      weight: Type.Number({ exclusiveMinimum: 0 }),
-    }),
-    { minItems: 1 },
-  ),
+  pages: Type.Array(quizQuestionPageInput, { minItems: 1 }),
   sourceRefs: Type.Array(Type.String()),
   answerKey: Type.Optional(Type.Unknown()),
 });
@@ -319,7 +227,7 @@ const quizInput = Type.Union([
   Type.Object({
     status: Type.Literal("published"),
     date: Type.String({ minLength: 1 }),
-    questions: Type.Array(quizQuestionProposal),
+    questions: Type.Array(quizQuestionProposal, { maxItems: 4 }),
   }),
   Type.Object({
     status: Type.Literal("skipped"),
@@ -333,8 +241,8 @@ const gradeReadingInput = Type.Object({
   anchor: Type.String({ minLength: 1 }),
   heading: Type.Optional(Type.String()),
 });
-const gradeCardInput = Type.Object({
-  cardId: Type.String({ minLength: 1 }),
+const gradePageInput = Type.Object({
+  pageId: Type.String({ minLength: 1 }),
   rating: Type.Union([Type.Literal("Again"), Type.Literal("Hard"), Type.Literal("Good"), Type.Literal("Easy")]),
   feedback: Type.Optional(Type.String()),
   evidence: Type.Array(Type.String()),
@@ -343,8 +251,6 @@ const gradeCardInput = Type.Object({
 const gradeQuestionInput = Type.Object({
   questionId: Type.String({ minLength: 1 }),
   feedback: Type.Optional(Type.String()),
-  cards: Type.Array(gradeCardInput, { minItems: 1 }),
-  readings: Type.Optional(Type.Array(gradeReadingInput)),
 });
 const gradeInput = Type.Object({
   requestId: Type.String({ minLength: 1 }),
@@ -352,6 +258,7 @@ const gradeInput = Type.Object({
   revision: Type.Integer({ minimum: 1 }),
   submissionId: Type.String({ minLength: 1 }),
   questions: Type.Array(gradeQuestionInput),
+  pages: Type.Array(gradePageInput),
 });
 
 const appCache = new Map<string, ScholarApplication>();
@@ -777,7 +684,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     label: "scholar_apply_maintenance",
     executionMode: "sequential",
     description:
-      "Apply one guarded wiki/card proposal; model-authored source pages must be self-contained textbook-style exposition.",
+      "Apply one guarded wiki-page proposal; model-authored source pages must be self-contained textbook-style exposition.",
     parameters: maintenanceInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded maintenance", "wiki-maintenance", (app) =>
