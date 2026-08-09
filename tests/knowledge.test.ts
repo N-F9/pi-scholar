@@ -378,7 +378,7 @@ describe("source admission mechanics", () => {
     expect((await fs.readFile(join(result.packetPath, "extracted.md"))).equals(before)).toBe(true);
     db.close();
   });
-  it("previews page, card, and open-quiz dependents and restores the packet after a failed removal transaction", async () => {
+  it("previews page and open-quiz dependents and restores the packet after a failed removal transaction", async () => {
     const { paths, db, sources, wiki } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
     const [entry] = await sources.discover();
@@ -387,18 +387,16 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "grounded.md",
-      body: `Grounded at ${chunkId}.\n`,
+      body: `# Grounded\n\nGrounded at ${chunkId}.\n`,
       quizWorthiness: "eligible",
     });
+    const pageId = page.page.pageId;
     const now = new Date().toISOString();
-    db.run(
-      "INSERT INTO review_cards (card_id, status, prompt, initial_due_at, due_at, fsrs_state, stability, difficulty, reps, lapses, scheduled_days, last_review_at, revision, created_at, updated_at) VALUES (?, 'active', ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL, 1, ?, ?)",
-      ["card-removal", "Explain the evidence", now, now, now, now],
-    );
-    db.run(
-      "INSERT INTO card_bindings (binding_id, card_id, page_id, heading, anchor, start_offset, end_offset, text_digest, revision, active) VALUES (?, ?, ?, ?, ?, 0, 9, ?, 1, 1)",
-      ["binding-removal", "card-removal", page.page.pageId, "Grounded", "#grounded", "text-digest"],
-    );
+    db.run("INSERT INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, 'citation')", [
+      result.sourceId,
+      pageId,
+      chunkId,
+    ]);
     const sheetPath = join(paths.quizzesRoot, "2099", "01", "2099-01-01.md");
     await fs.mkdir(join(paths.quizzesRoot, "2099", "01"), { recursive: true });
     const sheetBefore = Buffer.from("# canonical quiz\n");
@@ -408,30 +406,33 @@ describe("source admission mechanics", () => {
       ["quiz-removal", "2099-01-01", sheetPath, now],
     );
     db.run(
-      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, grading_criteria_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?, ?)",
-      [
-        "question-removal",
-        "quiz-removal",
-        "short-answer",
-        "Explain",
-        JSON.stringify([{ cardId: "card-removal", criterion: "Explain", weight: 1 }]),
-        JSON.stringify([`${page.page.pageId}#%23grounded`]),
-      ],
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?)",
+      ["question-removal", "quiz-removal", "short-answer", "Explain", "[]"],
     );
-    db.run("INSERT INTO question_cards (question_id, card_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
+    db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       "question-removal",
-      "card-removal",
+      pageId,
       JSON.stringify("Explain"),
       1,
     ]);
+    db.run(
+      "INSERT INTO quiz_evidence (quiz_id, reference, page_id, relative_path, anchor, heading, page_digest, page_revision, text_digest, excerpt, excerpt_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        "quiz-removal",
+        "evidence-removal",
+        pageId,
+        page.page.relativePath,
+        "#grounded",
+        "Grounded",
+        page.page.digest,
+        page.page.revision,
+        "text-digest",
+        `Grounded at ${chunkId}.`,
+        "excerpt-digest",
+      ],
+    );
     const preview = sources.removalPreview(result.sourceId);
-    expect(preview.dependents.some((item) => item.page_id === page.page.pageId && item.kind === "citation")).toBe(true);
-    expect(preview.dependents.some((item) => item.card_id === "card-removal" && item.kind === "card")).toBe(true);
-    expect(
-      preview.dependents.some(
-        (item) => item.quiz_id === "quiz-removal" && item.date === "2099-01-01" && item.kind === "quiz",
-      ),
-    ).toBe(true);
+    expect(preview.dependentPageIds).toContain(pageId);
     const originalRun = db.run.bind(db);
     db.run = ((sql: string, parameters?: readonly unknown[]) => {
       if (sql.startsWith("UPDATE sources SET status")) throw new Error("forced removal failure");
@@ -448,6 +449,93 @@ describe("source admission mechanics", () => {
     expect(db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", ["quiz-removal"])?.status).toBe(
       "open",
     );
+    db.close();
+  });
+  it("blocks removal while a cited page has an unsettled submitted quiz", async () => {
+    const { paths, db, sources, wiki } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const chunkId = result.manifest.chunks[0]?.chunkId;
+    if (!chunkId) throw new Error("source chunk is missing");
+    const page = await wiki.create({
+      path: "submitted-grounding.md",
+      body: `# Grounded\n\nGrounded at ${chunkId}.\n`,
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    const now = new Date().toISOString();
+    db.run("INSERT INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, 'citation')", [
+      result.sourceId,
+      pageId,
+      chunkId,
+    ]);
+    db.run(
+      "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', NULL, ?, NULL, NULL, NULL)",
+      ["quiz-submitted-removal", "2099-01-02", now],
+    );
+    db.run(
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?)",
+      ["question-submitted-removal", "quiz-submitted-removal", "short-answer", "Explain", "[]"],
+    );
+    db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
+      "question-submitted-removal",
+      pageId,
+      JSON.stringify("Explain"),
+      1,
+    ]);
+    db.run(
+      "INSERT INTO quiz_evidence (quiz_id, reference, page_id, relative_path, anchor, heading, page_digest, page_revision, text_digest, excerpt, excerpt_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        "quiz-submitted-removal",
+        "evidence-submitted-removal",
+        pageId,
+        page.page.relativePath,
+        "#grounded",
+        "Grounded",
+        page.page.digest,
+        page.page.revision,
+        "text-digest",
+        `Grounded at ${chunkId}.`,
+        "excerpt-digest",
+      ],
+    );
+    const openPreview = sources.removalPreview(result.sourceId);
+    db.run("UPDATE quizzes SET status = 'submitted', submitted_at = ? WHERE quiz_id = ?", [
+      now,
+      "quiz-submitted-removal",
+    ]);
+    await expect(sources.removeConfirmed(result.sourceId, openPreview.confirmationId)).rejects.toThrow(/stale/iu);
+    const preview = sources.removalPreview(result.sourceId);
+    const packetBefore = await fs.readFile(join(result.packetPath, "extracted.md"));
+    const sourceBefore = db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [
+      result.sourceId,
+    ]);
+    const pageBefore = db.get<{ status: string; revision: number }>(
+      "SELECT status, revision FROM pages WHERE page_id = ?",
+      [pageId],
+    );
+    const quizBefore = db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", [
+      "quiz-submitted-removal",
+    ]);
+    const dependenciesBefore = db.all<Record<string, unknown>>(
+      "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies WHERE source_id = ? ORDER BY page_id, chunk_id",
+      [result.sourceId],
+    );
+    await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(
+      /submitted quizzes without page settlement/iu,
+    );
+    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).equals(packetBefore)).toBe(true);
+    expect(await fs.lstat(result.packetPath)).toBeTruthy();
+    expect(db.get("SELECT status FROM sources WHERE source_id = ?", [result.sourceId])).toEqual(sourceBefore);
+    expect(db.get("SELECT status, revision FROM pages WHERE page_id = ?", [pageId])).toEqual(pageBefore);
+    expect(db.get("SELECT status FROM quizzes WHERE quiz_id = ?", ["quiz-submitted-removal"])).toEqual(quizBefore);
+    expect(
+      db.all<Record<string, unknown>>(
+        "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies WHERE source_id = ? ORDER BY page_id, chunk_id",
+        [result.sourceId],
+      ),
+    ).toEqual(dependenciesBefore);
     db.close();
   });
   it("restores an active packet from deterministic quarantine before recomputing removal confirmation", async () => {
@@ -481,7 +569,7 @@ describe("source admission mechanics", () => {
     const second = await sources.removeConfirmed(result.sourceId, preview.confirmationId);
     expect(first.removed).toBe(true);
     expect(second.removed).toBe(true);
-    expect(second.dependents).toEqual([]);
+    expect(second.dependentPageIds).toEqual([]);
     await expect(fs.lstat(quarantine)).rejects.toMatchObject({ code: "ENOENT" });
     db.close();
   });
@@ -691,13 +779,13 @@ describe("wiki mechanics", () => {
     await expect(wiki.patchIssue(issue.issueId, { status: "resolved" })).rejects.toThrow();
     const reopened = await wiki.patchIssue(issue.issueId, {
       status: "reopened",
-      resolution: "Needs a composite correction.",
+      resolution: "Needs a page correction.",
     });
     expect(reopened.status).toBe("reopened");
     db.close();
   });
 
-  it("resolves an issue only after a corrected page and related card binding pass together", async () => {
+  it("resolves an issue only after a corrected page passes together", async () => {
     const { db, paths } = await fixture();
     const app = new ScholarApplication({
       paths,
@@ -708,75 +796,39 @@ describe("wiki mechanics", () => {
     });
     try {
       const originalBody = "# Section\n\noriginal\n";
-      const correctedSection = "# Section\n\ncorrected\n";
-      const page = await app.wiki.create({ path: "composite.md", body: originalBody, quizWorthiness: "eligible" });
+      const correctedBody = "# Section\n\ncorrected\n";
+      const page = await app.wiki.create({ path: "page-issue.md", body: originalBody, quizWorthiness: "eligible" });
       const issue = await app.wiki.report({
         pageId: page.page.pageId,
         heading: "Section",
         description: "The section is wrong.",
       });
-      const binding = (anchor: string) => ({
-        pageId: page.page.pageId,
-        heading: "Section",
-        anchor,
-        startOffset: 900,
-        endOffset: 901,
-        textDigest: "model-supplied-digest",
-        pageDigest: "model-supplied-page-digest",
-        pageRevision: 99,
-        sectionText: correctedSection,
-      });
-      const proposal = (body: string, anchor: string, cardId: string) => ({
+      const proposal = (body: string) => ({
         kind: "resolve-issue" as const,
         issueId: issue.issueId,
         page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body },
-        card: { kind: "create-card" as const, cardId, dueAt: "2030-01-01T00:00:00.000Z", bindings: [binding(anchor)] },
-        resolution: "Corrected the section and refreshed its review card.",
+        resolution: "Corrected the section.",
       });
-      await expect(app.applyMaintenance(proposal(originalBody, "#section", "no-op-card"))).rejects.toThrow(
-        /actual page correction/u,
-      );
-      await expect(
-        app.applyMaintenance(proposal(correctedSection, "#unrelated", "wrong-section-card")),
-      ).rejects.toThrow(/corrected issue section/u);
+      await expect(app.applyMaintenance(proposal(originalBody))).rejects.toThrow(/actual page correction/u);
       expect((await app.wiki.get(page.page.pageId)).content).toContain("original");
       expect((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status).toBe("open");
-      expect(app.scheduler.listCards(false)).toHaveLength(0);
 
-      const applied = await app.applyMaintenance(proposal(correctedSection, "#section", "corrected-card"));
+      const applied = await app.applyMaintenance(proposal(correctedBody));
       expect(applied.issue?.status).toBe("resolved");
       expect((await app.wiki.get(page.page.pageId)).content).toContain("corrected");
       expect((await app.wiki.get(page.page.pageId)).revision).toBe(2);
-      expect(app.scheduler.bindings("corrected-card")[0]).toMatchObject({
-        pageId: page.page.pageId,
-        anchor: "#section",
-        startOffset: 0,
-        endOffset: correctedSection.length,
-      });
-      const beforeBlockedUpdate = await app.wiki.get(page.page.pageId);
-      const bindingBeforeRename = app.scheduler.bindings("corrected-card")[0];
-      await expect(
-        app.updateNote(page.page.pageId, { body: "# Section\n\ndirect stale binding candidate\n" }),
-      ).rejects.toThrow(/active card bindings stale/u);
+      expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
 
-      await expect(
-        app.applyMaintenance({
-          kind: "update-page",
-          pageId: page.page.pageId,
-          expectedDigest: beforeBlockedUpdate.digest,
-          body: "# Section\n\nstale binding candidate\n",
-        }),
-      ).rejects.toThrow(/active card bindings stale/u);
-      expect((await app.wiki.get(page.page.pageId)).content).toContain("corrected");
+      const beforeRename = await app.wiki.get(page.page.pageId);
       const renamed = await app.applyMaintenance({
         kind: "rename-page",
         pageId: page.page.pageId,
-        expectedDigest: beforeBlockedUpdate.digest,
-        path: "composite-renamed.md",
+        expectedDigest: beforeRename.digest,
+        path: "page-issue-renamed.md",
       });
-      expect(renamed.page?.relativePath).toBe("composite-renamed.md");
-      expect((await app.wiki.get(page.page.pageId)).digest).toBe(beforeBlockedUpdate.digest);
-      expect(app.scheduler.bindings("corrected-card")[0]).toEqual(bindingBeforeRename);
+      expect(renamed.page?.relativePath).toBe("page-issue-renamed.md");
+      expect((await app.wiki.get(page.page.pageId)).digest).toBe(beforeRename.digest);
+      expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
     } finally {
       await app.close();
       db.close();

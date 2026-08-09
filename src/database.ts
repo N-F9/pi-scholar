@@ -16,7 +16,7 @@ export interface OpenDatabaseOptions {
   readonly initializeSchema?: boolean;
 }
 
-export const SCHEMA_VERSION = 2 as const;
+export const SCHEMA_VERSION = 3 as const;
 export const REQUIRED_TABLES = [
   "schema_meta",
   "sources",
@@ -26,21 +26,20 @@ export const REQUIRED_TABLES = [
   "pages",
   "wiki_issues",
   "authored_snapshots",
-  "review_cards",
-  "card_bindings",
-  "card_prerequisites",
-  "card_lineage",
-  "raw_reviews",
+  "page_learning",
+  "page_prerequisites",
   "quizzes",
   "quiz_questions",
-  "question_cards",
+  "page_reviews",
+  "question_pages",
   "quiz_answers",
   "question_results",
-  "card_results",
+  "page_results",
   "quiz_evidence",
   "workflows",
   "settings",
 ] as const;
+
 const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   schema_meta: ["schema_version", "applied_at"],
   sources: [
@@ -87,7 +86,6 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     "issue_id",
     "page_id",
     "heading",
-    "card_id",
     "page_digest",
     "kind",
     "description",
@@ -97,10 +95,8 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     "updated_at",
   ],
   authored_snapshots: ["relative_path", "digest", "revision", "captured_at", "commit_id"],
-  review_cards: [
-    "card_id",
-    "status",
-    "prompt",
+  page_learning: [
+    "page_id",
     "initial_due_at",
     "due_at",
     "fsrs_state",
@@ -114,32 +110,7 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     "created_at",
     "updated_at",
   ],
-  card_bindings: [
-    "binding_id",
-    "card_id",
-    "page_id",
-    "heading",
-    "anchor",
-    "start_offset",
-    "end_offset",
-    "text_digest",
-    "revision",
-    "active",
-  ],
-  card_prerequisites: ["card_id", "prerequisite_card_id", "created_at"],
-  card_lineage: ["lineage_id", "event", "parent_card_id", "child_card_id", "occurred_at", "metadata_json"],
-  raw_reviews: [
-    "review_id",
-    "card_id",
-    "quiz_id",
-    "question_id",
-    "answer_revision",
-    "rating",
-    "reviewed_at",
-    "state_before_json",
-    "state_after_json",
-    "settlement_id",
-  ],
+  page_prerequisites: ["page_id", "prerequisite_page_id"],
   quizzes: [
     "quiz_id",
     "date",
@@ -159,16 +130,35 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     "prompt",
     "choices_json",
     "answer_key_json",
-    "grading_criteria_json",
     "source_refs_json",
   ],
-  question_cards: ["question_id", "card_id", "criterion_json", "weight"],
+  page_reviews: [
+    "review_id",
+    "page_id",
+    "quiz_id",
+    "submission_id",
+    "revision",
+    "rating",
+    "reviewed_at",
+    "state_before_json",
+    "state_after_json",
+    "settlement_id",
+  ],
+  question_pages: ["question_id", "page_id", "criterion_json", "weight"],
   quiz_answers: ["quiz_id", "question_id", "revision", "answer_json", "saved_at"],
   question_results: ["result_id", "quiz_id", "question_id", "answer_revision", "feedback", "graded_at"],
-  card_results: ["result_id", "quiz_id", "question_id", "card_id", "rating", "review_id"],
+  page_results: [
+    "result_id",
+    "quiz_id",
+    "page_id",
+    "rating",
+    "feedback",
+    "evidence_json",
+    "readings_json",
+    "review_id",
+  ],
   quiz_evidence: [
     "quiz_id",
-    "card_id",
     "reference",
     "page_id",
     "relative_path",
@@ -201,11 +191,11 @@ const REQUIRED_SCHEMA_FRAGMENTS: Readonly<Record<string, readonly string[]>> = {
     "check (page_id is not null or chunk_id is not null)",
     "foreign key (source_id, chunk_id) references source_chunks(source_id, chunk_id)",
   ],
-  card_lineage: [
-    "check ((event = 'retire' and child_card_id is null) or (event <> 'retire' and child_card_id is not null))",
-    "check (child_card_id is null or parent_card_id <> child_card_id)",
-  ],
-  question_cards: ["criterion_json text not null", "weight real not null"],
+  page_prerequisites: ["check (page_id <> prerequisite_page_id)"],
+  page_reviews: ["unique (quiz_id, page_id, revision)", "unique (settlement_id, page_id)"],
+  question_pages: ["criterion_json text not null", "weight real not null"],
+  page_results: ["unique (quiz_id, page_id)", "unique (review_id)"],
+  quiz_evidence: ["primary key (quiz_id, reference)"],
 };
 
 export const SCHEMA_SQL = `
@@ -242,6 +232,7 @@ CREATE TABLE IF NOT EXISTS source_files (
   media_type TEXT,
   PRIMARY KEY (source_id, relative_path)
 );
+
 CREATE TABLE IF NOT EXISTS source_chunks (
   chunk_id TEXT PRIMARY KEY,
   source_id TEXT NOT NULL REFERENCES sources(source_id) ON DELETE CASCADE,
@@ -254,6 +245,7 @@ CREATE TABLE IF NOT EXISTS source_chunks (
   UNIQUE (source_id, ordinal),
   UNIQUE (source_id, chunk_id)
 );
+
 CREATE TABLE IF NOT EXISTS source_dependencies (
   source_id TEXT NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
   page_id TEXT REFERENCES pages(page_id) ON DELETE RESTRICT,
@@ -275,11 +267,11 @@ CREATE TABLE IF NOT EXISTS pages (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS wiki_issues (
   issue_id TEXT PRIMARY KEY,
   page_id TEXT REFERENCES pages(page_id) ON DELETE RESTRICT,
   heading TEXT,
-  card_id TEXT REFERENCES review_cards(card_id) ON DELETE RESTRICT,
   page_digest TEXT,
   kind TEXT NOT NULL CHECK (kind IN ('incorrect','unclear','missing','bad-boundary')),
   description TEXT NOT NULL,
@@ -297,10 +289,8 @@ CREATE TABLE IF NOT EXISTS authored_snapshots (
   commit_id TEXT
 );
 
-CREATE TABLE IF NOT EXISTS review_cards (
-  card_id TEXT PRIMARY KEY,
-  status TEXT NOT NULL CHECK (status IN ('active','retired')),
-  prompt TEXT,
+CREATE TABLE IF NOT EXISTS page_learning (
+  page_id TEXT PRIMARY KEY REFERENCES pages(page_id) ON DELETE RESTRICT,
   initial_due_at TEXT NOT NULL,
   due_at TEXT NOT NULL,
   fsrs_state INTEGER NOT NULL CHECK (fsrs_state BETWEEN 0 AND 3),
@@ -315,53 +305,11 @@ CREATE TABLE IF NOT EXISTS review_cards (
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS card_bindings (
-  binding_id TEXT PRIMARY KEY,
-  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE CASCADE,
-  page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
-  heading TEXT,
-  anchor TEXT NOT NULL,
-  start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
-  end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
-  text_digest TEXT NOT NULL,
-  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
-  active INTEGER NOT NULL CHECK (active IN (0, 1)),
-  UNIQUE (card_id, page_id, anchor, revision)
-);
-
-CREATE TABLE IF NOT EXISTS card_prerequisites (
-  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE CASCADE,
-  prerequisite_card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (card_id, prerequisite_card_id),
-  CHECK (card_id <> prerequisite_card_id)
-);
-
-CREATE TABLE IF NOT EXISTS card_lineage (
-  lineage_id TEXT PRIMARY KEY,
-  event TEXT NOT NULL CHECK (event IN ('split','merge','retire','successor')),
-  parent_card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
-  child_card_id TEXT REFERENCES review_cards(card_id) ON DELETE RESTRICT,
-  occurred_at TEXT NOT NULL,
-  metadata_json TEXT,
-  CHECK ((event = 'retire' AND child_card_id IS NULL) OR (event <> 'retire' AND child_card_id IS NOT NULL)),
-  CHECK (child_card_id IS NULL OR parent_card_id <> child_card_id),
-  UNIQUE (lineage_id, parent_card_id, child_card_id)
-);
-
-CREATE TABLE IF NOT EXISTS raw_reviews (
-  review_id TEXT PRIMARY KEY,
-  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
-  quiz_id TEXT NOT NULL REFERENCES quizzes(quiz_id) ON DELETE RESTRICT,
-  question_id TEXT NOT NULL REFERENCES quiz_questions(question_id) ON DELETE RESTRICT,
-  answer_revision INTEGER NOT NULL CHECK (answer_revision >= 0),
-  rating TEXT NOT NULL CHECK (rating IN ('Again','Hard','Good','Easy')),
-  reviewed_at TEXT NOT NULL,
-  state_before_json TEXT NOT NULL,
-  state_after_json TEXT NOT NULL,
-  settlement_id TEXT NOT NULL,
-  UNIQUE (quiz_id, question_id, card_id, answer_revision),
-  UNIQUE (settlement_id, card_id)
+CREATE TABLE IF NOT EXISTS page_prerequisites (
+  page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
+  prerequisite_page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
+  PRIMARY KEY (page_id, prerequisite_page_id),
+  CHECK (page_id <> prerequisite_page_id)
 );
 
 CREATE TABLE IF NOT EXISTS quizzes (
@@ -384,17 +332,30 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
   prompt TEXT NOT NULL,
   choices_json TEXT,
   answer_key_json TEXT,
-  grading_criteria_json TEXT,
   source_refs_json TEXT NOT NULL,
   UNIQUE (quiz_id, ordinal)
 );
+CREATE TABLE IF NOT EXISTS page_reviews (
+  review_id TEXT PRIMARY KEY,
+  page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
+  quiz_id TEXT NOT NULL REFERENCES quizzes(quiz_id) ON DELETE RESTRICT,
+  submission_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  rating TEXT NOT NULL CHECK (rating IN ('Again','Hard','Good','Easy')),
+  reviewed_at TEXT NOT NULL,
+  state_before_json TEXT NOT NULL,
+  state_after_json TEXT NOT NULL,
+  settlement_id TEXT NOT NULL,
+  UNIQUE (quiz_id, page_id, revision),
+  UNIQUE (settlement_id, page_id)
+);
 
-CREATE TABLE IF NOT EXISTS question_cards (
+CREATE TABLE IF NOT EXISTS question_pages (
   question_id TEXT NOT NULL REFERENCES quiz_questions(question_id) ON DELETE CASCADE,
-  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
+  page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
   criterion_json TEXT NOT NULL,
   weight REAL NOT NULL CHECK (weight > 0),
-  PRIMARY KEY (question_id, card_id)
+  PRIMARY KEY (question_id, page_id)
 );
 
 CREATE TABLE IF NOT EXISTS quiz_answers (
@@ -417,19 +378,21 @@ CREATE TABLE IF NOT EXISTS question_results (
   UNIQUE (quiz_id, question_id, answer_revision)
 );
 
-CREATE TABLE IF NOT EXISTS card_results (
+CREATE TABLE IF NOT EXISTS page_results (
   result_id TEXT PRIMARY KEY,
   quiz_id TEXT NOT NULL REFERENCES quizzes(quiz_id) ON DELETE RESTRICT,
-  question_id TEXT NOT NULL REFERENCES quiz_questions(question_id) ON DELETE RESTRICT,
-  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
+  page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
   rating TEXT NOT NULL CHECK (rating IN ('Again','Hard','Good','Easy')),
-  review_id TEXT NOT NULL REFERENCES raw_reviews(review_id) ON DELETE RESTRICT,
-  UNIQUE (quiz_id, question_id, card_id),
+  feedback TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  readings_json TEXT NOT NULL,
+  review_id TEXT NOT NULL REFERENCES page_reviews(review_id) ON DELETE RESTRICT,
+  UNIQUE (quiz_id, page_id),
   UNIQUE (review_id)
 );
+
 CREATE TABLE IF NOT EXISTS quiz_evidence (
   quiz_id TEXT NOT NULL REFERENCES quizzes(quiz_id) ON DELETE CASCADE,
-  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
   reference TEXT NOT NULL,
   page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
   relative_path TEXT NOT NULL,
@@ -440,8 +403,7 @@ CREATE TABLE IF NOT EXISTS quiz_evidence (
   text_digest TEXT NOT NULL,
   excerpt TEXT NOT NULL,
   excerpt_digest TEXT NOT NULL,
-  PRIMARY KEY (quiz_id, card_id, reference),
-  UNIQUE (quiz_id, reference)
+  PRIMARY KEY (quiz_id, reference)
 );
 
 CREATE TABLE IF NOT EXISTS workflows (

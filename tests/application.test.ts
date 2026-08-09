@@ -1,14 +1,14 @@
 import { strict as assert } from "node:assert";
-import { createHash, randomUUID } from "node:crypto";
-import { promises as fs, mkdtempSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { promises as fs, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application.js";
+import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
-import { parseWikiSections } from "../src/wiki-sections.js";
 
 type DurableApplication = ScholarApplication & {
   durableDirect<T>(operation: () => T | PromiseLike<T>, subject: string): Promise<T>;
@@ -22,7 +22,7 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture() {
+function fixture(options: { readonly maintenance?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
@@ -30,6 +30,7 @@ function fixture() {
   const app = new ScholarApplication({
     paths,
     db,
+    adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
     doctor: () => {
       calls.push("doctor");
       return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
@@ -170,7 +171,7 @@ describe("durable application writes", () => {
       db.close();
     }
   });
-  it("restores a composite issue exactly when commit fails", async () => {
+  it("restores a page issue exactly when commit fails", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
@@ -187,10 +188,11 @@ describe("durable application writes", () => {
       "pages",
       "authored_snapshots",
       "wiki_issues",
-      "review_cards",
-      "card_bindings",
-      "card_lineage",
-      "card_prerequisites",
+      "page_learning",
+      "page_prerequisites",
+      "page_reviews",
+      "question_pages",
+      "page_results",
     ];
     const rows = (name: string) =>
       db
@@ -218,24 +220,6 @@ describe("durable application writes", () => {
           kind: "resolve-issue",
           issueId: issue.issueId,
           page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body: correctedBody },
-          card: {
-            kind: "create-card",
-            cardId: "rollback-card",
-            dueAt: "2030-01-01T00:00:00.000Z",
-            bindings: [
-              {
-                pageId: page.page.pageId,
-                heading: "Section",
-                anchor: "#section",
-                startOffset: 900,
-                endOffset: 901,
-                textDigest: "ignored",
-                pageDigest: "ignored",
-                pageRevision: 99,
-                sectionText: correctedBody,
-              },
-            ],
-          },
           resolution: "Corrected the section.",
         }),
         /injected commit failure/u,
@@ -331,7 +315,7 @@ describe("application quiz date guards", () => {
     }
   });
   it("does not expire prior open quizzes when current publication is rejected", async () => {
-    const { app, db, date, cardId } = gradingFixture();
+    const { app, db, date, pageId } = await gradingFixture();
     const previous = new Date(`${date}T00:00:00.000Z`);
     previous.setUTCDate(previous.getUTCDate() - 1);
     const oldDate = previous.toISOString().slice(0, 10);
@@ -349,8 +333,7 @@ describe("application quiz date guards", () => {
             {
               kind: "short-answer",
               prompt: "Explain",
-              cardIds: [cardId],
-              cards: [{ cardId, criterion: "Explain", weight: 1 }],
+              pages: [{ pageId, criterion: "Explain", weight: 1 }],
               sourceRefs: ["not-authorized"],
             },
           ],
@@ -367,9 +350,44 @@ describe("application quiz date guards", () => {
   });
 });
 
+describe("application quiz publication guards", () => {
+  it("rejects duplicate single-page coverage before persisting a quiz", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const page = await app.wiki.create({
+      path: "publication-page.md",
+      title: "Publication page",
+      body: "# Section\n\nSection text\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    try {
+      const context = await app.getQuizContext({ date });
+      const reference = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(reference);
+      const question = {
+        kind: "short-answer" as const,
+        prompt: "Explain the section",
+        pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
+        sourceRefs: [reference],
+      };
+      await assert.rejects(
+        app.publishQuiz({ status: "published", date, questions: [question, question] }),
+        /exactly one single-page question/u,
+      );
+      assert.equal(app.quiz.get(date), undefined);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
 describe("browser quiz drafts", () => {
   it("saves through the browser queue without checkpointing or committing", async () => {
-    const { app, db, calls, date, questionId, quiz } = gradingFixture();
+    const { app, db, calls, date, questionId, quiz } = await gradingFixture();
     try {
       calls.length = 0;
       const saved = await app.saveAnswers(
@@ -388,84 +406,70 @@ describe("browser quiz drafts", () => {
     }
   });
 });
-function gradingFixture() {
+async function gradingFixture() {
   const fixtureValue = fixture();
-  const { app, db } = fixtureValue;
+  const { app } = fixtureValue;
   const date = localDate(new Date());
-  const now = new Date().toISOString();
-  const pageContent = `---\nid: "page-1"\ntitle: "Page 1"\ntype: note\ncreated: "${now}"\nupdated: "${now}"\nquiz-worthiness: "eligible"\n---\n# Section\n\nSection text\n`;
-  writeFileSync(join(fixtureValue.app.paths.wikiRoot, "page-1.md"), pageContent);
-  const pageDigest = createHash("sha256").update(pageContent).digest("hex");
-  const section = parseWikiSections(pageContent, "page-1").find((candidate) => candidate.anchor === "#section");
-  if (!section) throw new Error("grading fixture section missing");
-  const sectionText = pageContent.slice(section.startOffset, section.endOffset);
-  const boundText = "Section text";
-  const startOffset = sectionText.indexOf(boundText);
-  if (startOffset < 0) throw new Error("grading fixture bytes missing");
-  const endOffset = startOffset + boundText.length;
-  db.run(
-    "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
-    ["page-1", "page-1.md", "Page 1", pageDigest, now, now],
-  );
-  const cardId = "card-1";
-  app.scheduler.createCard({
-    cardId,
-    initialDueAt: `${date}T00:00:00.000Z`,
-    bindings: [
-      {
-        pageId: "page-1",
-        heading: section.heading,
-        anchor: section.anchor,
-        startOffset,
-        endOffset,
-        textDigest: createHash("sha256").update(boundText).digest("hex"),
-        pageDigest,
-        pageRevision: 1,
-        sectionText,
-      },
-    ],
+  const page = await app.wiki.create({
+    path: "page-1.md",
+    title: "Page 1",
+    body: "# Section\n\nSection text\n",
+    quizWorthiness: "eligible",
   });
-  const questionId = "question-1";
+  const pageId = page.page.pageId;
+  app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
   const quiz = app.quiz.createDailyQuiz({
     date,
-    questions: [
+    selectedPageIds: [pageId],
+    questionSpecs: [
       {
-        questionId,
         kind: "short-answer",
         prompt: "Explain the section",
-        cardIds: [cardId],
-        cards: [{ cardId, criterion: "Explain the section", weight: 1 }],
+        pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
         sourceRefs: [],
       },
     ],
   });
+  const questionId = quiz.questions[0]?.questionId;
+  if (!questionId) throw new Error("grading fixture question missing");
   const draft = app.quiz.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
-  return { ...fixtureValue, date, cardId, questionId, quiz: app.quiz.get(date)!, draft };
+  return { ...fixtureValue, date, pageId, questionId, quiz: app.quiz.get(date)!, draft };
+}
+async function prerequisiteFixture() {
+  const fixtureValue = fixture({ maintenance: true });
+  const { app } = fixtureValue;
+  const dependent = await app.wiki.create({
+    path: "dependent.md",
+    title: "Dependent",
+    body: "# Section\n\ndependent\n",
+    quizWorthiness: "eligible",
+  });
+  const prerequisite = await app.wiki.create({
+    path: "prerequisite.md",
+    title: "Prerequisite",
+    body: "# Section\n\nprerequisite\n",
+    quizWorthiness: "eligible",
+  });
+  app.scheduler.ensurePageLearning(dependent.page.pageId);
+  app.scheduler.ensurePageLearning(prerequisite.page.pageId);
+  app.scheduler.setPrerequisites(dependent.page.pageId, [prerequisite.page.pageId]);
+  return { ...fixtureValue, dependent: dependent.page, prerequisite: prerequisite.page };
 }
 
-function gradeFor(
-  context: Awaited<ReturnType<ScholarApplication["getGradingContext"]>>,
-  cardId: string,
-  questionId: string,
-  evidence: readonly string[],
-) {
+function gradeFor(context: GradingContext, pageId: string, questionId: string, evidence: readonly string[]) {
   assert.ok(context.quiz);
   return {
     requestId: context.requestId!,
     date: context.date,
     revision: context.revision!,
     submissionId: context.submissionId!,
-    questions: [
+    questions: [{ questionId, feedback: "Explained the page." }],
+    pages: [
       {
-        questionId,
-        cards: [
-          {
-            cardId,
-            rating: "Good" as const,
-            evidence: [...evidence],
-            readings: [{ pageId: "page-1", anchor: "#section" }],
-          },
-        ],
+        pageId,
+        rating: "Good" as const,
+        evidence: [...evidence],
+        readings: [{ pageId, anchor: "#section" }],
       },
     ],
   };
@@ -473,7 +477,7 @@ function gradeFor(
 
 describe("quiz grading workflow lifecycle", () => {
   it("atomically queues, claims, validates ownership, and settles one sealed submission", async () => {
-    const { app, db, date, cardId, questionId, draft } = gradingFixture();
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const owner = randomUUID();
     const staleRequestId = randomUUID();
     db.run(
@@ -489,22 +493,24 @@ describe("quiz grading workflow lifecycle", () => {
       assert.equal(context.submissionId, `${sealed.quiz.quizId}:r${sealed.quiz.revision}`);
       assert.equal((await app.getWorkflow(context.requestId!)).status, "running");
       assert.equal((await app.getWorkflow(staleRequestId)).status, "queued");
-      const evidence = context.evidence?.find((item) => item.cardId === cardId)?.reference;
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
       await assert.rejects(
-        app.settleGrade({ ...gradeFor(context, cardId, questionId, [evidence]), requestId: "wrong-request" }, owner),
+        app.settleGrade({ ...gradeFor(context, pageId, questionId, [evidence]), requestId: "wrong-request" }, owner),
         /unknown/u,
       );
       assert.equal((await app.getWorkflow(context.requestId!)).status, "running");
-      const grade = gradeFor(context, cardId, questionId, [evidence]);
+      const grade = gradeFor(context, pageId, questionId, [evidence]);
       const settled = await app.settleGrade(grade, owner);
       assert.equal(settled.quiz.status, "submitted");
       assert.equal((await app.getWorkflow(context.requestId!)).status, "succeeded");
-      assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
       const replay = await app.settleGrade(grade, owner);
       assert.equal(replay.quiz.quizId, settled.quiz.quizId);
       await assert.rejects(app.settleGrade({ ...grade, questions: [] }, owner), /replay|committed result/u);
-      assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 1);
     } finally {
       await app.close();
       db.close();
@@ -512,7 +518,7 @@ describe("quiz grading workflow lifecycle", () => {
   });
 
   it("keeps running grading claims exclusive while allowing the same owner to retry", async () => {
-    const { app, db, date, cardId, questionId, draft } = gradingFixture();
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const ownerA = randomUUID();
     const ownerB = randomUUID();
     try {
@@ -524,10 +530,10 @@ describe("quiz grading workflow lifecycle", () => {
       const retry = await app.getGradingContext({ date }, ownerA);
       assert.equal(retry.requestId, first.requestId);
       assert.equal(retry.submissionId, first.submissionId);
-      const evidence = retry.evidence?.find((item) => item.cardId === cardId)?.reference;
+      const evidence = retry.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
-      await assert.rejects(app.settleGrade(gradeFor(retry, cardId, questionId, [evidence]), ownerB), /another grader/u);
-      await app.settleGrade(gradeFor(retry, cardId, questionId, [evidence]), ownerA);
+      await assert.rejects(app.settleGrade(gradeFor(retry, pageId, questionId, [evidence]), ownerB), /another grader/u);
+      await app.settleGrade(gradeFor(retry, pageId, questionId, [evidence]), ownerA);
       assert.equal((await app.getWorkflow(first.requestId!)).status, "succeeded");
     } finally {
       await app.close();
@@ -536,22 +542,23 @@ describe("quiz grading workflow lifecycle", () => {
   });
 
   it("fails an invalid owned request and creates a new retry request for the sealed quiz", async () => {
-    const { app, db, date, cardId, questionId, draft } = gradingFixture();
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const firstOwner = randomUUID();
     const retryOwner = randomUUID();
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
       const first = await app.getGradingContext({ date }, firstOwner);
       const firstWorkflow = first.requestId!;
-      await assert.rejects(app.settleGrade(gradeFor(first, cardId, questionId, ["not-authorized"]), firstOwner));
+      await assert.rejects(app.settleGrade(gradeFor(first, pageId, questionId, ["not-authorized"]), firstOwner));
       assert.equal((await app.getWorkflow(firstWorkflow)).status, "failed");
-      assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       const retry = await app.getGradingContext({ date }, retryOwner);
       assert.notEqual(retry.requestId, firstWorkflow);
       assert.equal(retry.submissionId, first.submissionId);
-      const evidence = retry.evidence?.find((item) => item.cardId === cardId)?.reference;
+      const evidence = retry.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
-      await app.settleGrade(gradeFor(retry, cardId, questionId, [evidence]), retryOwner);
+      await app.settleGrade(gradeFor(retry, pageId, questionId, [evidence]), retryOwner);
       assert.equal((await app.getWorkflow(retry.requestId!)).status, "succeeded");
     } finally {
       await app.close();
@@ -559,7 +566,7 @@ describe("quiz grading workflow lifecycle", () => {
     }
   });
   it("hides private quiz-grader messages from public workflow reads", async () => {
-    const { app, db, date, draft } = gradingFixture();
+    const { app, db, date, draft } = await gradingFixture();
     const owner = randomUUID();
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
@@ -585,6 +592,185 @@ describe("quiz grading workflow lifecycle", () => {
         requestId,
       ])?.message;
       assert.match(runningMessage ?? "", /ownerHash/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("application wiki mutation quiz guards", () => {
+  it("blocks an update covered by an open quiz without changing the page", async () => {
+    const { app, db, pageId } = await gradingFixture();
+    try {
+      const before = await app.wiki.get(pageId);
+      await assert.rejects(app.updateNote(pageId, { body: "# Section\n\nchanged\n" }), /unresolved quiz/u);
+      const after = await app.wiki.get(pageId);
+      assert.equal(after.content, before.content);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("blocks an update covered by a submitted but unsettled quiz without changing the page", async () => {
+    const { app, db, date, pageId, draft } = await gradingFixture();
+    try {
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      assert.equal(sealed.quiz.status, "submitted");
+      assert.equal(db.all("SELECT 1 FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      const before = await app.wiki.get(pageId);
+      await assert.rejects(app.updateNote(pageId, { body: "# Section\n\nchanged\n" }), /unresolved quiz/u);
+      const after = await app.wiki.get(pageId);
+      assert.equal(after.content, before.content);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("allows an update after the covered quiz is settled", async () => {
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
+    const owner = randomUUID();
+    try {
+      await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const context = await app.getGradingContext({ date }, owner);
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(evidence);
+      await app.settleGrade(gradeFor(context, pageId, questionId, [evidence]), owner);
+      const before = await app.wiki.get(pageId);
+      const updated = await app.updateNote(pageId, { body: "# Section\n\nchanged\n" });
+      assert.notEqual(updated.page.digest, before.digest);
+      assert.equal(updated.page.revision, before.revision + 1);
+      assert.match(updated.markdown, /changed/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("application prerequisite mutation guards", () => {
+  it("rejects making a dependent page ineligible without mutating the page or edge", async () => {
+    const { app, db, dependent } = await prerequisiteFixture();
+    try {
+      const before = await app.wiki.get(dependent.pageId);
+      const beforePrerequisites = db.all<Record<string, unknown>>(
+        "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(app.updateNote(dependent.pageId, { quizWorthiness: "skip" }), /prerequisites/u);
+      const after = await app.wiki.get(dependent.pageId);
+      assert.equal(after.quizWorthiness, before.quizWorthiness);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+        ),
+        beforePrerequisites,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects making a prerequisite page unknown through maintenance without mutating the page or edge", async () => {
+    const { app, db, prerequisite } = await prerequisiteFixture();
+    try {
+      const before = await app.wiki.get(prerequisite.pageId);
+      const beforePrerequisites = db.all<Record<string, unknown>>(
+        "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(
+        app.applyMaintenance({
+          kind: "update-page",
+          pageId: prerequisite.pageId,
+          expectedDigest: before.digest,
+          body: "# Section\n\nchanged\n",
+          quizWorthiness: "unknown",
+        }),
+        /prerequisites/u,
+      );
+      const after = await app.wiki.get(prerequisite.pageId);
+      assert.equal(after.quizWorthiness, before.quizWorthiness);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+        ),
+        beforePrerequisites,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects ineligible resolve-issue corrections before preparing the page update", async () => {
+    const { app, db, dependent } = await prerequisiteFixture();
+    try {
+      const issue = await app.wiki.report({
+        pageId: dependent.pageId,
+        heading: "Section",
+        description: "Correct the section.",
+      });
+      const before = await app.wiki.get(dependent.pageId);
+      const beforePrerequisites = db.all<Record<string, unknown>>(
+        "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(
+        app.applyMaintenance({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: dependent.pageId,
+            expectedDigest: before.digest,
+            body: "# Section\n\ncorrected\n",
+            quizWorthiness: "skip",
+          },
+          resolution: "Corrected the section.",
+        }),
+        /prerequisites/u,
+      );
+      const after = await app.wiki.get(dependent.pageId);
+      assert.equal(after.quizWorthiness, before.quizWorthiness);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+        ),
+        beforePrerequisites,
+      );
+      assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, "open");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("does not over-block body-only or eligible updates on prerequisite pages", async () => {
+    const { app, db, prerequisite } = await prerequisiteFixture();
+    try {
+      const first = await app.wiki.get(prerequisite.pageId);
+      const bodyOnly = await app.updateNote(prerequisite.pageId, {
+        body: "# Section\n\nbody-only\n",
+      });
+      assert.equal(bodyOnly.page.quizWorthiness, first.quizWorthiness);
+      assert.equal(bodyOnly.page.revision, first.revision + 1);
+      const eligible = await app.updateNote(prerequisite.pageId, {
+        body: "# Section\n\neligible\n",
+        quizWorthiness: "eligible",
+      });
+      assert.equal(eligible.page.quizWorthiness, "eligible");
+      assert.equal(eligible.page.revision, bodyOnly.page.revision + 1);
+      assert.equal(db.all("SELECT page_id, prerequisite_page_id FROM page_prerequisites").length, 1);
     } finally {
       await app.close();
       db.close();

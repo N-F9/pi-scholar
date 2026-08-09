@@ -6,6 +6,8 @@
 
 Pi Scholar is a local-first Markdown wiki and daily review application for Pi. The vault, SQLite state, source originals, quiz artifacts, and Git history stay on the machine; the HTTP server is only a loopback boundary.
 
+Learning is page-level: each eligible wiki page has one FSRS schedule and remains addressable by its stable page ID across renames. A retained page prerequisite DAG blocks a due page until every prerequisite is in FSRS `Review`; drifted or retired pages are excluded without losing history. The daily quiz selects due pages and generates ephemeral questions (at most four, at most two synthesis questions), with every selected page covered by one single-page question and direct page evidence. The host mints opaque question UUIDs; visible Markdown headings are numeric and the only quiz comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`. Grading preserves question feedback but applies exactly one bundled FSRS rating and page result per covered page.
+
 ## Install and initialize
 
 Requirements:

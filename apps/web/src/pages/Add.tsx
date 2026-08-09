@@ -310,18 +310,12 @@ export function AddPage() {
                   <h4 className="font-serif text-xl font-semibold">Removal impact</h4>
                   <p className="mt-2 text-sm text-muted">
                     This updates {preview.dependentPageIds.length} dependent{" "}
-                    {preview.dependentPageIds.length === 1 ? "page" : "pages"} and {preview.dependentCardIds.length}{" "}
-                    {preview.dependentCardIds.length === 1 ? "card" : "cards"}. Ordinary removal does not erase bytes
+                    {preview.dependentPageIds.length === 1 ? "page" : "pages"}. Ordinary removal does not erase bytes
                     from existing Git history.
                   </p>
                   {preview.dependentPageIds.length ? (
                     <p className="mt-3 break-words font-mono text-xs text-muted">
                       Pages: {preview.dependentPageIds.join(", ")}
-                    </p>
-                  ) : null}
-                  {preview.dependentCardIds.length ? (
-                    <p className="mt-2 break-words font-mono text-xs text-muted">
-                      Cards: {preview.dependentCardIds.join(", ")}
                     </p>
                   ) : null}
                   {remove.isError ? (

@@ -764,42 +764,53 @@ function checkScheduler(paths: VaultPaths): DoctorCheck {
   let db: ScholarDatabase | undefined;
   try {
     db = openDatabase(paths, { readOnly: true, initializeSchema: false });
-    const cards = new Set(db.all<{ card_id: string }>("SELECT card_id FROM review_cards").map((row) => row.card_id));
-    const graph = new Map<string, string[]>();
-    for (const row of db.all<{ card_id: string; prerequisite_card_id: string }>(
-      "SELECT card_id, prerequisite_card_id FROM card_prerequisites",
-    )) {
-      if (!cards.has(row.card_id) || !cards.has(row.prerequisite_card_id))
-        return check("scheduler", "fail", "Card prerequisite references a missing card");
-      graph.set(row.card_id, [...(graph.get(row.card_id) ?? []), row.prerequisite_card_id]);
-    }
-    const visiting = new Set<string>();
-    const visited = new Set<string>();
-    const visit = (cardId: string): boolean => {
-      if (visiting.has(cardId)) return false;
-      if (visited.has(cardId)) return true;
-      visiting.add(cardId);
-      for (const prerequisite of graph.get(cardId) ?? []) if (!visit(prerequisite)) return false;
-      visiting.delete(cardId);
-      visited.add(cardId);
-      return true;
-    };
-    for (const cardId of cards)
-      if (!visit(cardId)) return check("scheduler", "fail", "Card prerequisite graph contains a cycle");
-    const coverage = new SchedulerService(db, paths).validateCoverage();
-    if (!coverage.ok)
+    const pages = db.all<{ page_id: string; status: string; quiz_worthiness: string }>(
+      "SELECT page_id, status, quiz_worthiness FROM pages",
+    );
+    const pageIds = new Set(pages.map((page) => page.page_id));
+    const learningIds = new Set(
+      db.all<{ page_id: string }>("SELECT page_id FROM page_learning").map((row) => row.page_id),
+    );
+    const missingPageIds = pages
+      .filter(
+        (page) => page.status === "active" && page.quiz_worthiness === "eligible" && !learningIds.has(page.page_id),
+      )
+      .map((page) => page.page_id)
+      .sort();
+    if (missingPageIds.length)
       return check(
         "scheduler",
         "fail",
-        `Eligible wiki pages have no active card bindings: ${coverage.missingPageIds.join(", ")}`,
+        `Eligible wiki pages have no page learning record: ${missingPageIds.join(", ")}`,
       );
+    const graph = new Map<string, string[]>();
+    for (const row of db.all<{ page_id: string; prerequisite_page_id: string }>(
+      "SELECT page_id, prerequisite_page_id FROM page_prerequisites",
+    )) {
+      if (!pageIds.has(row.page_id) || !pageIds.has(row.prerequisite_page_id))
+        return check("scheduler", "fail", "Page prerequisite references a missing page");
+      graph.set(row.page_id, [...(graph.get(row.page_id) ?? []), row.prerequisite_page_id]);
+    }
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const visit = (pageId: string): boolean => {
+      if (visiting.has(pageId)) return false;
+      if (visited.has(pageId)) return true;
+      visiting.add(pageId);
+      for (const prerequisite of graph.get(pageId) ?? []) if (!visit(prerequisite)) return false;
+      visiting.delete(pageId);
+      visited.add(pageId);
+      return true;
+    };
+    for (const pageId of pageIds)
+      if (!visit(pageId)) return check("scheduler", "fail", "Page prerequisite graph contains a cycle");
     return check(
       "scheduler",
       "pass",
-      `${cards.size} review card(s) have valid prerequisite relationships and wiki coverage`,
+      `${learningIds.size} page learning record(s) have valid prerequisite relationships and wiki coverage`,
     );
   } catch (error) {
-    return check("scheduler", "fail", `Cannot inspect scheduler relationships: ${errorMessage(error)}`);
+    return check("scheduler", "fail", `Cannot inspect page learning relationships: ${errorMessage(error)}`);
   } finally {
     db?.close();
   }
@@ -839,14 +850,16 @@ function checkQuizzes(paths: VaultPaths): DoctorCheck {
     }
     if (/answer\s*key|correct\s+answer|grading\s+criteria|\brubric\b/iu.test(markdown))
       return check("quiz-projections", "fail", `Quiz projection contains private grading material: ${relativePath}`);
-    const header = new RegExp(`^# Pi Scholar Quiz — ${date}\\s*$`, "mu").test(markdown);
-    const identity = /<!--\s*pi-scholar quiz-id=([^\s]+) revision=(\d+)\s*-->/mu.exec(markdown);
+    const header = new RegExp(`^# \\d+\\. Pi Scholar Quiz — ${date}\\s*$`, "mu").test(markdown);
+    const identity = /<!--\s*pi-scholar:quiz format=1 id=([^\s]+) revision=(\d+)\s*-->/mu.exec(markdown);
     if (!header || !identity)
       return check("quiz-projections", "fail", `Quiz projection identity is invalid: ${relativePath}`);
     projections.set(date, {
       quizId: identity[1]!,
       revision: Number(identity[2]),
-      questionIds: [...markdown.matchAll(/^## \d+\. ([^\n]+)$/gmu)].map((question) => question[1]!),
+      questionIds: [...markdown.matchAll(/<!--\s*pi-scholar:question id=([^\s]+)\s*-->/gmu)].map(
+        (question) => question[1]!,
+      ),
       absolutePath,
       markdown,
     });

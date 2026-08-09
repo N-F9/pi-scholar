@@ -281,12 +281,76 @@ describe("vault foundation", () => {
     }
   });
 
-  it("creates the complete schema and rolls back transactions", () => {
+  it("creates schema v3 page learning tables and rolls back transactions", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
-    assert.ok(db.tableNames().includes("review_cards"));
-    assert.ok(db.tableNames().includes("question_results"));
+    const tables = db.tableNames();
+    for (const table of [
+      "schema_meta",
+      "pages",
+      "page_learning",
+      "page_prerequisites",
+      "page_reviews",
+      "quizzes",
+      "quiz_questions",
+      "question_pages",
+      "quiz_answers",
+      "question_results",
+      "page_results",
+      "quiz_evidence",
+    ])
+      assert.equal(tables.includes(table), true, `missing schema v3 table ${table}`);
+    for (const table of [
+      "review_cards",
+      "card_bindings",
+      "card_prerequisites",
+      "card_lineage",
+      "question_cards",
+      "card_results",
+      "raw_reviews",
+    ])
+      assert.equal(tables.includes(table), false, `removed schema table ${table} is still present`);
+    assert.equal(
+      db.get<{ schema_version: number }>("SELECT MAX(schema_version) AS schema_version FROM schema_meta")
+        ?.schema_version,
+      3,
+    );
+    const pagePrerequisitesSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'page_prerequisites'",
+    )?.sql;
+    const pageReviewsSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'page_reviews'",
+    )?.sql;
+    const questionPagesSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'question_pages'",
+    )?.sql;
+    const pageResultsSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'page_results'",
+    )?.sql;
+    const quizEvidenceSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'quiz_evidence'",
+    )?.sql;
+    assert.match(pagePrerequisitesSql ?? "", /PRIMARY KEY\s*\(\s*page_id\s*,\s*prerequisite_page_id\s*\)/iu);
+    assert.match(pagePrerequisitesSql ?? "", /CHECK\s*\(\s*page_id\s*<>\s*prerequisite_page_id\s*\)/iu);
+    assert.match(pageReviewsSql ?? "", /UNIQUE\s*\([^)]*quiz_id[^)]*page_id/iu);
+    assert.match(questionPagesSql ?? "", /criterion_json\s+TEXT\s+NOT\s+NULL/iu);
+    assert.match(questionPagesSql ?? "", /weight\s+REAL\s+NOT\s+NULL/iu);
+    assert.match(pageResultsSql ?? "", /UNIQUE\s*\([^)]*quiz_id[^)]*page_id/iu);
+    assert.match(quizEvidenceSql ?? "", /PRIMARY KEY\s*\(\s*quiz_id\s*,\s*reference\s*\)/iu);
+    assert.equal(/\bcard_id\b/iu.test(quizEvidenceSql ?? ""), false);
+    const issueColumns = db.all<{ name: string }>("PRAGMA table_info(wiki_issues)").map((column) => column.name);
+    assert.equal(issueColumns.includes("card_id"), false);
+    assert.equal(
+      db.all<{ table: string }>("PRAGMA foreign_key_list(page_prerequisites)").some((key) => key.table === "pages"),
+      true,
+    );
+    assert.equal(
+      db
+        .all<{ table: string }>("PRAGMA foreign_key_list(question_pages)")
+        .some((key) => key.table === "quiz_questions"),
+      true,
+    );
     assert.throws(() =>
       transaction(db, () => {
         db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
@@ -336,32 +400,29 @@ describe("vault foundation", () => {
     const date = new Date().toISOString().slice(0, 10);
     const now = new Date().toISOString();
     const sheetPath = join(paths.quizzesRoot, date.slice(0, 4), date.slice(5, 7), `${date}.md`);
+    const pageId = "doctor-page";
+    const questionId = randomUUID();
     db.run(
-      "INSERT INTO review_cards (card_id, status, prompt, initial_due_at, due_at, fsrs_state, stability, difficulty, reps, lapses, scheduled_days, last_review_at, revision, created_at, updated_at) VALUES (?, 'active', NULL, ?, ?, 0, 0, 0, 0, 0, 0, NULL, 1, ?, ?)",
-      ["doctor-card", now, now, now, now],
+      "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
+      [pageId, "doctor.md", "Doctor page", "doctor-digest", now, now],
     );
     db.run(
       "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', ?, ?, NULL, NULL, NULL)",
       ["doctor-quiz", date, sheetPath, now],
     );
     db.run(
-      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, grading_criteria_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, ?, '[]')",
-      [
-        "doctor-question",
-        "doctor-quiz",
-        "Explain the card",
-        JSON.stringify([{ cardId: "doctor-card", criterion: "Explain", weight: 1 }]),
-      ],
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, '[]')",
+      [questionId, "doctor-quiz", "Explain the page"],
     );
-    db.run("INSERT INTO question_cards (question_id, card_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
-      "doctor-question",
-      "doctor-card",
-      JSON.stringify("Explain"),
+    db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
+      questionId,
+      pageId,
+      JSON.stringify("Explain the page"),
       1,
     ]);
     db.run("INSERT INTO quiz_answers (quiz_id, question_id, revision, answer_json, saved_at) VALUES (?, ?, 1, ?, ?)", [
       "doctor-quiz",
-      "doctor-question",
+      questionId,
       JSON.stringify("expected"),
       now,
     ]);
@@ -374,18 +435,17 @@ describe("vault foundation", () => {
         status: "open",
         questions: [
           {
-            questionId: "doctor-question",
+            questionId,
             quizId: "doctor-quiz",
             ordinal: 0,
             kind: "short-answer",
-            prompt: "Explain the card",
-            cardIds: ["doctor-card"],
-            cards: [{ cardId: "doctor-card", criterion: "Explain", weight: 1 }],
+            prompt: "Explain the page",
+            pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
             sourceRefs: [],
           },
         ],
       },
-      { "doctor-question": "expected" },
+      { [questionId]: "expected" },
     );
     mkdirSync(join(sheetPath, ".."), { recursive: true });
     writeFileSync(sheetPath, sheet.replace("expected", "tampered"), "utf8");
@@ -402,27 +462,24 @@ describe("vault foundation", () => {
     const date = new Date().toISOString().slice(0, 10);
     const now = new Date().toISOString();
     const sheetPath = join(paths.quizzesRoot, date.slice(0, 4), date.slice(5, 7), `${date}.md`);
+    const pageId = "expired-page";
+    const questionId = randomUUID();
     db.run(
-      "INSERT INTO review_cards (card_id, status, prompt, initial_due_at, due_at, fsrs_state, stability, difficulty, reps, lapses, scheduled_days, last_review_at, revision, created_at, updated_at) VALUES (?, 'active', NULL, ?, ?, 0, 0, 0, 0, 0, 0, NULL, 1, ?, ?)",
-      ["expired-card", now, now, now, now],
+      "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
+      [pageId, "expired.md", "Expired page", "expired-digest", now, now],
     );
     db.run(
       "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'expired', ?, ?, NULL, NULL, NULL)",
       ["expired-quiz", date, sheetPath, now],
     );
     db.run(
-      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, grading_criteria_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, ?, '[]')",
-      [
-        "expired-question",
-        "expired-quiz",
-        "Explain the card",
-        JSON.stringify([{ cardId: "expired-card", criterion: "Explain", weight: 1 }]),
-      ],
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, '[]')",
+      [questionId, "expired-quiz", "Explain the page"],
     );
-    db.run("INSERT INTO question_cards (question_id, card_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
-      "expired-question",
-      "expired-card",
-      JSON.stringify("Explain"),
+    db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
+      questionId,
+      pageId,
+      JSON.stringify("Explain the page"),
       1,
     ]);
     const quizService = new QuizService(db, paths);

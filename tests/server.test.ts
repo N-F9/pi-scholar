@@ -49,8 +49,7 @@ function publicQuizFixture(): QuizRecord {
         ordinal: 1,
         kind: "short-answer",
         prompt: "Explain the idea.",
-        cardIds: ["card-1"],
-        cards: [{ cardId: "card-1", criterion: "secret rubric", weight: 9 }],
+        pages: [{ pageId: "page-1", criterion: "secret rubric", weight: 9 }],
         sourceRefs: ["private-source"],
         answerKey: "secret answer",
       } as QuizRecord["questions"][number],
@@ -248,7 +247,6 @@ describe("server browser boundary", () => {
         return {
           source: { sourceId: value },
           dependentPageIds: [],
-          dependentCardIds: [],
           confirmationId: "confirmation",
         };
       },
@@ -333,14 +331,13 @@ describe("server browser boundary", () => {
         const quiz = envelope.data.quizzes?.[0] ?? envelope.data.quiz;
         assert.equal("sheetPath" in quiz!, false);
         assert.equal(questions.length, 1);
-        assert.equal("cards" in questions[0]!, false);
+        assert.equal("pages" in questions[0]!, false);
         assert.equal("criterion" in questions[0]!, false);
         assert.equal("weight" in questions[0]!, false);
         assert.equal("answerKey" in questions[0]!, false);
-        assert.equal("cardIds" in questions[0]!, false);
         assert.equal("sourceRefs" in questions[0]!, false);
       }
-      assert.equal(internal.questions[0]!.cards[0]!.criterion, "secret rubric");
+      assert.equal(internal.questions[0]!.pages[0]!.criterion, "secret rubric");
     });
   });
 });

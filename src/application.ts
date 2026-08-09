@@ -7,37 +7,33 @@ import type {
   AdmissionPublicationInput,
   AdmissionPublicationResult,
   ApiEnvelope,
-  CardBindingRecord,
-  CardLineageRecord,
-  CardPrerequisiteRecord,
   DoctorReport,
   GradeSettlementInput,
   GradingContext,
   GradingResult,
   HealthResult,
-  MaintenanceBindingInput,
   MaintenanceContext,
   MaintenanceInput,
-  MaintenanceIssueCardInput,
   MaintenanceIssuePageInput,
   MaintenanceResult,
+  PageLearningRecord,
   PageRecord,
   PreparedAdmission,
   PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
   QuizAnswerInput,
-  QuizCardResultRecord,
   QuizContext,
   QuizDetailRecord,
   QuizEvidenceRecord,
   QuizGradeRecord,
+  QuizPageResultRecord,
   QuizPublicationInput,
   QuizQuestionProposal,
   QuizQuestionResultRecord,
   QuizReadingRecord,
   QuizRecord,
-  ReviewCardRecord,
+  ReviewRating,
   SettingsFacts,
   SettingsRecord,
   SettingsUpdateRequest,
@@ -58,7 +54,7 @@ import { doctor as runDoctor } from "./doctor.js";
 import { convertWithDocling } from "./external/docling.js";
 import { type GitCheckpointResult, type GitPushResult, localCheckpointCommit, safePush } from "./external/git.js";
 import { qmdSearch, runQmd } from "./external/qmd.js";
-import { evidenceReference, QuizConflictError, QuizService } from "./quiz.js";
+import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "./quiz.js";
 import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "./scheduler.js";
 import {
   type SourceStageRequest as MechanicsSourceStageRequest,
@@ -67,7 +63,7 @@ import {
   SourceService,
 } from "./sources.js";
 import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths, withWriterLock } from "./vault.js";
-import { parseWikiMarkdown, type WikiAdapters, type WikiPage, type WikiPreparedUpdate, WikiService } from "./wiki.js";
+import { parseWikiMarkdown, type WikiAdapters, type WikiPage, WikiService } from "./wiki.js";
 import { parseWikiSections } from "./wiki-sections.js";
 import {
   BrowserMutationWorker,
@@ -132,12 +128,10 @@ type DurableRollback<T> = {
 };
 const MAINTENANCE_ROLLBACK_TABLES = [
   { name: "pages", keys: ["page_id"] },
+  { name: "page_learning", keys: ["page_id"] },
+  { name: "page_prerequisites", keys: ["page_id", "prerequisite_page_id"] },
   { name: "authored_snapshots", keys: ["relative_path"] },
   { name: "wiki_issues", keys: ["issue_id"] },
-  { name: "review_cards", keys: ["card_id"] },
-  { name: "card_bindings", keys: ["binding_id"] },
-  { name: "card_lineage", keys: ["lineage_id"] },
-  { name: "card_prerequisites", keys: ["card_id", "prerequisite_card_id"] },
 ] as const;
 interface MaintenanceRollbackFile {
   readonly destination: string;
@@ -188,9 +182,9 @@ interface ReplayReading {
   readonly anchor: string;
   readonly heading?: string;
 }
-interface ReplayCard {
-  readonly cardId: string;
-  readonly rating: string;
+interface ReplayPage {
+  readonly pageId: string;
+  readonly rating: ReviewRating | string;
   readonly feedback?: string;
   readonly evidence?: readonly string[];
   readonly readings?: readonly ReplayReading[];
@@ -198,8 +192,6 @@ interface ReplayCard {
 interface ReplayQuestion {
   readonly questionId: string;
   readonly feedback?: string;
-  readonly cards: readonly ReplayCard[];
-  readonly readings?: readonly ReplayReading[];
 }
 function replayReadings(values: readonly ReplayReading[]): ReplayReading[] {
   const seen = new Set<string>();
@@ -212,30 +204,27 @@ function replayReadings(values: readonly ReplayReading[]): ReplayReading[] {
     })
     .sort((left, right) => `${left.pageId}#${left.anchor}`.localeCompare(`${right.pageId}#${right.anchor}`));
 }
-function gradingReplayKey(questions: readonly ReplayQuestion[]): string {
-  return JSON.stringify(
-    questions
-      .map((question) => {
-        const feedback = (question.feedback ?? "").trim();
-        const questionReadings = replayReadings(question.readings ?? []);
-        const cards = question.cards
-          .map((card) => ({
-            cardId: card.cardId,
-            rating: card.rating,
-            feedback: (card.feedback ?? "").trim() || feedback,
-            evidence: (card.evidence ?? []).map((item) => item.trim()).filter(Boolean),
-            readings: replayReadings([...(card.readings ?? []), ...questionReadings]),
-          }))
-          .sort((left, right) => left.cardId.localeCompare(right.cardId));
-        return {
-          questionId: question.questionId,
-          feedback,
-          readings: replayReadings(cards.flatMap((card) => card.readings)),
-          cards,
-        };
-      })
+function gradingReplayKey(questions: readonly ReplayQuestion[], pages: readonly ReplayPage[]): string {
+  return JSON.stringify({
+    questions: questions
+      .map((question) => ({
+        questionId: question.questionId,
+        feedback: (question.feedback ?? "").trim(),
+      }))
       .sort((left, right) => left.questionId.localeCompare(right.questionId)),
-  );
+    pages: pages
+      .map((page) => ({
+        pageId: page.pageId,
+        rating: page.rating,
+        feedback: (page.feedback ?? "").trim(),
+        evidence: (page.evidence ?? [])
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .sort(),
+        readings: replayReadings(page.readings ?? []),
+      }))
+      .sort((left, right) => left.pageId.localeCompare(right.pageId)),
+  });
 }
 function mutationFinalizationError(stage: "checkpoint" | "doctor" | "commit" | "rollback", cause: unknown): Error {
   return Object.assign(new Error(`mutation applied but ${stage} failed: ${errorMessage(cause)}`), {
@@ -420,7 +409,6 @@ function recordToIssue(row: Record<string, unknown>): WikiIssueRecord {
     issueId: String(row.issue_id),
     ...(row.page_id ? { pageId: String(row.page_id) } : {}),
     ...(row.heading ? { heading: String(row.heading) } : {}),
-    ...(row.card_id ? { cardId: String(row.card_id) } : {}),
     ...(row.page_digest ? { pageDigest: String(row.page_digest) } : {}),
     kind: String(row.kind) as WikiIssueRecord["kind"],
     description: String(row.description),
@@ -446,7 +434,7 @@ function publicQuiz(quiz: QuizRecord): PublicQuizRecord {
   return {
     ...withoutSheetPath,
     questions: quiz.questions.map(
-      ({ cards: _cards, cardIds: _cardIds, sourceRefs: _sourceRefs, ...question }) =>
+      ({ pages: _pages, sourceRefs: _sourceRefs, ...question }) =>
         Object.fromEntries(
           Object.entries(question).filter(([key]) => key !== "answerKey" && key !== "criterion" && key !== "weight"),
         ) as unknown as PublicQuizRecord["questions"][number],
@@ -458,7 +446,7 @@ function publicQuizDetail(quiz: QuizDetailRecord): PublicQuizDetailRecord {
     ...publicQuiz(quiz),
     answers: quiz.answers,
     questionResults: quiz.questionResults,
-    cardResults: quiz.cardResults,
+    pageResults: quiz.pageResults,
     grades: quiz.grades,
     readings: quiz.readings,
   };
@@ -515,103 +503,6 @@ function decodeMaintenancePage(value: unknown): MaintenanceIssuePageInput {
     ...(quizWorthiness === undefined ? {} : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
   };
 }
-function decodeMaintenanceCard(value: unknown): MaintenanceIssueCardInput {
-  if (!isRecord(value)) throw new ValidationError("resolve-issue card must be an object");
-  const kind = requiredString(value, "kind") as MaintenanceIssueCardInput["kind"];
-  switch (kind) {
-    case "create-card":
-      exact(value, ["kind", "cardId", "prompt", "initialDueAt", "dueAt", "bindings"], "resolve-issue create-card");
-      return {
-        kind,
-        ...(value.cardId === undefined ? {} : { cardId: requiredString(value, "cardId") }),
-        ...(value.prompt === undefined ? {} : { prompt: requiredString(value, "prompt") }),
-        ...(value.initialDueAt === undefined ? {} : { initialDueAt: requiredString(value, "initialDueAt") }),
-        ...(value.dueAt === undefined ? {} : { dueAt: requiredString(value, "dueAt") }),
-        bindings: decodeBindings(value.bindings),
-      };
-    case "revise-card":
-      exact(value, ["kind", "cardId", "expectedRevision", "prompt", "bindings"], "resolve-issue revise-card");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-        ...(value.prompt === undefined ? {} : { prompt: requiredString(value, "prompt") }),
-        bindings: decodeBindings(value.bindings),
-      };
-    case "retire-card":
-      exact(value, ["kind", "cardId", "expectedRevision"], "resolve-issue retire-card");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-      };
-    case "split-card":
-      exact(value, ["kind", "cardId", "expectedRevision", "children"], "resolve-issue split-card");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-        children: objectArray(value.children, "resolve-issue children").map((child) => {
-          exact(child, ["cardId", "prompt", "bindings"], "resolve-issue split child");
-          return {
-            ...(child.cardId === undefined ? {} : { cardId: requiredString(child, "cardId") }),
-            ...(child.prompt === undefined ? {} : { prompt: requiredString(child, "prompt") }),
-            bindings: decodeBindings(child.bindings),
-          };
-        }),
-      };
-    case "merge-card":
-      exact(
-        value,
-        ["kind", "parentCardIds", "expectedRevisions", "cardId", "prompt", "bindings"],
-        "resolve-issue merge-card",
-      );
-      if (!isRecord(value.expectedRevisions)) throw new ValidationError("expectedRevisions must be an object");
-      return {
-        kind,
-        parentCardIds: stringArray(value.parentCardIds, "parentCardIds"),
-        expectedRevisions: Object.fromEntries(
-          Object.entries(value.expectedRevisions).map(([key, item]) => {
-            if (typeof item !== "number" || !Number.isInteger(item))
-              throw new ValidationError("expectedRevisions values must be integers");
-            return [key, item] as const;
-          }),
-        ),
-        ...(value.cardId === undefined ? {} : { cardId: requiredString(value, "cardId") }),
-        ...(value.prompt === undefined ? {} : { prompt: requiredString(value, "prompt") }),
-        bindings: decodeBindings(value.bindings),
-      };
-    default:
-      throw new ValidationError(`unsupported resolve-issue card kind: ${kind}`);
-  }
-}
-function maintenanceCardBindingGroups(card: MaintenanceIssueCardInput): MaintenanceBindingInput[][] {
-  switch (card.kind) {
-    case "create-card":
-    case "revise-card":
-    case "merge-card":
-      return [[...card.bindings]];
-    case "split-card":
-      return card.children.map((child) => [...child.bindings]);
-    case "retire-card":
-      return [];
-  }
-}
-function maintenanceCardWithBindingGroups(
-  card: MaintenanceIssueCardInput,
-  groups: readonly MaintenanceBindingInput[][],
-): MaintenanceIssueCardInput {
-  switch (card.kind) {
-    case "create-card":
-    case "revise-card":
-    case "merge-card":
-      return { ...card, bindings: groups[0] ?? [] };
-    case "split-card":
-      return { ...card, children: card.children.map((child, index) => ({ ...child, bindings: groups[index] ?? [] })) };
-    case "retire-card":
-      return card;
-  }
-}
 function optionalInteger(value: Record<string, unknown>, key: string, label = key): number | undefined {
   if (value[key] === undefined) return undefined;
   return requiredInteger(value, key, label);
@@ -644,101 +535,51 @@ function decodeAdmissionInput(value: unknown): AdmissionPublicationInput {
     ...(endpoints ? { endpoints } : {}),
   };
 }
-function decodeBinding(value: unknown): MaintenanceBindingInput {
-  if (!isRecord(value)) throw new ValidationError("maintenance binding must be an object");
-  exact(
-    value,
-    [
-      "pageId",
-      "heading",
-      "anchor",
-      "startOffset",
-      "endOffset",
-      "start",
-      "end",
-      "textDigest",
-      "pageDigest",
-      "pageRevision",
-      "sectionText",
-    ],
-    "maintenance binding",
-  );
-  const binding: MaintenanceBindingInput = {
-    pageId: requiredString(value, "pageId"),
-    anchor: requiredString(value, "anchor"),
-    textDigest: requiredString(value, "textDigest"),
-    pageDigest: requiredString(value, "pageDigest"),
-    pageRevision: requiredInteger(value, "pageRevision"),
-    sectionText: requiredString(value, "sectionText"),
-  };
-  const heading = optionalString(value, "heading");
-  const startOffset = optionalInteger(value, "startOffset");
-  const endOffset = optionalInteger(value, "endOffset");
-  const start = optionalInteger(value, "start");
-  const end = optionalInteger(value, "end");
-  return {
-    ...binding,
-    ...(heading === undefined ? {} : { heading }),
-    ...(startOffset === undefined ? {} : { startOffset }),
-    ...(endOffset === undefined ? {} : { endOffset }),
-    ...(start === undefined ? {} : { start }),
-    ...(end === undefined ? {} : { end }),
-  };
-}
-function decodeBindings(value: unknown): MaintenanceBindingInput[] {
-  return objectArray(value, "bindings").map(decodeBinding);
-}
 function decodeMaintenanceInput(value: unknown): MaintenanceInput {
   if (!isRecord(value)) throw new ValidationError("maintenance proposal must be an object");
   const kind = requiredString(value, "kind") as MaintenanceInput["kind"];
   switch (kind) {
-    case "create-page":
+    case "create-page": {
       exact(value, ["kind", "path", "title", "body", "quizWorthiness"], "create-page");
-      {
-        const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
-        if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
-          throw new ValidationError("quizWorthiness is invalid");
-        return {
-          kind,
-          path: requiredString(value, "path"),
-          ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
-          body:
-            typeof value.body === "string"
-              ? value.body
-              : (() => {
-                  throw new ValidationError("body must be a string");
-                })(),
-          ...(quizWorthiness === undefined
-            ? {}
-            : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
-        };
-      }
-    case "update-page":
+      const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
+      if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
+        throw new ValidationError("quizWorthiness is invalid");
+      return {
+        kind,
+        path: requiredString(value, "path"),
+        ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
+        body:
+          typeof value.body === "string"
+            ? value.body
+            : (() => {
+                throw new ValidationError("body must be a string");
+              })(),
+        ...(quizWorthiness === undefined ? {} : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
+      };
+    }
+    case "update-page": {
       exact(value, ["kind", "pageId", "expectedDigest", "title", "body", "quizWorthiness"], "update-page");
-      {
-        const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
-        if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
-          throw new ValidationError("quizWorthiness is invalid");
-        return {
-          kind,
-          pageId: requiredString(value, "pageId"),
-          expectedDigest: requiredString(value, "expectedDigest"),
-          ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
-          ...(value.body === undefined
-            ? {}
-            : {
-                body:
-                  typeof value.body === "string"
-                    ? value.body
-                    : (() => {
-                        throw new ValidationError("body must be a string");
-                      })(),
-              }),
-          ...(quizWorthiness === undefined
-            ? {}
-            : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
-        };
-      }
+      const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
+      if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
+        throw new ValidationError("quizWorthiness is invalid");
+      return {
+        kind,
+        pageId: requiredString(value, "pageId"),
+        expectedDigest: requiredString(value, "expectedDigest"),
+        ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
+        ...(value.body === undefined
+          ? {}
+          : {
+              body:
+                typeof value.body === "string"
+                  ? value.body
+                  : (() => {
+                      throw new ValidationError("body must be a string");
+                    })(),
+            }),
+        ...(quizWorthiness === undefined ? {} : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
+      };
+    }
     case "rename-page":
       exact(value, ["kind", "pageId", "expectedDigest", "path"], "rename-page");
       return {
@@ -747,79 +588,22 @@ function decodeMaintenanceInput(value: unknown): MaintenanceInput {
         expectedDigest: requiredString(value, "expectedDigest"),
         path: requiredString(value, "path"),
       };
-    case "create-card":
-      exact(value, ["kind", "cardId", "prompt", "initialDueAt", "dueAt", "bindings"], "create-card");
+    case "prerequisites": {
+      exact(value, ["kind", "pageId", "expectedRevision", "prerequisitePageIds"], "prerequisites");
+      const expectedRevision = optionalInteger(value, "expectedRevision");
       return {
         kind,
-        ...(value.cardId === undefined ? {} : { cardId: requiredString(value, "cardId") }),
-        ...(value.prompt === undefined ? {} : { prompt: requiredString(value, "prompt") }),
-        ...(value.initialDueAt === undefined ? {} : { initialDueAt: requiredString(value, "initialDueAt") }),
-        ...(value.dueAt === undefined ? {} : { dueAt: requiredString(value, "dueAt") }),
-        bindings: decodeBindings(value.bindings),
+        pageId: requiredString(value, "pageId"),
+        prerequisitePageIds: stringArray(value.prerequisitePageIds, "prerequisitePageIds"),
+        ...(expectedRevision === undefined ? {} : { expectedRevision }),
       };
-    case "revise-card":
-      exact(value, ["kind", "cardId", "expectedRevision", "prompt", "bindings"], "revise-card");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-        ...(value.prompt === undefined ? {} : { prompt: requiredString(value, "prompt") }),
-        bindings: decodeBindings(value.bindings),
-      };
-    case "retire-card":
-      exact(value, ["kind", "cardId", "expectedRevision"], "retire-card");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-      };
-    case "split-card":
-      exact(value, ["kind", "cardId", "expectedRevision", "children"], "split-card");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-        children: objectArray(value.children, "children").map((child) => {
-          exact(child, ["cardId", "prompt", "bindings"], "split child");
-          return {
-            ...(child.cardId === undefined ? {} : { cardId: requiredString(child, "cardId") }),
-            ...(child.prompt === undefined ? {} : { prompt: requiredString(child, "prompt") }),
-            bindings: decodeBindings(child.bindings),
-          };
-        }),
-      };
-    case "merge-card":
-      exact(value, ["kind", "parentCardIds", "expectedRevisions", "cardId", "prompt", "bindings"], "merge-card");
-      if (!isRecord(value.expectedRevisions)) throw new ValidationError("expectedRevisions must be an object");
-      return {
-        kind,
-        parentCardIds: stringArray(value.parentCardIds, "parentCardIds"),
-        expectedRevisions: Object.fromEntries(
-          Object.entries(value.expectedRevisions).map(([key, item]) => {
-            if (typeof item !== "number" || !Number.isInteger(item))
-              throw new ValidationError("expectedRevisions values must be integers");
-            return [key, item] as const;
-          }),
-        ),
-        ...(value.cardId === undefined ? {} : { cardId: requiredString(value, "cardId") }),
-        ...(value.prompt === undefined ? {} : { prompt: requiredString(value, "prompt") }),
-        bindings: decodeBindings(value.bindings),
-      };
-    case "prerequisites":
-      exact(value, ["kind", "cardId", "expectedRevision", "prerequisiteCardIds"], "prerequisites");
-      return {
-        kind,
-        cardId: requiredString(value, "cardId"),
-        expectedRevision: requiredInteger(value, "expectedRevision"),
-        prerequisiteCardIds: stringArray(value.prerequisiteCardIds, "prerequisiteCardIds"),
-      };
+    }
     case "resolve-issue":
-      exact(value, ["kind", "issueId", "page", "card", "resolution"], "resolve-issue");
+      exact(value, ["kind", "issueId", "page", "resolution"], "resolve-issue");
       return {
         kind,
         issueId: requiredString(value, "issueId"),
         page: decodeMaintenancePage(value.page),
-        card: decodeMaintenanceCard(value.card),
         resolution: requiredString(value, "resolution"),
       };
     default:
@@ -828,32 +612,25 @@ function decodeMaintenanceInput(value: unknown): MaintenanceInput {
 }
 function decodeQuestion(value: unknown): QuizQuestionProposal {
   if (!isRecord(value)) throw new ValidationError("quiz question must be an object");
-  exact(
-    value,
-    ["questionId", "kind", "prompt", "choices", "cardIds", "cards", "sourceRefs", "answerKey"],
-    "quiz question",
-  );
-  const cards = objectArray(value.cards, "cards").map((item) => {
-    exact(item, ["cardId", "criterion", "weight"], "quiz question card");
+  exact(value, ["kind", "prompt", "choices", "pages", "sourceRefs", "answerKey"], "quiz question");
+  const pages = objectArray(value.pages, "pages").map((item) => {
+    exact(item, ["pageId", "criterion", "weight"], "quiz question page");
     const weight = item.weight;
     if (typeof weight !== "number" || !Number.isFinite(weight) || weight <= 0)
-      throw new ValidationError("quiz card weight must be a positive number");
-    return { cardId: requiredString(item, "cardId"), criterion: requiredString(item, "criterion"), weight };
+      throw new ValidationError("quiz page weight must be a positive number");
+    return { pageId: requiredString(item, "pageId"), criterion: requiredString(item, "criterion"), weight };
   });
   const choices = value.choices === undefined ? undefined : stringArray(value.choices, "choices");
   const kind = requiredString(value, "kind") as QuizQuestionProposal["kind"];
   if (kind !== "short-answer" && kind !== "multiple-choice") throw new ValidationError("quiz question kind is invalid");
-  const question: QuizQuestionProposal = {
+  return {
     kind,
     prompt: requiredString(value, "prompt"),
-    cardIds: stringArray(value.cardIds, "cardIds"),
-    cards,
+    pages,
     sourceRefs: stringArray(value.sourceRefs, "sourceRefs"),
-    ...(value.questionId === undefined ? {} : { questionId: requiredString(value, "questionId") }),
     ...(choices ? { choices } : {}),
     ...(value.answerKey === undefined ? {} : { answerKey: value.answerKey as QuizQuestionProposal["answerKey"] }),
   };
-  return question;
 }
 function decodeQuizPublication(value: unknown): QuizPublicationInput {
   if (!isRecord(value)) throw new ValidationError("quiz publication must be an object");
@@ -884,33 +661,28 @@ function decodeReading(value: unknown): { pageId: string; anchor: string; headin
 }
 function decodeGrade(value: unknown): GradeSettlementInput {
   if (!isRecord(value)) throw new ValidationError("grade settlement must be an object");
-  exact(value, ["requestId", "date", "revision", "submissionId", "questions"], "grade settlement");
+  exact(value, ["requestId", "date", "revision", "submissionId", "questions", "pages"], "grade settlement");
   const questions = objectArray(value.questions, "questions").map((question) => {
-    exact(question, ["questionId", "feedback", "cards", "readings"], "graded question");
+    exact(question, ["questionId", "feedback"], "graded question");
     const feedback = optionalString(question, "feedback");
-    const readings =
-      question.readings === undefined ? undefined : objectArray(question.readings, "readings").map(decodeReading);
-    const cards = objectArray(question.cards, "cards").map((card) => {
-      exact(card, ["cardId", "rating", "feedback", "evidence", "readings"], "graded card");
-      const feedback = optionalString(card, "feedback");
-      const readings =
-        card.readings === undefined ? undefined : objectArray(card.readings, "readings").map(decodeReading);
-      const rating = requiredString(card, "rating") as "Again" | "Hard" | "Good" | "Easy";
-      if (rating !== "Again" && rating !== "Hard" && rating !== "Good" && rating !== "Easy")
-        throw new ValidationError("rating is invalid");
-      const evidence = stringArray(card.evidence, "evidence");
-      return {
-        cardId: requiredString(card, "cardId"),
-        rating,
-        ...(feedback === undefined ? {} : { feedback }),
-        evidence,
-        ...(readings === undefined ? {} : { readings }),
-      };
-    });
     return {
       questionId: requiredString(question, "questionId"),
       ...(feedback === undefined ? {} : { feedback }),
-      cards,
+    };
+  });
+  const pages = objectArray(value.pages, "pages").map((page) => {
+    exact(page, ["pageId", "rating", "feedback", "evidence", "readings"], "graded page");
+    const feedback = optionalString(page, "feedback");
+    const readings =
+      page.readings === undefined ? undefined : objectArray(page.readings, "readings").map(decodeReading);
+    const rating = requiredString(page, "rating") as ReviewRating;
+    if (rating !== "Again" && rating !== "Hard" && rating !== "Good" && rating !== "Easy")
+      throw new ValidationError("rating is invalid");
+    return {
+      pageId: requiredString(page, "pageId"),
+      rating,
+      feedback,
+      evidence: stringArray(page.evidence, "evidence"),
       ...(readings === undefined ? {} : { readings }),
     };
   });
@@ -920,6 +692,7 @@ function decodeGrade(value: unknown): GradeSettlementInput {
     revision: requiredInteger(value, "revision"),
     submissionId: requiredString(value, "submissionId"),
     questions,
+    pages,
   };
 }
 export class ScholarApplication {
@@ -1025,6 +798,38 @@ export class ScholarApplication {
     operation: () => T | PromiseLike<T>,
   ): Promise<T> {
     return context?.origin === "browser" ? this.worker.enqueue(operation) : await operation();
+  }
+  private assertPageMutationAllowed(
+    pageId: string,
+    proposedQuizWorthiness?: WikiNoteUpdateInput["quizWorthiness"],
+  ): void {
+    const unresolved = this.db.get<{ readonly quiz_id: string }>(
+      `SELECT q.quiz_id
+       FROM quizzes q
+       JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id
+       JOIN question_pages qp ON qp.question_id = qq.question_id
+       WHERE qp.page_id = ?
+         AND (
+           q.status = 'open'
+           OR (
+             q.status = 'submitted'
+             AND NOT EXISTS (
+               SELECT 1 FROM page_results pr WHERE pr.quiz_id = q.quiz_id AND pr.page_id = qp.page_id
+             )
+           )
+         )
+       LIMIT 1`,
+      [pageId],
+    );
+    if (unresolved) throw new QuizConflictError(`Page ${pageId} is covered by an unresolved quiz`);
+    if (
+      (proposedQuizWorthiness === "skip" || proposedQuizWorthiness === "unknown") &&
+      this.db.get("SELECT 1 FROM page_prerequisites WHERE page_id = ? OR prerequisite_page_id = ? LIMIT 1", [
+        pageId,
+        pageId,
+      ])
+    )
+      throw new ValidationError("Pages participating in prerequisites must remain quiz-eligible");
   }
   private async readSetting<T>(key: string, fallback: T): Promise<T> {
     const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
@@ -1182,24 +987,9 @@ export class ScholarApplication {
       return { source: publicSource(this.pendingSource(entry)) };
     });
   }
-  private dependentIds(dependents: readonly Record<string, unknown>[]): { pageIds: string[]; cardIds: string[] } {
-    const pageIds = [...new Set(dependents.flatMap((row) => (typeof row.page_id === "string" ? [row.page_id] : [])))];
-    const cardIds = [
-      ...new Set([
-        ...dependents.flatMap((row) => (typeof row.card_id === "string" ? [row.card_id] : [])),
-        ...pageIds.flatMap((pageId) =>
-          this.db
-            .all<Record<string, unknown>>("SELECT card_id FROM card_bindings WHERE page_id = ?", [pageId])
-            .flatMap((row) => (typeof row.card_id === "string" ? [row.card_id] : [])),
-        ),
-      ]),
-    ];
-    return { pageIds, cardIds };
-  }
   async removalPreview(sourceId: string): Promise<{
     readonly source: PublicSourceRecord;
     readonly dependentPageIds: readonly string[];
-    readonly dependentCardIds: readonly string[];
     readonly confirmationId: string;
   }> {
     const preview = this.sources.removalPreview(sourceId);
@@ -1208,11 +998,9 @@ export class ScholarApplication {
       .map(sourceRecord)
       .find((item) => item.sourceId === sourceId);
     if (!source) throw new Error("source not found");
-    const ids = this.dependentIds(preview.dependents);
     return {
       source: publicSource(source),
-      dependentPageIds: ids.pageIds,
-      dependentCardIds: ids.cardIds,
+      dependentPageIds: preview.dependentPageIds,
       confirmationId: preview.confirmationId,
     };
   }
@@ -1224,8 +1012,7 @@ export class ScholarApplication {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
         const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
-        const ids = this.dependentIds(removed.dependents);
-        return { sourceId, status: "removed", dependentPageIds: ids.pageIds, dependentCardIds: ids.cardIds };
+        return { sourceId, status: "removed", dependentPageIds: removed.dependentPageIds };
       }, "source:remove"),
     );
   }
@@ -1251,6 +1038,7 @@ export class ScholarApplication {
         : undefined;
     const settled = this.quiz.readSettledResult(quiz);
     const settledByQuestion = new Map((settled?.questions ?? []).map((question) => [question.questionId, question]));
+    const settledByPage = new Map((settled?.pages ?? []).map((page) => [page.pageId, page]));
     const questionResults: QuizQuestionResultRecord[] = this.db
       .all<Record<string, unknown>>("SELECT * FROM question_results WHERE quiz_id = ? ORDER BY question_id", [
         quiz.quizId,
@@ -1263,52 +1051,67 @@ export class ScholarApplication {
         feedback: settledByQuestion.get(String(row.question_id))?.feedback ?? "",
         gradedAt: String(row.graded_at),
       }));
-    const cardResults: QuizCardResultRecord[] = this.db
-      .all<Record<string, unknown>>("SELECT * FROM card_results WHERE quiz_id = ? ORDER BY question_id, card_id", [
-        quiz.quizId,
-      ])
-      .map((row) => ({
-        resultId: String(row.result_id),
-        quizId: String(row.quiz_id),
-        questionId: String(row.question_id),
-        cardId: String(row.card_id),
-        rating: String(row.rating) as QuizCardResultRecord["rating"],
-        reviewId: String(row.review_id),
-      }));
-    const grades: QuizGradeRecord[] = cardResults.map((row) => {
-      const question = settledByQuestion.get(row.questionId);
-      const card = question?.cards.find((item) => item.cardId === row.cardId);
-      return {
-        gradeId: row.reviewId,
-        quizId: row.quizId,
-        questionId: row.questionId,
-        cardId: row.cardId,
-        rating: row.rating,
-        feedback: card?.feedback ?? "",
-        gradedAt: card?.gradedAt ?? new Date().toISOString(),
-        reviewId: row.reviewId,
-      };
-    });
-    const readings = [
-      ...new Map(
-        (settled?.questions ?? [])
-          .flatMap((question) => question.readings)
-          .map((reading) => [`${reading.pageId}#${reading.anchor}`, reading]),
-      ).values(),
-    ].map((reading) => {
+    const publicReading = (reading: ReadingLink): QuizReadingRecord => {
       const page = this.db.get<Record<string, unknown>>("SELECT relative_path FROM pages WHERE page_id = ?", [
         reading.pageId,
       ]);
       if (!page) throw new ValidationError(`Committed grade reading page is missing: ${reading.pageId}`);
-      const path = String(page.relative_path);
       return {
         pageId: reading.pageId,
-        path,
+        path: String(page.relative_path),
         ...(reading.heading === undefined ? {} : { heading: reading.heading }),
         href: this.quiz.readingHref(reading),
       };
-    });
-    return { ...quiz, answers, ...(draft ? { draft } : {}), questionResults, cardResults, grades, readings };
+    };
+    const internalPageResults = this.db
+      .all<Record<string, unknown>>("SELECT * FROM page_results WHERE quiz_id = ? ORDER BY page_id", [quiz.quizId])
+      .map((row) => {
+        const pageId = String(row.page_id);
+        const settledPage = settledByPage.get(pageId);
+        const evidenceValue = jsonValue(row.evidence_json);
+        const readingsValue = jsonValue(row.readings_json);
+        const evidence =
+          settledPage?.evidence ??
+          (Array.isArray(evidenceValue)
+            ? evidenceValue.filter((item): item is string => typeof item === "string")
+            : []);
+        const readings: readonly ReadingLink[] =
+          settledPage?.readings ?? (Array.isArray(readingsValue) ? readingsValue.map(decodeReading) : []);
+        return {
+          resultId: String(row.result_id),
+          quizId: String(row.quiz_id),
+          pageId,
+          rating: String(row.rating) as QuizPageResultRecord["rating"],
+          feedback: settledPage?.feedback ?? String(row.feedback ?? ""),
+          reviewId: String(row.review_id),
+          evidence,
+          readings,
+        };
+      });
+    const pageResults: QuizPageResultRecord[] = internalPageResults.map((page) => ({
+      ...page,
+      readings: page.readings.map(publicReading),
+    }));
+    const grades: QuizGradeRecord[] = pageResults.map((row) => ({
+      gradeId: row.reviewId,
+      quizId: row.quizId,
+      pageId: row.pageId,
+      rating: row.rating,
+      feedback: row.feedback,
+      gradedAt: String(
+        this.db.get<Record<string, unknown>>("SELECT reviewed_at FROM page_reviews WHERE review_id = ?", [row.reviewId])
+          ?.reviewed_at ?? new Date().toISOString(),
+      ),
+      reviewId: row.reviewId,
+    }));
+    const readings = [
+      ...new Map(
+        internalPageResults
+          .flatMap((page) => page.readings)
+          .map((reading): readonly [string, ReadingLink] => [`${reading.pageId}#${reading.anchor}`, reading]),
+      ).values(),
+    ].map(publicReading);
+    return { ...quiz, answers, ...(draft ? { draft } : {}), questionResults, pageResults, grades, readings };
   }
 
   async listWiki(): Promise<{ readonly pages: readonly PageRecord[] }> {
@@ -1320,15 +1123,12 @@ export class ScholarApplication {
     const page = pageRecord(inspected.page);
     const markdown = value.content;
     const pageSections = parseWikiSections(markdown, page.pageId);
-    const bindings: CardBindingRecord[] = [];
-    const cards = this.scheduler
-      .listCards(false)
-      .filter((card) => this.scheduler.bindings(card.cardId, false).some((binding) => binding.pageId === page.pageId));
-    for (const card of cards)
-      bindings.push(...this.scheduler.bindings(card.cardId, false).filter((binding) => binding.pageId === page.pageId));
-    const prerequisites: CardPrerequisiteRecord[] = cards.flatMap((card) => this.scheduler.prerequisites(card.cardId));
-    const lineage: CardLineageRecord[] = cards.flatMap((card) => this.scheduler.lineage(card.cardId));
-    const learning: WikiPageLearningProjection = { cards, bindings, prerequisites, lineage };
+    let schedule: PageLearningRecord | undefined;
+    if (page.quizWorthiness === "eligible") schedule = this.scheduler.ensurePageLearning(page.pageId);
+    else if (this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", [page.pageId]))
+      schedule = this.scheduler.getPageLearning(page.pageId);
+    const prerequisites = this.scheduler.listPrerequisites(page.pageId);
+    const learning: WikiPageLearningProjection = { ...(schedule ? { schedule } : {}), prerequisites };
     const drift = inspected.drifted
       ? { expectedDigest: inspected.authoredDigest, actualDigest: inspected.currentDigest, diff: inspected.diff }
       : undefined;
@@ -1391,8 +1191,7 @@ export class ScholarApplication {
   ): Promise<WikiIssueRecord> {
     if (input.status !== "reopened" && input.status !== "resolved")
       throw new ValidationError("issue status is invalid");
-    if (input.status === "resolved")
-      throw new ValidationError("issue resolution requires a composite maintenance proposal");
+    if (input.status === "resolved") throw new ValidationError("issue resolution requires a guarded page correction");
     return this.mutate(context, () =>
       this.durableDirect(
         () => this.wiki.patchIssue(issueId, { status: input.status, resolution: input.resolution }),
@@ -1407,6 +1206,7 @@ export class ScholarApplication {
   ): Promise<WikiPageResult> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        this.assertPageMutationAllowed(pageId);
         const before = await this.wiki.inspectDrift(pageId);
         if (before.currentDigest !== input.expectedDigest)
           throw new RevisionConflictError("The wiki page digest is stale");
@@ -1416,187 +1216,24 @@ export class ScholarApplication {
     );
   }
   async createNote(input: WikiNoteInput, context?: ApplicationMutationContext): Promise<WikiPageResult> {
-    if (input.quizWorthiness === "eligible")
-      throw new ValidationError("eligible notes require a maintenance card proposal");
     return this.mutate(context, () =>
       this.durableDirect(async () => {
         const created = await this.wiki.create(input);
+        if (created.page.quizWorthiness === "eligible") this.scheduler.ensurePageLearning(created.page.pageId);
         return this.wikiResult(created.page.pageId);
       }, "wiki:create"),
     );
-  }
-  private async prepareMaintenanceCardBindings(
-    card: MaintenanceIssueCardInput,
-    corrected?: { readonly issue: WikiIssueRecord; readonly prepared: WikiPreparedUpdate },
-  ): Promise<MaintenanceIssueCardInput> {
-    const groups = maintenanceCardBindingGroups(card);
-    const correctedSections = corrected
-      ? new Map(
-          parseWikiSections(corrected.prepared.content, corrected.prepared.page.pageId).map((section) => [
-            section.anchor,
-            section,
-          ]),
-        )
-      : undefined;
-    const normalizedGroups: MaintenanceBindingInput[][] = [];
-    for (const group of groups) {
-      const normalized: MaintenanceBindingInput[] = [];
-      for (const binding of group) {
-        if (corrected?.prepared && binding.pageId === corrected.prepared.page.pageId) {
-          const section = correctedSections?.get(binding.anchor);
-          if (
-            corrected.prepared.page.quizWorthiness === "skip" ||
-            !section ||
-            (binding.heading !== undefined && binding.heading !== section.heading) ||
-            (corrected.issue.heading !== undefined && section.heading !== corrected.issue.heading)
-          )
-            throw new ValidationError("card binding does not identify the corrected issue section");
-          const sectionText = corrected.prepared.content.slice(section.startOffset, section.endOffset);
-          if (binding.sectionText !== sectionText) throw new ValidationError("card binding section text is stale");
-          normalized.push({
-            pageId: corrected.prepared.page.pageId,
-            heading: section.heading,
-            anchor: section.anchor,
-            startOffset: 0,
-            endOffset: sectionText.length,
-            textDigest: sha256(sectionText),
-            pageDigest: corrected.prepared.page.digest,
-            pageRevision: corrected.prepared.page.revision,
-            sectionText,
-          });
-          continue;
-        }
-        const page = await this.wiki.get(binding.pageId);
-        const actualDigest = sha256(page.content);
-        if (
-          page.status !== "active" ||
-          page.quizWorthiness === "skip" ||
-          actualDigest !== page.digest ||
-          binding.pageDigest !== page.digest ||
-          binding.pageRevision !== page.revision
-        )
-          throw new ValidationError(`Binding page is stale or unavailable: ${binding.pageId}`);
-        const section = parseWikiSections(page.content, page.pageId).find(
-          (candidate) => candidate.anchor === binding.anchor,
-        );
-        if (!section || (binding.heading !== undefined && binding.heading !== section.heading))
-          throw new ValidationError(`Binding section is unavailable: ${binding.pageId}${binding.anchor}`);
-        const sectionText = page.content.slice(section.startOffset, section.endOffset);
-        const startOffset = binding.startOffset ?? binding.start;
-        const endOffset = binding.endOffset ?? binding.end;
-        if (
-          startOffset === undefined ||
-          endOffset === undefined ||
-          !Number.isInteger(startOffset) ||
-          !Number.isInteger(endOffset) ||
-          startOffset < 0 ||
-          endOffset <= startOffset ||
-          endOffset > sectionText.length ||
-          binding.sectionText !== sectionText
-        )
-          throw new ValidationError(`Binding section bytes are stale: ${binding.pageId}${binding.anchor}`);
-        const boundText = sectionText.slice(startOffset, endOffset);
-        const textDigest = sha256(boundText);
-        if (!boundText || textDigest !== binding.textDigest)
-          throw new ValidationError(`Binding section bytes are stale: ${binding.pageId}${binding.anchor}`);
-        normalized.push({
-          pageId: page.pageId,
-          heading: section.heading,
-          anchor: section.anchor,
-          startOffset,
-          endOffset,
-          textDigest,
-          pageDigest: page.digest,
-          pageRevision: page.revision,
-          sectionText,
-        });
-      }
-      normalizedGroups.push(normalized);
-    }
-    return maintenanceCardWithBindingGroups(card, normalizedGroups);
-  }
-  private async prepareCardMutation(
-    card: MaintenanceIssueCardInput,
-    issue?: WikiIssueRecord,
-    prepared?: WikiPreparedUpdate,
-  ): Promise<MaintenanceIssueCardInput> {
-    if (issue && (!issue.pageId || !prepared || prepared.page.pageId !== issue.pageId))
-      throw new ValidationError("issue must reference the corrected page");
-    const currentCards = new Map(this.scheduler.listCards(false).map((entry) => [entry.cardId, entry]));
-    const groups = maintenanceCardBindingGroups(card);
-    if (card.kind === "create-card") {
-      if (!(card.initialDueAt ?? card.dueAt) || Number.isNaN(new Date(card.initialDueAt ?? card.dueAt ?? "").getTime()))
-        throw new ValidationError("initialDueAt or dueAt must be a valid date");
-      if (!card.bindings.length) throw new ValidationError("A review card requires at least one binding");
-      if (card.cardId && currentCards.has(card.cardId))
-        throw new ValidationError(`Duplicate review card: ${card.cardId}`);
-    } else if (card.kind === "revise-card") {
-      if (!card.bindings.length) throw new ValidationError("A review card requires at least one binding");
-    } else if (card.kind === "split-card") {
-      if (card.children.length < 2 || card.children.some((child) => !child.bindings.length))
-        throw new ValidationError("A split requires at least two bound child cards");
-      const childIds = card.children.map((child) => child.cardId).filter((id): id is string => id !== undefined);
-      if (new Set(childIds).size !== childIds.length || childIds.some((id) => currentCards.has(id)))
-        throw new ValidationError("Split child IDs must be distinct and unused");
-    } else if (card.kind === "merge-card") {
-      if (new Set(card.parentCardIds).size < 2 || !card.bindings.length)
-        throw new ValidationError("A merge requires at least two parents and one binding");
-      if (card.cardId && currentCards.has(card.cardId))
-        throw new ValidationError(`Duplicate review card: ${card.cardId}`);
-    }
-    const targetIds =
-      card.kind === "merge-card" ? card.parentCardIds : card.kind === "create-card" ? [] : [card.cardId];
-    if (issue) {
-      if (issue.cardId) {
-        if (card.kind === "create-card" || !targetIds.includes(issue.cardId))
-          throw new ValidationError("card mutation must target the issue card");
-      } else if (card.kind === "retire-card" || card.kind === "split-card" || card.kind === "merge-card") {
-        throw new ValidationError("issue without a card reference requires a card create or revise");
-      }
-    }
-    for (const cardId of targetIds) {
-      const current = currentCards.get(cardId);
-      if (!current) throw new ValidationError(`issue card mutation references an unknown card: ${cardId}`);
-      if (current.status !== "active")
-        throw new ValidationError(`issue card mutation references a retired card: ${cardId}`);
-      if (card.kind === "merge-card") {
-        if (card.expectedRevisions[cardId] !== current.revision)
-          throw new RevisionConflictError(`The card revision is stale: ${cardId}`);
-      } else if (card.kind !== "create-card" && card.expectedRevision !== current.revision) {
-        throw new RevisionConflictError(`The card revision is stale: ${cardId}`);
-      }
-    }
-    if (prepared?.page.quizWorthiness === "skip" && groups.length)
-      throw new ValidationError("corrected page must remain non-skipped for card bindings");
-    if (
-      prepared &&
-      card.kind !== "retire-card" &&
-      !groups.some((group) => group.some((binding) => binding.pageId === prepared.page.pageId))
-    )
-      throw new ValidationError("card mutation must bind the corrected page section");
-    return this.prepareMaintenanceCardBindings(card, issue && prepared ? { issue, prepared } : undefined);
-  }
-  private assertPageMutationBindings(pageId: string, replacementCardIds: readonly string[] = []): void {
-    const replacements = new Set(replacementCardIds);
-    const leavesStaleBindings = this.db
-      .all<Record<string, unknown>>(
-        "SELECT DISTINCT bindings.card_id FROM card_bindings AS bindings JOIN review_cards AS cards ON cards.card_id = bindings.card_id WHERE bindings.page_id = ? AND bindings.active = 1 AND cards.status = 'active'",
-        [pageId],
-      )
-      .some((row) => !replacements.has(String(row.card_id)));
-    if (leavesStaleBindings) throw new ValidationError("page mutation would leave active card bindings stale");
   }
   async updateNote(
     pageId: string,
     input: WikiNoteUpdateInput,
     context?: ApplicationMutationContext,
   ): Promise<WikiPageResult> {
-    if (input.quizWorthiness === "eligible")
-      throw new ValidationError("eligible notes require a maintenance card proposal");
     return this.mutate(context, () =>
       this.durableDirect(async () => {
-        this.assertPageMutationBindings(pageId);
+        this.assertPageMutationAllowed(pageId, input.quizWorthiness);
         const updated = await this.wiki.update(pageId, input);
+        if (updated.page.quizWorthiness === "eligible") this.scheduler.ensurePageLearning(updated.page.pageId);
         return this.wikiResult(updated.page.pageId);
       }, "wiki:update"),
     );
@@ -1608,6 +1245,7 @@ export class ScholarApplication {
   ): Promise<WikiPageResult> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        this.assertPageMutationAllowed(pageId);
         const updated = await this.wiki.rename(pageId, requestedPath);
         return this.wikiResult(updated.pageId);
       }, "wiki:rename"),
@@ -1916,15 +1554,9 @@ export class ScholarApplication {
   }
   async getMaintenanceContext(): Promise<MaintenanceContext> {
     const pages = await Promise.all((await this.wiki.list()).map((page) => this.wikiResult(page.pageId)));
-    const cards = this.scheduler.listCards(false);
-    const bindings = cards.flatMap((card) => this.scheduler.bindings(card.cardId, false));
-    const prerequisites = cards.flatMap((card) => this.scheduler.prerequisites(card.cardId));
     return {
       pages,
       issues: (await this.listIssues()).issues,
-      cards,
-      bindings,
-      prerequisites,
       sources: this.sources.list().map(sourceRecord),
     };
   }
@@ -1932,15 +1564,13 @@ export class ScholarApplication {
     const reports = await Promise.all((await this.wiki.list()).map((page) => this.wiki.inspectDrift(page.pageId)));
     return new Set(reports.filter((report) => report.drifted).map((report) => report.page.pageId));
   }
+  private async filterLiveDriftPages(pages: readonly PageLearningRecord[]): Promise<PageLearningRecord[]> {
+    const drifted = await this.liveDriftPageIds();
+    return pages.filter((page) => !drifted.has(page.pageId));
+  }
   private async assertNoLiveWikiDrift(): Promise<void> {
     const drifted = await this.liveDriftPageIds();
     if (drifted.size) throw new ValidationError(`Wiki pages have unresolved live drift: ${[...drifted].join(", ")}`);
-  }
-  private async filterLiveDriftCards(cards: readonly ReviewCardRecord[]): Promise<ReviewCardRecord[]> {
-    const drifted = await this.liveDriftPageIds();
-    return cards.filter((card) =>
-      this.scheduler.bindings(card.cardId).every((binding) => !drifted.has(binding.pageId)),
-    );
   }
   private assertMaintenanceCoverage(
     pages?: readonly {
@@ -1951,9 +1581,7 @@ export class ScholarApplication {
   ): void {
     const coverage = this.scheduler.validateCoverage(pages);
     if (!coverage.ok)
-      throw new ValidationError(
-        `Eligible wiki pages have no active card bindings: ${coverage.missingPageIds.join(", ")}`,
-      );
+      throw new ValidationError(`Eligible wiki pages lack learning rows: ${coverage.missingPageIds.join(", ")}`);
   }
   private async maintenancePreflight(allowDrift = false): Promise<void> {
     if (!allowDrift) await this.assertNoLiveWikiDrift();
@@ -2019,24 +1647,8 @@ export class ScholarApplication {
     }
   }
   private async restoreMaintenanceRollback(snapshot: MaintenanceRollbackSnapshot): Promise<void> {
-    const deleteOrder = [
-      "wiki_issues",
-      "card_bindings",
-      "card_prerequisites",
-      "card_lineage",
-      "review_cards",
-      "authored_snapshots",
-      "pages",
-    ];
-    const writeOrder = [
-      "pages",
-      "authored_snapshots",
-      "review_cards",
-      "wiki_issues",
-      "card_bindings",
-      "card_lineage",
-      "card_prerequisites",
-    ];
+    const deleteOrder = ["wiki_issues", "page_prerequisites", "page_learning", "authored_snapshots", "pages"];
+    const writeOrder = ["pages", "authored_snapshots", "page_learning", "page_prerequisites", "wiki_issues"];
     const specs = new Map<string, (typeof MAINTENANCE_ROLLBACK_TABLES)[number]>(
       MAINTENANCE_ROLLBACK_TABLES.map((spec): [string, (typeof MAINTENANCE_ROLLBACK_TABLES)[number]] => [
         spec.name,
@@ -2136,7 +1748,11 @@ export class ScholarApplication {
     const projection = await this.wiki.refreshProjections();
     const lint = this.wiki.lintSync(pages, projection.backlinks);
     if (lint.length) throw new ValidationError(`wiki lint failed: ${lint.join("; ")}`);
-    this.assertMaintenanceCoverage();
+    for (const page of pages) {
+      if (page.status === "active" && page.quizWorthiness === "eligible")
+        this.scheduler.ensurePageLearning(page.pageId);
+    }
+    this.assertMaintenanceCoverage(pages);
     const qmd = this.wiki.adapters.qmd;
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
     await qmd.index();
@@ -2156,98 +1772,56 @@ export class ScholarApplication {
         await this.maintenancePreflight(proposal.kind === "update-page" || proposal.kind === "resolve-issue");
         switch (proposal.kind) {
           case "create-page": {
-            if (proposal.quizWorthiness === "eligible")
-              throw new ValidationError("Eligible pages require a card before creation");
             const created = await this.wiki.create(proposal);
+            const pageLearning =
+              created.page.quizWorthiness === "eligible"
+                ? this.scheduler.ensurePageLearning(created.page.pageId)
+                : undefined;
             const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, page: pageRecord(created.page), checks };
+            return {
+              kind: proposal.kind,
+              page: pageRecord(created.page),
+              ...(pageLearning ? { pageLearning } : {}),
+              checks,
+            };
           }
           case "update-page": {
+            this.assertPageMutationAllowed(proposal.pageId, proposal.quizWorthiness);
             const current = await this.wiki.get(proposal.pageId);
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
-            this.assertPageMutationBindings(proposal.pageId);
-
-            const targetQuizWorthiness = proposal.quizWorthiness ?? current.quizWorthiness;
-            const pages = (await this.wiki.list()).map((page) =>
-              page.pageId === current.pageId
-                ? { ...page, status: current.status, quizWorthiness: targetQuizWorthiness }
-                : page,
-            );
-            this.assertMaintenanceCoverage(pages);
             const updated = await this.wiki.update(proposal.pageId, proposal);
+            const pageLearning =
+              updated.page.quizWorthiness === "eligible"
+                ? this.scheduler.ensurePageLearning(updated.page.pageId)
+                : undefined;
             const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, page: pageRecord(updated.page), checks };
+            return {
+              kind: proposal.kind,
+              page: pageRecord(updated.page),
+              ...(pageLearning ? { pageLearning } : {}),
+              checks,
+            };
           }
           case "rename-page": {
+            this.assertPageMutationAllowed(proposal.pageId);
             const current = await this.wiki.get(proposal.pageId);
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
-            this.assertMaintenanceCoverage();
             const renamed = await this.wiki.rename(proposal.pageId, proposal.path);
             const checks = await this.maintenanceChecks();
             return { kind: proposal.kind, page: pageRecord(renamed), checks };
           }
-          case "create-card": {
-            const prepared = await this.prepareCardMutation(proposal);
-            if (prepared.kind !== "create-card") throw new ValidationError("invalid create-card proposal");
-            const card = this.scheduler.createCard(prepared);
-            const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, cards: [card], checks };
-          }
-          case "revise-card": {
-            const prepared = await this.prepareCardMutation(proposal);
-            if (prepared.kind !== "revise-card") throw new ValidationError("invalid revise-card proposal");
-            const card = this.scheduler.reviseCard(prepared.cardId, {
-              prompt: prepared.prompt,
-              bindings: prepared.bindings,
-              expectedRevision: prepared.expectedRevision,
-            });
-            const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, cards: [card], checks };
-          }
-          case "retire-card": {
-            const prepared = await this.prepareCardMutation(proposal);
-            if (prepared.kind !== "retire-card") throw new ValidationError("invalid retire-card proposal");
-            const card = this.scheduler.retireCard(prepared.cardId, prepared.expectedRevision);
-            const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, cards: [card], checks };
-          }
-          case "split-card": {
-            const prepared = await this.prepareCardMutation(proposal);
-            if (prepared.kind !== "split-card") throw new ValidationError("invalid split-card proposal");
-            const cards = this.scheduler.splitCard(
-              prepared.cardId,
-              prepared.children.map((child) => ({ ...child, expectedRevision: prepared.expectedRevision })),
-            );
-            const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, cards, checks };
-          }
-          case "merge-card": {
-            const prepared = await this.prepareCardMutation(proposal);
-            if (prepared.kind !== "merge-card") throw new ValidationError("invalid merge-card proposal");
-            const card = this.scheduler.mergeCards(prepared.parentCardIds, {
-              cardId: prepared.cardId,
-              prompt: prepared.prompt,
-              bindings: prepared.bindings,
-              expectedRevisions: prepared.expectedRevisions,
-            });
-            const checks = await this.maintenanceChecks();
-            return { kind: proposal.kind, cards: [card], checks };
-          }
           case "prerequisites": {
-            const result = this.scheduler.setPrerequisites(
-              proposal.cardId,
-              proposal.prerequisiteCardIds,
-              proposal.expectedRevision,
-            );
+            const page = await this.wiki.get(proposal.pageId);
+            const pageLearning =
+              page.quizWorthiness === "eligible" ? this.scheduler.ensurePageLearning(page.pageId) : undefined;
+            this.scheduler.setPrerequisites(proposal.pageId, proposal.prerequisitePageIds, proposal.expectedRevision);
             const checks = await this.maintenanceChecks();
             return {
               kind: proposal.kind,
-              prerequisites: result.prerequisites.map((prerequisiteCardId) => ({
-                cardId: result.cardId,
-                prerequisiteCardId,
-              })),
+              prerequisites: this.scheduler.listPrerequisites(page.pageId),
+              ...(pageLearning ? { pageLearning } : {}),
               checks,
             };
           }
@@ -2271,17 +1845,13 @@ export class ScholarApplication {
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
               (proposal.page.quizWorthiness !== undefined && proposal.page.quizWorthiness !== current.quizWorthiness);
             if (!pageChanged) throw new ValidationError("resolve-issue requires an actual page correction");
+            this.assertPageMutationAllowed(proposal.page.pageId, proposal.page.quizWorthiness);
             const prepared = await this.wiki.prepareUpdate(issue.pageId, {
               expectedDigest: proposal.page.expectedDigest,
               ...(proposal.page.body === undefined ? {} : { body: proposal.page.body }),
               ...(proposal.page.title === undefined ? {} : { title: proposal.page.title }),
               ...(proposal.page.quizWorthiness === undefined ? {} : { quizWorthiness: proposal.page.quizWorthiness }),
             });
-            const card = await this.prepareCardMutation(proposal.card, issue, prepared);
-            const replacementCardIds =
-              card.kind === "create-card" ? [] : card.kind === "merge-card" ? card.parentCardIds : [card.cardId];
-            this.assertPageMutationBindings(issue.pageId, replacementCardIds);
-
             const updatedPage = await this.wiki.update(
               issue.pageId,
               {
@@ -2292,43 +1862,19 @@ export class ScholarApplication {
               },
               prepared,
             );
-            let cards: readonly ReviewCardRecord[];
-            switch (card.kind) {
-              case "create-card":
-                cards = [this.scheduler.createCard(card)];
-                break;
-              case "revise-card":
-                cards = [
-                  this.scheduler.reviseCard(card.cardId, {
-                    prompt: card.prompt,
-                    bindings: card.bindings,
-                    expectedRevision: card.expectedRevision,
-                  }),
-                ];
-                break;
-              case "retire-card":
-                cards = [this.scheduler.retireCard(card.cardId, card.expectedRevision)];
-                break;
-              case "split-card":
-                cards = this.scheduler.splitCard(
-                  card.cardId,
-                  card.children.map((child) => ({ ...child, expectedRevision: card.expectedRevision })),
-                );
-                break;
-              case "merge-card":
-                cards = [
-                  this.scheduler.mergeCards(card.parentCardIds, {
-                    cardId: card.cardId,
-                    prompt: card.prompt,
-                    bindings: card.bindings,
-                    expectedRevisions: card.expectedRevisions,
-                  }),
-                ];
-                break;
-            }
+            const pageLearning =
+              updatedPage.page.quizWorthiness === "eligible"
+                ? this.scheduler.ensurePageLearning(updatedPage.page.pageId)
+                : undefined;
             const checks = await this.maintenanceChecks();
             const resolved = await this.wiki.resolveIssueAfterCorrection(proposal.issueId, proposal.resolution);
-            return { kind: proposal.kind, page: pageRecord(updatedPage.page), cards, issue: resolved, checks };
+            return {
+              kind: proposal.kind,
+              page: pageRecord(updatedPage.page),
+              issue: resolved,
+              ...(pageLearning ? { pageLearning } : {}),
+              checks,
+            };
           }
         }
       },
@@ -2336,78 +1882,56 @@ export class ScholarApplication {
       rollback,
     );
   }
-  private async quizEvidence(cards: readonly ReviewCardRecord[]): Promise<QuizEvidenceRecord[]> {
-    const pages = new Map<string, Buffer>();
+  private async quizEvidence(pages: readonly PageLearningRecord[]): Promise<QuizEvidenceRecord[]> {
+    const contents = new Map<string, Buffer>();
     const evidence: QuizEvidenceRecord[] = [];
-    for (const card of cards) {
-      for (const binding of this.scheduler.bindings(card.cardId)) {
-        const catalog = this.db.get<Record<string, unknown>>(
-          "SELECT relative_path, digest, revision, status, quiz_worthiness FROM pages WHERE page_id = ?",
-          [binding.pageId],
-        );
-        const path = String(catalog?.relative_path ?? "");
-        const pageDigest = String(catalog?.digest ?? "");
-        const pageRevision = Number(catalog?.revision ?? 0);
-        if (
-          !catalog ||
-          String(catalog.status) !== "active" ||
-          String(catalog.quiz_worthiness) !== "eligible" ||
-          !path ||
-          !pageDigest ||
-          !Number.isInteger(pageRevision) ||
-          pageRevision < 1
-        )
-          throw new ValidationError(`Binding page is stale or unavailable: ${binding.pageId}`);
-        let bytes = pages.get(binding.pageId);
-        if (bytes === undefined) {
-          try {
-            bytes = readFileNoFollow(safeRelativePath(this.paths.wikiRoot, path));
-          } catch {
-            throw new ValidationError(`Binding page is stale or unavailable: ${binding.pageId}`);
-          }
-          pages.set(binding.pageId, bytes);
+    const seenPages = new Set<string>();
+    for (const learning of pages) {
+      if (seenPages.has(learning.pageId)) continue;
+      seenPages.add(learning.pageId);
+      const catalog = this.db.get<Record<string, unknown>>(
+        "SELECT relative_path, digest, revision, status, quiz_worthiness FROM pages WHERE page_id = ?",
+        [learning.pageId],
+      );
+      const path = String(catalog?.relative_path ?? "");
+      const pageDigest = String(catalog?.digest ?? "");
+      const pageRevision = Number(catalog?.revision ?? 0);
+      if (
+        !catalog ||
+        String(catalog.status) !== "active" ||
+        String(catalog.quiz_worthiness) !== "eligible" ||
+        !path ||
+        !pageDigest ||
+        !Number.isInteger(pageRevision) ||
+        pageRevision < 1
+      )
+        throw new ValidationError(`Learning page is stale or unavailable: ${learning.pageId}`);
+      let bytes = contents.get(learning.pageId);
+      if (bytes === undefined) {
+        try {
+          bytes = readFileNoFollow(safeRelativePath(this.paths.wikiRoot, path));
+        } catch {
+          throw new ValidationError(`Learning page is stale or unavailable: ${learning.pageId}`);
         }
-        const content = bytes.toString("utf8");
-        if (sha256(bytes) !== pageDigest)
-          throw new ValidationError(`Binding page is stale or unavailable: ${binding.pageId}`);
-        const section = parseWikiSections(content, binding.pageId).find(
-          (candidate) => candidate.anchor === binding.anchor,
-        );
-        if (!section || (binding.heading !== undefined && binding.heading !== section.heading))
-          throw new ValidationError(`Binding section is unavailable: ${binding.pageId}${binding.anchor}`);
+        contents.set(learning.pageId, bytes);
+      }
+      if (sha256(bytes) !== pageDigest)
+        throw new ValidationError(`Learning page is stale or unavailable: ${learning.pageId}`);
+      const content = bytes.toString("utf8");
+      for (const section of parseWikiSections(content, learning.pageId)) {
         const sectionText = content.slice(section.startOffset, section.endOffset);
-        const startOffset = binding.startOffset;
-        const endOffset = binding.endOffset;
-        if (
-          !Number.isInteger(startOffset) ||
-          !Number.isInteger(endOffset) ||
-          startOffset < 0 ||
-          endOffset <= startOffset ||
-          endOffset > sectionText.length
-        )
-          throw new ValidationError(`Binding section bytes are stale: ${binding.pageId}${binding.anchor}`);
-        const boundText = sectionText.slice(startOffset, endOffset);
-        const textDigest = sha256(boundText);
-        if (!boundText || textDigest !== binding.textDigest)
-          throw new ValidationError(`Binding section bytes are stale: ${binding.pageId}${binding.anchor}`);
+        if (!sectionText || sha256(sectionText) !== section.textDigest)
+          throw new ValidationError(`Learning section is stale: ${learning.pageId}${section.anchor}`);
         evidence.push({
-          reference: evidenceReference(
-            card.cardId,
-            binding.pageId,
-            binding.anchor,
-            pageDigest,
-            pageRevision,
-            binding.textDigest,
-          ),
-          cardId: card.cardId,
-          pageId: binding.pageId,
+          reference: evidenceReference(learning.pageId, section.anchor, pageDigest, pageRevision, section.textDigest),
+          pageId: learning.pageId,
           path,
-          anchor: binding.anchor,
-          ...(binding.heading === undefined ? {} : { heading: binding.heading }),
+          anchor: section.anchor,
+          ...(section.heading === undefined ? {} : { heading: section.heading }),
           pageDigest,
           pageRevision,
-          textDigest: binding.textDigest,
-          excerpt: boundedUtf8(boundText, 8192),
+          textDigest: section.textDigest,
+          excerpt: boundedUtf8(sectionText, 8192),
         });
       }
     }
@@ -2422,14 +1946,14 @@ export class ScholarApplication {
     return this.durableDirect(async () => {
       const expiredCount = this.quiz.expirePrior(date);
       const settings = await this.getSettings();
-      const eligibleCards = await this.filterLiveDriftCards(this.scheduler.selectDueCards(date));
+      const eligiblePages = await this.filterLiveDriftPages(this.scheduler.selectDuePages(date));
       const quiz = this.quiz.get(date);
       return {
         date,
         initializationEnabled: settings.settings.initializationEnabled,
         expiredCount,
-        eligibleCards,
-        evidence: await this.quizEvidence(eligibleCards),
+        eligiblePages,
+        evidence: await this.quizEvidence(eligiblePages),
         ...(quiz ? { quiz: await this.quizDetail(quiz) } : {}),
         ...(settings.settings.initializationEnabled
           ? { message: "Initialization maintenance is active; quiz publication is blocked." }
@@ -2439,29 +1963,41 @@ export class ScholarApplication {
   }
   private async validateQuizEvidence(
     questions: readonly QuizQuestionProposal[],
-    selectedCards: readonly ReviewCardRecord[],
+    selectedPages: readonly PageLearningRecord[],
   ): Promise<void> {
-    const selected = new Set(selectedCards.map((card) => card.cardId));
-    const evidence = await this.quizEvidence(selectedCards);
-    const byCard = new Map<string, Set<string>>();
+    if (questions.length > 4) throw new ValidationError("A quiz may contain at most four questions");
+    if (questions.filter((question) => question.pages.length > 1).length > 2)
+      throw new ValidationError("A quiz may contain at most two synthesis questions");
+    const selected = new Set(selectedPages.map((page) => page.pageId));
+    const evidence = await this.quizEvidence(selectedPages);
+    const known = new Set(evidence.map((item) => item.reference));
+    const byPage = new Map<string, Set<string>>();
     for (const item of evidence) {
-      let references = byCard.get(item.cardId);
-      if (references === undefined) {
-        references = new Set<string>();
-        byCard.set(item.cardId, references);
-      }
+      const references = byPage.get(item.pageId) ?? new Set<string>();
       references.add(item.reference);
+      byPage.set(item.pageId, references);
     }
+    const singlePageCoverage = new Map<string, number>();
     for (const question of questions) {
+      if (!question.pages.length) throw new ValidationError("Every quiz question must cover a wiki page");
       if (!question.sourceRefs.length) throw new ValidationError("Every quiz question requires source evidence");
-      for (const cardId of question.cardIds) {
-        if (!selected.has(cardId)) throw new ValidationError(`Quiz question references an ineligible card: ${cardId}`);
-        const refs = byCard.get(cardId) ?? new Set<string>();
-        if (!question.sourceRefs.some((reference) => refs.has(reference)))
-          throw new ValidationError(`Quiz question lacks source evidence for card: ${cardId}`);
+      if (question.pages.length === 1) {
+        const pageId = question.pages[0]!.pageId.trim();
+        singlePageCoverage.set(pageId, (singlePageCoverage.get(pageId) ?? 0) + 1);
       }
-      if (question.sourceRefs.some((reference) => !evidence.some((item) => item.reference === reference)))
+      for (const page of question.pages) {
+        if (!selected.has(page.pageId))
+          throw new ValidationError(`Quiz question references an ineligible page: ${page.pageId}`);
+        const references = byPage.get(page.pageId) ?? new Set<string>();
+        if (!question.sourceRefs.some((reference) => references.has(reference)))
+          throw new ValidationError(`Quiz question lacks source evidence for page: ${page.pageId}`);
+      }
+      if (question.sourceRefs.some((reference) => !known.has(reference)))
         throw new ValidationError("Quiz question references unknown source evidence");
+    }
+    for (const page of selectedPages) {
+      if (singlePageCoverage.get(page.pageId) !== 1)
+        throw new ValidationError(`Every selected page requires exactly one single-page question: ${page.pageId}`);
     }
   }
   async publishQuiz(input: QuizPublicationInput): Promise<QuizDetailRecord> {
@@ -2476,17 +2012,17 @@ export class ScholarApplication {
         blocked = true;
         return undefined;
       }
-      const selectedCards = await this.filterLiveDriftCards(this.scheduler.selectDueCards(date));
+      const selectedPages = await this.filterLiveDriftPages(this.scheduler.selectDuePages(date));
       if (proposal.status === "skipped") {
-        if (selectedCards.length) throw new ValidationError("A quiz may be skipped only when no cards are eligible");
-        return this.quizDetail(this.quiz.createDailyQuiz({ date, selectedCardIds: [] }));
+        if (selectedPages.length) throw new ValidationError("A quiz may be skipped only when pages are eligible");
+        return this.quizDetail(this.quiz.createDailyQuiz({ date, selectedPageIds: [], questionSpecs: [] }));
       }
-      await this.validateQuizEvidence(proposal.questions, selectedCards);
+      await this.validateQuizEvidence(proposal.questions, selectedPages);
       return this.quizDetail(
         this.quiz.createDailyQuiz({
           date,
-          questions: proposal.questions,
-          selectedCardIds: selectedCards.map((card) => card.cardId),
+          selectedPageIds: selectedPages.map((page) => page.pageId),
+          questionSpecs: proposal.questions,
         }),
       );
     }, "quiz:publish");
@@ -2524,7 +2060,7 @@ export class ScholarApplication {
           !quiz ||
           (date !== undefined && quiz.date !== date) ||
           quiz.status !== "submitted" ||
-          this.db.get("SELECT 1 FROM card_results WHERE quiz_id = ? LIMIT 1", [binding.quizId])
+          this.db.get("SELECT 1 FROM page_results WHERE quiz_id = ? LIMIT 1", [binding.quizId])
         )
           continue;
         if (binding.ownerHash === ownerHash) {
@@ -2550,8 +2086,8 @@ export class ScholarApplication {
       }
       const quizzes = this.db.all<Record<string, unknown>>(
         date
-          ? "SELECT q.quiz_id, q.date, q.revision FROM quizzes q WHERE q.date = ? AND q.status = 'submitted' AND NOT EXISTS (SELECT 1 FROM card_results c WHERE c.quiz_id = q.quiz_id) ORDER BY q.submitted_at, q.quiz_id"
-          : "SELECT q.quiz_id, q.date, q.revision FROM quizzes q WHERE q.status = 'submitted' AND NOT EXISTS (SELECT 1 FROM card_results c WHERE c.quiz_id = q.quiz_id) ORDER BY q.submitted_at, q.quiz_id",
+          ? "SELECT q.quiz_id, q.date, q.revision FROM quizzes q WHERE q.date = ? AND q.status = 'submitted' AND NOT EXISTS (SELECT 1 FROM page_results p WHERE p.quiz_id = q.quiz_id) ORDER BY q.submitted_at, q.quiz_id"
+          : "SELECT q.quiz_id, q.date, q.revision FROM quizzes q WHERE q.status = 'submitted' AND NOT EXISTS (SELECT 1 FROM page_results p WHERE p.quiz_id = q.quiz_id) ORDER BY q.submitted_at, q.quiz_id",
         date ? [date] : [],
       );
       const quiz = quizzes.find((candidate) => !occupiedQuizIds.has(String(candidate.quiz_id)));
@@ -2652,10 +2188,12 @@ export class ScholarApplication {
         if (status === "succeeded") {
           const settled = this.quiz.readSettledResult(quiz);
           if (!settled) throw new QuizConflictError("The succeeded grading workflow has no committed result");
-          if (gradingReplayKey(proposal.questions) !== gradingReplayKey(settled.questions))
+          if (
+            gradingReplayKey(proposal.questions, proposal.pages) !== gradingReplayKey(settled.questions, settled.pages)
+          )
             throw new QuizConflictError("The grading replay does not match the committed result");
           const detail = await this.quizDetail(settled.quiz);
-          return { quiz: detail, questions: settled.questions };
+          return { quiz: detail, questions: settled.questions, pages: settled.pages };
         }
         if (status !== "running") throw new QuizConflictError("The grading workflow is not running");
         owned = true;
@@ -2665,6 +2203,7 @@ export class ScholarApplication {
             revision: proposal.revision,
             submissionId: proposal.submissionId,
             questions: proposal.questions,
+            pages: proposal.pages,
           },
           (persisted) => {
             const result = this.db.run(
@@ -2677,7 +2216,7 @@ export class ScholarApplication {
           },
         );
         const detail = await this.quizDetail(settled.quiz);
-        return { quiz: detail, questions: settled.questions };
+        return { quiz: detail, questions: settled.questions, pages: settled.pages };
       }, "quiz:grade");
     } catch (error) {
       if (owned) await this.failGradingWorkflow(proposal.requestId, error, sha256(ownerToken ?? ""));
