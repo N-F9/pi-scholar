@@ -1,0 +1,18 @@
+# Product staging and derived state
+/inbox/
+/.pi-scholar/qmd/
+/.pi-scholar/work/
+
+# SQLite runtime sidecars; state.sqlite itself is durable and tracked
+/.pi-scholar/state.sqlite-wal
+/.pi-scholar/state.sqlite-shm
+/.pi-scholar/state.sqlite-journal
+
+# Local process output
+/*.log
+/.pi-scholar/*.log
+
+# JavaScript/tool output
+/node_modules/
+/dist/
+/apps/web/dist/

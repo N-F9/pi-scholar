@@ -1,0 +1,54 @@
+{
+  "name": "pi-scholar",
+  "version": "0.1.0",
+  "description": "Local-first sourced Markdown wiki and daily review for Pi",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "pi-scholar": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./contracts": "./dist/contracts.js",
+    "./vault": "./dist/vault.js",
+    "./database": "./dist/database.js"
+  },
+  "files": [
+    "dist",
+    "apps/web/dist",
+    "skills",
+    "pi"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:web": "vite build --config apps/web/vite.config.ts",
+    "dev": "vite --config apps/web/vite.config.ts",
+    "test": "vitest run",
+    "verify": "npm run build && npm run build:web && npm test"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.101.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "react-router-dom": "7.18.2",
+    "remark-gfm": "4.0.1",
+    "ts-fsrs": "5.4.1"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
+  }
+}
