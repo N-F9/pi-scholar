@@ -766,12 +766,14 @@ export class QuizService {
       }
     }
     if (pageResults?.length) {
-      lines.push(
-        `## ${quiz.questions.length + 1}. Page review`,
-        "",
-        ...pageResults.map((page) => cleanMarkdown(page.feedback || "No page feedback.")),
-        "",
-      );
+      lines.push(`## ${quiz.questions.length + 1}. Page review`, "");
+      for (const page of pageResults) {
+        lines.push(cleanMarkdown(page.feedback || "No page feedback."));
+        for (const [index, reading] of page.readings.entries()) {
+          lines.push(`- [Reading ${index + 1}](${this.readingHref(reading)})`);
+        }
+        lines.push("");
+      }
     }
     return `${lines
       .join("\n")

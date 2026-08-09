@@ -266,14 +266,14 @@ test("grading snapshots page sections directly and settles one FSRS transition p
       {
         pageId: "p1",
         rating: "Good" as const,
-        feedback: "Understood",
+        feedback: "P1 feedback",
         evidence: [authorized.reference],
         readings: [{ pageId: "p1", anchor: authorized.anchor }],
       },
       {
         pageId: "p2",
         rating: "Good" as const,
-        feedback: "Understood",
+        feedback: "P2 feedback",
         evidence: [authorizedP2.reference],
         readings: [{ pageId: "p2", anchor: authorizedP2.anchor }],
       },
@@ -285,6 +285,13 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(settled.pages[1]!.pageId, "p2");
   assert.equal(settled.pages[0]!.evidence.length, 1);
   assert.equal(settled.pages[0]!.readings.length, 1);
+  const sheet = quiz.renderSheet(settled.quiz, undefined, settled.questions, settled.pages);
+  const p1Feedback = sheet.indexOf("P1 feedback");
+  const p1Reading = sheet.indexOf(`- [Reading 1](${quiz.readingHref(settled.pages[0]!.readings[0]!)})`);
+  const p2Feedback = sheet.indexOf("P2 feedback");
+  const p2Reading = sheet.indexOf(`- [Reading 1](${quiz.readingHref(settled.pages[1]!.readings[0]!)})`);
+  assert.ok(p1Feedback >= 0 && p1Reading > p1Feedback);
+  assert.ok(p2Feedback > p1Reading && p2Reading > p2Feedback);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [generated.quizId]).length, 2);
   assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
   assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [generated.quizId]).length, 3);
