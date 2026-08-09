@@ -1,5 +1,9 @@
 # Pi Scholar
 
+<p align="center">
+  <img src="assets/pi-scholar-readme.png" alt="A scholar writing in a book by candlelight" width="720">
+</p>
+
 Pi Scholar is a local-first Markdown wiki and daily review application for Pi. The vault, SQLite state, source originals, quiz artifacts, and Git history stay on the machine; the HTTP server is only a loopback boundary.
 
 ## Install and initialize
