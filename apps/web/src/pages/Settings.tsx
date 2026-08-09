@@ -12,7 +12,8 @@ export function SettingsPage() {
     queryFn: ({ signal }) => api<SettingsResult>("/api/v1/settings", { signal }, isSettingsResult),
   });
   const update = useMutation({
-    mutationFn: (request: SettingsUpdateRequest) => api<SettingsResult>("/api/v1/settings", { method: "PUT", body: JSON.stringify(request) }, isSettingsResult),
+    mutationFn: (request: SettingsUpdateRequest) =>
+      api<SettingsResult>("/api/v1/settings", { method: "PUT", body: JSON.stringify(request) }, isSettingsResult),
     onSuccess: async () => {
       setConfirming(false);
       await Promise.all([
@@ -32,72 +33,174 @@ export function SettingsPage() {
       </header>
 
       {query.isLoading ? <Spinner label="Loading settings" /> : null}
-      {query.isError ? <StateView title="Could not load settings" tone="danger"><p>{errorMessage(query.error)}</p></StateView> : null}
+      {query.isError ? (
+        <StateView title="Could not load settings" tone="danger">
+          <p>{errorMessage(query.error)}</p>
+        </StateView>
+      ) : null}
       {query.data ? (
         <div className="grid gap-6">
           <Card>
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
                 <p className="eyebrow">Quiz publishing</p>
-                <h2 className="mt-2 font-serif text-3xl font-semibold">Initialization {query.data.settings.initializationEnabled ? "enabled" : "disabled"}</h2>
-                <p className="mt-3 max-w-2xl text-muted">{query.data.settings.initializationEnabled ? "Initialization blocks quiz publishing until you turn it off." : "Quiz publishing is enabled. Skills run independently according to your cron entries."}</p>
+                <h2 className="mt-2 font-serif text-3xl font-semibold">
+                  Initialization {query.data.settings.initializationEnabled ? "enabled" : "disabled"}
+                </h2>
+                <p className="mt-3 max-w-2xl text-muted">
+                  {query.data.settings.initializationEnabled
+                    ? "Initialization blocks quiz publishing until you turn it off."
+                    : "Quiz publishing is enabled. Skills run independently according to your cron entries."}
+                </p>
               </div>
-              <Badge tone={query.data.settings.initializationEnabled ? "caution" : "neutral"}>{query.data.settings.initializationEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}</Badge>
+              <Badge tone={query.data.settings.initializationEnabled ? "caution" : "neutral"}>
+                {query.data.settings.initializationEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}
+              </Badge>
             </div>
 
-            {query.data.settings.initializationEnabled && !confirming ? <Button className="mt-6" variant="secondary" onClick={() => setConfirming(true)}>Turn off initialization</Button> : null}
+            {query.data.settings.initializationEnabled && !confirming ? (
+              <Button className="mt-6" variant="secondary" onClick={() => setConfirming(true)}>
+                Turn off initialization
+              </Button>
+            ) : null}
             {query.data.settings.initializationEnabled && confirming ? (
               <div className="mt-6 rounded-md border border-caution/40 bg-caution/10 p-4">
                 <h3 className="font-bold">Turn off initialization?</h3>
-                <p className="mt-2 text-sm text-muted">Quiz publishing will be enabled. Skills will run independently according to your cron entries.</p>
+                <p className="mt-2 text-sm text-muted">
+                  Quiz publishing will be enabled. Skills will run independently according to your cron entries.
+                </p>
                 <div className="mt-4 flex flex-wrap gap-3">
-                  <Button onClick={() => update.mutate({ initializationEnabled: false })} disabled={update.isPending}>{update.isPending ? "Saving…" : "Turn off initialization"}</Button>
-                  <Button variant="quiet" onClick={() => setConfirming(false)} disabled={update.isPending}>Cancel</Button>
+                  <Button onClick={() => update.mutate({ initializationEnabled: false })} disabled={update.isPending}>
+                    {update.isPending ? "Saving…" : "Turn off initialization"}
+                  </Button>
+                  <Button variant="quiet" onClick={() => setConfirming(false)} disabled={update.isPending}>
+                    Cancel
+                  </Button>
                 </div>
               </div>
             ) : null}
-            {update.isError ? <p className="mt-4 text-sm font-bold text-danger" role="alert">{errorMessage(update.error)}</p> : null}
+            {update.isError ? (
+              <p className="mt-4 text-sm font-bold text-danger" role="alert">
+                {errorMessage(update.error)}
+              </p>
+            ) : null}
           </Card>
 
           <section aria-labelledby="current-facts-heading">
             <p className="eyebrow">Current facts</p>
-            <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-facts-heading">Vault activity</h2>
+            <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-facts-heading">
+              Vault activity
+            </h2>
             <dl className="mt-4 grid gap-px overflow-hidden rounded-lg border border-line bg-line sm:grid-cols-2 lg:grid-cols-4">
-              <div className="bg-paper p-5"><dt className="text-sm text-muted">Pending inbox entries</dt><dd className="mt-2 font-serif text-3xl font-semibold">{query.data.settings.facts.pendingInboxCount}</dd></div>
-              <div className="bg-paper p-5"><dt className="text-sm text-muted">Open issues</dt><dd className="mt-2 font-serif text-3xl font-semibold">{query.data.settings.facts.openIssueCount}</dd></div>
+              <div className="bg-paper p-5">
+                <dt className="text-sm text-muted">Pending inbox entries</dt>
+                <dd className="mt-2 font-serif text-3xl font-semibold">
+                  {query.data.settings.facts.pendingInboxCount}
+                </dd>
+              </div>
+              <div className="bg-paper p-5">
+                <dt className="text-sm text-muted">Open issues</dt>
+                <dd className="mt-2 font-serif text-3xl font-semibold">{query.data.settings.facts.openIssueCount}</dd>
+              </div>
               <div className="bg-paper p-5">
                 <dt className="text-sm text-muted">Last maintenance</dt>
-                <dd className="mt-2 font-bold">{query.data.settings.facts.lastMaintenanceAt ? formatDate(query.data.settings.facts.lastMaintenanceAt, { dateStyle: "medium", timeStyle: "short" }) : "No run recorded"}</dd>
-                {query.data.settings.facts.lastMaintenanceResult ? <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastMaintenanceResult}</dd> : null}
+                <dd className="mt-2 font-bold">
+                  {query.data.settings.facts.lastMaintenanceAt
+                    ? formatDate(query.data.settings.facts.lastMaintenanceAt, {
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                      })
+                    : "No run recorded"}
+                </dd>
+                {query.data.settings.facts.lastMaintenanceResult ? (
+                  <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastMaintenanceResult}</dd>
+                ) : null}
               </div>
-              <div className="bg-paper p-5"><dt className="text-sm text-muted">Settings updated</dt><dd className="mt-2 font-bold">{formatDate(query.data.settings.updatedAt, { dateStyle: "medium", timeStyle: "short" })}</dd></div>
+              <div className="bg-paper p-5">
+                <dt className="text-sm text-muted">Settings updated</dt>
+                <dd className="mt-2 font-bold">
+                  {formatDate(query.data.settings.updatedAt, { dateStyle: "medium", timeStyle: "short" })}
+                </dd>
+              </div>
             </dl>
           </section>
 
           <div className="grid gap-6 lg:grid-cols-2">
             <Card className="shadow-none">
               <h2 className="font-serif text-2xl font-semibold">Recent changes</h2>
-              {query.data.settings.facts.recentChanges.length ? <ul className="mt-4 list-disc space-y-2 pl-5 text-sm text-muted">{query.data.settings.facts.recentChanges.map((change) => <li key={change}>{change}</li>)}</ul> : <p className="mt-3 text-sm text-muted">No recent changes reported.</p>}
+              {query.data.settings.facts.recentChanges.length ? (
+                <ul className="mt-4 list-disc space-y-2 pl-5 text-sm text-muted">
+                  {query.data.settings.facts.recentChanges.map((change) => (
+                    <li key={change}>{change}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-3 text-sm text-muted">No recent changes reported.</p>
+              )}
             </Card>
 
             <Card className="shadow-none">
-              <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-serif text-2xl font-semibold">Git synchronization</h2><Badge tone={query.data.settings.facts.git.diverged ? "danger" : query.data.settings.facts.git.clean && query.data.settings.facts.git.ahead === 0 && query.data.settings.facts.git.behind === 0 ? "positive" : "caution"}>{query.data.settings.facts.git.diverged ? "diverged" : query.data.settings.facts.git.clean ? "clean" : "changes present"}</Badge></div>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h2 className="font-serif text-2xl font-semibold">Git synchronization</h2>
+                <Badge
+                  tone={
+                    query.data.settings.facts.git.diverged
+                      ? "danger"
+                      : query.data.settings.facts.git.clean &&
+                          query.data.settings.facts.git.ahead === 0 &&
+                          query.data.settings.facts.git.behind === 0
+                        ? "positive"
+                        : "caution"
+                  }
+                >
+                  {query.data.settings.facts.git.diverged
+                    ? "diverged"
+                    : query.data.settings.facts.git.clean
+                      ? "clean"
+                      : "changes present"}
+                </Badge>
+              </div>
               <dl className="mt-4 grid grid-cols-2 gap-4 text-sm">
-                <div><dt className="text-muted">Branch</dt><dd className="mt-1 break-all font-mono">{query.data.settings.facts.git.branch ?? "Not reported"}</dd></div>
-                <div><dt className="text-muted">Upstream</dt><dd className="mt-1 break-all font-mono">{query.data.settings.facts.git.upstream ?? "Not configured"}</dd></div>
-                <div><dt className="text-muted">Ahead</dt><dd className="mt-1 font-bold">{query.data.settings.facts.git.ahead}</dd></div>
-                <div><dt className="text-muted">Behind</dt><dd className="mt-1 font-bold">{query.data.settings.facts.git.behind}</dd></div>
+                <div>
+                  <dt className="text-muted">Branch</dt>
+                  <dd className="mt-1 break-all font-mono">{query.data.settings.facts.git.branch ?? "Not reported"}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted">Upstream</dt>
+                  <dd className="mt-1 break-all font-mono">
+                    {query.data.settings.facts.git.upstream ?? "Not configured"}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted">Ahead</dt>
+                  <dd className="mt-1 font-bold">{query.data.settings.facts.git.ahead}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted">Behind</dt>
+                  <dd className="mt-1 font-bold">{query.data.settings.facts.git.behind}</dd>
+                </div>
               </dl>
-              {query.data.settings.facts.git.message ? <p className="mt-4 text-sm text-muted">{query.data.settings.facts.git.message}</p> : null}
+              {query.data.settings.facts.git.message ? (
+                <p className="mt-4 text-sm text-muted">{query.data.settings.facts.git.message}</p>
+              ) : null}
             </Card>
           </div>
 
           <Card className="shadow-none">
             <h2 className="font-serif text-2xl font-semibold">Service facts</h2>
             <dl className="mt-4 grid gap-4 text-sm sm:grid-cols-3">
-              <div><dt className="text-muted">Timezone</dt><dd className="mt-1 font-bold">{query.data.settings.timezone}</dd></div>
-              <div><dt className="text-muted">Host</dt><dd className="mt-1 font-mono">{query.data.settings.host}</dd></div>
-              <div><dt className="text-muted">Port</dt><dd className="mt-1 font-mono">{query.data.settings.port}</dd></div>
+              <div>
+                <dt className="text-muted">Timezone</dt>
+                <dd className="mt-1 font-bold">{query.data.settings.timezone}</dd>
+              </div>
+              <div>
+                <dt className="text-muted">Host</dt>
+                <dd className="mt-1 font-mono">{query.data.settings.host}</dd>
+              </div>
+              <div>
+                <dt className="text-muted">Port</dt>
+                <dd className="mt-1 font-mono">{query.data.settings.port}</dd>
+              </div>
             </dl>
           </Card>
         </div>

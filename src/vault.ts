@@ -3,9 +3,9 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
-  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -242,7 +242,13 @@ export function safeRelativePath(root: string | VaultPaths, requestedPath: strin
     throw new PathSafetyError("relative path is required");
   }
   rejectControls(requestedPath, "relative path");
-  if (requestedPath.includes("\\") || isAbsolute(requestedPath) || posix.isAbsolute(requestedPath) || win32.isAbsolute(requestedPath) || /^[A-Za-z]:/u.test(requestedPath)) {
+  if (
+    requestedPath.includes("\\") ||
+    isAbsolute(requestedPath) ||
+    posix.isAbsolute(requestedPath) ||
+    win32.isAbsolute(requestedPath) ||
+    /^[A-Za-z]:/u.test(requestedPath)
+  ) {
     throw new PathSafetyError(`absolute or platform-specific path is not allowed: ${requestedPath}`);
   }
   const normalized = normalize(requestedPath);
@@ -266,7 +272,8 @@ export function readFileNoFollow(path: string, maxBytes?: number): Buffer {
   try {
     const opened = fstatSync(fd);
     if (!opened.isFile()) throw new PathSafetyError(`regular file required: ${path}`);
-    if (maxBytes !== undefined && opened.size > maxBytes) throw new PathSafetyError(`file exceeds ${maxBytes} bytes: ${path}`);
+    if (maxBytes !== undefined && opened.size > maxBytes)
+      throw new PathSafetyError(`file exceeds ${maxBytes} bytes: ${path}`);
     return readFileSync(fd);
   } finally {
     closeSync(fd);
@@ -280,7 +287,8 @@ export function atomicWriteFile(path: string, data: string | Uint8Array, mode = 
   assertDirectory(directory, "file parent");
   if (existsSync(path)) {
     const destination = lstatSync(path);
-    if (destination.isSymbolicLink() || !destination.isFile()) throw new PathSafetyError(`atomic destination must be a regular file: ${path}`);
+    if (destination.isSymbolicLink() || !destination.isFile())
+      throw new PathSafetyError(`atomic destination must be a regular file: ${path}`);
   }
   const temporary = join(directory, `.${randomUUID()}.tmp`);
   const fd = openSync(temporary, "wx", mode);
@@ -331,7 +339,8 @@ function ignoresDurablePath(rule: string): boolean {
 function validateGitignore(path: string): void {
   try {
     const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile()) throw new PathSafetyError(`vault .gitignore must be a regular file: ${path}`);
+    if (stat.isSymbolicLink() || !stat.isFile())
+      throw new PathSafetyError(`vault .gitignore must be a regular file: ${path}`);
     const contents = readFileNoFollow(path).toString("utf8");
     for (const rawRule of contents.split(/\r?\n/u)) {
       const rule = rawRule.trim();
@@ -367,7 +376,8 @@ function seedDefaultSettings(paths: VaultPaths): void {
         ["port", String(DEFAULT_VAULT_PORT)],
         ["host", JSON.stringify(DEFAULT_VAULT_HOST)],
       ];
-      for (const [key, value] of defaults) db.run("INSERT OR IGNORE INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [key, value, now]);
+      for (const [key, value] of defaults)
+        db.run("INSERT OR IGNORE INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [key, value, now]);
     });
     db.checkpoint();
   } finally {
@@ -410,7 +420,8 @@ export function initVault(requestedRoot = process.cwd()): VaultPaths {
     ["work", paths.workRoot],
     ["snapshots", join(paths.metadataRoot, "snapshots")],
     ["wiki snapshots", join(paths.metadataRoot, "snapshots", "wiki")],
-  ] as const) ensureDirectory(path, name);
+  ] as const)
+    ensureDirectory(path, name);
   ensureGitignore(join(vaultRoot, ".gitignore"));
   validateVaultLayout(paths);
   seedDefaultSettings(paths);
@@ -482,11 +493,16 @@ function acquireLock(path: string): LockHandle | undefined {
   };
 }
 
-export function acquireWriterLock(paths: VaultPaths, options: { readonly waitMs?: number; readonly pollMs?: number } = {}): LockHandle {
+export function acquireWriterLock(
+  paths: VaultPaths,
+  options: { readonly waitMs?: number; readonly pollMs?: number } = {},
+): LockHandle {
   const waitMs = options.waitMs ?? 0;
   const pollMs = options.pollMs ?? 25;
-  if (!Number.isFinite(waitMs) || waitMs < 0) throw new VaultError("INVALID_LOCK_WAIT", "Lock waitMs must be a finite nonnegative number");
-  if (!Number.isFinite(pollMs) || pollMs <= 0) throw new VaultError("INVALID_LOCK_WAIT", "Lock pollMs must be a finite positive number");
+  if (!Number.isFinite(waitMs) || waitMs < 0)
+    throw new VaultError("INVALID_LOCK_WAIT", "Lock waitMs must be a finite nonnegative number");
+  if (!Number.isFinite(pollMs) || pollMs <= 0)
+    throw new VaultError("INVALID_LOCK_WAIT", "Lock pollMs must be a finite positive number");
   const deadline = Date.now() + waitMs;
   const sleeper = waitMs > 0 ? new Int32Array(new SharedArrayBuffer(4)) : undefined;
   for (;;) {
@@ -498,7 +514,6 @@ export function acquireWriterLock(paths: VaultPaths, options: { readonly waitMs?
   }
 }
 
-
 export async function withWriterLock<T>(paths: VaultPaths, operation: () => T | PromiseLike<T>): Promise<T> {
   const lock = acquireWriterLock(paths);
   try {
@@ -507,7 +522,6 @@ export async function withWriterLock<T>(paths: VaultPaths, operation: () => T | 
     lock.release();
   }
 }
-
 
 export function productRoots(paths: VaultPaths): readonly string[] {
   return PRODUCT_DIRECTORIES.map((name) => join(paths.vaultRoot, name));

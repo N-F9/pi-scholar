@@ -23,28 +23,57 @@ const linkClass = ({ isActive }: { isActive: boolean }) =>
 export function AppShell() {
   return (
     <div className="min-h-screen">
-      <aside className="fixed inset-y-0 left-0 hidden w-64 border-r border-line bg-canvas px-5 py-8 lg:flex lg:flex-col" aria-label="Application navigation">
+      <aside
+        className="fixed inset-y-0 left-0 hidden w-64 border-r border-line bg-canvas px-5 py-8 lg:flex lg:flex-col"
+        aria-label="Application navigation"
+      >
         <NavLink className="mb-10 block rounded-sm" to="/" aria-label="Pi Scholar home">
           <span className="block font-serif text-2xl font-semibold">Pi Scholar</span>
           <span className="eyebrow mt-1 block">A local field guide</span>
         </NavLink>
         <nav className="grid gap-1" aria-label="Primary">
-          {primary.map((item) => <NavLink className={linkClass} key={item.to} to={item.to} end={item.to === "/"}>{item.label}</NavLink>)}
+          {primary.map((item) => (
+            <NavLink className={linkClass} key={item.to} to={item.to} end={item.to === "/"}>
+              {item.label}
+            </NavLink>
+          ))}
         </nav>
         <div className="my-6 border-t border-line" />
         <nav className="grid gap-1" aria-label="Secondary">
-          {secondary.map((item) => <NavLink className={linkClass} key={item.to} to={item.to}>{item.label}</NavLink>)}
+          {secondary.map((item) => (
+            <NavLink className={linkClass} key={item.to} to={item.to}>
+              {item.label}
+            </NavLink>
+          ))}
         </nav>
-        <p className="mt-auto text-xs leading-5 text-muted">Your vault stays on this machine. Changes use the same local application boundary as Pi.</p>
+        <p className="mt-auto text-xs leading-5 text-muted">
+          Your vault stays on this machine. Changes use the same local application boundary as Pi.
+        </p>
       </aside>
 
       <div className="min-w-0 pb-24 lg:ml-64 lg:pb-0">
         <header className="sticky top-0 z-20 flex min-h-16 items-center justify-between border-b border-line bg-canvas px-4 sm:px-6 lg:hidden">
-          <NavLink className="rounded-sm font-serif text-xl font-semibold" to="/">Pi Scholar</NavLink>
+          <NavLink className="rounded-sm font-serif text-xl font-semibold" to="/">
+            Pi Scholar
+          </NavLink>
           <details className="relative">
-            <summary className="flex min-h-11 cursor-pointer list-none items-center rounded-md border border-line bg-paper px-3 text-sm font-bold marker:content-none">More</summary>
-            <nav className="absolute right-0 mt-2 grid w-44 gap-1 rounded-lg border border-line bg-paper p-2 shadow-quiet" aria-label="Secondary">
-              {secondary.map((item) => <NavLink className={linkClass} key={item.to} to={item.to} onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>{item.label}</NavLink>)}
+            <summary className="flex min-h-11 cursor-pointer list-none items-center rounded-md border border-line bg-paper px-3 text-sm font-bold marker:content-none">
+              More
+            </summary>
+            <nav
+              className="absolute right-0 mt-2 grid w-44 gap-1 rounded-lg border border-line bg-paper p-2 shadow-quiet"
+              aria-label="Secondary"
+            >
+              {secondary.map((item) => (
+                <NavLink
+                  className={linkClass}
+                  key={item.to}
+                  to={item.to}
+                  onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}
+                >
+                  {item.label}
+                </NavLink>
+              ))}
             </nav>
           </details>
         </header>
@@ -54,10 +83,18 @@ export function AppShell() {
         </main>
       </div>
 
-      <nav className="safe-bottom fixed inset-x-0 bottom-0 z-30 grid grid-cols-4 border-t border-line bg-paper px-1 lg:hidden" aria-label="Primary">
+      <nav
+        className="safe-bottom fixed inset-x-0 bottom-0 z-30 grid grid-cols-4 border-t border-line bg-paper px-1 lg:hidden"
+        aria-label="Primary"
+      >
         {primary.map((item) => (
           <NavLink
-            className={({ isActive }) => cx("flex min-h-14 items-center justify-center rounded-sm px-1 text-xs font-bold", isActive ? "text-ink underline decoration-accent decoration-4 underline-offset-8" : "text-muted")}
+            className={({ isActive }) =>
+              cx(
+                "flex min-h-14 items-center justify-center rounded-sm px-1 text-xs font-bold",
+                isActive ? "text-ink underline decoration-accent decoration-4 underline-offset-8" : "text-muted",
+              )
+            }
             key={item.to}
             to={item.to}
             end={item.to === "/"}

@@ -1,20 +1,24 @@
 import { strict as assert } from "node:assert";
-import { promises as fs, mkdtempSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import { promises as fs, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application.js";
 import { openDatabase } from "../src/database.js";
+import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
 import { parseWikiSections } from "../src/wiki-sections.js";
-import { localDate } from "../src/scheduler.js";
 
 type DurableApplication = ScholarApplication & {
   durableDirect<T>(operation: () => T | PromiseLike<T>, subject: string): Promise<T>;
 };
 
-function durable(app: ScholarApplication, operation: () => unknown | PromiseLike<unknown>, subject: string): Promise<unknown> {
+function durable(
+  app: ScholarApplication,
+  operation: () => unknown | PromiseLike<unknown>,
+  subject: string,
+): Promise<unknown> {
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
@@ -47,10 +51,17 @@ describe("durable application writes", () => {
   it("checkpoints, doctors, and commits exactly once after the operation", async () => {
     const { app, db, calls } = fixture();
     try {
-      assert.equal(await durable(app, () => {
-        calls.push("operation");
-        return "done";
-      }, "test:write"), "done");
+      assert.equal(
+        await durable(
+          app,
+          () => {
+            calls.push("operation");
+            return "done";
+          },
+          "test:write",
+        ),
+        "done",
+      );
       assert.deepEqual(calls, ["operation", "checkpoint", "doctor", "commit:test:write"]);
     } finally {
       await app.close();
@@ -62,10 +73,11 @@ describe("durable application writes", () => {
     for (const stage of ["checkpoint", "doctor", "commit"] as const) {
       const { app, db, calls } = fixture();
       const originalCheckpoint = db.checkpoint.bind(db);
-      if (stage === "checkpoint") (db as unknown as { checkpoint: () => void }).checkpoint = () => {
-        calls.push("checkpoint");
-        throw new Error("checkpoint failed");
-      };
+      if (stage === "checkpoint")
+        (db as unknown as { checkpoint: () => void }).checkpoint = () => {
+          calls.push("checkpoint");
+          throw new Error("checkpoint failed");
+        };
       if (stage === "doctor") {
         (app as unknown as { doctorFn: () => unknown }).doctorFn = () => {
           calls.push("doctor");
@@ -79,15 +91,29 @@ describe("durable application writes", () => {
         };
       }
       try {
-        await assert.rejects(durable(app, () => {
-          calls.push("operation");
-          return "applied";
-        }, "test:write"), (error: unknown) => {
-          assert.equal((error as { code?: string }).code, "MUTATION_APPLIED_FINALIZATION_FAILED");
-          assert.deepEqual((error as { details?: unknown }).details, { applied: true, retryable: false, stage });
-          return true;
-        });
-        assert.deepEqual(calls, stage === "checkpoint" ? ["operation", "checkpoint"] : stage === "doctor" ? ["operation", "checkpoint", "doctor"] : ["operation", "checkpoint", "doctor", "commit:test:write"]);
+        await assert.rejects(
+          durable(
+            app,
+            () => {
+              calls.push("operation");
+              return "applied";
+            },
+            "test:write",
+          ),
+          (error: unknown) => {
+            assert.equal((error as { code?: string }).code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+            assert.deepEqual((error as { details?: unknown }).details, { applied: true, retryable: false, stage });
+            return true;
+          },
+        );
+        assert.deepEqual(
+          calls,
+          stage === "checkpoint"
+            ? ["operation", "checkpoint"]
+            : stage === "doctor"
+              ? ["operation", "checkpoint", "doctor"]
+              : ["operation", "checkpoint", "doctor", "commit:test:write"],
+        );
       } finally {
         (db as unknown as { checkpoint: () => void }).checkpoint = originalCheckpoint;
         await app.close();
@@ -115,19 +141,29 @@ describe("durable application writes", () => {
       const claim = context.claims[0];
       if (!claim) throw new Error("admission claim is missing");
       const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest };
-      (db as unknown as { checkpoint: () => void }).checkpoint = () => { throw new Error("checkpoint failed after publication"); };
+      (db as unknown as { checkpoint: () => void }).checkpoint = () => {
+        throw new Error("checkpoint failed after publication");
+      };
       await assert.rejects(app.admitSource(input), (error: unknown) => {
         if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
         assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
         assert.deepEqual(error.details, { applied: true, retryable: false, stage: "checkpoint" });
         return true;
       });
-      const row = db.get<{ source_id: string; status: string; error_code: string | null }>("SELECT source_id, status, error_code FROM sources");
+      const row = db.get<{ source_id: string; status: string; error_code: string | null }>(
+        "SELECT source_id, status, error_code FROM sources",
+      );
       assert.equal(row?.status, "published");
       assert.equal(row?.error_code, null);
       const retry = await app.admitSource(input);
       assert.equal(retry.sourceId, row?.source_id);
-      assert.equal(db.get<{ status: string; error_code: string | null }>("SELECT status, error_code FROM sources WHERE source_id = ?", [retry.sourceId])?.status, "published");
+      assert.equal(
+        db.get<{ status: string; error_code: string | null }>(
+          "SELECT status, error_code FROM sources WHERE source_id = ?",
+          [retry.sourceId],
+        )?.status,
+        "published",
+      );
     } finally {
       (db as unknown as { checkpoint: () => void }).checkpoint = originalCheckpoint;
       await app.close();
@@ -143,15 +179,32 @@ describe("durable application writes", () => {
       db,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
-      commit: () => { throw new Error("injected commit failure"); },
+      commit: () => {
+        throw new Error("injected commit failure");
+      },
     });
-    const tableNames = ["pages", "authored_snapshots", "wiki_issues", "review_cards", "card_bindings", "card_lineage", "card_prerequisites"];
-    const rows = (name: string) => db.all<Record<string, unknown>>(`SELECT * FROM ${name}`).sort((left, right) => String(JSON.stringify(left)).localeCompare(String(JSON.stringify(right))));
+    const tableNames = [
+      "pages",
+      "authored_snapshots",
+      "wiki_issues",
+      "review_cards",
+      "card_bindings",
+      "card_lineage",
+      "card_prerequisites",
+    ];
+    const rows = (name: string) =>
+      db
+        .all<Record<string, unknown>>(`SELECT * FROM ${name}`)
+        .sort((left, right) => String(JSON.stringify(left)).localeCompare(String(JSON.stringify(right))));
     try {
       const originalBody = "# Section\n\nauthored\n";
       const correctedBody = "# Section\n\ncorrected\n";
       const page = await app.wiki.create({ path: "rollback.md", body: originalBody, quizWorthiness: "eligible" });
-      const issue = await app.wiki.report({ pageId: page.page.pageId, heading: "Section", description: "Wrong section." });
+      const issue = await app.wiki.report({
+        pageId: page.page.pageId,
+        heading: "Section",
+        description: "Wrong section.",
+      });
       const destinations = [
         join(paths.wikiRoot, page.page.relativePath),
         join(paths.metadataRoot, "snapshots", "wiki", `${page.page.pageId}.md`),
@@ -160,32 +213,41 @@ describe("durable application writes", () => {
       ];
       const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
       const beforeTables = Object.fromEntries(tableNames.map((name) => [name, rows(name)]));
-      await assert.rejects(app.applyMaintenance({
-        kind: "resolve-issue",
-        issueId: issue.issueId,
-        page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body: correctedBody },
-        card: {
-          kind: "create-card",
-          cardId: "rollback-card",
-          dueAt: "2030-01-01T00:00:00.000Z",
-          bindings: [{
-            pageId: page.page.pageId,
-            heading: "Section",
-            anchor: "#section",
-            startOffset: 900,
-            endOffset: 901,
-            textDigest: "ignored",
-            pageDigest: "ignored",
-            pageRevision: 99,
-            sectionText: correctedBody,
-          }],
-        },
-        resolution: "Corrected the section.",
-      }), /injected commit failure/u);
-      for (const [index, path] of destinations.entries()) assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
+      await assert.rejects(
+        app.applyMaintenance({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body: correctedBody },
+          card: {
+            kind: "create-card",
+            cardId: "rollback-card",
+            dueAt: "2030-01-01T00:00:00.000Z",
+            bindings: [
+              {
+                pageId: page.page.pageId,
+                heading: "Section",
+                anchor: "#section",
+                startOffset: 900,
+                endOffset: 901,
+                textDigest: "ignored",
+                pageDigest: "ignored",
+                pageRevision: 99,
+                sectionText: correctedBody,
+              },
+            ],
+          },
+          resolution: "Corrected the section.",
+        }),
+        /injected commit failure/u,
+      );
+      for (const [index, path] of destinations.entries())
+        assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
       for (const name of tableNames) assert.deepEqual(rows(name), beforeTables[name]);
       assert.equal((await app.listIssues()).issues.find((entry) => entry.issueId === issue.issueId)?.status, "open");
-      assert.deepEqual((await fs.readdir(paths.workRoot)).filter((name) => name.startsWith("maintenance-rollback-")), []);
+      assert.deepEqual(
+        (await fs.readdir(paths.workRoot)).filter((name) => name.startsWith("maintenance-rollback-")),
+        [],
+      );
     } finally {
       await app.close();
       db.close();
@@ -200,7 +262,17 @@ describe("durable application writes", () => {
     const app = new ScholarApplication({
       paths,
       db,
-      adapters: { wiki: { qmd: { search: () => [], index: async () => { qmdIndexes += 1; if (qmdIndexes === 2) throw new Error("injected page qmd failure"); } } } },
+      adapters: {
+        wiki: {
+          qmd: {
+            search: () => [],
+            index: async () => {
+              qmdIndexes += 1;
+              if (qmdIndexes === 2) throw new Error("injected page qmd failure");
+            },
+          },
+        },
+      },
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
       commit: (_paths, subject) => ({ committed: true, subject }),
     });
@@ -215,17 +287,24 @@ describe("durable application writes", () => {
       const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
       const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
       const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
-      await assert.rejects(app.applyMaintenance({
-        kind: "update-page",
-        pageId: page.page.pageId,
-        expectedDigest: page.page.digest,
-        body: "after\n",
-      }), /injected page qmd failure/u);
+      await assert.rejects(
+        app.applyMaintenance({
+          kind: "update-page",
+          pageId: page.page.pageId,
+          expectedDigest: page.page.digest,
+          body: "after\n",
+        }),
+        /injected page qmd failure/u,
+      );
       assert.equal(qmdIndexes, 3);
-      for (const [index, path] of destinations.entries()) assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
+      for (const [index, path] of destinations.entries())
+        assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
       assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
       assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
-      assert.deepEqual((await fs.readdir(paths.workRoot)).filter((name) => name.startsWith("maintenance-rollback-")), []);
+      assert.deepEqual(
+        (await fs.readdir(paths.workRoot)).filter((name) => name.startsWith("maintenance-rollback-")),
+        [],
+      );
     } finally {
       await app.close();
       db.close();
@@ -242,7 +321,10 @@ describe("application quiz date guards", () => {
       const current = (await app.getSettings()).settings.facts.localDate;
       const stale = new Date(`${current}T00:00:00.000Z`);
       stale.setUTCDate(stale.getUTCDate() - 1);
-      await assert.rejects(app.sealSubmission(stale.toISOString().slice(0, 10), { expectedRevision: 1 }), /current local date/u);
+      await assert.rejects(
+        app.sealSubmission(stale.toISOString().slice(0, 10), { expectedRevision: 1 }),
+        /current local date/u,
+      );
     } finally {
       await app.close();
       db.close();
@@ -259,18 +341,25 @@ describe("application quiz date guards", () => {
       [oldQuizId, oldDate, new Date().toISOString()],
     );
     try {
-      await assert.rejects(app.publishQuiz({
-        status: "published",
-        date,
-        questions: [{
-          kind: "short-answer",
-          prompt: "Explain",
-          cardIds: [cardId],
-          cards: [{ cardId, criterion: "Explain", weight: 1 }],
-          sourceRefs: ["not-authorized"],
-        }],
-      }));
-      assert.equal(db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", [oldQuizId])?.status, "open");
+      await assert.rejects(
+        app.publishQuiz({
+          status: "published",
+          date,
+          questions: [
+            {
+              kind: "short-answer",
+              prompt: "Explain",
+              cardIds: [cardId],
+              cards: [{ cardId, criterion: "Explain", weight: 1 }],
+              sourceRefs: ["not-authorized"],
+            },
+          ],
+        }),
+      );
+      assert.equal(
+        db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", [oldQuizId])?.status,
+        "open",
+      );
     } finally {
       await app.close();
       db.close();
@@ -283,10 +372,14 @@ describe("browser quiz drafts", () => {
     const { app, db, calls, date, questionId, quiz } = gradingFixture();
     try {
       calls.length = 0;
-      const saved = await app.saveAnswers(date, {
-        expectedRevision: quiz.revision,
-        answers: [{ questionId, answer: "updated answer" }],
-      }, { origin: "browser" });
+      const saved = await app.saveAnswers(
+        date,
+        {
+          expectedRevision: quiz.revision,
+          answers: [{ questionId, answer: "updated answer" }],
+        },
+        { origin: "browser" },
+      );
       assert.equal(saved.revision, quiz.revision + 1);
       assert.deepEqual(calls, []);
     } finally {
@@ -318,45 +411,63 @@ function gradingFixture() {
   app.scheduler.createCard({
     cardId,
     initialDueAt: `${date}T00:00:00.000Z`,
-    bindings: [{
-      pageId: "page-1",
-      heading: section.heading,
-      anchor: section.anchor,
-      startOffset,
-      endOffset,
-      textDigest: createHash("sha256").update(boundText).digest("hex"),
-      pageDigest,
-      pageRevision: 1,
-      sectionText,
-    }],
+    bindings: [
+      {
+        pageId: "page-1",
+        heading: section.heading,
+        anchor: section.anchor,
+        startOffset,
+        endOffset,
+        textDigest: createHash("sha256").update(boundText).digest("hex"),
+        pageDigest,
+        pageRevision: 1,
+        sectionText,
+      },
+    ],
   });
   const questionId = "question-1";
   const quiz = app.quiz.createDailyQuiz({
     date,
-    questions: [{
-      questionId,
-      kind: "short-answer",
-      prompt: "Explain the section",
-      cardIds: [cardId],
-      cards: [{ cardId, criterion: "Explain the section", weight: 1 }],
-      sourceRefs: [],
-    }],
+    questions: [
+      {
+        questionId,
+        kind: "short-answer",
+        prompt: "Explain the section",
+        cardIds: [cardId],
+        cards: [{ cardId, criterion: "Explain the section", weight: 1 }],
+        sourceRefs: [],
+      },
+    ],
   });
   const draft = app.quiz.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
   return { ...fixtureValue, date, cardId, questionId, quiz: app.quiz.get(date)!, draft };
 }
 
-function gradeFor(context: Awaited<ReturnType<ScholarApplication["getGradingContext"]>>, cardId: string, questionId: string, evidence: readonly string[]) {
+function gradeFor(
+  context: Awaited<ReturnType<ScholarApplication["getGradingContext"]>>,
+  cardId: string,
+  questionId: string,
+  evidence: readonly string[],
+) {
   assert.ok(context.quiz);
   return {
     requestId: context.requestId!,
     date: context.date,
     revision: context.revision!,
     submissionId: context.submissionId!,
-    questions: [{
-      questionId,
-      cards: [{ cardId, rating: "Good" as const, evidence: [...evidence], readings: [{ pageId: "page-1", anchor: "#section" }] }],
-    }],
+    questions: [
+      {
+        questionId,
+        cards: [
+          {
+            cardId,
+            rating: "Good" as const,
+            evidence: [...evidence],
+            readings: [{ pageId: "page-1", anchor: "#section" }],
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -365,7 +476,10 @@ describe("quiz grading workflow lifecycle", () => {
     const { app, db, date, cardId, questionId, draft } = gradingFixture();
     const owner = randomUUID();
     const staleRequestId = randomUUID();
-    db.run("INSERT INTO workflows (request_id, kind, status, started_at, finished_at, progress, message, error_code, error_message, idempotency_key) VALUES (?, 'quiz-grader', 'queued', NULL, NULL, 0, ?, NULL, NULL, ?)", [staleRequestId, "malformed-grader-payload", "stale-grader-queue"]);
+    db.run(
+      "INSERT INTO workflows (request_id, kind, status, started_at, finished_at, progress, message, error_code, error_message, idempotency_key) VALUES (?, 'quiz-grader', 'queued', NULL, NULL, 0, ?, NULL, NULL, ?)",
+      [staleRequestId, "malformed-grader-payload", "stale-grader-queue"],
+    );
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
       assert.equal(db.all("SELECT request_id FROM workflows WHERE kind = 'quiz-grader'").length, 2);
@@ -377,7 +491,10 @@ describe("quiz grading workflow lifecycle", () => {
       assert.equal((await app.getWorkflow(staleRequestId)).status, "queued");
       const evidence = context.evidence?.find((item) => item.cardId === cardId)?.reference;
       assert.ok(evidence);
-      await assert.rejects(app.settleGrade({ ...gradeFor(context, cardId, questionId, [evidence]), requestId: "wrong-request" }, owner), /unknown/u);
+      await assert.rejects(
+        app.settleGrade({ ...gradeFor(context, cardId, questionId, [evidence]), requestId: "wrong-request" }, owner),
+        /unknown/u,
+      );
       assert.equal((await app.getWorkflow(context.requestId!)).status, "running");
       const grade = gradeFor(context, cardId, questionId, [evidence]);
       const settled = await app.settleGrade(grade, owner);
@@ -447,7 +564,9 @@ describe("quiz grading workflow lifecycle", () => {
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
       const requestId = sealed.workflow.requestId;
-      const queuedMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [requestId])?.message;
+      const queuedMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [
+        requestId,
+      ])?.message;
       assert.match(queuedMessage ?? "", /submissionId/u);
       assert.equal("message" in sealed.workflow, false);
       const listedWorkflow = (await app.listWorkflows()).workflows.find((workflow) => workflow.requestId === requestId);
@@ -462,7 +581,9 @@ describe("quiz grading workflow lifecycle", () => {
       const statusWorkflow = (await app.status()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(statusWorkflow);
       assert.equal("message" in statusWorkflow, false);
-      const runningMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [requestId])?.message;
+      const runningMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [
+        requestId,
+      ])?.message;
       assert.match(runningMessage ?? "", /ownerHash/u);
     } finally {
       await app.close();

@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
-import type { AddressInfo } from "node:net";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
@@ -8,7 +8,11 @@ import { ScholarApplication } from "../src/application.js";
 import type { QuizRecord } from "../src/contracts.js";
 import { startServer } from "../src/server.js";
 
-async function withServer(application: ScholarApplication, run: (base: string) => Promise<void>, staticRoot?: string): Promise<void> {
+async function withServer(
+  application: ScholarApplication,
+  run: (base: string) => Promise<void>,
+  staticRoot?: string,
+): Promise<void> {
   const server = await startServer({ application, port: 0, ...(staticRoot ? { staticRoot } : {}) });
   const address = server.address();
   assert.ok(address && typeof address !== "string");
@@ -18,7 +22,9 @@ async function withServer(application: ScholarApplication, run: (base: string) =
     await server.closeGracefully();
   }
 }
-function sameOriginHeaders(base: string, headers: Record<string, string> = {}): Record<string, string> { return { ...headers, Origin: base }; }
+function sameOriginHeaders(base: string, headers: Record<string, string> = {}): Record<string, string> {
+  return { ...headers, Origin: base };
+}
 
 const issue = {
   issueId: "11111111-1111-4111-8111-111111111111",
@@ -36,17 +42,19 @@ function publicQuizFixture(): QuizRecord {
     revision: 1,
     status: "open",
     sheetPath: "/private/sheet.md",
-    questions: [{
-      questionId: "question-1",
-      quizId: "quiz-1",
-      ordinal: 1,
-      kind: "short-answer",
-      prompt: "Explain the idea.",
-      cardIds: ["card-1"],
-      cards: [{ cardId: "card-1", criterion: "secret rubric", weight: 9 }],
-      sourceRefs: [],
-      answerKey: "secret answer",
-    } as QuizRecord["questions"][number]],
+    questions: [
+      {
+        questionId: "question-1",
+        quizId: "quiz-1",
+        ordinal: 1,
+        kind: "short-answer",
+        prompt: "Explain the idea.",
+        cardIds: ["card-1"],
+        cards: [{ cardId: "card-1", criterion: "secret rubric", weight: 9 }],
+        sourceRefs: [],
+        answerKey: "secret answer",
+      } as QuizRecord["questions"][number],
+    ],
   };
 }
 
@@ -72,7 +80,12 @@ describe("server browser boundary", () => {
       wrongPort.port = String(Number(wrongPort.port) + 1);
       const sameSiteWrongPort = await fetch(`${base}/api/v1/wiki/issues`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Origin": wrongPort.origin, "Sec-Fetch-Site": "same-site", "X-Pi-Scholar-Request": "1" },
+        headers: {
+          "Content-Type": "application/json",
+          Origin: wrongPort.origin,
+          "Sec-Fetch-Site": "same-site",
+          "X-Pi-Scholar-Request": "1",
+        },
         body: JSON.stringify({ kind: "contradiction", description: "wrong port" }),
       });
       assert.equal(sameSiteWrongPort.status, 403);
@@ -128,7 +141,6 @@ describe("server browser boundary", () => {
     });
   });
 
-
   it("requires JSON for mutations while allowing same-origin JSON and multipart uploads", async () => {
     let issueCalls = 0;
     let sourceCalls = 0;
@@ -141,14 +153,30 @@ describe("server browser boundary", () => {
         sourceCalls += 1;
         return { source: {} };
       },
-      listSources: async () => ({ sources: [{ sourceId: "source-1", kind: "upload", status: "pending", displayName: "notes", manifestPath: "/private/manifest.json", createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() }] }),
+      listSources: async () => ({
+        sources: [
+          {
+            sourceId: "source-1",
+            kind: "upload",
+            status: "pending",
+            displayName: "notes",
+            manifestPath: "/private/manifest.json",
+            createdAt: new Date(0).toISOString(),
+            updatedAt: new Date(0).toISOString(),
+          },
+        ],
+      }),
       close: async () => undefined,
     } as unknown as ScholarApplication;
 
     await withServer(application, async (base) => {
       const textResponse = await fetch(`${base}/api/v1/wiki/issues`, {
         method: "POST",
-        headers: sameOriginHeaders(base, { "Content-Type": "text/plain", "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
+        headers: sameOriginHeaders(base, {
+          "Content-Type": "text/plain",
+          "Sec-Fetch-Site": "same-origin",
+          "X-Pi-Scholar-Request": "1",
+        }),
         body: JSON.stringify({ kind: "incorrect", description: "wrong type" }),
       });
       assert.equal(textResponse.status, 415);
@@ -156,13 +184,19 @@ describe("server browser boundary", () => {
 
       const jsonResponse = await fetch(`${base}/api/v1/wiki/issues`, {
         method: "POST",
-        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
+        headers: sameOriginHeaders(base, {
+          "Content-Type": "application/json",
+          "Sec-Fetch-Site": "same-origin",
+          "X-Pi-Scholar-Request": "1",
+        }),
         body: JSON.stringify({ kind: "incorrect", description: "valid" }),
       });
       assert.equal(jsonResponse.status, 200);
       assert.equal(issueCalls, 1);
       const sourceListResponse = await fetch(`${base}/api/v1/sources`);
-      const sourceListEnvelope = await sourceListResponse.json() as { data: { sources: Array<Record<string, unknown>> } };
+      const sourceListEnvelope = (await sourceListResponse.json()) as {
+        data: { sources: Array<Record<string, unknown>> };
+      };
       assert.equal(sourceListResponse.status, 200);
       assert.equal("manifestPath" in sourceListEnvelope.data.sources[0]!, false);
 
@@ -211,7 +245,12 @@ describe("server browser boundary", () => {
     const application = {
       removalPreview: async (value: string) => {
         received = value;
-        return { source: { sourceId: value }, dependentPageIds: [], dependentCardIds: [], confirmationId: "confirmation" };
+        return {
+          source: { sourceId: value },
+          dependentPageIds: [],
+          dependentCardIds: [],
+          confirmationId: "confirmation",
+        };
       },
       close: async () => undefined,
     } as unknown as ScholarApplication;
@@ -226,7 +265,6 @@ describe("server browser boundary", () => {
       assert.equal(received, sourceId);
     });
   });
-
 
   it("rejects unsupported wiki search modes", async () => {
     let calls = 0;
@@ -253,17 +291,20 @@ describe("server browser boundary", () => {
     const application = { close: async () => undefined } as unknown as ScholarApplication;
 
     try {
-      await withServer(application, async (base) => {
-        const response = await fetch(`${base}/escape/secret.txt`);
-        assert.notEqual(response.status, 200);
-        assert.notEqual(await response.text(), "private");
-      }, root);
+      await withServer(
+        application,
+        async (base) => {
+          const response = await fetch(`${base}/escape/secret.txt`);
+          assert.notEqual(response.status, 200);
+          assert.notEqual(await response.text(), "private");
+        },
+        root,
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
   });
-
 
   it("projects quiz list and detail responses without rubric or answer material", async () => {
     const internal = publicQuizFixture();
@@ -282,7 +323,12 @@ describe("server browser boundary", () => {
       for (const path of ["/api/v1/quizzes", "/api/v1/quizzes/2026-08-09"]) {
         const response = await fetch(`${base}${path}`);
         assert.equal(response.status, 200);
-        const envelope = await response.json() as { data: { quizzes?: Array<{ questions: Array<Record<string, unknown>> }>; quiz?: { questions: Array<Record<string, unknown>> } } };
+        const envelope = (await response.json()) as {
+          data: {
+            quizzes?: Array<{ questions: Array<Record<string, unknown>> }>;
+            quiz?: { questions: Array<Record<string, unknown>> };
+          };
+        };
         const questions = envelope.data.quizzes?.[0]?.questions ?? envelope.data.quiz?.questions ?? [];
         const quiz = envelope.data.quizzes?.[0] ?? envelope.data.quiz;
         assert.equal("sheetPath" in quiz!, false);

@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import type { WikiPageSection } from "./contracts.js";
 
 function headingAnchor(heading: string, used: Map<string, number>): string {
-  const slug = heading.normalize("NFKD").toLocaleLowerCase().replace(/[^\p{Letter}\p{Number}\s-]/gu, "").trim().replace(/[\s-]+/gu, "-");
+  const slug = heading
+    .normalize("NFKD")
+    .toLocaleLowerCase()
+    .replace(/[^\p{Letter}\p{Number}\s-]/gu, "")
+    .trim()
+    .replace(/[\s-]+/gu, "-");
   if (!slug) return "";
   const suffix = used.get(slug) ?? 0;
   used.set(slug, suffix + 1);
@@ -35,7 +40,11 @@ export function parseWikiSections(markdown: string, pageId: string): WikiPageSec
           const previous = output.at(-1);
           if (previous) {
             const sectionText = markdown.slice(previous.startOffset, offset);
-            output[output.length - 1] = { ...previous, endOffset: offset, textDigest: createHash("sha256").update(sectionText).digest("hex") };
+            output[output.length - 1] = {
+              ...previous,
+              endOffset: offset,
+              textDigest: createHash("sha256").update(sectionText).digest("hex"),
+            };
           }
           output.push({ pageId, heading, anchor, startOffset: offset, endOffset: markdown.length, textDigest: "" });
         }
@@ -47,7 +56,11 @@ export function parseWikiSections(markdown: string, pageId: string): WikiPageSec
   if (output.length) {
     const last = output.at(-1)!;
     const sectionText = markdown.slice(last.startOffset);
-    output[output.length - 1] = { ...last, endOffset: markdown.length, textDigest: createHash("sha256").update(sectionText).digest("hex") };
+    output[output.length - 1] = {
+      ...last,
+      endOffset: markdown.length,
+      textDigest: createHash("sha256").update(sectionText).digest("hex"),
+    };
   }
   return output;
 }

@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-import { createApplication } from "./application.js";
-import { doctor } from "./doctor.js";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { initVault, NoVaultError, resolveVault } from "./vault.js";
-import { ensureQmdCollection } from "./external/qmd.js";
-import { localCheckpointCommit } from "./external/git.js";
+import { createApplication } from "./application.js";
 import { openDatabase } from "./database.js";
+import { doctor } from "./doctor.js";
+import { localCheckpointCommit } from "./external/git.js";
 import type { ChildResult } from "./external/process.js";
+import { ensureQmdCollection } from "./external/qmd.js";
+import { initVault, NoVaultError, resolveVault } from "./vault.js";
 
 export interface CliArgs {
   readonly command: "init" | "doctor" | "serve" | "sync";
@@ -42,7 +42,8 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
     } else if (value === "--port") {
       const next = argv[++index];
       const parsed = Number(next);
-      if (!next || !Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) throw new Error("--port must be an integer between 1 and 65535");
+      if (!next || !Number.isInteger(parsed) || parsed < 1 || parsed > 65_535)
+        throw new Error("--port must be an integer between 1 and 65535");
       port = parsed;
     } else if (value.startsWith("-")) {
       throw new Error(`Unknown option: ${value}`);
@@ -51,12 +52,21 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
     }
   }
   if (port !== undefined && command !== "serve") throw new Error("--port is only valid for serve");
-  if (vaultPath !== undefined && command !== "serve" && command !== "sync") throw new Error(`--vault is not used with ${command}; pass [path]`);
-  if ((command === "serve" || command === "sync") && positional.length > 0) throw new Error(`${command} accepts no positional arguments`);
-  if ((command === "init" || command === "doctor") && positional.length > 1) throw new Error(`${command} accepts at most one path`);
-  if ((command === "init" || command === "doctor") && vaultPath !== undefined) throw new Error(`--vault is not used with ${command}; pass [path]`);
+  if (vaultPath !== undefined && command !== "serve" && command !== "sync")
+    throw new Error(`--vault is not used with ${command}; pass [path]`);
+  if ((command === "serve" || command === "sync") && positional.length > 0)
+    throw new Error(`${command} accepts no positional arguments`);
+  if ((command === "init" || command === "doctor") && positional.length > 1)
+    throw new Error(`${command} accepts at most one path`);
+  if ((command === "init" || command === "doctor") && vaultPath !== undefined)
+    throw new Error(`--vault is not used with ${command}; pass [path]`);
   const positionalPath = command === "init" || command === "doctor" ? positional[0] : undefined;
-  return { command, positional, ...(positionalPath ? { vaultPath: positionalPath } : vaultPath ? { vaultPath } : {}), ...(port === undefined ? {} : { port }) };
+  return {
+    command,
+    positional,
+    ...(positionalPath ? { vaultPath: positionalPath } : vaultPath ? { vaultPath } : {}),
+    ...(port === undefined ? {} : { port }),
+  };
 }
 
 function print(value: unknown): void {
@@ -115,7 +125,10 @@ function waitForServerShutdown(server: GracefulServer): Promise<void> {
   const onSignal = (): void => {
     if (closePromise) return;
     closePromise = Promise.resolve().then(() => server.closeGracefully());
-    closePromise.then(() => finish(), (error: unknown) => finish(error));
+    closePromise.then(
+      () => finish(),
+      (error: unknown) => finish(error),
+    );
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
@@ -134,19 +147,32 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       qmdError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
     }
     const db = openDatabase(paths);
-    try { db.checkpoint(); } finally { db.close(); }
+    try {
+      db.checkpoint();
+    } finally {
+      db.close();
+    }
     const report = doctor(paths.vaultRoot);
     const qmdFailure = qmdResult ? qmdInitializationFailure(qmdResult) : undefined;
     const qmdCheckNames: Record<string, true> = { qmd: true, "qmd-scope": true };
     const warnings = [
       ...(qmdError ? [`qmd: ${qmdError}`] : []),
       ...(qmdFailure ? [`qmd: ${qmdFailure}`] : []),
-      ...report.checks.filter((item) => qmdCheckNames[item.name] === true && item.status !== "pass").map((item) => `${item.name}: ${item.message}`),
+      ...report.checks
+        .filter((item) => qmdCheckNames[item.name] === true && item.status !== "pass")
+        .map((item) => `${item.name}: ${item.message}`),
     ];
-    const failures = report.checks.filter((item) => item.status === "fail" && qmdCheckNames[item.name] !== true).map((item) => `${item.name}: ${item.message}`);
+    const failures = report.checks
+      .filter((item) => item.status === "fail" && qmdCheckNames[item.name] !== true)
+      .map((item) => `${item.name}: ${item.message}`);
     if (failures.length > 0) throw new Error(`Initialization failed: ${failures.join("; ")}`);
     localCheckpointCommit(paths, "scholar: initialize vault");
-    print({ ok: true, vaultRoot: paths.vaultRoot, vaultId: paths.vaultId, ...(warnings.length ? { warnings: [...new Set(warnings)] } : {}) });
+    print({
+      ok: true,
+      vaultRoot: paths.vaultRoot,
+      vaultId: paths.vaultId,
+      ...(warnings.length ? { warnings: [...new Set(warnings)] } : {}),
+    });
     return 0;
   }
   if (parsed.command === "doctor") return reportDoctor(parsed.positional[0]);
@@ -162,7 +188,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     try {
       const result = await application.sync();
       if (!result.ok) {
-        print({ ok: false, status: result.status, error: result.error ?? "git push failed", output: result.output.slice(-4096) });
+        print({
+          ok: false,
+          status: result.status,
+          error: result.error ?? "git push failed",
+          output: result.output.slice(-4096),
+        });
         return 1;
       }
       print({ ok: true, status: result.status, output: result.output.slice(-4096) });
@@ -175,11 +206,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().then((code) => {
-    process.exitCode = code;
-  }).catch((error: unknown) => {
-    const message = error instanceof NoVaultError ? error.message : error instanceof Error ? error.message : String(error);
-    process.stderr.write(`pi-scholar: ${message}\n`);
-    process.exitCode = 1;
-  });
+  main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error: unknown) => {
+      const message =
+        error instanceof NoVaultError ? error.message : error instanceof Error ? error.message : String(error);
+      process.stderr.write(`pi-scholar: ${message}\n`);
+      process.exitCode = 1;
+    });
 }

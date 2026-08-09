@@ -1,14 +1,38 @@
+export type {
+  ApplicationAdapters,
+  ApplicationMutationContext,
+  ApplicationOptions,
+  ApplicationStatus,
+  SourceStageResult,
+  WikiIssueListResult,
+  WikiNoteInput,
+  WikiNoteUpdateInput,
+  WikiSearchResult,
+} from "./application.js";
+export { createApplication, ScholarApplication } from "./application.js";
 export * from "./contracts.js";
 export * from "./database.js";
 export * from "./doctor.js";
+export { FORBIDDEN_SHEET_TEXT, QuizConflictError, QuizService } from "./quiz.js";
+export { localDate, RevisionConflictError, SchedulerService, ValidationError } from "./scheduler.js";
+export type { ScholarServer, ServerOptions } from "./server.js";
+export { createServer, serve, startServer } from "./server.js";
+export {
+  atomizeExtraction,
+  chunkExtraction,
+  nativeExtraction,
+  reconstructChunks,
+  SourceService,
+  sha256,
+  validateChunkEndpoints,
+} from "./sources.js";
 export * from "./vault.js";
-export { SourceService, atomizeExtraction, chunkExtraction, reconstructChunks, validateChunkEndpoints, nativeExtraction, sha256 } from "./sources.js";
-export { WikiService, isExecutableHtml, parseWikiMarkdown, sanitizeImportedMarkdown, serializeWikiMarkdown } from "./wiki.js";
-export { QuizConflictError, QuizService, FORBIDDEN_SHEET_TEXT } from "./quiz.js";
-export { RevisionConflictError, SchedulerService, ValidationError, localDate } from "./scheduler.js";
-export { ScholarApplication, createApplication } from "./application.js";
-export { BrowserMutationWorker, WorkflowCoordinator, workflowFromRow } from "./workflows.js";
-export { createServer, startServer, serve } from "./server.js";
-export type { ApplicationOptions, ApplicationStatus, ApplicationMutationContext, ApplicationAdapters, SourceStageResult, WikiSearchResult, WikiIssueListResult, WikiNoteInput, WikiNoteUpdateInput } from "./application.js";
+export {
+  isExecutableHtml,
+  parseWikiMarkdown,
+  sanitizeImportedMarkdown,
+  serializeWikiMarkdown,
+  WikiService,
+} from "./wiki.js";
 export type { WorkflowKind } from "./workflows.js";
-export type { ServerOptions, ScholarServer } from "./server.js";
+export { BrowserMutationWorker, WorkflowCoordinator, workflowFromRow } from "./workflows.js";

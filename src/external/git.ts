@@ -1,6 +1,6 @@
 import { lstatSync, type Stats } from "node:fs";
-import { runChild, runChildSync, type ChildResult, type ChildRunOptions } from "./process.js";
 import type { VaultPaths } from "../vault.js";
+import { type ChildResult, type ChildRunOptions, runChild, runChildSync } from "./process.js";
 
 const GIT_TIMEOUT_MS = 120_000;
 const GIT_REVISION_TIMEOUT_MS = 5_000;
@@ -9,7 +9,13 @@ const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]{1,160}$/u;
 const ARG_PATTERN = /^[A-Za-z0-9._/@:+-]+$/u;
 const SAFE_GIT_ASSIGNMENTS: readonly string[] = ["--porcelain=v2"];
 const SAFE_GIT_CONFIG = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"] as const;
-const SAFE_GIT_COMMIT_CONFIG = [...SAFE_GIT_CONFIG, "-c", "user.name=Pi Scholar", "-c", "user.email=pi-scholar@localhost"] as const;
+const SAFE_GIT_COMMIT_CONFIG = [
+  ...SAFE_GIT_CONFIG,
+  "-c",
+  "user.name=Pi Scholar",
+  "-c",
+  "user.email=pi-scholar@localhost",
+] as const;
 
 export interface GitStatus {
   readonly branch?: string;
@@ -39,7 +45,16 @@ function validateGitArg(value: string, label: string): void {
 }
 
 function gitOptions(cwd: string, timeoutMs = GIT_TIMEOUT_MS): ChildRunOptions {
-  return { cwd, timeoutMs, env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" } };
+  return {
+    cwd,
+    timeoutMs,
+    env: {
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_OPTIONAL_LOCKS: "0",
+    },
+  };
 }
 
 function assertGitDirectory(paths: VaultPaths, allowMissing = false): void {
@@ -55,21 +70,30 @@ function assertGitDirectory(paths: VaultPaths, allowMissing = false): void {
   if (stat.isSymbolicLink()) throw new Error(".git must not be a symbolic link");
   if (stat.isDirectory()) return;
   if (stat.isFile()) {
-    const result = runChildSync("git", ["-C", paths.vaultRoot, ...SAFE_GIT_CONFIG, "rev-parse", "--git-dir"], { ...gitOptions(paths.vaultRoot, GIT_REVISION_TIMEOUT_MS), maxOutputBytes: GIT_REVISION_OUTPUT_BYTES });
-    if (result.code !== 0 || result.timedOut || result.signal || !result.stdout.trim()) throw new Error("vault Git linked-worktree metadata is invalid");
+    const result = runChildSync("git", ["-C", paths.vaultRoot, ...SAFE_GIT_CONFIG, "rev-parse", "--git-dir"], {
+      ...gitOptions(paths.vaultRoot, GIT_REVISION_TIMEOUT_MS),
+      maxOutputBytes: GIT_REVISION_OUTPUT_BYTES,
+    });
+    if (result.code !== 0 || result.timedOut || result.signal || !result.stdout.trim())
+      throw new Error("vault Git linked-worktree metadata is invalid");
     return;
   }
   throw new Error(".git must be a real directory or linked-worktree file");
 }
 
 function commandFailure(result: ChildResult, command: string): Error {
-  return new Error(`${command} failed (${result.code ?? result.signal ?? "unknown"}): ${(result.stderr || result.stdout).trim()}`);
+  return new Error(
+    `${command} failed (${result.code ?? result.signal ?? "unknown"}): ${(result.stderr || result.stdout).trim()}`,
+  );
 }
 
 export async function gitRevision(root: string): Promise<string> {
   const args = ["rev-parse", "HEAD"] as const;
   validateGitCommand(args);
-  const result = await runChild("git", ["-C", root, ...SAFE_GIT_CONFIG, ...args], { ...gitOptions(root, GIT_REVISION_TIMEOUT_MS), maxOutputBytes: GIT_REVISION_OUTPUT_BYTES });
+  const result = await runChild("git", ["-C", root, ...SAFE_GIT_CONFIG, ...args], {
+    ...gitOptions(root, GIT_REVISION_TIMEOUT_MS),
+    maxOutputBytes: GIT_REVISION_OUTPUT_BYTES,
+  });
   if (result.code !== 0) throw commandFailure(result, "git rev-parse");
   return result.stdout.trim();
 }
@@ -83,13 +107,26 @@ export function initializeRepository(paths: VaultPaths): void {
 
 function validateGitCommand(args: readonly string[]): void {
   const command = args[0];
-  if (!command || !["init", "status", "add", "diff", "commit", "push", "fetch", "rev-parse", "show", "ls-files"].includes(command)) throw new Error("unsupported Git operation");
+  if (
+    !command ||
+    !["init", "status", "add", "diff", "commit", "push", "fetch", "rev-parse", "show", "ls-files"].includes(command)
+  )
+    throw new Error("unsupported Git operation");
   if (args.some((arg) => /[\u0000\u000a\u000d]/u.test(arg))) throw new Error("Git argv contains a control character");
-  if (args.some((arg) => /^(?:--force(?:-with-lease)?(?:=|$)|-f(?:=|$))/u.test(arg)) || ["reset", "merge", "rebase", "checkout", "clean"].includes(command)) throw new Error("unsafe Git operation");
-  if (args.some((arg) => arg.startsWith("--") && arg.includes("=") && !SAFE_GIT_ASSIGNMENTS.includes(arg))) throw new Error("Git options must use separate argv values");
+  if (
+    args.some((arg) => /^(?:--force(?:-with-lease)?(?:=|$)|-f(?:=|$))/u.test(arg)) ||
+    ["reset", "merge", "rebase", "checkout", "clean"].includes(command)
+  )
+    throw new Error("unsafe Git operation");
+  if (args.some((arg) => arg.startsWith("--") && arg.includes("=") && !SAFE_GIT_ASSIGNMENTS.includes(arg)))
+    throw new Error("Git options must use separate argv values");
 }
 
-export async function runGit(paths: VaultPaths, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS): Promise<ChildResult> {
+export async function runGit(
+  paths: VaultPaths,
+  args: readonly string[],
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<ChildResult> {
   assertGitDirectory(paths);
   validateGitCommand(args);
   return runChild("git", [...SAFE_GIT_CONFIG, ...args], gitOptions(paths.vaultRoot, timeoutMs));
@@ -155,14 +192,19 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
   validateRemote(remote);
   if (branch !== undefined) validateGitArg(branch, "branch");
   const status = gitStatus(paths);
-  if (status.diverged) return { ok: false, status, output: "Git history is diverged; no push attempted", error: "DIVERGED" };
-  if (status.ahead === 0 && /^# branch\.upstream /mu.test(status.raw)) return { ok: true, status, output: "No local commits to push" };
+  if (status.diverged)
+    return { ok: false, status, output: "Git history is diverged; no push attempted", error: "DIVERGED" };
+  if (status.ahead === 0 && /^# branch\.upstream /mu.test(status.raw))
+    return { ok: true, status, output: "No local commits to push" };
   const args = ["push", "--porcelain", remote];
   if (branch !== undefined) args.push(branch);
   const result = runGitSync(paths, args);
   const output = `${result.stdout}${result.stderr}`.trim();
   if (result.code !== 0) {
-    const noUpstream = /no configured push destination|has no upstream branch|src refspec .* does not match any|set the remote as upstream/iu.test(output);
+    const noUpstream =
+      /no configured push destination|has no upstream branch|src refspec .* does not match any|set the remote as upstream/iu.test(
+        output,
+      );
     let reconciled = false;
     try {
       const fetch = runGitSync(paths, ["fetch", "--prune", remote]);
@@ -178,18 +220,34 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
       // Preserve the original push failure when reconciliation cannot run.
     }
     const reconciledStatus = gitStatus(paths);
-    if (reconciled) return { ok: true, status: reconciledStatus, output: `${output}\nPush status reconciled after remote update` };
-    return { ok: false, status: reconciledStatus, output, error: noUpstream ? "NO_UPSTREAM" : result.timedOut ? "TIMEOUT" : "PUSH_FAILED" };
+    if (reconciled)
+      return { ok: true, status: reconciledStatus, output: `${output}\nPush status reconciled after remote update` };
+    return {
+      ok: false,
+      status: reconciledStatus,
+      output,
+      error: noUpstream ? "NO_UPSTREAM" : result.timedOut ? "TIMEOUT" : "PUSH_FAILED",
+    };
   }
   return { ok: true, status: gitStatus(paths), output };
 }
 
-export function gitDependencyIdentity(paths: VaultPaths): { readonly executable: string; readonly version: string; readonly workTree: boolean } {
+export function gitDependencyIdentity(paths: VaultPaths): {
+  readonly executable: string;
+  readonly version: string;
+  readonly workTree: boolean;
+} {
   const version = runChildSync("git", ["--version"], gitOptions(paths.vaultRoot, 10_000));
   const versionText = version.stdout.trim();
-  if (version.code !== 0 || version.timedOut || version.signal !== null || !versionText) throw commandFailure(version, "git --version");
+  if (version.code !== 0 || version.timedOut || version.signal !== null || !versionText)
+    throw commandFailure(version, "git --version");
   validateGitCommand(["rev-parse", "--is-inside-work-tree"]);
-  const workTree = runChildSync("git", [...SAFE_GIT_CONFIG, "rev-parse", "--is-inside-work-tree"], gitOptions(paths.vaultRoot, GIT_REVISION_TIMEOUT_MS));
-  if (workTree.code !== 0 || workTree.timedOut || workTree.signal !== null || workTree.stdout.trim() !== "true") throw commandFailure(workTree, "git rev-parse --is-inside-work-tree");
+  const workTree = runChildSync(
+    "git",
+    [...SAFE_GIT_CONFIG, "rev-parse", "--is-inside-work-tree"],
+    gitOptions(paths.vaultRoot, GIT_REVISION_TIMEOUT_MS),
+  );
+  if (workTree.code !== 0 || workTree.timedOut || workTree.signal !== null || workTree.stdout.trim() !== "true")
+    throw commandFailure(workTree, "git rev-parse --is-inside-work-tree");
   return { executable: version.executable, version: versionText, workTree: true };
 }

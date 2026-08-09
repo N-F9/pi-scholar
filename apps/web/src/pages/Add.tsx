@@ -1,8 +1,27 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState, type FormEvent } from "react";
-import type { SourceCreateResult, SourceListResult, SourceRecord, SourceRemovalPreviewRequest, SourceRemovalPreviewResult, SourceRemovalRequest, SourceRemovalResult, SourceRequest, SourceStatus } from "../../../../src/contracts";
-import { ApiRequestError, api, errorMessage, formatDate, isSourceCreateResult, isSourceListResult, isSourceRemovalPreviewResult, isSourceRemovalResult } from "../api";
-import { Badge, Button, Card, Field, Input, Spinner, StateView, Textarea, cx } from "../components/ui";
+import { type FormEvent, useRef, useState } from "react";
+import type {
+  SourceCreateResult,
+  SourceListResult,
+  SourceRecord,
+  SourceRemovalPreviewRequest,
+  SourceRemovalPreviewResult,
+  SourceRemovalRequest,
+  SourceRemovalResult,
+  SourceRequest,
+  SourceStatus,
+} from "../../../../src/contracts";
+import {
+  ApiRequestError,
+  api,
+  errorMessage,
+  formatDate,
+  isSourceCreateResult,
+  isSourceListResult,
+  isSourceRemovalPreviewResult,
+  isSourceRemovalResult,
+} from "../api";
+import { Badge, Button, Card, cx, Field, Input, Spinner, StateView, Textarea } from "../components/ui";
 
 type StageInput =
   | { mode: "upload"; files: File[] }
@@ -41,21 +60,37 @@ export function AddPage() {
           form.set("displayName", file.name);
           form.set("file", file);
           try {
-            const result = await api<SourceCreateResult>("/api/v1/sources", { method: "POST", body: form }, isSourceCreateResult);
+            const result = await api<SourceCreateResult>(
+              "/api/v1/sources",
+              { method: "POST", body: form },
+              isSourceCreateResult,
+            );
             staged.push(result.source);
           } catch (error) {
             failures.push(`${file.name}: ${errorMessage(error)}`);
           }
         }
         if (failures.length) {
-          throw new Error(`${staged.length} ${staged.length === 1 ? "file was" : "files were"} staged before an upload failed. ${failures.join(" ")} Choose only the failed files before trying again.`);
+          throw new Error(
+            `${staged.length} ${staged.length === 1 ? "file was" : "files were"} staged before an upload failed. ${failures.join(" ")} Choose only the failed files before trying again.`,
+          );
         }
         return staged;
       }
-      const request: SourceRequest = input.mode === "url"
-        ? { kind: "url", url: input.url }
-        : { kind: "text", displayName: input.displayName || "Pasted source", text: input.text, mediaType: "text/plain" };
-      const result = await api<SourceCreateResult>("/api/v1/sources", { method: "POST", body: JSON.stringify(request) }, isSourceCreateResult);
+      const request: SourceRequest =
+        input.mode === "url"
+          ? { kind: "url", url: input.url }
+          : {
+              kind: "text",
+              displayName: input.displayName || "Pasted source",
+              text: input.text,
+              mediaType: "text/plain",
+            };
+      const result = await api<SourceCreateResult>(
+        "/api/v1/sources",
+        { method: "POST", body: JSON.stringify(request) },
+        isSourceCreateResult,
+      );
       return [result.source];
     },
     onSuccess: async (created, input) => {
@@ -78,7 +113,11 @@ export function AddPage() {
   const previewRemoval = useMutation({
     mutationFn: (sourceId: string) => {
       const request: SourceRemovalPreviewRequest = { sourceId };
-      return api<SourceRemovalPreviewResult>(`/api/v1/sources/${encodeURIComponent(sourceId)}/removal-preview`, { method: "POST", body: JSON.stringify(request) }, isSourceRemovalPreviewResult);
+      return api<SourceRemovalPreviewResult>(
+        `/api/v1/sources/${encodeURIComponent(sourceId)}/removal-preview`,
+        { method: "POST", body: JSON.stringify(request) },
+        isSourceRemovalPreviewResult,
+      );
     },
     onSuccess: setPreview,
   });
@@ -86,10 +125,14 @@ export function AddPage() {
   const remove = useMutation({
     mutationFn: (value: SourceRemovalPreviewResult) => {
       const request: SourceRemovalRequest = { sourceId: value.source.sourceId, confirmationId: value.confirmationId };
-      return api<SourceRemovalResult>(`/api/v1/sources/${encodeURIComponent(value.source.sourceId)}/removal`, {
-        method: "POST",
-        body: JSON.stringify(request),
-      }, isSourceRemovalResult);
+      return api<SourceRemovalResult>(
+        `/api/v1/sources/${encodeURIComponent(value.source.sourceId)}/removal`,
+        {
+          method: "POST",
+          body: JSON.stringify(request),
+        },
+        isSourceRemovalResult,
+      );
     },
     onSuccess: async () => {
       setPreview(undefined);
@@ -130,7 +173,9 @@ export function AddPage() {
       <header>
         <p className="eyebrow">Inbox staging</p>
         <h1 className="page-heading mt-2">Add sources</h1>
-        <p className="mt-3 max-w-2xl text-muted">Stage files, a URL, or pasted source text. Each waits in the inbox for the next admission run.</p>
+        <p className="mt-3 max-w-2xl text-muted">
+          Stage files, a URL, or pasted source text. Each waits in the inbox for the next admission run.
+        </p>
       </header>
 
       <Card>
@@ -139,8 +184,21 @@ export function AddPage() {
             <legend className="text-sm font-bold">Source type</legend>
             <div className="mt-2 grid grid-cols-3 rounded-md border border-line bg-canvas p-1">
               {(["upload", "url", "paste"] as const).map((value) => (
-                <label className={cx("flex min-h-11 cursor-pointer items-center justify-center rounded-sm px-2 text-sm font-bold capitalize focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2", mode === value ? "bg-paper text-ink shadow-sm" : "text-muted hover:text-ink")} key={value}>
-                  <input className="sr-only" type="radio" name="sourceMode" value={value} checked={mode === value} onChange={() => setMode(value)} />
+                <label
+                  className={cx(
+                    "flex min-h-11 cursor-pointer items-center justify-center rounded-sm px-2 text-sm font-bold capitalize focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2",
+                    mode === value ? "bg-paper text-ink shadow-sm" : "text-muted hover:text-ink",
+                  )}
+                  key={value}
+                >
+                  <input
+                    className="sr-only"
+                    type="radio"
+                    name="sourceMode"
+                    value={value}
+                    checked={mode === value}
+                    onChange={() => setMode(value)}
+                  />
                   {value}
                 </label>
               ))}
@@ -148,7 +206,10 @@ export function AddPage() {
           </fieldset>
 
           {mode === "upload" ? (
-            <Field label="Choose files" hint="Files are copied into the inbox; selecting them does not admit them immediately.">
+            <Field
+              label="Choose files"
+              hint="Files are copied into the inbox; selecting them does not admit them immediately."
+            >
               <Input name="files" type="file" multiple required />
             </Field>
           ) : null}
@@ -169,8 +230,14 @@ export function AddPage() {
           ) : null}
 
           <div className="flex flex-wrap items-center gap-3">
-            <Button type="submit" disabled={stage.isPending}>{stage.isPending ? "Staging…" : "Stage in inbox"}</Button>
-            <p className={stage.isError ? "text-sm text-danger" : "text-sm text-positive"} role={stage.isError ? "alert" : "status"} aria-live="polite">
+            <Button type="submit" disabled={stage.isPending}>
+              {stage.isPending ? "Staging…" : "Stage in inbox"}
+            </Button>
+            <p
+              className={stage.isError ? "text-sm text-danger" : "text-sm text-positive"}
+              role={stage.isError ? "alert" : "status"}
+              aria-live="polite"
+            >
               {stage.isError ? errorMessage(stage.error) : stageMessage}
             </p>
           </div>
@@ -181,14 +248,30 @@ export function AddPage() {
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <p className="eyebrow">Source ledger</p>
-            <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-sources-heading">Current sources</h2>
+            <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-sources-heading">
+              Current sources
+            </h2>
           </div>
-          <Button variant="quiet" onClick={() => void sources.refetch()} disabled={sources.isFetching}>Refresh</Button>
+          <Button variant="quiet" onClick={() => void sources.refetch()} disabled={sources.isFetching}>
+            Refresh
+          </Button>
         </div>
 
         {sources.isLoading ? <Spinner label="Loading sources" /> : null}
-        {sources.isError ? <div className="mt-5"><StateView title="Could not load sources" tone="danger"><p>{errorMessage(sources.error)}</p></StateView></div> : null}
-        {sources.data?.sources.length === 0 ? <div className="mt-5"><StateView title="No sources yet"><p>Stage a source above, or copy files directly into the vault inbox.</p></StateView></div> : null}
+        {sources.isError ? (
+          <div className="mt-5">
+            <StateView title="Could not load sources" tone="danger">
+              <p>{errorMessage(sources.error)}</p>
+            </StateView>
+          </div>
+        ) : null}
+        {sources.data?.sources.length === 0 ? (
+          <div className="mt-5">
+            <StateView title="No sources yet">
+              <p>Stage a source above, or copy files directly into the vault inbox.</p>
+            </StateView>
+          </div>
+        ) : null}
 
         <ul className="mt-5 grid gap-3">
           {sources.data?.sources.map((source) => (
@@ -199,29 +282,81 @@ export function AddPage() {
                     <h3 className="break-words font-bold">{source.displayName}</h3>
                     <Badge tone={sourceTones[source.status]}>{source.status}</Badge>
                   </div>
-                  <p className="mt-1 text-sm text-muted">{source.kind} · Updated {formatDate(source.updatedAt, { dateStyle: "medium", timeStyle: "short" })}</p>
-                  {source.errorMessage ? <p className="mt-2 text-sm text-danger" role="alert">{source.errorMessage}</p> : null}
+                  <p className="mt-1 text-sm text-muted">
+                    {source.kind} · Updated {formatDate(source.updatedAt, { dateStyle: "medium", timeStyle: "short" })}
+                  </p>
+                  {source.errorMessage ? (
+                    <p className="mt-2 text-sm text-danger" role="alert">
+                      {source.errorMessage}
+                    </p>
+                  ) : null}
                 </div>
-                {source.status === "published" ? <Button variant="secondary" onClick={() => { remove.reset(); previewRemoval.mutate(source.sourceId); }} disabled={previewRemoval.isPending || remove.isPending}>Preview removal</Button> : null}
+                {source.status === "published" ? (
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      remove.reset();
+                      previewRemoval.mutate(source.sourceId);
+                    }}
+                    disabled={previewRemoval.isPending || remove.isPending}
+                  >
+                    Preview removal
+                  </Button>
+                ) : null}
               </div>
 
               {preview?.source.sourceId === source.sourceId ? (
                 <div className="mt-5 border-t border-line pt-5" aria-live="polite">
                   <h4 className="font-serif text-xl font-semibold">Removal impact</h4>
-                  <p className="mt-2 text-sm text-muted">This updates {preview.dependentPageIds.length} dependent {preview.dependentPageIds.length === 1 ? "page" : "pages"} and {preview.dependentCardIds.length} {preview.dependentCardIds.length === 1 ? "card" : "cards"}. Ordinary removal does not erase bytes from existing Git history.</p>
-                  {preview.dependentPageIds.length ? <p className="mt-3 break-words font-mono text-xs text-muted">Pages: {preview.dependentPageIds.join(", ")}</p> : null}
-                  {preview.dependentCardIds.length ? <p className="mt-2 break-words font-mono text-xs text-muted">Cards: {preview.dependentCardIds.join(", ")}</p> : null}
-                  {remove.isError ? <p className="mt-3 text-sm text-danger" role="alert">{errorMessage(remove.error)}{remove.error instanceof ApiRequestError && remove.error.status === 409 ? " The impact changed; review the refreshed preview before confirming." : ""}</p> : null}
+                  <p className="mt-2 text-sm text-muted">
+                    This updates {preview.dependentPageIds.length} dependent{" "}
+                    {preview.dependentPageIds.length === 1 ? "page" : "pages"} and {preview.dependentCardIds.length}{" "}
+                    {preview.dependentCardIds.length === 1 ? "card" : "cards"}. Ordinary removal does not erase bytes
+                    from existing Git history.
+                  </p>
+                  {preview.dependentPageIds.length ? (
+                    <p className="mt-3 break-words font-mono text-xs text-muted">
+                      Pages: {preview.dependentPageIds.join(", ")}
+                    </p>
+                  ) : null}
+                  {preview.dependentCardIds.length ? (
+                    <p className="mt-2 break-words font-mono text-xs text-muted">
+                      Cards: {preview.dependentCardIds.join(", ")}
+                    </p>
+                  ) : null}
+                  {remove.isError ? (
+                    <p className="mt-3 text-sm text-danger" role="alert">
+                      {errorMessage(remove.error)}
+                      {remove.error instanceof ApiRequestError && remove.error.status === 409
+                        ? " The impact changed; review the refreshed preview before confirming."
+                        : ""}
+                    </p>
+                  ) : null}
                   <div className="mt-4 flex flex-wrap gap-3">
-                    <Button variant="danger" onClick={() => remove.mutate(preview)} disabled={remove.isPending}>{remove.isPending ? "Removing…" : "Confirm removal"}</Button>
-                    <Button variant="quiet" onClick={() => { remove.reset(); setPreview(undefined); }} disabled={remove.isPending}>Cancel</Button>
+                    <Button variant="danger" onClick={() => remove.mutate(preview)} disabled={remove.isPending}>
+                      {remove.isPending ? "Removing…" : "Confirm removal"}
+                    </Button>
+                    <Button
+                      variant="quiet"
+                      onClick={() => {
+                        remove.reset();
+                        setPreview(undefined);
+                      }}
+                      disabled={remove.isPending}
+                    >
+                      Cancel
+                    </Button>
                   </div>
                 </div>
               ) : null}
             </li>
           ))}
         </ul>
-        {previewRemoval.isError ? <p className="mt-4 text-sm text-danger" role="alert">{errorMessage(previewRemoval.error)}</p> : null}
+        {previewRemoval.isError ? (
+          <p className="mt-4 text-sm text-danger" role="alert">
+            {errorMessage(previewRemoval.error)}
+          </p>
+        ) : null}
       </section>
     </div>
   );

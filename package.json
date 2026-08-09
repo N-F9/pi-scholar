@@ -2,7 +2,9 @@
   "name": "pi-scholar",
   "version": "0.1.0",
   "description": "Local-first sourced Markdown wiki and daily review for Pi",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -24,7 +26,9 @@
     "THIRD_PARTY_NOTICES"
   ],
   "pi": {
-    "extensions": ["./pi/extension.ts"],
+    "extensions": [
+      "./pi/extension.ts"
+    ],
     "skills": [
       "./skills/source-admission",
       "./skills/wiki-maintenance",
@@ -42,8 +46,11 @@
     "prepack": "npm run clean && npm run build && npm run build:web",
     "typecheck": "tsc -p apps/web/tsconfig.json && tsc -p tsconfig.pi.json",
     "dev": "vite --config apps/web/vite.config.ts",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check .",
     "test": "vitest run",
-    "verify": "npm run build && npm run typecheck && npm run build:web && npm test"
+    "verify": "npm run check && npm run build && npm run typecheck && npm run build:web && npm test"
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
@@ -59,6 +66,7 @@
     "typebox": "*"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.7",
     "@earendil-works/pi-coding-agent": "0.84.1",
     "@tailwindcss/vite": "4.3.3",
     "@types/node": "26.2.0",

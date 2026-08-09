@@ -1,18 +1,20 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, it } from "vitest";
-import { openDatabase } from "../src/database.js";
-import { parseCliArgs } from "../src/cli.js";
-import { WorkflowCoordinator } from "../src/workflows.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { describe, it } from "vitest";
 import piScholarExtension from "../pi/extension.ts";
+import { parseCliArgs } from "../src/cli.js";
+import { openDatabase } from "../src/database.js";
+import { WorkflowCoordinator } from "../src/workflows.js";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-function packageManifest(): { readonly pi: { readonly extensions: readonly string[]; readonly skills: readonly string[] } } {
+function packageManifest(): {
+  readonly pi: { readonly extensions: readonly string[]; readonly skills: readonly string[] };
+} {
   return JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
     readonly pi: { readonly extensions: readonly string[]; readonly skills: readonly string[] };
   };
@@ -23,19 +25,22 @@ describe("Pi package lifecycle", () => {
     const manifest = packageManifest();
     assert.deepEqual(manifest.pi.extensions, ["./pi/extension.ts"]);
     assert.equal(manifest.pi.skills.length, 4);
-    assert.deepEqual(
-      [...manifest.pi.skills].sort(),
-      [
-        "./skills/daily-quiz",
-        "./skills/quiz-grader",
-        "./skills/source-admission",
-        "./skills/wiki-maintenance",
-      ],
-    );
+    assert.deepEqual([...manifest.pi.skills].sort(), [
+      "./skills/daily-quiz",
+      "./skills/quiz-grader",
+      "./skills/source-admission",
+      "./skills/wiki-maintenance",
+    ]);
     for (const skill of manifest.pi.skills) {
       assert.equal(readFileSync(join(repositoryRoot, skill, "SKILL.md"), "utf8").includes("name:"), true);
     }
-    assert.deepEqual(readdirSync(join(repositoryRoot, "skills"), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort(), ["daily-quiz", "quiz-grader", "source-admission", "wiki-maintenance"]);
+    assert.deepEqual(
+      readdirSync(join(repositoryRoot, "skills"), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort(),
+      ["daily-quiz", "quiz-grader", "source-admission", "wiki-maintenance"],
+    );
   });
 
   it("registers public and typed internal Scholar tools without a process launcher", () => {
@@ -69,20 +74,26 @@ describe("Pi package lifecycle", () => {
       "scholar_settle_grade",
       "scholar_status",
     ]);
-    assert.deepEqual([...toolModes].filter(([, mode]) => mode === "sequential").map(([name]) => name).sort(), [
-      "scholar_add",
-      "scholar_admit_source",
-      "scholar_apply_maintenance",
-      "scholar_finish_maintenance",
-      "scholar_get_admission_context",
-      "scholar_get_grading_context",
-      "scholar_get_maintenance_context",
-      "scholar_get_quiz_context",
-      "scholar_note",
-      "scholar_publish_quiz",
-      "scholar_remove_source",
-      "scholar_settle_grade",
-    ]);
+    assert.deepEqual(
+      [...toolModes]
+        .filter(([, mode]) => mode === "sequential")
+        .map(([name]) => name)
+        .sort(),
+      [
+        "scholar_add",
+        "scholar_admit_source",
+        "scholar_apply_maintenance",
+        "scholar_finish_maintenance",
+        "scholar_get_admission_context",
+        "scholar_get_grading_context",
+        "scholar_get_maintenance_context",
+        "scholar_get_quiz_context",
+        "scholar_note",
+        "scholar_publish_quiz",
+        "scholar_remove_source",
+        "scholar_settle_grade",
+      ],
+    );
     assert.equal(toolModes.get("scholar_search"), undefined);
     assert.equal(toolModes.get("scholar_status"), undefined);
     assert.deepEqual([...commands].sort(), ["add", "issue", "scholar-status"]);
@@ -128,7 +139,10 @@ describe("Pi package lifecycle", () => {
       assert.throws(() => workflows.updateWorkflow(started.requestId, { progress: 0.75 }), /not running/u);
 
       const failed = workflows.beginWorkflow("wiki-maintenance");
-      const failure = workflows.failWorkflow(failed.requestId, { errorCode: "E".repeat(120), errorMessage: "é".repeat(400) });
+      const failure = workflows.failWorkflow(failed.requestId, {
+        errorCode: "E".repeat(120),
+        errorMessage: "é".repeat(400),
+      });
       assert.equal(failure.status, "failed");
       assert.ok(Buffer.byteLength(failure.errorCode ?? "", "utf8") <= 100);
       assert.ok(Buffer.byteLength(failure.errorMessage ?? "", "utf8") <= 500);

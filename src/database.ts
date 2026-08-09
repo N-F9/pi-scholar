@@ -1,7 +1,6 @@
-import { DatabaseSync } from "node:sqlite";
 import { lstatSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import type { VaultPaths } from "./vault.js";
-
 
 export type SqlValue = string | number | bigint | boolean | Uint8Array | null;
 export type SqlParameters = readonly unknown[] | Readonly<Record<string, SqlValue>>;
@@ -44,33 +43,168 @@ export const REQUIRED_TABLES = [
 ] as const;
 const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   schema_meta: ["schema_version", "applied_at"],
-  sources: ["source_id", "kind", "status", "display_name", "original_name", "source_uri", "media_type", "repository_revision", "captured_at", "digest", "manifest_path", "error_code", "error_message", "created_at", "updated_at"],
+  sources: [
+    "source_id",
+    "kind",
+    "status",
+    "display_name",
+    "original_name",
+    "source_uri",
+    "media_type",
+    "repository_revision",
+    "captured_at",
+    "digest",
+    "manifest_path",
+    "error_code",
+    "error_message",
+    "created_at",
+    "updated_at",
+  ],
   source_files: ["source_id", "relative_path", "byte_length", "digest", "media_type"],
-  source_chunks: ["chunk_id", "source_id", "ordinal", "relative_path", "byte_length", "digest", "atom_start", "atom_end"],
+  source_chunks: [
+    "chunk_id",
+    "source_id",
+    "ordinal",
+    "relative_path",
+    "byte_length",
+    "digest",
+    "atom_start",
+    "atom_end",
+  ],
   source_dependencies: ["source_id", "page_id", "chunk_id", "relation"],
-  pages: ["page_id", "relative_path", "title", "digest", "revision", "status", "quiz_worthiness", "created_at", "updated_at"],
-  wiki_issues: ["issue_id", "page_id", "heading", "card_id", "page_digest", "kind", "description", "status", "resolution", "created_at", "updated_at"],
+  pages: [
+    "page_id",
+    "relative_path",
+    "title",
+    "digest",
+    "revision",
+    "status",
+    "quiz_worthiness",
+    "created_at",
+    "updated_at",
+  ],
+  wiki_issues: [
+    "issue_id",
+    "page_id",
+    "heading",
+    "card_id",
+    "page_digest",
+    "kind",
+    "description",
+    "status",
+    "resolution",
+    "created_at",
+    "updated_at",
+  ],
   authored_snapshots: ["relative_path", "digest", "revision", "captured_at", "commit_id"],
-  review_cards: ["card_id", "status", "prompt", "initial_due_at", "due_at", "fsrs_state", "stability", "difficulty", "reps", "lapses", "scheduled_days", "last_review_at", "revision", "created_at", "updated_at"],
-  card_bindings: ["binding_id", "card_id", "page_id", "heading", "anchor", "start_offset", "end_offset", "text_digest", "revision", "active"],
+  review_cards: [
+    "card_id",
+    "status",
+    "prompt",
+    "initial_due_at",
+    "due_at",
+    "fsrs_state",
+    "stability",
+    "difficulty",
+    "reps",
+    "lapses",
+    "scheduled_days",
+    "last_review_at",
+    "revision",
+    "created_at",
+    "updated_at",
+  ],
+  card_bindings: [
+    "binding_id",
+    "card_id",
+    "page_id",
+    "heading",
+    "anchor",
+    "start_offset",
+    "end_offset",
+    "text_digest",
+    "revision",
+    "active",
+  ],
   card_prerequisites: ["card_id", "prerequisite_card_id", "created_at"],
   card_lineage: ["lineage_id", "event", "parent_card_id", "child_card_id", "occurred_at", "metadata_json"],
-  raw_reviews: ["review_id", "card_id", "quiz_id", "question_id", "answer_revision", "rating", "reviewed_at", "state_before_json", "state_after_json", "settlement_id"],
-  quizzes: ["quiz_id", "date", "revision", "status", "sheet_path", "generated_at", "submitted_at", "error_code", "error_message"],
-  quiz_questions: ["question_id", "quiz_id", "ordinal", "kind", "prompt", "choices_json", "answer_key_json", "grading_criteria_json", "source_refs_json"],
+  raw_reviews: [
+    "review_id",
+    "card_id",
+    "quiz_id",
+    "question_id",
+    "answer_revision",
+    "rating",
+    "reviewed_at",
+    "state_before_json",
+    "state_after_json",
+    "settlement_id",
+  ],
+  quizzes: [
+    "quiz_id",
+    "date",
+    "revision",
+    "status",
+    "sheet_path",
+    "generated_at",
+    "submitted_at",
+    "error_code",
+    "error_message",
+  ],
+  quiz_questions: [
+    "question_id",
+    "quiz_id",
+    "ordinal",
+    "kind",
+    "prompt",
+    "choices_json",
+    "answer_key_json",
+    "grading_criteria_json",
+    "source_refs_json",
+  ],
   question_cards: ["question_id", "card_id", "criterion_json", "weight"],
   quiz_answers: ["quiz_id", "question_id", "revision", "answer_json", "saved_at"],
   question_results: ["result_id", "quiz_id", "question_id", "answer_revision", "feedback", "graded_at"],
   card_results: ["result_id", "quiz_id", "question_id", "card_id", "rating", "review_id"],
-  quiz_evidence: ["quiz_id", "card_id", "reference", "page_id", "relative_path", "anchor", "heading", "page_digest", "page_revision", "text_digest", "excerpt", "excerpt_digest"],
-  workflows: ["request_id", "kind", "status", "started_at", "finished_at", "progress", "message", "error_code", "error_message", "idempotency_key"],
+  quiz_evidence: [
+    "quiz_id",
+    "card_id",
+    "reference",
+    "page_id",
+    "relative_path",
+    "anchor",
+    "heading",
+    "page_digest",
+    "page_revision",
+    "text_digest",
+    "excerpt",
+    "excerpt_digest",
+  ],
+  workflows: [
+    "request_id",
+    "kind",
+    "status",
+    "started_at",
+    "finished_at",
+    "progress",
+    "message",
+    "error_code",
+    "error_message",
+    "idempotency_key",
+  ],
   settings: ["key", "value_json", "updated_at"],
 };
 
 const REQUIRED_SCHEMA_FRAGMENTS: Readonly<Record<string, readonly string[]>> = {
   source_chunks: ["unique (source_id, chunk_id)"],
-  source_dependencies: ["check (page_id is not null or chunk_id is not null)", "foreign key (source_id, chunk_id) references source_chunks(source_id, chunk_id)"],
-  card_lineage: ["check ((event = 'retire' and child_card_id is null) or (event <> 'retire' and child_card_id is not null))", "check (child_card_id is null or parent_card_id <> child_card_id)"],
+  source_dependencies: [
+    "check (page_id is not null or chunk_id is not null)",
+    "foreign key (source_id, chunk_id) references source_chunks(source_id, chunk_id)",
+  ],
+  card_lineage: [
+    "check ((event = 'retire' and child_card_id is null) or (event <> 'retire' and child_card_id is not null))",
+    "check (child_card_id is null or parent_card_id <> child_card_id)",
+  ],
   question_cards: ["criterion_json text not null", "weight real not null"],
 };
 
@@ -352,7 +486,10 @@ export class ScholarDatabase {
   }
 
   run(sql: string, parameters?: SqlParameters): SqlRunResult {
-    const result = bind(this.#database.prepare(sql), parameters, "run") as { changes: number | bigint; lastInsertRowid: number | bigint };
+    const result = bind(this.#database.prepare(sql), parameters, "run") as {
+      changes: number | bigint;
+      lastInsertRowid: number | bigint;
+    };
     return { changes: result.changes, lastInsertRowid: result.lastInsertRowid };
   }
   get<T = SqlRow>(sql: string, parameters?: SqlParameters): T | undefined {
@@ -372,7 +509,9 @@ export class ScholarDatabase {
   }
 
   tableNames(): string[] {
-    return this.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").map((row) => row.name);
+    return this.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").map(
+      (row) => row.name,
+    );
   }
 
   close(): void {
@@ -426,22 +565,32 @@ export function validateSchema(db: ScholarDatabase): void {
   if (current !== SCHEMA_VERSION) throw new Error(`Unsupported Pi Scholar database schema version: ${current}`);
   const existing = db.tableNames().filter((table) => table !== "sqlite_sequence");
   const required = Object.fromEntries(REQUIRED_TABLES.map((table) => [table, true])) as Record<string, true>;
-  const unsupported = db.all<{ type: string; name: string }>("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").filter((object) => object.type !== "table" || !required[object.name]);
-  if (unsupported.length) throw new Error(`Pi Scholar database has unsupported objects: ${unsupported.map((object) => `${object.type} ${object.name}`).join(", ")}`);
+  const unsupported = db
+    .all<{ type: string; name: string }>("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+    .filter((object) => object.type !== "table" || !required[object.name]);
+  if (unsupported.length)
+    throw new Error(
+      `Pi Scholar database has unsupported objects: ${unsupported.map((object) => `${object.type} ${object.name}`).join(", ")}`,
+    );
   const missing = REQUIRED_TABLES.filter((table) => !existing.includes(table));
   if (missing.length) throw new Error(`Pi Scholar database schema is missing tables: ${missing.join(", ")}`);
   const metadata = db.all<{ schema_version: number | bigint }>("SELECT schema_version FROM schema_meta");
-  if (metadata.length !== 1 || Number(metadata[0]?.schema_version) !== SCHEMA_VERSION) throw new Error("Pi Scholar database schema_meta does not match the schema version");
+  if (metadata.length !== 1 || Number(metadata[0]?.schema_version) !== SCHEMA_VERSION)
+    throw new Error("Pi Scholar database schema_meta does not match the schema version");
   for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
     const actual = new Set(db.all<{ name: string }>(`PRAGMA table_info('${table}')`).map((row) => row.name));
     const missingColumns = columns.filter((column) => !actual.has(column));
-    if (missingColumns.length) throw new Error(`Pi Scholar database table ${table} is missing columns: ${missingColumns.join(", ")}`);
+    if (missingColumns.length)
+      throw new Error(`Pi Scholar database table ${table} is missing columns: ${missingColumns.join(", ")}`);
   }
   for (const [table, fragments] of Object.entries(REQUIRED_SCHEMA_FRAGMENTS)) {
-    const definition = db.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", [table])?.sql;
+    const definition = db.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", [
+      table,
+    ])?.sql;
     const normalized = normalizedSql(definition ?? "");
     const missingFragments = fragments.filter((fragment) => !normalized.includes(normalizedSql(fragment)));
-    if (missingFragments.length) throw new Error(`Pi Scholar database table ${table} is missing constraints: ${missingFragments.join("; ")}`);
+    if (missingFragments.length)
+      throw new Error(`Pi Scholar database table ${table} is missing constraints: ${missingFragments.join("; ")}`);
   }
 }
 
@@ -457,7 +606,10 @@ function ensureSchema(db: ScholarDatabase): void {
   }
   if (existing.length > 0) throw new Error("Pi Scholar database has an unknown unversioned schema");
   db.exec(SCHEMA_SQL);
-  db.run("INSERT INTO schema_meta (schema_version, applied_at) VALUES (?, ?)", [SCHEMA_VERSION, new Date().toISOString()]);
+  db.run("INSERT INTO schema_meta (schema_version, applied_at) VALUES (?, ?)", [
+    SCHEMA_VERSION,
+    new Date().toISOString(),
+  ]);
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   validateSchema(db);
 }
@@ -467,7 +619,8 @@ function validateDatabaseSidecars(path: string): void {
     const sidecar = `${path}${suffix}`;
     try {
       const stat = lstatSync(sidecar);
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Pi Scholar database sidecar must be a regular file: ${sidecar}`);
+      if (stat.isSymbolicLink() || !stat.isFile())
+        throw new Error(`Pi Scholar database sidecar must be a regular file: ${sidecar}`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -479,7 +632,8 @@ export function openDatabase(input: string | VaultPaths, options: OpenDatabaseOp
   const path = typeof input === "string" ? input : input.databasePath;
   try {
     const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Pi Scholar database path must be a regular file: ${path}`);
+    if (stat.isSymbolicLink() || !stat.isFile())
+      throw new Error(`Pi Scholar database path must be a regular file: ${path}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }

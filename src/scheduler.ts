@@ -1,8 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { transaction as databaseTransaction } from "./database.js";
+import type { DateInput, CardInput as FsrsCardInput, Grade } from "ts-fsrs";
 import { fsrs, Rating } from "ts-fsrs";
-import type { CardInput as FsrsCardInput, DateInput, Grade } from "ts-fsrs";
-import type { ScholarDatabase } from "./database.js";
 import type {
   CardBindingRecord,
   CardLineageRecord,
@@ -12,6 +10,8 @@ import type {
   RawReviewRecord,
   ReviewCardRecord,
 } from "./contracts.js";
+import type { ScholarDatabase } from "./database.js";
+import { transaction as databaseTransaction } from "./database.js";
 export interface SqlDatabase {
   exec(sql: string): void;
   run(sql: string, ...parameters: unknown[]): unknown;
@@ -24,9 +24,9 @@ export type SqlDatabaseSource = Pick<ScholarDatabase, "exec" | "run" | "get" | "
 function adaptDatabase(source: SqlDatabaseSource): SqlDatabase {
   return {
     exec: (sql) => source.exec(sql),
-    run: (sql, ...parameters) => source.run(sql, parameters.length ? parameters as never : undefined),
-    get: (sql, ...parameters) => source.get(sql, parameters.length ? parameters as never : undefined),
-    all: (sql, ...parameters) => source.all(sql, parameters.length ? parameters as never : undefined),
+    run: (sql, ...parameters) => source.run(sql, parameters.length ? (parameters as never) : undefined),
+    get: (sql, ...parameters) => source.get(sql, parameters.length ? (parameters as never) : undefined),
+    all: (sql, ...parameters) => source.all(sql, parameters.length ? (parameters as never) : undefined),
   };
 }
 export interface VaultPathsLike {
@@ -112,7 +112,6 @@ export interface PrerequisiteResult {
   readonly cardId: string;
   readonly prerequisites: readonly string[];
 }
-
 
 export interface HistoricalReview extends RawReviewRecord {
   readonly originCardId: string;
@@ -205,7 +204,8 @@ function fsrsSnapshot(card: {
     reps: card.reps,
     lapses: card.lapses,
     state,
-    last_review: card.last_review === undefined || card.last_review === null ? null : new Date(card.last_review).toISOString(),
+    last_review:
+      card.last_review === undefined || card.last_review === null ? null : new Date(card.last_review).toISOString(),
   };
 }
 function changedRows(result: unknown): number {
@@ -217,8 +217,7 @@ function changedRows(result: unknown): number {
 function requireRevision(result: unknown): void {
   if (changedRows(result) !== 1) throw new RevisionConflictError();
 }
- 
- 
+
 function transaction<T>(db: SqlDatabaseSource, fn: () => T): T {
   return databaseTransaction(db as never, fn);
 }
@@ -229,11 +228,16 @@ function stateNumber(value: FsrsState | number): number {
 
 function ratingValue(value: CardRating): Grade {
   switch (value) {
-    case "Again": return Rating.Again;
-    case "Hard": return Rating.Hard;
-    case "Good": return Rating.Good;
-    case "Easy": return Rating.Easy;
-    default: throw new ValidationError(`Unsupported FSRS rating: ${value}`);
+    case "Again":
+      return Rating.Again;
+    case "Hard":
+      return Rating.Hard;
+    case "Good":
+      return Rating.Good;
+    case "Easy":
+      return Rating.Easy;
+    default:
+      throw new ValidationError(`Unsupported FSRS rating: ${value}`);
   }
 }
 
@@ -276,7 +280,6 @@ function parseState(value: unknown): FsrsState {
   }
   return "New";
 }
-
 
 function mapCard(row: Record<string, unknown>): ReviewCardRecord {
   const state = parseState(row.fsrs_state);
@@ -328,7 +331,6 @@ function mapLineage(row: Record<string, unknown>): CardLineageRecord {
   };
 }
 
-
 export class SchedulerService {
   readonly db: SqlDatabase;
   readonly paths?: VaultPathsLike;
@@ -349,7 +351,9 @@ export class SchedulerService {
 
   listCards(activeOnly = false): ReviewCardRecord[] {
     const rows = this.db.all<Record<string, unknown>>(
-      activeOnly ? "SELECT * FROM review_cards WHERE status = 'active' ORDER BY due_at, card_id" : "SELECT * FROM review_cards ORDER BY created_at, card_id",
+      activeOnly
+        ? "SELECT * FROM review_cards WHERE status = 'active' ORDER BY due_at, card_id"
+        : "SELECT * FROM review_cards ORDER BY created_at, card_id",
     );
     return rows.map(mapCard);
   }
@@ -363,7 +367,10 @@ export class SchedulerService {
 
   prerequisites(cardId: string): CardPrerequisiteRecord[] {
     return this.db
-      .all<Record<string, unknown>>("SELECT card_id, prerequisite_card_id FROM card_prerequisites WHERE card_id = ? ORDER BY prerequisite_card_id", cardId)
+      .all<Record<string, unknown>>(
+        "SELECT card_id, prerequisite_card_id FROM card_prerequisites WHERE card_id = ? ORDER BY prerequisite_card_id",
+        cardId,
+      )
       .map((row) => ({ cardId: String(row.card_id), prerequisiteCardId: String(row.prerequisite_card_id) }));
   }
 
@@ -380,12 +387,17 @@ export class SchedulerService {
       if (!sectionText.trim() || binding.endOffset > sectionText.length) {
         throw new ValidationError("Binding section text must be nonempty and contain the binding bounds");
       }
-      const page = this.db.get<Record<string, unknown>>("SELECT status, quiz_worthiness, digest, revision FROM pages WHERE page_id = ?", binding.pageId);
-      if (!page || page.status !== "active" || page.quiz_worthiness !== "eligible") {
+      const page = this.db.get<Record<string, unknown>>(
+        "SELECT status, quiz_worthiness, digest, revision FROM pages WHERE page_id = ?",
+        binding.pageId,
+      );
+      if (page?.status !== "active" || page.quiz_worthiness !== "eligible") {
         throw new ValidationError(`Binding references an unavailable page: ${binding.pageId}`);
       }
-      if (String(page.digest) !== pageDigest) throw new ValidationError(`Binding page digest is stale: ${binding.pageId}`);
-      if (Number(page.revision) !== input.pageRevision) throw new ValidationError(`Binding page revision is stale: ${binding.pageId}`);
+      if (String(page.digest) !== pageDigest)
+        throw new ValidationError(`Binding page digest is stale: ${binding.pageId}`);
+      if (Number(page.revision) !== input.pageRevision)
+        throw new ValidationError(`Binding page revision is stale: ${binding.pageId}`);
     }
     return bindings;
   }
@@ -396,7 +408,8 @@ export class SchedulerService {
     const cardId = input.cardId?.trim() || randomUUID();
     const now = nowIso();
     transaction(this.source, () => {
-      if (this.db.get("SELECT card_id FROM review_cards WHERE card_id = ?", cardId)) throw new ValidationError(`Duplicate review card: ${cardId}`);
+      if (this.db.get("SELECT card_id FROM review_cards WHERE card_id = ?", cardId))
+        throw new ValidationError(`Duplicate review card: ${cardId}`);
       this.db.run(
         `INSERT INTO review_cards
           (card_id, status, prompt, initial_due_at, due_at, fsrs_state, stability, difficulty, reps, lapses, scheduled_days, last_review_at, revision, created_at, updated_at)
@@ -415,10 +428,17 @@ export class SchedulerService {
 
   updateCard(cardId: string, input: UpdateReviewCardInput): ReviewCardRecord {
     const current = this.getCard(cardId);
-    if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) throw new RevisionConflictError();
-    if (input.bindings) return this.reviseCard(cardId, { bindings: input.bindings, prompt: input.prompt, expectedRevision: input.expectedRevision });
-    if (input.status !== undefined && input.status !== "active" && input.status !== "retired") throw new ValidationError("Invalid card status");
-    const prompt = input.prompt === undefined ? current.prompt ?? null : input.prompt.trim() || null;
+    if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision)
+      throw new RevisionConflictError();
+    if (input.bindings)
+      return this.reviseCard(cardId, {
+        bindings: input.bindings,
+        prompt: input.prompt,
+        expectedRevision: input.expectedRevision,
+      });
+    if (input.status !== undefined && input.status !== "active" && input.status !== "retired")
+      throw new ValidationError("Invalid card status");
+    const prompt = input.prompt === undefined ? (current.prompt ?? null) : input.prompt.trim() || null;
     transaction(this.source, () => {
       const result = this.db.run(
         "UPDATE review_cards SET prompt = ?, status = COALESCE(?, status), revision = revision + 1, updated_at = ? WHERE card_id = ? AND revision = ?",
@@ -439,7 +459,8 @@ export class SchedulerService {
 
   reviseCard(cardId: string, input: CardRevisionInput): ReviewCardRecord {
     const current = this.getCard(cardId);
-    if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) throw new RevisionConflictError();
+    if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision)
+      throw new RevisionConflictError();
     const bindings = this.validateBindings(input.bindings);
     if (!bindings.length) throw new ValidationError("A review card requires at least one binding");
     transaction(this.source, () => {
@@ -482,8 +503,12 @@ export class SchedulerService {
     const parent = this.getCard(cardId);
     if (parent.status !== "active") throw new ValidationError("Only an active card can be split");
     if (children.length < 2) throw new ValidationError("A split requires at least two child cards");
-    const expectedRevision = children.find((child) => child.expectedRevision !== undefined)?.expectedRevision ?? parent.revision;
-    if (expectedRevision !== parent.revision || children.some((child) => child.expectedRevision !== undefined && child.expectedRevision !== expectedRevision)) {
+    const expectedRevision =
+      children.find((child) => child.expectedRevision !== undefined)?.expectedRevision ?? parent.revision;
+    if (
+      expectedRevision !== parent.revision ||
+      children.some((child) => child.expectedRevision !== undefined && child.expectedRevision !== expectedRevision)
+    ) {
       throw new RevisionConflictError();
     }
     const normalized = children.map((child) => {
@@ -491,8 +516,10 @@ export class SchedulerService {
       if (!bindings.length) throw new ValidationError("Split child requires at least one binding");
       return { id: child.cardId?.trim() || randomUUID(), prompt: child.prompt, bindings };
     });
-    if (new Set(normalized.map((child) => child.id)).size !== normalized.length) throw new ValidationError("Split child IDs must be distinct");
-    if (normalized.some((child) => this.db.get("SELECT card_id FROM review_cards WHERE card_id = ?", child.id))) throw new ValidationError("Split child ID already exists");
+    if (new Set(normalized.map((child) => child.id)).size !== normalized.length)
+      throw new ValidationError("Split child IDs must be distinct");
+    if (normalized.some((child) => this.db.get("SELECT card_id FROM review_cards WHERE card_id = ?", child.id)))
+      throw new ValidationError("Split child ID already exists");
     const now = new Date();
     transaction(this.source, () => {
       this.retireWithinTransaction(cardId, expectedRevision);
@@ -513,10 +540,12 @@ export class SchedulerService {
     const bindings = this.validateBindings(input.bindings);
     if (!bindings.length) throw new ValidationError("Merged card requires at least one binding");
     const cardId = input.cardId?.trim() || randomUUID();
-    if (this.db.get("SELECT card_id FROM review_cards WHERE card_id = ?", cardId)) throw new ValidationError(`Duplicate review card: ${cardId}`);
+    if (this.db.get("SELECT card_id FROM review_cards WHERE card_id = ?", cardId))
+      throw new ValidationError(`Duplicate review card: ${cardId}`);
     const now = new Date();
     transaction(this.source, () => {
-      for (const parent of parents) this.retireWithinTransaction(parent.cardId, input.expectedRevisions?.[parent.cardId] ?? parent.revision);
+      for (const parent of parents)
+        this.retireWithinTransaction(parent.cardId, input.expectedRevisions?.[parent.cardId] ?? parent.revision);
       this.insertFreshCard(cardId, input.prompt, now, bindings);
       this.recordLineage("merge", ids, [cardId], undefined);
       this.rewritePrerequisitesForMerge(ids, cardId);
@@ -524,7 +553,11 @@ export class SchedulerService {
     return this.getCard(cardId);
   }
 
-  setPrerequisites(cardId: string, prerequisiteCardIds: readonly string[], expectedRevision?: number): PrerequisiteResult {
+  setPrerequisites(
+    cardId: string,
+    prerequisiteCardIds: readonly string[],
+    expectedRevision?: number,
+  ): PrerequisiteResult {
     const card = this.getCard(cardId);
     if (card.status !== "active") throw new ValidationError("Retired cards cannot receive prerequisites");
     if (expectedRevision !== undefined && expectedRevision !== card.revision) throw new RevisionConflictError();
@@ -533,17 +566,28 @@ export class SchedulerService {
     if (ids.includes(cardId)) throw new ValidationError("A card cannot prerequisite itself");
     const cards = this.listCards(false);
     const known = new Set(cards.filter((entry) => entry.status === "active").map((entry) => entry.cardId));
-    if (ids.some((id) => !known.has(id))) throw new ValidationError("Prerequisite references an unknown or retired card");
+    if (ids.some((id) => !known.has(id)))
+      throw new ValidationError("Prerequisite references an unknown or retired card");
     const edges = new Map<string, Set<string>>();
-    for (const entry of cards) edges.set(entry.cardId, new Set(this.prerequisites(entry.cardId).map((edge) => edge.prerequisiteCardId)));
+    for (const entry of cards)
+      edges.set(entry.cardId, new Set(this.prerequisites(entry.cardId).map((edge) => edge.prerequisiteCardId)));
     edges.set(cardId, new Set(ids));
     if (this.hasCycle(edges)) throw new ValidationError("Prerequisite graph contains a cycle");
     const revision = expectedRevision ?? card.revision;
     transaction(this.source, () => {
-      const current = this.db.get<Record<string, unknown>>("SELECT revision, status FROM review_cards WHERE card_id = ?", cardId);
-      if (!current || current.status !== "active" || Number(current.revision) !== revision) throw new RevisionConflictError();
+      const current = this.db.get<Record<string, unknown>>(
+        "SELECT revision, status FROM review_cards WHERE card_id = ?",
+        cardId,
+      );
+      if (current?.status !== "active" || Number(current.revision) !== revision) throw new RevisionConflictError();
       this.db.run("DELETE FROM card_prerequisites WHERE card_id = ?", cardId);
-      for (const prerequisiteCardId of ids) this.db.run("INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)", cardId, prerequisiteCardId, nowIso());
+      for (const prerequisiteCardId of ids)
+        this.db.run(
+          "INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)",
+          cardId,
+          prerequisiteCardId,
+          nowIso(),
+        );
     });
     return { cardId, prerequisites: ids };
   }
@@ -551,12 +595,20 @@ export class SchedulerService {
   validateCoverage(pages?: readonly CoveragePage[]): CoverageReport {
     const sourcePages = pages
       ? [...pages]
-      : this.db.all<Record<string, unknown>>("SELECT page_id, status, quiz_worthiness FROM pages ORDER BY page_id").map((row) => ({
-          pageId: String(row.page_id),
-          status: (row.status as CoveragePage["status"]) ?? "active",
-          quizWorthiness: (row.quiz_worthiness as CoveragePage["quizWorthiness"]) ?? "unknown",
-        }));
-    const covered = new Set(this.db.all<{ page_id: string }>("SELECT DISTINCT b.page_id FROM card_bindings b JOIN review_cards c ON c.card_id = b.card_id WHERE b.active = 1 AND c.status = 'active'").map((row) => String(row.page_id)));
+      : this.db
+          .all<Record<string, unknown>>("SELECT page_id, status, quiz_worthiness FROM pages ORDER BY page_id")
+          .map((row) => ({
+            pageId: String(row.page_id),
+            status: (row.status as CoveragePage["status"]) ?? "active",
+            quizWorthiness: (row.quiz_worthiness as CoveragePage["quizWorthiness"]) ?? "unknown",
+          }));
+    const covered = new Set(
+      this.db
+        .all<{ page_id: string }>(
+          "SELECT DISTINCT b.page_id FROM card_bindings b JOIN review_cards c ON c.card_id = b.card_id WHERE b.active = 1 AND c.status = 'active'",
+        )
+        .map((row) => String(row.page_id)),
+    );
     const coveredPageIds: string[] = [];
     const skippedPageIds: string[] = [];
     const missingPageIds: string[] = [];
@@ -597,7 +649,8 @@ export class SchedulerService {
       queue.push(card);
       byTopic.set(topic, queue);
     }
-    for (const queue of byTopic.values()) queue.sort((a, b) => a.dueAt.localeCompare(b.dueAt) || a.cardId.localeCompare(b.cardId));
+    for (const queue of byTopic.values())
+      queue.sort((a, b) => a.dueAt.localeCompare(b.dueAt) || a.cardId.localeCompare(b.cardId));
     const topics = [...byTopic.keys()].sort();
     const selected: ReviewCardRecord[] = [];
     while (selected.length < 4 && topics.some((topic) => (byTopic.get(topic)?.length ?? 0) > 0)) {
@@ -614,7 +667,10 @@ export class SchedulerService {
     this.getCard(cardId);
     const ancestors = this.ancestorIds(cardId);
     const placeholders = ancestors.map(() => "?").join(",");
-    const rows = this.db.all<Record<string, unknown>>(`SELECT * FROM raw_reviews WHERE card_id IN (${placeholders}) ORDER BY reviewed_at, review_id`, ...ancestors);
+    const rows = this.db.all<Record<string, unknown>>(
+      `SELECT * FROM raw_reviews WHERE card_id IN (${placeholders}) ORDER BY reviewed_at, review_id`,
+      ...ancestors,
+    );
     return rows.map((row) => ({
       reviewId: String(row.review_id),
       cardId: String(row.card_id),
@@ -632,19 +688,34 @@ export class SchedulerService {
 
   lineage(cardId?: string): CardLineageRecord[] {
     const rows = cardId
-      ? this.db.all<Record<string, unknown>>("SELECT * FROM card_lineage WHERE parent_card_id = ? OR child_card_id = ? ORDER BY occurred_at, lineage_id", cardId, cardId)
+      ? this.db.all<Record<string, unknown>>(
+          "SELECT * FROM card_lineage WHERE parent_card_id = ? OR child_card_id = ? ORDER BY occurred_at, lineage_id",
+          cardId,
+          cardId,
+        )
       : this.db.all<Record<string, unknown>>("SELECT * FROM card_lineage ORDER BY occurred_at, lineage_id");
     return rows.map(mapLineage);
   }
 
   /** Apply one independent FSRS transition. Call inside a caller transaction for atomic grading. */
-  transitionCard(cardId: string, rating: CardRating, reviewedAt: string | Date, context: ReviewTransitionContext): RawReviewRecord {
+  transitionCard(
+    cardId: string,
+    rating: CardRating,
+    reviewedAt: string | Date,
+    context: ReviewTransitionContext,
+  ): RawReviewRecord {
     return transaction(this.source, () => this.transitionCardInTransaction(cardId, rating, reviewedAt, context));
   }
 
-  transitionCardInTransaction(cardId: string, rating: CardRating, reviewedAt: string | Date, context: ReviewTransitionContext): RawReviewRecord {
+  transitionCardInTransaction(
+    cardId: string,
+    rating: CardRating,
+    reviewedAt: string | Date,
+    context: ReviewTransitionContext,
+  ): RawReviewRecord {
     const card = this.getCard(cardId);
-    if (card.status !== "active" && context.authorization !== SEALED_QUIZ_REVIEW) throw new ValidationError("Retired cards cannot be reviewed");
+    if (card.status !== "active" && context.authorization !== SEALED_QUIZ_REVIEW)
+      throw new ValidationError("Retired cards cannot be reviewed");
     const at = asDate(reviewedAt, "reviewedAt");
     const before = this.toFsrsCard(card);
     const result = this.engine.next(before, at, ratingValue(rating));
@@ -689,7 +760,8 @@ export class SchedulerService {
       reviewedAt: at.toISOString(),
       stateBefore: beforeSnapshot,
       stateAfter: afterSnapshot,
-      settlementId: context.settlementId ?? `${context.quizId}:${context.questionId}:${cardId}:${context.answerRevision}`,
+      settlementId:
+        context.settlementId ?? `${context.quizId}:${context.questionId}:${cardId}:${context.answerRevision}`,
     };
   }
 
@@ -726,7 +798,12 @@ export class SchedulerService {
     }
   }
 
-  private insertFreshCard(cardId: string, prompt: string | undefined, due: Date, bindings: readonly NormalizedBinding[]): void {
+  private insertFreshCard(
+    cardId: string,
+    prompt: string | undefined,
+    due: Date,
+    bindings: readonly NormalizedBinding[],
+  ): void {
     const iso = nowIso();
     this.db.run(
       `INSERT INTO review_cards
@@ -743,12 +820,22 @@ export class SchedulerService {
   }
 
   private retireWithinTransaction(cardId: string, expectedRevision: number): void {
-    const result = this.db.run("UPDATE review_cards SET status = 'retired', updated_at = ? WHERE card_id = ? AND status = 'active' AND revision = ?", nowIso(), cardId, expectedRevision);
+    const result = this.db.run(
+      "UPDATE review_cards SET status = 'retired', updated_at = ? WHERE card_id = ? AND status = 'active' AND revision = ?",
+      nowIso(),
+      cardId,
+      expectedRevision,
+    );
     requireRevision(result);
     this.recordLineage("retire", [cardId], [], undefined);
   }
 
-  private recordLineage(event: CardLineageRecord["event"], parentCardIds: readonly string[], childCardIds: readonly string[], metadata: unknown): void {
+  private recordLineage(
+    event: CardLineageRecord["event"],
+    parentCardIds: readonly string[],
+    childCardIds: readonly string[],
+    metadata: unknown,
+  ): void {
     if (!childCardIds.length && event !== "retire") throw new ValidationError(`${event} lineage requires child cards`);
     const children: readonly (string | null)[] = childCardIds.length ? childCardIds : [null];
     for (const parentCardId of parentCardIds) {
@@ -767,21 +854,65 @@ export class SchedulerService {
   }
 
   private rewritePrerequisitesForSplit(parentId: string, childIds: readonly string[]): void {
-    const incoming = this.db.all<{ card_id: string }>("SELECT card_id FROM card_prerequisites WHERE prerequisite_card_id = ?", parentId);
-    const outgoing = this.db.all<{ prerequisite_card_id: string }>("SELECT prerequisite_card_id FROM card_prerequisites WHERE card_id = ?", parentId);
+    const incoming = this.db.all<{ card_id: string }>(
+      "SELECT card_id FROM card_prerequisites WHERE prerequisite_card_id = ?",
+      parentId,
+    );
+    const outgoing = this.db.all<{ prerequisite_card_id: string }>(
+      "SELECT prerequisite_card_id FROM card_prerequisites WHERE card_id = ?",
+      parentId,
+    );
     this.db.run("DELETE FROM card_prerequisites WHERE card_id = ? OR prerequisite_card_id = ?", parentId, parentId);
-    for (const childId of childIds) for (const row of outgoing) this.db.run("INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)", childId, row.prerequisite_card_id, nowIso());
-    for (const row of incoming) for (const childId of childIds) this.db.run("INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)", row.card_id, childId, nowIso());
+    for (const childId of childIds)
+      for (const row of outgoing)
+        this.db.run(
+          "INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)",
+          childId,
+          row.prerequisite_card_id,
+          nowIso(),
+        );
+    for (const row of incoming)
+      for (const childId of childIds)
+        this.db.run(
+          "INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)",
+          row.card_id,
+          childId,
+          nowIso(),
+        );
   }
 
   private rewritePrerequisitesForMerge(parentIds: readonly string[], mergedId: string): void {
     const placeholders = parentIds.map(() => "?").join(",");
-    const outgoing = this.db.all<{ prerequisite_card_id: string }>(`SELECT prerequisite_card_id FROM card_prerequisites WHERE card_id IN (${placeholders})`, ...parentIds);
-    const incoming = this.db.all<{ card_id: string }>(`SELECT card_id FROM card_prerequisites WHERE prerequisite_card_id IN (${placeholders})`, ...parentIds);
-    this.db.run(`DELETE FROM card_prerequisites WHERE card_id IN (${placeholders}) OR prerequisite_card_id IN (${placeholders})`, ...parentIds, ...parentIds);
-    const outgoingIds = [...new Set(outgoing.map((row) => row.prerequisite_card_id).filter((id) => !parentIds.includes(id)))];
-    for (const prerequisiteCardId of outgoingIds) this.db.run("INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)", mergedId, prerequisiteCardId, nowIso());
-    for (const cardId of [...new Set(incoming.map((row) => row.card_id).filter((id) => !parentIds.includes(id)))]) this.db.run("INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)", cardId, mergedId, nowIso());
+    const outgoing = this.db.all<{ prerequisite_card_id: string }>(
+      `SELECT prerequisite_card_id FROM card_prerequisites WHERE card_id IN (${placeholders})`,
+      ...parentIds,
+    );
+    const incoming = this.db.all<{ card_id: string }>(
+      `SELECT card_id FROM card_prerequisites WHERE prerequisite_card_id IN (${placeholders})`,
+      ...parentIds,
+    );
+    this.db.run(
+      `DELETE FROM card_prerequisites WHERE card_id IN (${placeholders}) OR prerequisite_card_id IN (${placeholders})`,
+      ...parentIds,
+      ...parentIds,
+    );
+    const outgoingIds = [
+      ...new Set(outgoing.map((row) => row.prerequisite_card_id).filter((id) => !parentIds.includes(id))),
+    ];
+    for (const prerequisiteCardId of outgoingIds)
+      this.db.run(
+        "INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)",
+        mergedId,
+        prerequisiteCardId,
+        nowIso(),
+      );
+    for (const cardId of [...new Set(incoming.map((row) => row.card_id).filter((id) => !parentIds.includes(id)))])
+      this.db.run(
+        "INSERT INTO card_prerequisites (card_id, prerequisite_card_id, created_at) VALUES (?, ?, ?)",
+        cardId,
+        mergedId,
+        nowIso(),
+      );
   }
 
   private ancestorIds(cardId: string): string[] {
@@ -789,7 +920,10 @@ export class SchedulerService {
     const visit = (id: string): void => {
       if (seen.has(id)) return;
       seen.add(id);
-      const rows = this.db.all<Record<string, unknown>>("SELECT parent_card_id FROM card_lineage WHERE child_card_id = ?", id);
+      const rows = this.db.all<Record<string, unknown>>(
+        "SELECT parent_card_id FROM card_lineage WHERE child_card_id = ?",
+        id,
+      );
       for (const row of rows) visit(String(row.parent_card_id));
     };
     visit(cardId);

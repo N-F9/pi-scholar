@@ -1,4 +1,4 @@
-import { isValidElement, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import { type ComponentPropsWithoutRef, isValidElement, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -39,10 +39,22 @@ type MarkdownCodeProps = ComponentPropsWithoutRef<"code"> & { node?: unknown };
 
 function InertCode({ className, children, node: _node, ...props }: MarkdownCodeProps) {
   const mermaid = className?.split(" ").includes("language-mermaid");
-  return <code className={mermaid ? `${className} mermaid-source` : className} data-diagram={mermaid ? "inert" : undefined} {...props}>{children}</code>;
+  return (
+    <code
+      className={mermaid ? `${className} mermaid-source` : className}
+      data-diagram={mermaid ? "inert" : undefined}
+      {...props}
+    >
+      {children}
+    </code>
+  );
 }
 
-export function Markdown({ source, pagePath = "", headings = [] }: {
+export function Markdown({
+  source,
+  pagePath = "",
+  headings = [],
+}: {
   source: string;
   pagePath?: string;
   headings?: readonly { readonly heading?: string; readonly anchor: string }[];
@@ -70,16 +82,48 @@ export function Markdown({ source, pagePath = "", headings = [] }: {
         components={{
           a: ({ href, children, node: _node, ...props }) => {
             const safe = safeHref(href, pagePath);
-            return safe ? <a href={safe} rel={safe.startsWith("http") ? "noreferrer" : undefined} {...props}>{children}</a> : <span>{children}</span>;
+            return safe ? (
+              <a href={safe} rel={safe.startsWith("http") ? "noreferrer" : undefined} {...props}>
+                {children}
+              </a>
+            ) : (
+              <span>{children}</span>
+            );
           },
           code: InertCode,
-          img: ({ alt, node: _node }) => <span className="text-sm italic text-muted">[Image: {alt || "illustration"}]</span>,
-          h1: ({ children, node: _node, ...props }) => <h1 id={idFor(children)} {...props}>{children}</h1>,
-          h2: ({ children, node: _node, ...props }) => <h2 id={idFor(children)} {...props}>{children}</h2>,
-          h3: ({ children, node: _node, ...props }) => <h3 id={idFor(children)} {...props}>{children}</h3>,
-          h4: ({ children, node: _node, ...props }) => <h4 id={idFor(children)} {...props}>{children}</h4>,
-          h5: ({ children, node: _node, ...props }) => <h5 id={idFor(children)} {...props}>{children}</h5>,
-          h6: ({ children, node: _node, ...props }) => <h6 id={idFor(children)} {...props}>{children}</h6>,
+          img: ({ alt, node: _node }) => (
+            <span className="text-sm italic text-muted">[Image: {alt || "illustration"}]</span>
+          ),
+          h1: ({ children, node: _node, ...props }) => (
+            <h1 id={idFor(children)} {...props}>
+              {children}
+            </h1>
+          ),
+          h2: ({ children, node: _node, ...props }) => (
+            <h2 id={idFor(children)} {...props}>
+              {children}
+            </h2>
+          ),
+          h3: ({ children, node: _node, ...props }) => (
+            <h3 id={idFor(children)} {...props}>
+              {children}
+            </h3>
+          ),
+          h4: ({ children, node: _node, ...props }) => (
+            <h4 id={idFor(children)} {...props}>
+              {children}
+            </h4>
+          ),
+          h5: ({ children, node: _node, ...props }) => (
+            <h5 id={idFor(children)} {...props}>
+              {children}
+            </h5>
+          ),
+          h6: ({ children, node: _node, ...props }) => (
+            <h6 id={idFor(children)} {...props}>
+              {children}
+            </h6>
+          ),
         }}
       >
         {source}

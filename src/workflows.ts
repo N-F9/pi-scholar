@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { transaction, type ScholarDatabase } from "./database.js";
 import type { WorkflowRecord } from "./contracts.js";
+import { type ScholarDatabase, transaction } from "./database.js";
 
 export type WorkflowKind = WorkflowRecord["kind"];
 
@@ -112,7 +112,6 @@ function workflowRequestId(value: string): string {
   return value;
 }
 
-
 function rowToWorkflow(row: Record<string, unknown>): WorkflowRecord {
   return {
     requestId: String(row.request_id),
@@ -129,7 +128,8 @@ function rowToWorkflow(row: Record<string, unknown>): WorkflowRecord {
 
 function cleanIdempotencyKey(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  if (!value || value.length > 200 || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("invalid workflow idempotency key");
+  if (!value || value.length > 200 || /[\u0000-\u001f\u007f]/u.test(value))
+    throw new Error("invalid workflow idempotency key");
   return value;
 }
 
@@ -142,15 +142,15 @@ export class WorkflowCoordinator {
     this.worker = options.worker ?? new BrowserMutationWorker();
   }
 
-
-
   get(requestId: string): WorkflowRecord | undefined {
     const row = this.db.get<Record<string, unknown>>("SELECT * FROM workflows WHERE request_id = ?", [requestId]);
     return row ? rowToWorkflow(row) : undefined;
   }
 
   list(): WorkflowRecord[] {
-    return this.db.all<Record<string, unknown>>("SELECT * FROM workflows ORDER BY rowid DESC, request_id").map(rowToWorkflow);
+    return this.db
+      .all<Record<string, unknown>>("SELECT * FROM workflows ORDER BY rowid DESC, request_id")
+      .map(rowToWorkflow);
   }
   /** Insert a queued workflow inside a caller-owned SQLite transaction. */
   queueInTransaction(kind: WorkflowKind, requestId: string, idempotencyKey?: string): WorkflowRecord {
@@ -159,7 +159,8 @@ export class WorkflowCoordinator {
     if (key) {
       const prior = this.db.get<Record<string, unknown>>("SELECT * FROM workflows WHERE idempotency_key = ?", [key]);
       if (prior) {
-        if (String(prior.kind) !== kind || String(prior.request_id) !== requestId) throw new Error("workflow idempotency key is already bound");
+        if (String(prior.kind) !== kind || String(prior.request_id) !== requestId)
+          throw new Error("workflow idempotency key is already bound");
         return rowToWorkflow(prior);
       }
     }
@@ -225,7 +226,11 @@ export class WorkflowCoordinator {
     });
   }
 
-  finishWorkflow(requestId: string, status: "succeeded" | "failed", options: WorkflowFinishOptions = {}): WorkflowRecord {
+  finishWorkflow(
+    requestId: string,
+    status: "succeeded" | "failed",
+    options: WorkflowFinishOptions = {},
+  ): WorkflowRecord {
     workflowRequestId(requestId);
     if (status !== "succeeded" && status !== "failed") throw new Error("workflow finish status is invalid");
     const progress = workflowProgress(options.progress);
@@ -244,8 +249,8 @@ export class WorkflowCoordinator {
           new Date().toISOString(),
           progress ?? (status === "succeeded" ? 1 : current.progress),
           message ?? current.message ?? null,
-          status === "failed" ? errorCode ?? null : null,
-          status === "failed" ? errorMessage ?? null : null,
+          status === "failed" ? (errorCode ?? null) : null,
+          status === "failed" ? (errorMessage ?? null) : null,
           requestId,
         ],
       );
@@ -263,7 +268,6 @@ export class WorkflowCoordinator {
   failWorkflow(requestId: string, options: WorkflowFinishOptions = {}): WorkflowRecord {
     return this.finishWorkflow(requestId, "failed", options);
   }
-
 
   async close(options: { readonly drain?: boolean } = {}): Promise<void> {
     await this.worker.close({ drain: options.drain ?? true });

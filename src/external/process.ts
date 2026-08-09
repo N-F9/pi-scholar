@@ -1,5 +1,5 @@
-import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -26,7 +26,8 @@ export interface ChildResult {
 
 function validateArgv(executable: string, args: readonly string[]): void {
   if (!executable || /[\u0000-\u001f\u007f]/u.test(executable)) throw new Error("invalid child executable");
-  if (!isAbsolute(executable) && !/^[A-Za-z0-9._-]+$/u.test(executable)) throw new Error("child executable must be a name or absolute path");
+  if (!isAbsolute(executable) && !/^[A-Za-z0-9._-]+$/u.test(executable))
+    throw new Error("child executable must be a name or absolute path");
   for (const arg of args) {
     if (typeof arg !== "string" || /[\u0000]/u.test(arg)) throw new Error("child argv contains an invalid value");
   }
@@ -72,7 +73,8 @@ function validateEnvironment(overrides: Readonly<Record<string, string>> | undef
   if (entries.length > 64) throw new Error("child environment has too many entries");
   let bytes = 0;
   for (const [key, value] of entries) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("child environment contains an invalid value");
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || /[\u0000-\u001f\u007f]/u.test(value))
+      throw new Error("child environment contains an invalid value");
     bytes += Buffer.byteLength(key, "utf8") + Buffer.byteLength(value, "utf8");
   }
   if (bytes > 64 * 1024) throw new Error("child environment exceeds 64 KiB");
@@ -82,10 +84,16 @@ function validateOptions(options: ChildRunOptions): void {
   if (!options.cwd || /[\u0000\u000a\u000d]/u.test(options.cwd)) throw new Error("invalid child working directory");
   const stat = lstatSync(options.cwd);
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("child working directory must be a real directory");
-  if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new Error("child timeout must be positive");
-  if (options.maxOutputBytes !== undefined && (!Number.isInteger(options.maxOutputBytes) || options.maxOutputBytes <= 0)) throw new Error("child output bound must be positive");
+  if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0))
+    throw new Error("child timeout must be positive");
+  if (
+    options.maxOutputBytes !== undefined &&
+    (!Number.isInteger(options.maxOutputBytes) || options.maxOutputBytes <= 0)
+  )
+    throw new Error("child output bound must be positive");
   validateEnvironment(options.env);
-  if (options.stdin !== undefined && Buffer.byteLength(options.stdin) > 64 * 1024) throw new Error("child stdin exceeds 64 KiB");
+  if (options.stdin !== undefined && Buffer.byteLength(options.stdin) > 64 * 1024)
+    throw new Error("child stdin exceeds 64 KiB");
 }
 
 function environment(overrides: Readonly<Record<string, string>> | undefined): NodeJS.ProcessEnv {
@@ -189,7 +197,11 @@ export function runChildSync(executable: string, args: readonly string[], option
     code: result.status,
     signal: result.signal,
     timedOut,
-    stdout: Buffer.isBuffer(result.stdout) ? result.stdout.subarray(0, maxOutputBytes).toString("utf8") : String(result.stdout ?? ""),
-    stderr: Buffer.isBuffer(result.stderr) ? result.stderr.subarray(0, maxOutputBytes).toString("utf8") : String(result.stderr ?? ""),
+    stdout: Buffer.isBuffer(result.stdout)
+      ? result.stdout.subarray(0, maxOutputBytes).toString("utf8")
+      : String(result.stdout ?? ""),
+    stderr: Buffer.isBuffer(result.stderr)
+      ? result.stderr.subarray(0, maxOutputBytes).toString("utf8")
+      : String(result.stderr ?? ""),
   };
 }

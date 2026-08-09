@@ -22,9 +22,21 @@ import type {
   QuizPublicationInput,
   SourceRequest,
 } from "../src/contracts.js";
-type WikiNoteInput = { readonly path: string; readonly title?: string; readonly body: string; readonly pageId?: string; readonly quizWorthiness?: "eligible" | "skip" | "unknown" };
-type WikiNoteUpdateInput = { readonly path?: string; readonly title?: string; readonly body?: string; readonly quizWorthiness?: "eligible" | "skip" | "unknown"; readonly expectedDigest?: string };
 
+type WikiNoteInput = {
+  readonly path: string;
+  readonly title?: string;
+  readonly body: string;
+  readonly pageId?: string;
+  readonly quizWorthiness?: "eligible" | "skip" | "unknown";
+};
+type WikiNoteUpdateInput = {
+  readonly path?: string;
+  readonly title?: string;
+  readonly body?: string;
+  readonly quizWorthiness?: "eligible" | "skip" | "unknown";
+  readonly expectedDigest?: string;
+};
 
 type LifecycleKind = "source-admission" | "wiki-maintenance" | "daily-quiz";
 
@@ -50,11 +62,21 @@ type ScholarApplication = {
   readonly updateNote: (pageId: string, input: WikiNoteUpdateInput) => Promise<unknown>;
   readonly removalPreview: (sourceId: string) => Promise<unknown>;
   readonly removeSource: (sourceId: string, confirmationId: string) => Promise<unknown>;
-  readonly searchWiki: (query: string, options?: { readonly mode?: "semantic" | "lexical" | "exact"; readonly limit?: number }) => Promise<unknown>;
+  readonly searchWiki: (
+    query: string,
+    options?: { readonly mode?: "semantic" | "lexical" | "exact"; readonly limit?: number },
+  ) => Promise<unknown>;
   readonly reportIssue: (input: Record<string, unknown>) => Promise<unknown>;
   readonly beginWorkflow: (kind: LifecycleKind) => Promise<{ readonly workflow: { readonly requestId: string } }>;
-  readonly updateWorkflow: (requestId: string, input: { readonly progress?: number; readonly message?: string }) => Promise<unknown>;
-  readonly finishWorkflow: (requestId: string, status: "succeeded" | "failed", options?: WorkflowFinishOptions) => Promise<unknown>;
+  readonly updateWorkflow: (
+    requestId: string,
+    input: { readonly progress?: number; readonly message?: string },
+  ) => Promise<unknown>;
+  readonly finishWorkflow: (
+    requestId: string,
+    status: "succeeded" | "failed",
+    options?: WorkflowFinishOptions,
+  ) => Promise<unknown>;
   readonly getAdmissionContext: () => Promise<AdmissionContext>;
   readonly admitSource: (input: AdmissionPublicationInput) => Promise<AdmissionPublicationResult>;
   readonly getMaintenanceContext: () => Promise<MaintenanceContext>;
@@ -74,7 +96,17 @@ interface RuntimeModule {
 }
 
 const sourceInput = Type.Object({
-  kind: Type.Optional(Type.Union([Type.Literal("document"), Type.Literal("url"), Type.Literal("text"), Type.Literal("note"), Type.Literal("code"), Type.Literal("directory"), Type.Literal("repository")])),
+  kind: Type.Optional(
+    Type.Union([
+      Type.Literal("document"),
+      Type.Literal("url"),
+      Type.Literal("text"),
+      Type.Literal("note"),
+      Type.Literal("code"),
+      Type.Literal("directory"),
+      Type.Literal("repository"),
+    ]),
+  ),
   path: Type.Optional(Type.String()),
   filePath: Type.Optional(Type.String()),
   url: Type.Optional(Type.String()),
@@ -179,7 +211,9 @@ const maintenanceInput = Type.Union([
     path: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
     body: Type.String(),
-    quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
+    quizWorthiness: Type.Optional(
+      Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")]),
+    ),
   }),
   Type.Object({
     kind: Type.Literal("update-page"),
@@ -187,7 +221,9 @@ const maintenanceInput = Type.Union([
     expectedDigest: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
     body: Type.Optional(Type.String()),
-    quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
+    quizWorthiness: Type.Optional(
+      Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")]),
+    ),
   }),
   Type.Object({
     kind: Type.Literal("rename-page"),
@@ -250,11 +286,14 @@ const quizQuestionProposal = Type.Object({
   prompt: Type.String({ minLength: 1 }),
   choices: Type.Optional(Type.Array(Type.String())),
   cardIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-  cards: Type.Array(Type.Object({
-    cardId: Type.String({ minLength: 1 }),
-    criterion: Type.String({ minLength: 1 }),
-    weight: Type.Number({ exclusiveMinimum: 0 }),
-  }), { minItems: 1 }),
+  cards: Type.Array(
+    Type.Object({
+      cardId: Type.String({ minLength: 1 }),
+      criterion: Type.String({ minLength: 1 }),
+      weight: Type.Number({ exclusiveMinimum: 0 }),
+    }),
+    { minItems: 1 },
+  ),
   sourceRefs: Type.Array(Type.String()),
   answerKey: Type.Optional(Type.Unknown()),
 });
@@ -301,8 +340,8 @@ const appCache = new Map<string, ScholarApplication>();
 const gradingClaimOwner = randomUUID();
 
 async function loadRuntimeModule(): Promise<RuntimeModule> {
-  const application = await import("../dist/application.js") as unknown as Pick<RuntimeModule, "createApplication">;
-  const vault = await import("../dist/vault.js") as unknown as Pick<RuntimeModule, "resolveVault">;
+  const application = (await import("../dist/application.js")) as unknown as Pick<RuntimeModule, "createApplication">;
+  const vault = (await import("../dist/vault.js")) as unknown as Pick<RuntimeModule, "resolveVault">;
   return { ...application, ...vault };
 }
 
@@ -316,7 +355,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function jsonResult(value: unknown): AgentToolResult<unknown> {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? null) ?? String(value);
+  const text = typeof value === "string" ? value : (JSON.stringify(value ?? null) ?? String(value));
   return { content: [{ type: "text", text }], details: value };
 }
 
@@ -356,7 +395,8 @@ function workflowKey(app: ScholarApplication, kind: LifecycleKind): string {
 
 function workflowError(error: unknown): WorkflowFinishOptions {
   return {
-    errorCode: error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "PI_WORKFLOW_FAILED",
+    errorCode:
+      error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "PI_WORKFLOW_FAILED",
     errorMessage: (error instanceof Error ? error.message : String(error)).slice(0, 500),
   };
 }
@@ -427,7 +467,10 @@ async function lifecycleFinal<T>(
     cancelled(signal);
     const result = await operation(app);
     if (kind === "wiki-maintenance") {
-      await app.updateWorkflow(state.requestId, { progress: 0.5, message: "Maintenance proposal applied; submit another or finish" });
+      await app.updateWorkflow(state.requestId, {
+        progress: 0.5,
+        message: "Maintenance proposal applied; submit another or finish",
+      });
       workflowStates.set(key, state);
     } else {
       const remaining = state.remaining - 1;
@@ -444,7 +487,10 @@ async function lifecycleFinal<T>(
   } catch (error) {
     if (kind === "wiki-maintenance") {
       try {
-        await app.updateWorkflow(state.requestId, { progress: 0.5, message: "Maintenance proposal rejected; submit another or finish" });
+        await app.updateWorkflow(state.requestId, {
+          progress: 0.5,
+          message: "Maintenance proposal rejected; submit another or finish",
+        });
       } catch {
         // Preserve the tool error if progress persistence is unavailable.
       }
@@ -452,11 +498,19 @@ async function lifecycleFinal<T>(
     } else if (kind === "source-admission") {
       const remaining = state.remaining - 1;
       if (remaining > 0) {
-        try { await app.updateWorkflow(state.requestId, { progress: 0.5, message: `${remaining} admission(s) remaining` }); } catch { /* Preserve the source failure if progress persistence is unavailable. */ }
+        try {
+          await app.updateWorkflow(state.requestId, { progress: 0.5, message: `${remaining} admission(s) remaining` });
+        } catch {
+          /* Preserve the source failure if progress persistence is unavailable. */
+        }
         workflowStates.set(key, { requestId: state.requestId, remaining });
       } else {
         workflowStates.delete(key);
-        try { await app.finishWorkflow(state.requestId, "failed", workflowError(error)); } catch { /* Preserve the tool error if lifecycle persistence is unavailable. */ }
+        try {
+          await app.finishWorkflow(state.requestId, "failed", workflowError(error));
+        } catch {
+          /* Preserve the tool error if lifecycle persistence is unavailable. */
+        }
       }
     } else {
       workflowStates.delete(key);
@@ -511,14 +565,24 @@ async function stage(app: ScholarApplication, params: Record<string, unknown>): 
 }
 
 async function note(app: ScholarApplication, params: Record<string, unknown>): Promise<unknown> {
-  const body = typeof params.body === "string" ? params.body : typeof params.content === "string" ? params.content : undefined;
+  const body =
+    typeof params.body === "string" ? params.body : typeof params.content === "string" ? params.content : undefined;
   const title = typeof params.title === "string" ? params.title : undefined;
   const quizWorthinessValue = params.quizWorthiness;
-  const quizWorthiness = quizWorthinessValue === "eligible" || quizWorthinessValue === "skip" || quizWorthinessValue === "unknown" ? quizWorthinessValue : undefined;
+  const quizWorthiness =
+    quizWorthinessValue === "eligible" || quizWorthinessValue === "skip" || quizWorthinessValue === "unknown"
+      ? quizWorthinessValue
+      : undefined;
   const path = typeof params.path === "string" ? params.path : undefined;
   if (typeof params.pageId === "string") {
-    if (body === undefined && title === undefined && quizWorthiness === undefined && path === undefined) throw new Error("an update is required");
-    const update: WikiNoteUpdateInput = { ...(body === undefined ? {} : { body }), ...(title === undefined ? {} : { title }), ...(quizWorthiness === undefined ? {} : { quizWorthiness }), ...(path === undefined ? {} : { path }) };
+    if (body === undefined && title === undefined && quizWorthiness === undefined && path === undefined)
+      throw new Error("an update is required");
+    const update: WikiNoteUpdateInput = {
+      ...(body === undefined ? {} : { body }),
+      ...(title === undefined ? {} : { title }),
+      ...(quizWorthiness === undefined ? {} : { quizWorthiness }),
+      ...(path === undefined ? {} : { path }),
+    };
     return app.updateNote(params.pageId, update);
   }
   if (typeof body !== "string" || !body.trim()) throw new Error("body or content is required");
@@ -541,12 +605,21 @@ async function remove(app: ScholarApplication, sourceId: string, confirmationId:
 async function handleAddCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
   const raw = args.trim() || (ctx.hasUI ? await ctx.ui.input("Add source", "URL, path, or pasted text") : undefined);
   if (!raw) return;
-  await call(ctx, ctx.signal, undefined, "Staging source", (app) => stage(app, /^https?:\/\//iu.test(raw) ? { url: raw } : raw.startsWith("text:") ? { text: raw.slice(5) } : { path: raw }));
+  await call(ctx, ctx.signal, undefined, "Staging source", (app) =>
+    stage(
+      app,
+      /^https?:\/\//iu.test(raw) ? { url: raw } : raw.startsWith("text:") ? { text: raw.slice(5) } : { path: raw },
+    ),
+  );
   ctx.ui.notify("Source staged in inbox", "info");
 }
 
 async function handleIssueCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-  const raw = args.trim() || (ctx.hasUI ? await ctx.ui.input("Report wiki issue", "kind:description (incorrect, unclear, missing, or bad-boundary)") : undefined);
+  const raw =
+    args.trim() ||
+    (ctx.hasUI
+      ? await ctx.ui.input("Report wiki issue", "kind:description (incorrect, unclear, missing, or bad-boundary)")
+      : undefined);
   if (!raw) return;
   const match = /^(incorrect|unclear|missing|bad-boundary)\s*:\s*(.+)$/iu.exec(raw);
   const kind = match?.[1]?.toLowerCase() ?? "unclear";
@@ -611,7 +684,10 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
         const confirmationId = String(input.confirmationId ?? asRecord(preview).confirmationId ?? "");
         if (!confirmationId) throw new Error("A current removal confirmation is required");
         if (!ctx.hasUI) throw new Error("Source removal requires interactive confirmation");
-        const accepted = await ctx.ui.confirm("Remove source", "This removes current dependent artifacts and does not erase Git history.");
+        const accepted = await ctx.ui.confirm(
+          "Remove source",
+          "This removes current dependent artifacts and does not erase Git history.",
+        );
         if (!accepted) return { cancelled: true, preview };
         const current = await removalPreview(app, sourceId);
         if (String(asRecord(current).confirmationId ?? "") !== confirmationId) return { stale: true, preview: current };
@@ -625,7 +701,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Search trusted wiki content with qmd semantic ranking.",
     parameters: searchInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return call(ctx, _signal, onUpdate, "Searching wiki", (app) => app.searchWiki(params.query, { mode: "semantic", limit: params.limit }));
+      return call(ctx, _signal, onUpdate, "Searching wiki", (app) =>
+        app.searchWiki(params.query, { mode: "semantic", limit: params.limit }),
+      );
     },
   });
   pi.registerTool({
@@ -645,7 +723,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "List and claim the current stable source-admission context.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
-      return lifecycleContext(ctx, _signal, onUpdate, "Loading admission context", "source-admission", (app) => app.getAdmissionContext());
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading admission context", "source-admission", (app) =>
+        app.getAdmissionContext(),
+      );
     },
   });
   pi.registerTool({
@@ -655,7 +735,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Publish one claimed source packet with validated chunk endpoints.",
     parameters: admissionInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing source admission", "source-admission", (app) => app.admitSource(params as AdmissionPublicationInput));
+      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing source admission", "source-admission", (app) =>
+        app.admitSource(params as AdmissionPublicationInput),
+      );
     },
   });
   pi.registerTool({
@@ -665,7 +747,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Read the current bounded wiki-maintenance context.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
-      return lifecycleContext(ctx, _signal, onUpdate, "Loading maintenance context", "wiki-maintenance", (app) => app.getMaintenanceContext());
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading maintenance context", "wiki-maintenance", (app) =>
+        app.getMaintenanceContext(),
+      );
     },
   });
 
@@ -676,7 +760,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Apply one guarded wiki/card maintenance proposal.",
     parameters: maintenanceInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded maintenance", "wiki-maintenance", (app) => app.applyMaintenance(params as MaintenanceInput));
+      return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded maintenance", "wiki-maintenance", (app) =>
+        app.applyMaintenance(params as MaintenanceInput),
+      );
     },
   });
   pi.registerTool({
@@ -686,7 +772,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Finish a wiki-maintenance context after submitting all bounded proposals, including none.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
-      return lifecycleFinish(ctx, _signal, onUpdate, "Finishing wiki maintenance", "wiki-maintenance", async () => ({ status: "completed" as const }));
+      return lifecycleFinish(ctx, _signal, onUpdate, "Finishing wiki maintenance", "wiki-maintenance", async () => ({
+        status: "completed" as const,
+      }));
     },
   });
   pi.registerTool({
@@ -696,7 +784,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Read the current local-date quiz context and initialization guard.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleContext(ctx, _signal, onUpdate, "Loading quiz context", "daily-quiz", (app) => app.getQuizContext(params));
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading quiz context", "daily-quiz", (app) =>
+        app.getQuizContext(params),
+      );
     },
   });
   pi.registerTool({
@@ -706,7 +796,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     executionMode: "sequential",
     parameters: quizInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily-quiz", (app) => app.publishQuiz(params as QuizPublicationInput));
+      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily-quiz", (app) =>
+        app.publishQuiz(params as QuizPublicationInput),
+      );
     },
   });
   pi.registerTool({
@@ -716,7 +808,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Read the current sealed quiz revision and submission context.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return call(ctx, _signal, onUpdate, "Loading grading context", (app) => app.getGradingContext(params, gradingClaimOwner));
+      return call(ctx, _signal, onUpdate, "Loading grading context", (app) =>
+        app.getGradingContext(params, gradingClaimOwner),
+      );
     },
   });
   pi.registerTool({
@@ -726,7 +820,9 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     description: "Settle one validated sealed quiz grading result.",
     parameters: gradeInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return call(ctx, _signal, onUpdate, "Settling quiz grade", (app) => app.settleGrade(params as GradeSettlementInput, gradingClaimOwner));
+      return call(ctx, _signal, onUpdate, "Settling quiz grade", (app) =>
+        app.settleGrade(params as GradeSettlementInput, gradingClaimOwner),
+      );
     },
   });
 

@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { runChild, runChildSync, type ChildResult } from "./process.js";
 import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
+import { type ChildResult, runChild, runChildSync } from "./process.js";
+
 const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
 const DOCLING_TIMEOUT_MS = 300_000;
 const DOCLING_VERSION_PATTERN = /^(?:docling(?:\s+version)?\s*:?\s+)?v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/iu;
@@ -38,11 +39,14 @@ function validateOutputDirectory(paths: VaultPaths, relativePath: string): strin
 }
 function assertSuccessful(command: ChildResult): void {
   if (command.timedOut) throw new Error("Docling conversion timed out");
-  if (command.code !== 0) throw new Error(`Docling conversion failed with exit code ${command.code ?? "unknown"}: ${command.stderr.trim()}`);
+  if (command.code !== 0)
+    throw new Error(`Docling conversion failed with exit code ${command.code ?? "unknown"}: ${command.stderr.trim()}`);
 }
 
 function findMarkdown(directory: string): string {
-  const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+  const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
   for (const entry of entries) {
     const target = join(directory, entry.name);
     if (entry.isSymbolicLink()) throw new Error(`Docling output contains a symlink: ${target}`);
@@ -65,7 +69,10 @@ function readExtracted(outputDirectory: string): Buffer {
   return readFileNoFollow(findMarkdown(outputDirectory), MAX_SOURCE_BYTES);
 }
 
-export function doclingArgs(paths: VaultPaths, request: DoclingRequest): { readonly inputPath: string; readonly outputDirectory: string; readonly args: readonly string[] } {
+export function doclingArgs(
+  paths: VaultPaths,
+  request: DoclingRequest,
+): { readonly inputPath: string; readonly outputDirectory: string; readonly args: readonly string[] } {
   const inputPath = validateDocumentPath(paths, request.inputRelativePath);
   const outputDirectory = validateOutputDirectory(paths, request.outputRelativeDirectory);
   return {
@@ -87,7 +94,11 @@ export async function convertWithDocling(paths: VaultPaths, request: DoclingRequ
     env: doclingEnvironment(paths),
   });
   assertSuccessful(result);
-  return { command: result, outputDirectory: command.outputDirectory, extracted: readExtracted(command.outputDirectory) };
+  return {
+    command: result,
+    outputDirectory: command.outputDirectory,
+    extracted: readExtracted(command.outputDirectory),
+  };
 }
 
 export function convertWithDoclingSync(paths: VaultPaths, request: DoclingRequest): DoclingResult {
@@ -98,13 +109,26 @@ export function convertWithDoclingSync(paths: VaultPaths, request: DoclingReques
     env: doclingEnvironment(paths),
   });
   assertSuccessful(result);
-  return { command: result, outputDirectory: command.outputDirectory, extracted: readExtracted(command.outputDirectory) };
+  return {
+    command: result,
+    outputDirectory: command.outputDirectory,
+    extracted: readExtracted(command.outputDirectory),
+  };
 }
 
-export function doclingDependencyIdentity(paths: VaultPaths, runner: DoclingSyncRunner = (target, args, timeoutMs = 10_000) => runChildSync("docling", args, { cwd: target.workRoot, timeoutMs, env: doclingEnvironment(target) })): { readonly executable: string; readonly version: string } {
+export function doclingDependencyIdentity(
+  paths: VaultPaths,
+  runner: DoclingSyncRunner = (target, args, timeoutMs = 10_000) =>
+    runChildSync("docling", args, { cwd: target.workRoot, timeoutMs, env: doclingEnvironment(target) }),
+): { readonly executable: string; readonly version: string } {
   const result = runner(paths, ["--version"], 10_000);
   if (result.timedOut || result.signal || result.code !== 0) {
-    const detail = (result.stderr.trim() || result.stdout.trim() || result.signal || String(result.code ?? "unknown")).slice(0, 500);
+    const detail = (
+      result.stderr.trim() ||
+      result.stdout.trim() ||
+      result.signal ||
+      String(result.code ?? "unknown")
+    ).slice(0, 500);
     throw new Error(`docling --version failed: ${detail}`);
   }
   const version = [...result.stdout.split(/\r?\n/u), ...result.stderr.split(/\r?\n/u)]
