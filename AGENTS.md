@@ -22,7 +22,7 @@ These instructions apply to the entire repository. Treat `pi-scholar.md` as the 
 - Preserve path containment, no-follow file access, transactionality, idempotency, and revision checks.
 - Do not edit generated `dist/` files by hand.
 - Do not access credentials, deploy, push, or modify remote services unless the user explicitly requests it.
-- Never merge a pull request automatically. Leave it open for review, and merge only after the user explicitly confirms that review is complete and asks for the merge.
+- Never merge a pull request automatically. Leave it open for a substantive review discussion, resolve the resulting feedback, and merge only after the user confirms that discussion is complete and explicitly asks for the merge.
 
 ## Verification
 
