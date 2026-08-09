@@ -50,7 +50,8 @@
     "lint": "biome lint .",
     "check": "biome check .",
     "test": "vitest run",
-    "verify": "npm run check && npm run build && npm run typecheck && npm run build:web && npm test"
+    "verify": "npm run check && npm run build && npm run typecheck && npm run build:web && npm test",
+    "eval": "npm run build && node --test tests/black-box.eval.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
