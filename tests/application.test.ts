@@ -349,6 +349,41 @@ describe("application quiz date guards", () => {
   });
 });
 
+describe("application quiz publication guards", () => {
+  it("rejects duplicate single-page coverage before persisting a quiz", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const page = await app.wiki.create({
+      path: "publication-page.md",
+      title: "Publication page",
+      body: "# Section\n\nSection text\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    try {
+      const context = await app.getQuizContext({ date });
+      const reference = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(reference);
+      const question = {
+        kind: "short-answer" as const,
+        prompt: "Explain the section",
+        pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
+        sourceRefs: [reference],
+      };
+      await assert.rejects(
+        app.publishQuiz({ status: "published", date, questions: [question, question] }),
+        /exactly one single-page question/u,
+      );
+      assert.equal(app.quiz.get(date), undefined);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
 describe("browser quiz drafts", () => {
   it("saves through the browser queue without checkpointing or committing", async () => {
     const { app, db, calls, date, questionId, quiz } = await gradingFixture();

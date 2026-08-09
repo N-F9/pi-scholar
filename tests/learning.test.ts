@@ -199,15 +199,43 @@ test("open quiz sheets use opaque comments, numeric headings, and no learner met
   assert.throws(() => quiz.parseSheet(`${sheet}\n## rubric\nprivate metadata`), ValidationError);
   db.close();
 });
-
-test("grading snapshots page sections directly and settles one FSRS transition per page bundle", () => {
+test("quiz rejects repeated single-page coverage before persistence", () => {
   const { db, scheduler, date } = setup();
   ensureDue(scheduler, ["p1"], date);
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", "First explanation"), question("p1", "Second explanation")],
+      }),
+    (error) => error instanceof ValidationError && /exactly one single-page question/u.test(error.message),
+  );
+  assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM quizzes")?.count, 0);
+  db.close();
+});
+
+test("grading snapshots page sections directly and settles one FSRS transition per page bundle", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1", "p2"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
   const generated = quiz.createDailyQuiz({
     date,
-    selectedPageIds: ["p1"],
-    questionSpecs: [question("p1", "First explanation"), question("p1", "Second explanation")],
+    selectedPageIds: ["p1", "p2"],
+    questionSpecs: [
+      question("p1", "First explanation"),
+      question("p2", "Second explanation"),
+      {
+        kind: "short-answer" as const,
+        prompt: "Compare both pages",
+        pages: [
+          { pageId: "p1", criterion: "Compare p1", weight: 1 },
+          { pageId: "p2", criterion: "Compare p2", weight: 1 },
+        ],
+        sourceRefs: [],
+      },
+    ],
   });
   const evidence = quiz.gradingEvidence(generated);
   const pageEvidence = evidence.filter((item) => item.pageId === "p1");
@@ -223,9 +251,11 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   const draft = quiz.saveDraft(generated.date, generated.revision, {
     [generated.questions[0]!.questionId]: "first answer",
     [generated.questions[1]!.questionId]: "second answer",
+    [generated.questions[2]!.questionId]: "comparison answer",
   });
   const sealed = quiz.sealSubmission(generated.date, draft.revision);
   const authorized = quiz.gradingEvidence(sealed).find((item) => item.pageId === "p1")!;
+  const authorizedP2 = quiz.gradingEvidence(sealed).find((item) => item.pageId === "p2")!;
   const grade = {
     requestId: "page-bundle-request",
     date: generated.date,
@@ -240,22 +270,31 @@ test("grading snapshots page sections directly and settles one FSRS transition p
         evidence: [authorized.reference],
         readings: [{ pageId: "p1", anchor: authorized.anchor }],
       },
+      {
+        pageId: "p2",
+        rating: "Good" as const,
+        feedback: "Understood",
+        evidence: [authorizedP2.reference],
+        readings: [{ pageId: "p2", anchor: authorizedP2.anchor }],
+      },
     ],
   };
   const settled = quiz.settleGrade(grade);
-  assert.equal(settled.pages.length, 1);
+  assert.equal(settled.pages.length, 2);
   assert.equal(settled.pages[0]!.pageId, "p1");
+  assert.equal(settled.pages[1]!.pageId, "p2");
   assert.equal(settled.pages[0]!.evidence.length, 1);
   assert.equal(settled.pages[0]!.readings.length, 1);
-  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [generated.quizId]).length, 1);
-  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 1);
-  assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [generated.quizId]).length, 2);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
+  assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [generated.quizId]).length, 3);
   assert.equal(scheduler.pageHistory("p1").length, 1);
+  assert.equal(scheduler.pageHistory("p2").length, 1);
 
   const retry = quiz.settleGrade(grade);
-  assert.equal(retry.pages.length, 1);
-  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [generated.quizId]).length, 1);
-  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 1);
+  assert.equal(retry.pages.length, 2);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [generated.quizId]).length, 2);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
   db.close();
 });
 

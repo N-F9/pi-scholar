@@ -1068,7 +1068,7 @@ export class QuizService {
       throw new ValidationError("A daily quiz may contain at most two synthesis questions");
     const selected = new Set(selectedPageIds);
     const covered = new Set<string>();
-    const singlePageCoverage = new Set<string>();
+    const singlePageCoverage = new Map<string, number>();
     for (const question of specs) {
       if (!question || (question.kind !== "short-answer" && question.kind !== "multiple-choice"))
         throw new ValidationError("Question kind is invalid");
@@ -1092,7 +1092,10 @@ export class QuizService {
         covered.add(page.pageId);
         if (!selected.has(page.pageId)) throw new ValidationError("Question references an ineligible wiki page");
       }
-      if (question.pages.length === 1) singlePageCoverage.add(pageIds[0]!);
+      if (question.pages.length === 1) {
+        const pageId = pageIds[0]!;
+        singlePageCoverage.set(pageId, (singlePageCoverage.get(pageId) ?? 0) + 1);
+      }
       if (
         question.sourceRefs !== undefined &&
         (!Array.isArray(question.sourceRefs) || question.sourceRefs.some((reference) => typeof reference !== "string"))
@@ -1111,8 +1114,8 @@ export class QuizService {
       if (question.choices?.some((choice) => !choice.trim() || FORBIDDEN_SHEET_TEXT.test(choice)))
         throw new ValidationError("Question options must be nonempty and answer-key-free");
     }
-    if (covered.size !== selected.size || [...selected].some((pageId) => !singlePageCoverage.has(pageId)))
-      throw new ValidationError("Daily quiz questions must cover every selected page with a single-page question");
+    if (covered.size !== selected.size || [...selected].some((pageId) => singlePageCoverage.get(pageId) !== 1))
+      throw new ValidationError("Every selected/eligible page requires exactly one single-page question");
     return specs;
   }
   private prepareGradeSubmission(quiz: QuizRecord, input: GradeSubmissionInput): PreparedGradeSubmission {
