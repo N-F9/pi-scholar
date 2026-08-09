@@ -74,13 +74,11 @@ function isQuestion(value: unknown): value is PublicQuizQuestionRecord {
   return (
     isRecord(value) &&
     Object.keys(value).every((field) =>
-      ["questionId", "quizId", "ordinal", "kind", "prompt", "choices", "cardIds", "sourceRefs"].includes(field),
+      ["questionId", "quizId", "ordinal", "kind", "prompt", "choices"].includes(field),
     ) &&
     hasStrings(value, ["questionId", "quizId", "kind", "prompt"]) &&
     isEnum(value.kind, QUESTION_KINDS) &&
     typeof value.ordinal === "number" &&
-    isStringArray(value.cardIds) &&
-    isStringArray(value.sourceRefs) &&
     (value.choices === undefined || isStringArray(value.choices))
   );
 }

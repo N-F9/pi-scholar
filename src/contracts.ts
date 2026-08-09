@@ -500,8 +500,6 @@ export interface PublicQuizQuestionRecord {
   readonly kind: QuizQuestionKind;
   readonly prompt: string;
   readonly choices?: readonly string[];
-  readonly cardIds: readonly string[];
-  readonly sourceRefs: readonly string[];
 }
 
 export type PublicQuizRecord = Omit<QuizRecord, "questions" | "sheetPath"> & {

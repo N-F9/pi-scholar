@@ -83,7 +83,7 @@ describe("api response boundary", () => {
     assert.equal(multipartHeaders.get("Content-Type"), null);
   });
 
-  it("rejects quiz responses carrying private grading fields", () => {
+  it("rejects quiz responses carrying private quiz metadata", () => {
     assert.equal(
       isQuizListResult({
         quizzes: [
@@ -100,8 +100,7 @@ describe("api response boundary", () => {
                 kind: "short-answer",
                 prompt: "Explain",
                 cardIds: ["card-1"],
-                sourceRefs: [],
-                cards: [{ cardId: "card-1", criterion: "private", weight: 1 }],
+                sourceRefs: ["private-source"],
               },
             ],
           },

@@ -446,7 +446,7 @@ function publicQuiz(quiz: QuizRecord): PublicQuizRecord {
   return {
     ...withoutSheetPath,
     questions: quiz.questions.map(
-      ({ cards: _cards, ...question }) =>
+      ({ cards: _cards, cardIds: _cardIds, sourceRefs: _sourceRefs, ...question }) =>
         Object.fromEntries(
           Object.entries(question).filter(([key]) => key !== "answerKey" && key !== "criterion" && key !== "weight"),
         ) as unknown as PublicQuizRecord["questions"][number],

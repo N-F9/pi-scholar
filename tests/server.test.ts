@@ -51,7 +51,7 @@ function publicQuizFixture(): QuizRecord {
         prompt: "Explain the idea.",
         cardIds: ["card-1"],
         cards: [{ cardId: "card-1", criterion: "secret rubric", weight: 9 }],
-        sourceRefs: [],
+        sourceRefs: ["private-source"],
         answerKey: "secret answer",
       } as QuizRecord["questions"][number],
     ],
@@ -337,6 +337,8 @@ describe("server browser boundary", () => {
         assert.equal("criterion" in questions[0]!, false);
         assert.equal("weight" in questions[0]!, false);
         assert.equal("answerKey" in questions[0]!, false);
+        assert.equal("cardIds" in questions[0]!, false);
+        assert.equal("sourceRefs" in questions[0]!, false);
       }
       assert.equal(internal.questions[0]!.cards[0]!.criterion, "secret rubric");
     });
