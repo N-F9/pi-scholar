@@ -21,15 +21,16 @@ Use real Git, qmd, Docling, and a configured Pi provider with a small source who
 
 1. Initialize the disposable vault and run `pi-scholar doctor`.
 2. Add the source and run source admission.
-3. Confirm published wiki claims cite valid source chunks.
-4. Find a known phrase and concept through search.
-5. Run guarded wiki maintenance.
-6. Generate a daily quiz, submit answers, and grade it.
-7. Restart Pi Scholar and confirm durable state remains available.
-8. Rerun the workflow and confirm it does not duplicate canonical artifacts.
-9. Inspect Git history and confirm each durable operation produced a coherent commit.
+3. Confirm a multi-section source is chunked at coherent section or topic boundaries with lossless full coverage.
+4. Run guarded wiki maintenance and confirm each model-authored page teaches the source's central terminology, mechanisms, equations or algorithms, concrete examples, empirical results, and supported limitations at textbook depth rather than restating the abstract.
+5. Confirm published wiki claims cite valid source chunks near the claims they support.
+6. Find a known phrase and concept through search.
+7. Generate a daily quiz, submit answers, and grade it.
+8. Restart Pi Scholar and confirm durable state remains available.
+9. Rerun the workflow and confirm it does not duplicate canonical artifacts.
+10. Inspect Git history and confirm each durable operation produced a coherent commit.
 
-Validate meaning rather than exact model prose. Every accepted claim and quiz answer must trace to the source.
+Validate meaning and source coverage rather than exact model prose or a fixed word count. Every accepted claim and quiz answer must trace to the source, and a source-grounded page fails validation when it omits central technical content or reduces the source to an abstract-style summary.
 
 ## Failure and safety validation
 

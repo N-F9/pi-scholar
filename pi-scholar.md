@@ -82,7 +82,7 @@ SQLite, files, qmd, Git, Pi, and the web client have distinct ownership. None is
 2. Support PDFs, EPUBs, Markdown, text, HTML, XML, JSON, DOCX, URLs, pasted text, direct notes, code files, directories, and Git repositories without truncating accepted inputs or requiring one command per inbox entry.
 3. Use Docling for document conversion and native text/Git handling where Docling adds no value.
 4. Let the model choose coherent source boundaries while the host proves lossless reconstruction and provenance.
-5. Keep notes and synthesized knowledge as ordinary OKF-compatible Markdown under `wiki/`.
+5. Preserve direct human prose and keep model-authored knowledge as self-contained, textbook-depth OKF-compatible Markdown under `wiki/`, not abstract-only summaries.
 6. Let Pi use native exact and lexical operations in addition to qmd semantic ranking.
 7. Cover the quiz-worthy knowledge in the whole eligible stable wiki through bounded review cards and one small daily quiz.
 8. Apply retrieval practice, spacing, and topic interleaving without exposing a tutoring or curriculum product.
@@ -226,12 +226,14 @@ Packets are immutable while retained. Recapturing changed material creates a new
 `wiki/` contains inspectable, product-authored OKF-compatible Markdown:
 
 - direct notes;
-- source summaries;
+- source-grounded textbook chapters and focused concept pages rather than abstract-only summaries;
 - concepts, entities, procedures, requirements, and cases;
 - cross-source syntheses;
 - deterministic indexes and dated logs;
 - standard Markdown links and source-chunk citations;
 - optional inline Mermaid where a relationship genuinely benefits from a diagram.
+
+Model-authored source pages teach their bounded topic without requiring the source to be open. They define terminology and symbols, explain central mechanisms step by step, retain relevant equations, algorithms, architecture, examples, and empirical values, and discuss supported assumptions, tradeoffs, and limitations. Depth follows the source rather than a fixed word count. Claims cite the nearest relevant immutable source chunks; direct human-authored prose is not expanded or rewritten without a bounded request.
 
 Every admitted page receives a host-minted immutable page ID in frontmatter. The catalog maps that ID to the current path; review cards bind to page IDs and validated sections rather than using paths as scheduler identity. Moving or renaming a page therefore preserves its card bindings and review history. Duplicate or missing IDs fail doctor. Folder hierarchy remains organization, not a type system.
 
@@ -309,8 +311,8 @@ Pi's built-in `read`, `grep`, `find`, and bounded shell tool remain available fo
 
 Semantic workflows are inspectable Pi skills under `skills/*/SKILL.md`. The initial set is deliberately small:
 
-- `source-admission`: read the current stable inbox snapshot, process entries sequentially in canonical order, use host claims and per-source idempotency, isolate failures, reconcile complete coverage, and publish immutable packets;
-- `wiki-maintenance`: consume admitted packets and open issue reports, maintain the wiki, derive or revise review-card bindings, refresh qmd, and lint through guarded proposals;
+- `source-admission`: read the current stable inbox snapshot, process entries sequentially in canonical order, choose coherent semantic chunk boundaries with complete lossless coverage, use host claims and per-source idempotency, isolate failures, reconcile complete coverage, and publish immutable packets;
+- `wiki-maintenance`: consume admitted packets and open issue reports, create or revise self-contained textbook-depth source pages, preserve direct human prose, derive or revise review-card bindings, refresh qmd, and lint through guarded proposals;
 - `daily-quiz`: expire earlier unsubmitted quizzes, refuse generation while initialization is enabled, and otherwise select prerequisite-unblocked review cards due today and generate the dated grounded quiz or record an explicit skip;
 - `quiz-grader`: inspect sealed pending submissions, grade each in an isolated context, settle FSRS, write Results, and select wiki readings through the facade.
 
