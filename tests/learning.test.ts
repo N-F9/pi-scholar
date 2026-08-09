@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, test } from "vitest";
 import { openDatabase } from "../src/database.js";
-import { QuizService } from "../src/quiz.js";
+import { parseWikiSections } from "../src/wiki-sections.js";
+import { QuizConflictError, QuizService } from "../src/quiz.js";
 import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
+import { WorkflowCoordinator } from "../src/workflows.js";
 
 function currentDate(): string {
   return localDate(new Date());
@@ -19,8 +25,29 @@ function nextDate(date: string): string {
   return value.toISOString().slice(0, 10);
 }
 
+const LEARNING_WIKI_ROOT = mkdtempSync(join(tmpdir(), "pi-scholar-learning-"));
+const PAGE_MARKDOWN = [
+  "# Part", "section text",
+  "# A", "section text",
+  "# B", "section text",
+  "# Left", "section text",
+  "# Right", "section text",
+  "# Merged", "section text",
+  "# 0", "section text",
+  "# 1", "section text",
+  "# 2", "section text",
+  "# 3", "section text",
+  "# 4", "section text",
+  "# 5", "section text",
+  "# Atomic", "section text",
+  "# Callback", "section text",
+  "# Later", "later section text",
+].join("\n") + "\n";
+afterAll(() => rmSync(LEARNING_WIKI_ROOT, { recursive: true, force: true }));
 
-function page(db: ReturnType<typeof openDatabase>, pageId: string, digest = `digest-${pageId}`): void {
+function page(db: ReturnType<typeof openDatabase>, pageId: string): void {
+  writeFileSync(join(LEARNING_WIKI_ROOT, `${pageId}.md`), PAGE_MARKDOWN);
+  const digest = createHash("sha256").update(PAGE_MARKDOWN).digest("hex");
   const now = new Date().toISOString();
   db.run(
     "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
@@ -29,15 +56,23 @@ function page(db: ReturnType<typeof openDatabase>, pageId: string, digest = `dig
 }
 
 function binding(pageId: string, anchor = "#part") {
+  const section = parseWikiSections(PAGE_MARKDOWN, pageId).find((candidate) => candidate.anchor === anchor);
+  if (!section) throw new Error(`missing fixture section ${anchor}`);
+  const sectionText = PAGE_MARKDOWN.slice(section.startOffset, section.endOffset);
+  const boundText = section.heading === "Later" ? "later section text" : "section text";
+  const startOffset = sectionText.indexOf(boundText);
+  if (startOffset < 0) throw new Error(`missing fixture bytes ${anchor}`);
+  const endOffset = startOffset + boundText.length;
   return {
     pageId,
+    heading: section.heading,
     anchor,
-    startOffset: 0,
-    endOffset: 12,
-    textDigest: `digest-${pageId}`,
-    pageDigest: `digest-${pageId}`,
+    startOffset,
+    endOffset,
+    textDigest: createHash("sha256").update(boundText).digest("hex"),
+    pageDigest: createHash("sha256").update(PAGE_MARKDOWN).digest("hex"),
     pageRevision: 1,
-    sectionText: "section text",
+    sectionText,
   };
 }
 
@@ -114,10 +149,10 @@ test("due selection interleaves page topics and is bounded", () => {
   db.close();
 });
 
-test("quiz skips empty days and records failed generation without partial questions", () => {
+test("quiz skips empty days and lets invalid proposals retry without a dated row", () => {
   const { db, scheduler, date } = setup();
   scheduler.createCard({ cardId: "future", initialDueAt: `${nextDate(date)}T00:00:00Z`, bindings: [binding("p1")] });
-  const quiz = new QuizService(db, undefined, scheduler);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
   const skipped = quiz.createDailyQuiz({ date });
   assert.equal(skipped.status, "skipped");
   assert.equal(skipped.sheetPath, undefined);
@@ -125,18 +160,46 @@ test("quiz skips empty days and records failed generation without partial questi
 
   const generatedSetup = setup();
   generatedSetup.scheduler.createCard({ cardId: "q-a", initialDueAt: `${generatedSetup.date}T00:00:00Z`, bindings: [binding("p1", "#a")] });
-  const generatedQuiz = new QuizService(generatedSetup.db, undefined, generatedSetup.scheduler);
-  const failed = generatedQuiz.createDailyQuiz({ date: generatedSetup.date, questions: [] });
-  assert.equal(failed.status, "failed");
-  assert.equal(generatedSetup.db.all("SELECT * FROM quiz_questions WHERE quiz_id = ?", [failed.quizId]).length, 0);
+  insertQuizFixture(generatedSetup.db, "prior-open", previousDate(generatedSetup.date), "q-a", "prior-question");
+  const generatedQuiz = new QuizService(generatedSetup.db, { wiki: LEARNING_WIKI_ROOT }, generatedSetup.scheduler);
+  assert.throws(() => generatedQuiz.createDailyQuiz({ date: generatedSetup.date, questions: [] }), ValidationError);
+  assert.equal(generatedQuiz.get(previousDate(generatedSetup.date))?.status, "open");
+  assert.equal(generatedSetup.db.all("SELECT * FROM quizzes WHERE date = ?", [generatedSetup.date]).length, 0);
+  const retried = generatedQuiz.createDailyQuiz({
+    date: generatedSetup.date,
+    questions: [{
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["q-a"],
+      cards: [{ cardId: "q-a", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  assert.equal(retried.status, "open");
   generatedSetup.db.close();
+});
+
+test("quiz grading requires a submitted quiz", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "open-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  quiz.createDailyQuiz({
+    date,
+    questions: [{
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["open-card"],
+      cards: [{ cardId: "open-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  assert.throws(() => quiz.settleGrade({ date, submissionId: "open-grade", questions: [] }), QuizConflictError);
+  db.close();
 });
 
 test("quiz seals revision-safe answers and settles differential grades idempotently", () => {
   const { db, scheduler, date } = setup();
   scheduler.createCard({ cardId: "q-a", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1", "#a")] });
   scheduler.createCard({ cardId: "q-b", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p2", "#b")] });
-  const quiz = new QuizService(db, undefined, scheduler);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
   const generated = quiz.createDailyQuiz({
     date,
     questions: [{
@@ -154,6 +217,9 @@ test("quiz seals revision-safe answers and settles differential grades idempoten
   const draft = quiz.saveDraft(generated.date, generated.revision, { q: "answer" });
   assert.throws(() => quiz.saveDraft(generated.date, generated.revision, { q: "stale" }));
   const sealed = quiz.sealSubmission(generated.date, draft.revision);
+  const evidence = quiz.gradingEvidence(sealed);
+  const evidenceA = evidence.find((item) => item.cardId === "q-a")!;
+  const evidenceB = evidence.find((item) => item.cardId === "q-b")!;
   const settled = quiz.settleGrade({
     date: generated.date,
     revision: sealed.revision,
@@ -162,8 +228,8 @@ test("quiz seals revision-safe answers and settles differential grades idempoten
       questionId: "q",
       feedback: "Review the distinction",
       cards: [
-        { cardId: "q-a", rating: "Good", feedback: "Correct", evidence: ["Explained A"] },
-        { cardId: "q-b", rating: "Again", feedback: "Missed", evidence: ["Omitted B"] },
+        { cardId: "q-a", rating: "Good", feedback: "Correct", evidence: [evidenceA.reference], readings: [{ pageId: evidenceA.pageId, anchor: evidenceA.anchor }] },
+        { cardId: "q-b", rating: "Again", feedback: "Missed", evidence: [evidenceB.reference], readings: [{ pageId: evidenceB.pageId, anchor: evidenceB.anchor }] },
       ],
     }],
   });
@@ -174,11 +240,204 @@ test("quiz seals revision-safe answers and settles differential grades idempoten
   assert.equal(db.all("SELECT * FROM raw_reviews WHERE quiz_id = ?", [generated.quizId]).length, 2);
   db.close();
 });
+test("quiz rejects fabricated and stale evidence before FSRS transitions", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "evidence-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1", "#part")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    questions: [{
+      questionId: "evidence-question",
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["evidence-card"],
+      cards: [{ cardId: "evidence-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  const draft = quiz.saveDraft(generated.date, generated.revision, { "evidence-question": "answer" });
+  const sealed = quiz.sealSubmission(generated.date, draft.revision);
+  const authorized = quiz.gradingEvidence(sealed).find((item) => item.cardId === "evidence-card")!;
+  const grade = (evidence: string, readingAnchor = authorized.anchor) => ({
+    date,
+    revision: sealed.revision,
+    submissionId: "evidence-test",
+    questions: [{
+      questionId: "evidence-question",
+      cards: [{
+        cardId: "evidence-card",
+        rating: "Good" as const,
+        evidence: [evidence],
+        readings: [{ pageId: authorized.pageId, anchor: readingAnchor }],
+      }],
+    }],
+  });
+  assert.throws(() => quiz.settleGrade(grade("fabricated")), ValidationError);
+  assert.equal(db.all("SELECT * FROM raw_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.run("UPDATE pages SET digest = ?, revision = revision + 1 WHERE page_id = ?", ["changed-page-digest", "p1"]);
+  assert.throws(() => quiz.settleGrade(grade(authorized.reference)), ValidationError);
+  assert.equal(db.all("SELECT * FROM raw_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(scheduler.getCard("evidence-card").fsrsState, "New");
+  db.close();
+});
+test("quiz evidence resolves a later anchored section to its bound bytes", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "later-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1", "#later")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    questions: [{
+      questionId: "later-question",
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["later-card"],
+      cards: [{ cardId: "later-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  const evidence = quiz.gradingEvidence(generated).find((item) => item.cardId === "later-card");
+  assert.equal(evidence?.anchor, "#later");
+  assert.equal(evidence?.excerpt, "later section text");
+  db.close();
+});
+
+test("quiz missing evidence page fails before writes or FSRS transition", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "missing-page-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    questions: [{
+      questionId: "missing-page-question",
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["missing-page-card"],
+      cards: [{ cardId: "missing-page-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  const draft = quiz.saveDraft(generated.date, generated.revision, { "missing-page-question": "answer" });
+  const sealed = quiz.sealSubmission(generated.date, draft.revision);
+  const authorized = quiz.gradingEvidence(sealed).find((item) => item.cardId === "missing-page-card")!;
+  rmSync(join(LEARNING_WIKI_ROOT, "p1.md"));
+  assert.throws(() => quiz.settleGrade({
+    date,
+    revision: sealed.revision,
+    submissionId: "missing-page-submission",
+    questions: [{
+      questionId: "missing-page-question",
+      cards: [{ cardId: "missing-page-card", rating: "Good", evidence: [authorized.reference], readings: [{ pageId: authorized.pageId, anchor: authorized.anchor }] }],
+    }],
+  }), ValidationError);
+  assert.equal(scheduler.getCard("missing-page-card").fsrsState, "New");
+  assert.equal(db.all("SELECT * FROM raw_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
+test("quiz post-context page drift fails before FSRS transition", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "drift-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    questions: [{
+      questionId: "drift-question",
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["drift-card"],
+      cards: [{ cardId: "drift-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  const draft = quiz.saveDraft(generated.date, generated.revision, { "drift-question": "answer" });
+  const sealed = quiz.sealSubmission(generated.date, draft.revision);
+  const authorized = quiz.gradingEvidence(sealed).find((item) => item.cardId === "drift-card")!;
+  writeFileSync(join(LEARNING_WIKI_ROOT, "p1.md"), PAGE_MARKDOWN.replace("# Part\nsection text", "# Part\nchanged section text"));
+  assert.throws(() => quiz.settleGrade({
+    date,
+    revision: sealed.revision,
+    submissionId: "drift-submission",
+    questions: [{
+      questionId: "drift-question",
+      cards: [{ cardId: "drift-card", rating: "Good", evidence: [authorized.reference], readings: [{ pageId: authorized.pageId, anchor: authorized.anchor }] }],
+    }],
+  }), ValidationError);
+  assert.equal(scheduler.getCard("drift-card").fsrsState, "New");
+  assert.equal(db.all("SELECT * FROM raw_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+test("atomic seal queue callback rolls back submission and workflow together", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "atomic-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1", "#atomic")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    questions: [{
+      questionId: "atomic-question",
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["atomic-card"],
+      cards: [{ cardId: "atomic-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  const draft = quiz.saveDraft(generated.date, generated.revision, { "atomic-question": "answer" });
+  const workflows = new WorkflowCoordinator(db);
+  const requestId = randomUUID();
+  assert.throws(() => quiz.sealSubmissionAndQueue(
+    { date, revision: draft.revision },
+    requestId,
+    (id, sealed) => {
+      workflows.queueInTransaction("quiz-grader", id, `${sealed.quizId}:r${sealed.revision}`);
+      throw new Error("queue callback failed");
+    },
+  ));
+  assert.equal(quiz.get(date)?.status, "open");
+  assert.equal(db.all("SELECT * FROM workflows WHERE request_id = ?", [requestId]).length, 0);
+  db.close();
+});
+test("grade callback failure rolls back FSRS and result rows", () => {
+  const { db, scheduler, date } = setup();
+  scheduler.createCard({ cardId: "grade-callback-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1", "#callback")] });
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    questions: [{
+      questionId: "grade-callback-question",
+      kind: "short-answer",
+      prompt: "Explain",
+      cardIds: ["grade-callback-card"],
+      cards: [{ cardId: "grade-callback-card", criterion: "Explain", weight: 1 }],
+    }],
+  });
+  const draft = quiz.saveDraft(generated.date, generated.revision, { "grade-callback-question": "answer" });
+  const sealed = quiz.sealSubmission(generated.date, draft.revision);
+  const evidence = quiz.gradingEvidence(sealed).find((item) => item.cardId === "grade-callback-card")!;
+  const grade = {
+    date,
+    revision: sealed.revision,
+    submissionId: "callback-failure",
+    questions: [{
+      questionId: "grade-callback-question",
+      cards: [{
+        cardId: "grade-callback-card",
+        rating: "Good" as const,
+        evidence: [evidence.reference],
+        readings: [{ pageId: evidence.pageId, anchor: evidence.anchor }],
+      }],
+    }],
+  };
+  assert.throws(() => quiz.settleGrade(grade, () => {
+    throw new Error("workflow update failed");
+  }));
+  assert.equal(db.all("SELECT * FROM raw_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM card_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
+
+
 
 test("canonical parser validates the stored open quiz and expiration changes no FSRS state", () => {
   const { db, scheduler, date } = setup();
   scheduler.createCard({ cardId: "parser-card", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1")] });
-  const quiz = new QuizService(db, undefined, scheduler);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
   const generated = quiz.createDailyQuiz({
     date,
     questions: [{
@@ -197,9 +456,21 @@ test("canonical parser validates the stored open quiz and expiration changes no 
   const card = expiration.scheduler.createCard({ cardId: "old", initialDueAt: `${date}T00:00:00Z`, bindings: [binding("p1")] });
   const oldDate = previousDate(date);
   insertQuizFixture(expiration.db, "old-quiz", oldDate, card.cardId, "old-question");
-  const oldQuiz = new QuizService(expiration.db, undefined, expiration.scheduler);
+  const oldQuiz = new QuizService(expiration.db, { wiki: LEARNING_WIKI_ROOT }, expiration.scheduler);
   assert.equal(oldQuiz.expirePrior(date), 1);
   assert.equal(oldQuiz.get(oldDate)?.status, "expired");
   assert.equal(expiration.db.all("SELECT * FROM raw_reviews").length, 0);
   expiration.db.close();
+});
+
+test("workflow idempotency keys reject a different supplied request ID", () => {
+  const { db } = setup();
+  const workflows = new WorkflowCoordinator(db);
+  const requestId = randomUUID();
+  const first = workflows.queueInTransaction("quiz-grader", requestId, "workflow-key");
+  assert.equal(first.requestId, requestId);
+  assert.throws(() => workflows.queueInTransaction("quiz-grader", randomUUID(), "workflow-key"), /workflow idempotency key is already bound/u);
+  const retry = workflows.queueInTransaction("quiz-grader", requestId, "workflow-key");
+  assert.equal(retry.requestId, requestId);
+  db.close();
 });

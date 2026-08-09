@@ -17,7 +17,7 @@ export interface OpenDatabaseOptions {
   readonly initializeSchema?: boolean;
 }
 
-export const SCHEMA_VERSION = 1 as const;
+export const SCHEMA_VERSION = 2 as const;
 export const REQUIRED_TABLES = [
   "schema_meta",
   "sources",
@@ -38,6 +38,7 @@ export const REQUIRED_TABLES = [
   "quiz_answers",
   "question_results",
   "card_results",
+  "quiz_evidence",
   "workflows",
   "settings",
 ] as const;
@@ -61,6 +62,7 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   quiz_answers: ["quiz_id", "question_id", "revision", "answer_json", "saved_at"],
   question_results: ["result_id", "quiz_id", "question_id", "answer_revision", "feedback", "graded_at"],
   card_results: ["result_id", "quiz_id", "question_id", "card_id", "rating", "review_id"],
+  quiz_evidence: ["quiz_id", "card_id", "reference", "page_id", "relative_path", "anchor", "heading", "page_digest", "page_revision", "text_digest", "excerpt", "excerpt_digest"],
   workflows: ["request_id", "kind", "status", "started_at", "finished_at", "progress", "message", "error_code", "error_message", "idempotency_key"],
   settings: ["key", "value_json", "updated_at"],
 };
@@ -291,6 +293,22 @@ CREATE TABLE IF NOT EXISTS card_results (
   UNIQUE (quiz_id, question_id, card_id),
   UNIQUE (review_id)
 );
+CREATE TABLE IF NOT EXISTS quiz_evidence (
+  quiz_id TEXT NOT NULL REFERENCES quizzes(quiz_id) ON DELETE CASCADE,
+  card_id TEXT NOT NULL REFERENCES review_cards(card_id) ON DELETE RESTRICT,
+  reference TEXT NOT NULL,
+  page_id TEXT NOT NULL REFERENCES pages(page_id) ON DELETE RESTRICT,
+  relative_path TEXT NOT NULL,
+  anchor TEXT NOT NULL,
+  heading TEXT,
+  page_digest TEXT NOT NULL,
+  page_revision INTEGER NOT NULL CHECK (page_revision > 0),
+  text_digest TEXT NOT NULL,
+  excerpt TEXT NOT NULL,
+  excerpt_digest TEXT NOT NULL,
+  PRIMARY KEY (quiz_id, card_id, reference),
+  UNIQUE (quiz_id, reference)
+);
 
 CREATE TABLE IF NOT EXISTS workflows (
   request_id TEXT PRIMARY KEY,
@@ -408,8 +426,8 @@ export function validateSchema(db: ScholarDatabase): void {
   if (current !== SCHEMA_VERSION) throw new Error(`Unsupported Pi Scholar database schema version: ${current}`);
   const existing = db.tableNames().filter((table) => table !== "sqlite_sequence");
   const required = Object.fromEntries(REQUIRED_TABLES.map((table) => [table, true])) as Record<string, true>;
-  const unknown = existing.filter((table) => !required[table]);
-  if (unknown.length) throw new Error(`Pi Scholar database has unknown tables: ${unknown.join(", ")}`);
+  const unsupported = db.all<{ type: string; name: string }>("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").filter((object) => object.type !== "table" || !required[object.name]);
+  if (unsupported.length) throw new Error(`Pi Scholar database has unsupported objects: ${unsupported.map((object) => `${object.type} ${object.name}`).join(", ")}`);
   const missing = REQUIRED_TABLES.filter((table) => !existing.includes(table));
   if (missing.length) throw new Error(`Pi Scholar database schema is missing tables: ${missing.join(", ")}`);
   const metadata = db.all<{ schema_version: number | bigint }>("SELECT schema_version FROM schema_meta");
@@ -444,6 +462,18 @@ function ensureSchema(db: ScholarDatabase): void {
   validateSchema(db);
 }
 
+function validateDatabaseSidecars(path: string): void {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const sidecar = `${path}${suffix}`;
+    try {
+      const stat = lstatSync(sidecar);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Pi Scholar database sidecar must be a regular file: ${sidecar}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
 export function openDatabase(input: string | VaultPaths, options: OpenDatabaseOptions = {}): ScholarDatabase {
   const readOnly = options.readOnly ?? false;
   const path = typeof input === "string" ? input : input.databasePath;
@@ -453,6 +483,7 @@ export function openDatabase(input: string | VaultPaths, options: OpenDatabaseOp
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+  validateDatabaseSidecars(path);
   const database = new DatabaseSync(path, { readOnly, enableForeignKeyConstraints: true });
   const db = new ScholarDatabase(path, database);
   if (!readOnly) db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");

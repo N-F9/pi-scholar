@@ -1,15 +1,17 @@
-import { lstatSync } from "node:fs";
+import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { isAbsolute } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT_BYTES = 64 * 1024;
+const PINNED_EXECUTABLES = new Map<string, string>();
 
 export interface ChildRunOptions {
   readonly cwd: string;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
   readonly env?: Readonly<Record<string, string>>;
+  readonly stdin?: string | Uint8Array;
 }
 
 export interface ChildResult {
@@ -30,12 +32,60 @@ function validateArgv(executable: string, args: readonly string[]): void {
   }
 }
 
+function assertExecutableFile(path: string): string {
+  let realPath: string;
+  try {
+    realPath = realpathSync(path);
+    const stat = statSync(realPath);
+    if (!stat.isFile() || (stat.mode & 0o111) === 0) throw new Error("not a regular executable file");
+    accessSync(realPath, constants.X_OK);
+  } catch (error) {
+    throw new Error(`child executable is not a regular executable file: ${path}`, { cause: error });
+  }
+  return realPath;
+}
+
+function findBareExecutable(name: string): string {
+  const path = process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  for (const directory of path.split(delimiter)) {
+    if (!directory || !isAbsolute(directory) || /[\u0000-\u001f\u007f]/u.test(directory)) continue;
+    try {
+      return assertExecutableFile(join(directory, name));
+    } catch {
+      // Try the next closed PATH entry.
+    }
+  }
+  throw new Error(`child executable was not found in PATH: ${name}`);
+}
+
+function pinExecutable(executable: string): string {
+  const pinned = PINNED_EXECUTABLES.get(executable);
+  if (pinned) return pinned;
+  const resolved = isAbsolute(executable) ? assertExecutableFile(executable) : findBareExecutable(executable);
+  PINNED_EXECUTABLES.set(executable, resolved);
+  return resolved;
+}
+
+function validateEnvironment(overrides: Readonly<Record<string, string>> | undefined): void {
+  if (!overrides) return;
+  const entries = Object.entries(overrides);
+  if (entries.length > 64) throw new Error("child environment has too many entries");
+  let bytes = 0;
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error("child environment contains an invalid value");
+    bytes += Buffer.byteLength(key, "utf8") + Buffer.byteLength(value, "utf8");
+  }
+  if (bytes > 64 * 1024) throw new Error("child environment exceeds 64 KiB");
+}
+
 function validateOptions(options: ChildRunOptions): void {
   if (!options.cwd || /[\u0000\u000a\u000d]/u.test(options.cwd)) throw new Error("invalid child working directory");
   const stat = lstatSync(options.cwd);
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("child working directory must be a real directory");
   if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new Error("child timeout must be positive");
   if (options.maxOutputBytes !== undefined && (!Number.isInteger(options.maxOutputBytes) || options.maxOutputBytes <= 0)) throw new Error("child output bound must be positive");
+  validateEnvironment(options.env);
+  if (options.stdin !== undefined && Buffer.byteLength(options.stdin) > 64 * 1024) throw new Error("child stdin exceeds 64 KiB");
 }
 
 function environment(overrides: Readonly<Record<string, string>> | undefined): NodeJS.ProcessEnv {
@@ -70,17 +120,19 @@ function boundedAppend(current: string, chunk: Buffer, maxBytes: number): string
 
 export function runChild(executable: string, args: readonly string[], options: ChildRunOptions): Promise<ChildResult> {
   validateArgv(executable, args);
+  const pinnedExecutable = pinExecutable(executable);
   validateOptions(options);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES;
   const { promise, resolve, reject } = Promise.withResolvers<ChildResult>();
-  const child = spawn(executable, [...args], {
+  const child = spawn(pinnedExecutable, [...args], {
     cwd: options.cwd,
     env: environment(options.env),
     shell: false,
     detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  child.stdin.end(options.stdin === undefined ? undefined : Buffer.from(options.stdin));
   let stdout = "";
   let stderr = "";
   let timedOut = false;
@@ -90,24 +142,31 @@ export function runChild(executable: string, args: readonly string[], options: C
   child.stderr.on("data", (chunk: Buffer) => {
     stderr = boundedAppend(stderr, chunk, maxOutputBytes);
   });
+  let killTimer: NodeJS.Timeout | undefined;
   const timer = setTimeout(() => {
     timedOut = true;
-    terminateTree(child.pid, "SIGTERM");
-    setTimeout(() => terminateTree(child.pid, "SIGKILL"), 1_000).unref();
+    const pid = child.pid;
+    terminateTree(pid, "SIGTERM");
+    killTimer = setTimeout(() => terminateTree(pid, "SIGKILL"), 1_000);
+    killTimer.unref();
   }, timeoutMs);
-  child.once("error", (error) => {
+  const clearTimers = (): void => {
     clearTimeout(timer);
+    clearTimeout(killTimer);
+  };
+  child.once("error", (error) => {
+    clearTimers();
     reject(error);
   });
   child.once("close", (code, signal) => {
-    clearTimeout(timer);
-    resolve({ executable, args: [...args], code, signal, timedOut, stdout, stderr });
+    clearTimers();
+    resolve({ executable: pinnedExecutable, args: [...args], code, signal, timedOut, stdout, stderr });
   });
   return promise;
 }
-
 export function runChildSync(executable: string, args: readonly string[], options: ChildRunOptions): ChildResult {
   validateArgv(executable, args);
+  const pinnedExecutable = pinExecutable(executable);
   validateOptions(options);
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES;
   const spawnOptions = {
@@ -118,13 +177,14 @@ export function runChildSync(executable: string, args: readonly string[], option
     killSignal: "SIGKILL" as const,
     encoding: "buffer" as const,
     maxBuffer: maxOutputBytes,
+    input: options.stdin === undefined ? undefined : Buffer.from(options.stdin),
   };
   Object.assign(spawnOptions, { detached: true });
-  const result = spawnSync(executable, [...args], spawnOptions);
+  const result = spawnSync(pinnedExecutable, [...args], spawnOptions);
   const timedOut = Boolean(result.error && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT");
   if (timedOut) terminateTree(result.pid, "SIGKILL");
   return {
-    executable,
+    executable: pinnedExecutable,
     args: [...args],
     code: result.status,
     signal: result.signal,

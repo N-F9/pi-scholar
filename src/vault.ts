@@ -5,6 +5,7 @@ import {
   existsSync,
   fsyncSync,
   lstatSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -18,7 +19,6 @@ import {
 import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep, win32 } from "node:path";
 import { openDatabase, transaction } from "./database.js";
 import { initializeRepository } from "./external/git.js";
-import { ensureQmdCollection } from "./external/qmd.js";
 export const VAULT_FORMAT_VERSION = 1 as const;
 export const DEFAULT_VAULT_HOST = "127.0.0.1" as const;
 export const DEFAULT_VAULT_PORT = 4816 as const;
@@ -26,7 +26,7 @@ export const DEFAULT_VAULT_PORT = 4816 as const;
 const PRODUCT_DIRECTORIES = [".pi-scholar", "inbox", "sources", "wiki", "quizzes"] as const;
 const METADATA_DIRECTORIES = ["qmd", "work"] as const;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
-const VAULT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+export const VAULT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 export interface VaultPaths {
   readonly vaultRoot: string;
@@ -40,7 +40,6 @@ export interface VaultPaths {
   readonly wikiRoot: string;
   readonly quizzesRoot: string;
   readonly writerLockPath: string;
-  readonly runLockPath: string;
   readonly vaultId: string;
   readonly formatVersion: number;
 }
@@ -168,7 +167,6 @@ function createPaths(vaultRoot: string, config: VaultConfig): VaultPaths {
     wikiRoot: join(vaultRoot, "wiki"),
     quizzesRoot: join(vaultRoot, "quizzes"),
     writerLockPath: `${vaultRoot}.pi-scholar.lock`,
-    runLockPath: `${vaultRoot}.pi-scholar.run`,
     vaultId: config.vaultId,
     formatVersion: config.formatVersion,
   });
@@ -179,6 +177,8 @@ function validateVaultLayout(paths: VaultPaths): void {
   assertDirectory(paths.vaultRoot, "vault root");
   for (const [name, path] of [
     [".pi-scholar", paths.metadataRoot],
+    ["snapshots", join(paths.metadataRoot, "snapshots")],
+    ["wiki snapshots", join(paths.metadataRoot, "snapshots", "wiki")],
     ["inbox", paths.inboxRoot],
     ["sources", paths.sourcesRoot],
     ["wiki", paths.wikiRoot],
@@ -193,11 +193,9 @@ function validateVaultLayout(paths: VaultPaths): void {
   if (configStat.isSymbolicLink() || !configStat.isFile()) {
     throw new PathSafetyError(`vault.json must be a regular file: ${paths.vaultConfigPath}`);
   }
+  validateGitignore(join(paths.vaultRoot, ".gitignore"));
   if (existsSync(paths.writerLockPath) && lstatSync(paths.writerLockPath).isSymbolicLink()) {
     throw new PathSafetyError(`writer lock must not be a symlink: ${paths.writerLockPath}`);
-  }
-  if (existsSync(paths.runLockPath) && lstatSync(paths.runLockPath).isSymbolicLink()) {
-    throw new PathSafetyError(`run guard must not be a symlink: ${paths.runLockPath}`);
   }
 }
 
@@ -261,11 +259,14 @@ export function safeRelativePath(root: string | VaultPaths, requestedPath: strin
   assertNoSymlinkComponents(candidate);
   return candidate;
 }
-export function readFileNoFollow(path: string): Buffer {
+export function readFileNoFollow(path: string, maxBytes?: number): Buffer {
   const stat = lstatSync(path);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new PathSafetyError(`regular file required: ${path}`);
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new PathSafetyError(`regular file required: ${path}`);
+    if (maxBytes !== undefined && opened.size > maxBytes) throw new PathSafetyError(`file exceeds ${maxBytes} bytes: ${path}`);
     return readFileSync(fd);
   } finally {
     closeSync(fd);
@@ -314,6 +315,47 @@ function ensureDirectory(path: string, label: string): void {
 
 const VAULT_GITIGNORE = `# Pi Scholar transient state\n/inbox/\n/.pi-scholar/qmd/\n/.pi-scholar/work/\n/.pi-scholar/state.sqlite-wal\n/.pi-scholar/state.sqlite-shm\n/.pi-scholar/state.sqlite-journal\n/*.log\n/.pi-scholar/*.log\n`;
 
+const DURABLE_GITIGNORE_PATTERNS = [
+  /^(?:\/|\*\*\/)?(?:sources|wiki|quizzes)(?:[*?/]|$)/iu,
+  /^(?:\/|\*\*\/)?(?:snapshots|state\.sqlite)(?:[*?/]|$)/iu,
+  /^(?:\/|\*\*\/)?\.pi-scholar(?:\/?$|\/(?:snapshots|state\.sqlite)(?:[*?/]|$)|\/\*{1,2}(?:\/|$))/iu,
+  /^(?:\/|\*\*\/)?\*{1,2}(?:\/\*{1,2})*\/?$/u,
+  /^(?:\/|\*\*\/)?\*[^/]*\.(?:md|sqlite)(?:\/)?$/iu,
+] as const;
+
+function ignoresDurablePath(rule: string): boolean {
+  const pattern = rule.startsWith("!") ? rule.slice(1).trim() : rule;
+  return DURABLE_GITIGNORE_PATTERNS.some((candidate) => candidate.test(pattern));
+}
+
+function validateGitignore(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new PathSafetyError(`vault .gitignore must be a regular file: ${path}`);
+    const contents = readFileNoFollow(path).toString("utf8");
+    for (const rawRule of contents.split(/\r?\n/u)) {
+      const rule = rawRule.trim();
+      if (rule.length > 0 && !rule.startsWith("#") && ignoresDurablePath(rule)) {
+        throw new PathSafetyError(`vault .gitignore must not ignore durable vault data: ${rule}`);
+      }
+    }
+  } catch (error) {
+    if (error instanceof PathSafetyError) throw error;
+    throw new PathSafetyError(`vault .gitignore is unavailable: ${path}`);
+  }
+}
+
+function ensureGitignore(path: string): void {
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    atomicWriteFile(path, VAULT_GITIGNORE);
+    return;
+  }
+  validateGitignore(path);
+}
+
 function seedDefaultSettings(paths: VaultPaths): void {
   const db = openDatabase(paths);
   try {
@@ -346,11 +388,11 @@ export function initVault(requestedRoot = process.cwd()): VaultPaths {
   const metadataRoot = join(vaultRoot, ".pi-scholar");
   const configPath = join(metadataRoot, "vault.json");
   if (existsSync(configPath)) {
+    ensureDirectory(join(metadataRoot, "snapshots"), "snapshots");
+    ensureDirectory(join(metadataRoot, "snapshots", "wiki"), "wiki snapshots");
     const paths = resolveVault(vaultRoot);
-    if (!existsSync(join(vaultRoot, ".gitignore"))) atomicWriteFile(join(vaultRoot, ".gitignore"), VAULT_GITIGNORE);
     seedDefaultSettings(paths);
     initializeRepository(paths);
-    ensureQmdCollection(paths);
     return paths;
   }
 
@@ -365,12 +407,13 @@ export function initVault(requestedRoot = process.cwd()): VaultPaths {
     ["quizzes", paths.quizzesRoot],
     ["qmd", paths.qmdRoot],
     ["work", paths.workRoot],
+    ["snapshots", join(paths.metadataRoot, "snapshots")],
+    ["wiki snapshots", join(paths.metadataRoot, "snapshots", "wiki")],
   ] as const) ensureDirectory(path, name);
-  if (!existsSync(join(vaultRoot, ".gitignore"))) atomicWriteFile(join(vaultRoot, ".gitignore"), VAULT_GITIGNORE);
+  ensureGitignore(join(vaultRoot, ".gitignore"));
+  validateVaultLayout(paths);
   seedDefaultSettings(paths);
   initializeRepository(paths);
-  ensureQmdCollection(paths);
-  validateVaultLayout(paths);
   return paths;
 }
 
@@ -454,9 +497,6 @@ export function acquireWriterLock(paths: VaultPaths, options: { readonly waitMs?
   }
 }
 
-export function tryAcquireRunGuard(paths: VaultPaths): LockHandle | undefined {
-  return acquireLock(paths.runLockPath);
-}
 
 export async function withWriterLock<T>(paths: VaultPaths, operation: () => T | PromiseLike<T>): Promise<T> {
   const lock = acquireWriterLock(paths);
@@ -467,15 +507,6 @@ export async function withWriterLock<T>(paths: VaultPaths, operation: () => T | 
   }
 }
 
-export function withRunGuard<T>(paths: VaultPaths, operation: () => T): T | undefined {
-  const lock = tryAcquireRunGuard(paths);
-  if (!lock) return undefined;
-  try {
-    return operation();
-  } finally {
-    lock.release();
-  }
-}
 
 export function productRoots(paths: VaultPaths): readonly string[] {
   return PRODUCT_DIRECTORIES.map((name) => join(paths.vaultRoot, name));

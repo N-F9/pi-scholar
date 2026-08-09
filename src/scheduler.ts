@@ -165,11 +165,14 @@ export function localDate(value: string | Date): string {
   return `${year}-${month}-${day}`;
 }
 
+export const SEALED_QUIZ_REVIEW = Symbol("sealed-quiz-review");
+
 export interface ReviewTransitionContext {
   readonly quizId: string;
   readonly questionId: string;
   readonly answerRevision: number;
   readonly settlementId?: string;
+  readonly authorization?: typeof SEALED_QUIZ_REVIEW;
 }
 
 function parseJson<T>(value: unknown, fallback: T): T {
@@ -553,7 +556,7 @@ export class SchedulerService {
           status: (row.status as CoveragePage["status"]) ?? "active",
           quizWorthiness: (row.quiz_worthiness as CoveragePage["quizWorthiness"]) ?? "unknown",
         }));
-    const covered = new Set(this.db.all<{ page_id: string }>("SELECT DISTINCT page_id FROM card_bindings WHERE active = 1").map((row) => String(row.page_id)));
+    const covered = new Set(this.db.all<{ page_id: string }>("SELECT DISTINCT b.page_id FROM card_bindings b JOIN review_cards c ON c.card_id = b.card_id WHERE b.active = 1 AND c.status = 'active'").map((row) => String(row.page_id)));
     const coveredPageIds: string[] = [];
     const skippedPageIds: string[] = [];
     const missingPageIds: string[] = [];
@@ -641,7 +644,7 @@ export class SchedulerService {
 
   transitionCardInTransaction(cardId: string, rating: CardRating, reviewedAt: string | Date, context: ReviewTransitionContext): RawReviewRecord {
     const card = this.getCard(cardId);
-    if (card.status !== "active") throw new ValidationError("Retired cards cannot be reviewed");
+    if (card.status !== "active" && context.authorization !== SEALED_QUIZ_REVIEW) throw new ValidationError("Retired cards cannot be reviewed");
     const at = asDate(reviewedAt, "reviewedAt");
     const before = this.toFsrsCard(card);
     const result = this.engine.next(before, at, ratingValue(rating));

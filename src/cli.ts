@@ -1,9 +1,15 @@
 #!/usr/bin/env node
+import { createApplication } from "./application.js";
 import { doctor } from "./doctor.js";
-import { initVault, NoVaultError, resolveVault, tryAcquireRunGuard, type LockHandle, type VaultPaths } from "./vault.js";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { initVault, NoVaultError, resolveVault } from "./vault.js";
+import { ensureQmdCollection } from "./external/qmd.js";
+import { localCheckpointCommit } from "./external/git.js";
+import type { ChildResult } from "./external/process.js";
 
 export interface CliArgs {
-  readonly command: "init" | "doctor" | "serve" | "run" | "sync";
+  readonly command: "init" | "doctor" | "serve" | "sync";
   readonly positional: readonly string[];
   readonly vaultPath?: string;
   readonly port?: number;
@@ -15,14 +21,13 @@ function usage(): string {
     "  pi-scholar init [path]",
     "  pi-scholar doctor [path]",
     "  pi-scholar serve [--vault path] [--port port]",
-    "  pi-scholar run scheduled [--vault path]",
     "  pi-scholar sync [--vault path]",
   ].join("\n");
 }
 
 export function parseCliArgs(argv: readonly string[]): CliArgs {
   const command = argv[0];
-  if (command !== "init" && command !== "doctor" && command !== "serve" && command !== "run" && command !== "sync") throw new Error(usage());
+  if (command !== "init" && command !== "doctor" && command !== "serve" && command !== "sync") throw new Error(usage());
   const positional: string[] = [];
   let vaultPath: string | undefined;
   let port: number | undefined;
@@ -44,8 +49,8 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
       positional.push(value);
     }
   }
-  if (command === "run" && positional[0] !== "scheduled") throw new Error("Only 'pi-scholar run scheduled' is supported");
-  if (command === "run" && positional.length > 1) throw new Error("run scheduled accepts no positional arguments");
+  if (port !== undefined && command !== "serve") throw new Error("--port is only valid for serve");
+  if (vaultPath !== undefined && command !== "serve" && command !== "sync") throw new Error(`--vault is not used with ${command}; pass [path]`);
   if ((command === "serve" || command === "sync") && positional.length > 0) throw new Error(`${command} accepts no positional arguments`);
   if ((command === "init" || command === "doctor") && positional.length > 1) throw new Error(`${command} accepts at most one path`);
   if ((command === "init" || command === "doctor") && vaultPath !== undefined) throw new Error(`--vault is not used with ${command}; pass [path]`);
@@ -66,7 +71,13 @@ function reportDoctor(path: string | undefined): number {
   return report.ok ? 0 : 1;
 }
 
-// Server/application are optional stage-owned hooks; keep CLI bootstrap compilable while those modules are packaged.
+function qmdInitializationFailure(result: ChildResult): string | undefined {
+  if (result.timedOut) return "collection setup timed out";
+  if (result.signal) return `collection setup terminated by ${result.signal}`;
+  if (result.code === 0) return undefined;
+  return `collection setup failed (${result.code ?? "unknown"}): ${(result.stderr.trim() || result.stdout.trim()).slice(0, 500)}`;
+}
+
 async function delegate(modulePath: string, names: readonly string[], ...args: unknown[]): Promise<unknown> {
   const module = (await import(modulePath)) as Record<string, unknown>;
   for (const name of names) {
@@ -76,39 +87,89 @@ async function delegate(modulePath: string, names: readonly string[], ...args: u
   throw new Error(`No supported ${names.join(" or ")} delegation hook is installed`);
 }
 
-async function runScheduled(paths: VaultPaths): Promise<number> {
-  const guard: LockHandle | undefined = tryAcquireRunGuard(paths);
-  if (!guard) {
-    print("A scheduled run is already active; exiting without blocking writers.");
-    return 0;
-  }
-  try {
-    await delegate("./application.js", ["runScheduled", "runScheduledWorkflow"], paths);
-    return 0;
-  } finally {
-    guard.release();
-  }
+interface GracefulServer {
+  readonly closeGracefully: () => Promise<void>;
+}
+
+function isGracefulServer(value: unknown): value is GracefulServer {
+  if (typeof value !== "object" || value === null || !("closeGracefully" in value)) return false;
+  return typeof value.closeGracefully === "function";
+}
+
+function waitForServerShutdown(server: GracefulServer): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  let closePromise: Promise<void> | undefined;
+  let settled = false;
+  const cleanup = (): void => {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  };
+  const finish = (error?: unknown): void => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (error === undefined) resolve();
+    else reject(error);
+  };
+  const onSignal = (): void => {
+    if (closePromise) return;
+    closePromise = Promise.resolve().then(() => server.closeGracefully());
+    closePromise.then(() => finish(), (error: unknown) => finish(error));
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  return promise;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const parsed = parseCliArgs(argv);
   if (parsed.command === "init") {
     const paths = initVault(parsed.positional[0] ?? process.cwd());
+    let qmdResult: ChildResult | undefined;
+    let qmdError: string | undefined;
+    try {
+      qmdResult = ensureQmdCollection(paths);
+    } catch (error) {
+      qmdError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    }
+    const report = doctor(paths.vaultRoot);
+    const qmdFailure = qmdResult ? qmdInitializationFailure(qmdResult) : undefined;
+    const failures = [
+      ...(qmdError ? [`qmd: ${qmdError}`] : []),
+      ...(qmdFailure ? [`qmd: ${qmdFailure}`] : []),
+      ...report.checks.filter((item) => item.status === "fail").map((item) => `${item.name}: ${item.message}`),
+    ];
+    if (failures.length > 0) throw new Error(`Initialization failed: ${failures.join("; ")}`);
+    localCheckpointCommit(paths, "scholar: initialize vault");
     print({ ok: true, vaultRoot: paths.vaultRoot, vaultId: paths.vaultId });
     return 0;
   }
   if (parsed.command === "doctor") return reportDoctor(parsed.positional[0]);
   const paths = resolveVault(parsed.vaultPath);
   if (parsed.command === "serve") {
-    await delegate("./server.js", ["startServer", "serve"], { paths, port: parsed.port });
+    const server = await delegate("./server.js", ["startServer", "serve"], { paths, port: parsed.port });
+    if (!isGracefulServer(server)) throw new Error("server delegation did not return a graceful server");
+    await waitForServerShutdown(server);
     return 0;
   }
-  if (parsed.command === "run") return runScheduled(paths);
-  await delegate("./application.js", ["sync", "syncVault"], paths);
-  return 0;
+  if (parsed.command === "sync") {
+    const application = createApplication(paths);
+    try {
+      const result = await application.sync();
+      if (!result.ok) {
+        print({ ok: false, status: result.status, error: result.error ?? "git push failed", output: result.output.slice(-4096) });
+        return 1;
+      }
+      print({ ok: true, status: result.status, output: result.output.slice(-4096) });
+      return 0;
+    } finally {
+      await application.close();
+    }
+  }
+  throw new Error("unsupported CLI command");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main().then((code) => {
     process.exitCode = code;
   }).catch((error: unknown) => {

@@ -5,6 +5,8 @@ import { doclingDependencyIdentity } from "./external/docling.js";
 import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import { openDatabase, SCHEMA_VERSION, validateSchema, type ScholarDatabase } from "./database.js";
+import { QuizService } from "./quiz.js";
+import { SchedulerService } from "./scheduler.js";
 import type { DoctorCheck, DoctorReport, JsonValue } from "./contracts.js";
 import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
 
@@ -15,14 +17,11 @@ function check(name: string, status: DoctorCheck["status"], message: string, det
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+const dependencyCheckCache = new Map<string, DoctorCheck>();
+
 
 function collectFiles(root: string, suffix: string, output: string[] = [], prefix = ""): string[] {
-  let entries;
-  try {
-    entries = readdirSync(root, { withFileTypes: true });
-  } catch {
-    return output;
-  }
+  const entries = readdirSync(root, { withFileTypes: true });
   for (const entry of entries) {
     const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
     const absolutePath = join(root, entry.name);
@@ -41,6 +40,8 @@ function checkRoots(paths: VaultPaths): DoctorCheck {
   const roots = [
     paths.vaultRoot,
     paths.metadataRoot,
+    join(paths.metadataRoot, "snapshots"),
+    join(paths.metadataRoot, "snapshots", "wiki"),
     paths.inboxRoot,
     paths.sourcesRoot,
     paths.wikiRoot,
@@ -56,11 +57,14 @@ function checkRoots(paths: VaultPaths): DoctorCheck {
       return check("roots", "fail", `Root is unavailable: ${root}: ${errorMessage(error)}`);
     }
   }
-  try {
-    const config = lstatSync(paths.vaultConfigPath);
-    if (config.isSymbolicLink() || !config.isFile()) return check("roots", "fail", `vault.json is not a regular file: ${paths.vaultConfigPath}`);
-  } catch (error) {
-    return check("roots", "fail", `vault.json is unavailable: ${errorMessage(error)}`);
+  for (const [label, path] of [["vault.json", paths.vaultConfigPath], [".gitignore", join(paths.vaultRoot, ".gitignore")]] as const) {
+    try {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || !stat.isFile()) return check("roots", "fail", `${label} is not a regular file: ${path}`);
+      readFileNoFollow(path);
+    } catch (error) {
+      return check("roots", "fail", `${label} is unavailable or unsafe: ${errorMessage(error)}`);
+    }
   }
   return check("roots", "pass", "All product roots and vault metadata are real directories/files");
 }
@@ -103,6 +107,9 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
     for (const entry of entries) {
       if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error(`Invalid source packet entry: ${entry.name}`);
       const packet = join(paths.sourcesRoot, entry.name);
+      const packetNames = readdirSync(packet).sort((left, right) => left.localeCompare(right));
+      const allowedPacketNames = ["attachments", "chunks", "extracted.md", "manifest.json", "original"];
+      if (packetNames.length !== allowedPacketNames.length || packetNames.some((name, index) => name !== allowedPacketNames[index])) throw new Error(`Packet contains unexpected artifacts: ${entry.name}`);
       const unsafeEntry = collectFiles(packet, "\u0000").find((item) => item.startsWith("SYMLINK:"));
       if (unsafeEntry) throw new Error(`Packet contains symlink: ${entry.name}/${unsafeEntry.slice(8)}`);
       const readRegular = (target: string): Buffer => {
@@ -121,6 +128,18 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       const chunks = Array.isArray(manifest.chunks) ? manifest.chunks.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object") : [];
       const files = Array.isArray(manifest.files) ? manifest.files.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object") : [];
       if (manifest.sourceId !== entry.name || chunks.length !== (Array.isArray(manifest.chunks) ? manifest.chunks.length : -1) || files.length !== (Array.isArray(manifest.files) ? manifest.files.length : -1)) throw new Error(`Manifest identity/files/chunks are invalid: ${entry.name}`);
+      const assertExactFiles = (root: string, expected: string[], label: string): void => {
+        const actual = collectFiles(root, "");
+        const expectedSet = new Set(expected);
+        if (expectedSet.size !== expected.length || actual.length !== expected.length || actual.some((file) => !expectedSet.has(file))) throw new Error(`${label} mismatch: ${entry.name}`);
+      };
+      const originalNames = files.map((file) => {
+        const filePath = String(file.relativePath ?? file.path ?? "");
+        safeRelativePath(join(packet, "original"), filePath);
+        return filePath;
+      });
+      assertExactFiles(join(packet, "original"), originalNames, "Original file set");
+      assertExactFiles(join(packet, "chunks"), chunks.map((_chunk, index) => `${String(index + 1).padStart(4, "0")}.md`), "Chunk file set");
       const extracted = readRegular(join(packet, "extracted.md"));
       const extractedDigest = createHash("sha256").update(extracted).digest("hex");
       if (manifest.extractedDigest !== extractedDigest || manifest.extractionDigest !== extractedDigest || Number(manifest.extractedByteLength ?? manifest.extractionBytes) !== extracted.byteLength) throw new Error(`Extracted artifact digest/length mismatch: ${entry.name}`);
@@ -144,14 +163,30 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         const digest = createHash("sha256").update(body).digest("hex");
         if (file.digest !== digest || Number(file.byteLength ?? file.bytes) !== body.byteLength) throw new Error(`Original file digest/length mismatch: ${entry.name}/${filePath}`);
       }
-      const source = db.get<{ source_id: string; digest: string | null; manifest_path: string | null }>("SELECT source_id, digest, manifest_path FROM sources WHERE source_id = ?", [entry.name]);
-      if (!source || source.digest !== manifest.originalDigest || !source.manifest_path || resolve(source.manifest_path) !== resolve(packet)) throw new Error(`Source catalog linkage is invalid: ${entry.name}`);
+      const source = db.get<{ source_id: string; status: string; digest: string | null; manifest_path: string | null }>("SELECT source_id, status, digest, manifest_path FROM sources WHERE source_id = ?", [entry.name]);
+      if (!source || source.status !== "published" || source.digest !== manifest.originalDigest || !source.manifest_path || resolve(source.manifest_path) !== resolve(packet)) throw new Error(`Source catalog linkage is invalid: ${entry.name}`);
       const dbFiles = db.all<{ relative_path: string; byte_length: number; digest: string }>("SELECT relative_path, byte_length, digest FROM source_files WHERE source_id = ? ORDER BY relative_path", [entry.name]);
       if (dbFiles.length !== files.length || files.some((file) => !dbFiles.some((row) => row.relative_path === String(file.relativePath ?? file.path) && row.byte_length === Number(file.byteLength ?? file.bytes) && row.digest === file.digest))) throw new Error(`Source file catalog linkage is invalid: ${entry.name}`);
       const dbChunks = db.all<{ ordinal: number; relative_path: string; byte_length: number; digest: string; atom_start: number; atom_end: number }>("SELECT ordinal, relative_path, byte_length, digest, atom_start, atom_end FROM source_chunks WHERE source_id = ? ORDER BY ordinal", [entry.name]);
       if (dbChunks.length !== chunks.length || chunks.some((chunk, index) => dbChunks[index]?.ordinal !== Number(chunk.ordinal) || dbChunks[index]?.byte_length !== Number(chunk.byteLength) || dbChunks[index]?.digest !== chunk.digest || dbChunks[index]?.atom_start !== Number(chunk.atomStart) || dbChunks[index]?.atom_end !== Number(chunk.atomEnd))) throw new Error(`Source chunk catalog linkage is invalid: ${entry.name}`);
     }
-    return check("source-packets", "pass", `${entries.length} source packet(s) have valid immutable artifacts, reconstruction, and catalog linkage`);
+    const sources = db.all<{ source_id: string; status: string; digest: string | null; manifest_path: string | null }>("SELECT source_id, status, digest, manifest_path FROM sources WHERE status != 'removed' ORDER BY source_id");
+    for (const source of sources) {
+      if (source.manifest_path === null) {
+        if (source.status === "failed") continue;
+        throw new Error(`Source catalog row has no packet path: ${source.source_id}`);
+      }
+      const packet = safeRelativePath(paths.sourcesRoot, source.source_id);
+      if (resolve(source.manifest_path) !== resolve(packet)) throw new Error(`Source catalog packet path is not exact and contained: ${source.source_id}`);
+      const packetStat = lstatSync(packet);
+      if (packetStat.isSymbolicLink() || !packetStat.isDirectory()) throw new Error(`Source catalog packet is not a real directory: ${source.source_id}`);
+      const manifestPath = join(packet, "manifest.json");
+      const manifestStat = lstatSync(manifestPath);
+      if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) throw new Error(`Source catalog manifest is not a regular file: ${source.source_id}`);
+      const manifest = JSON.parse(readFileNoFollow(manifestPath).toString("utf8")) as Record<string, unknown>;
+      if (manifest.sourceId !== source.source_id || manifest.originalDigest !== source.digest) throw new Error(`Source catalog reverse linkage is invalid: ${source.source_id}`);
+    }
+    return check("source-packets", "pass", `${entries.length} source packet(s) have valid immutable artifacts, reconstruction, and bidirectional catalog linkage`);
   } catch (error) {
     return check("source-packets", "fail", errorMessage(error));
   } finally {
@@ -167,7 +202,13 @@ function pageIdFromMarkdown(markdown: string): string | undefined {
 }
 
 function checkPages(paths: VaultPaths): DoctorCheck {
-  const files = collectFiles(paths.wikiRoot, ".md");
+  let files: string[];
+  try {
+    files = collectFiles(paths.wikiRoot, ".md");
+  } catch (error) {
+    return check("page-ids", "fail", `Cannot traverse wiki pages: ${errorMessage(error)}`);
+  }
+  files = files.filter((relativePath) => relativePath.startsWith("SYMLINK:") || (!relativePath.startsWith(".snapshots/") && relativePath !== ".snapshots"));
   const ids = new Map<string, string>();
   for (const relativePath of files) {
     if (relativePath.startsWith("SYMLINK:")) return check("page-ids", "fail", `Wiki contains symlink: ${relativePath.slice(8)}`);
@@ -189,8 +230,32 @@ function checkPages(paths: VaultPaths): DoctorCheck {
   let db: ScholarDatabase | undefined;
   try {
     db = openDatabase(paths, { readOnly: true, initializeSchema: false });
-    const rows = db.all<{ page_id: string; relative_path: string; digest: string; status: string }>("SELECT page_id, relative_path, digest, status FROM pages");
+    const rows = db.all<{ page_id: string; relative_path: string; digest: string; revision: number; status: string }>("SELECT page_id, relative_path, digest, revision, status FROM pages");
     const byPath = new Map(rows.map((row) => [row.relative_path, row]));
+    const snapshots = db.all<{ relative_path: string; digest: string; revision: number }>("SELECT relative_path, digest, revision FROM authored_snapshots");
+    const snapshotsByPath = new Map(snapshots.map((row) => [row.relative_path, row]));
+    const byPageId = new Map(rows.map((row) => [row.page_id, row]));
+    for (const relativePath of snapshotsByPath.keys()) {
+      if (!byPath.has(relativePath)) return check("page-drift", "fail", `Authored snapshot catalog has no matching page: ${relativePath}`);
+    }
+    let snapshotFiles: string[];
+    try {
+      snapshotFiles = collectFiles(join(paths.metadataRoot, "snapshots", "wiki"), ".md");
+    } catch (error) {
+      return check("page-drift", "fail", `Cannot traverse authored wiki snapshots: ${errorMessage(error)}`);
+    }
+    const snapshotIds = new Map<string, string>();
+    for (const relativePath of snapshotFiles) {
+      if (relativePath.startsWith("SYMLINK:")) return check("page-drift", "fail", `Authored snapshot tree contains symlink: ${relativePath.slice(8)}`);
+      if (relativePath.includes("/")) return check("page-drift", "fail", `Authored snapshot has invalid path: ${relativePath}`);
+      const pageId = relativePath.slice(0, -3);
+      if (!PAGE_ID_PATTERN.test(pageId)) return check("page-drift", "fail", `Authored snapshot has a non-UUID filename: ${relativePath}`);
+      if (snapshotIds.has(pageId)) return check("page-drift", "fail", `Duplicate authored snapshot filename: ${relativePath}`);
+      snapshotIds.set(pageId, relativePath);
+      const row = byPageId.get(pageId);
+      if (!row) return check("page-drift", "fail", `Authored snapshot has no matching page: ${relativePath}`);
+      if (!snapshotsByPath.has(row.relative_path)) return check("page-drift", "fail", `Authored snapshot has no catalog row: ${relativePath}`);
+    }
     for (const [pageId, relativePath] of ids) {
       const row = byPath.get(relativePath);
       if (!row || row.page_id !== pageId) return check("page-drift", "fail", `Page catalog mismatch: ${relativePath}`);
@@ -200,6 +265,14 @@ function checkPages(paths: VaultPaths): DoctorCheck {
     for (const row of rows) {
       if (row.status === "retired") continue;
       if (ids.get(row.page_id) !== row.relative_path) return check("page-drift", "fail", `Page catalog has no matching wiki artifact: ${row.relative_path}`);
+      if (!PAGE_ID_PATTERN.test(row.page_id)) return check("page-drift", "fail", `Page catalog has an invalid stable ID: ${row.relative_path}`);
+      const snapshot = snapshotsByPath.get(row.relative_path);
+      if (!snapshot || snapshot.digest !== row.digest || Number(snapshot.revision) !== Number(row.revision)) return check("page-drift", "fail", `Authored snapshot catalog mismatch: ${row.relative_path}`);
+      const snapshotPath = safeRelativePath(join(paths.metadataRoot, "snapshots", "wiki"), `${row.page_id}.md`);
+      const snapshotStat = lstatSync(snapshotPath);
+      if (snapshotStat.isSymbolicLink() || !snapshotStat.isFile()) return check("page-drift", "fail", `Authored snapshot is not a regular file: ${row.relative_path}`);
+      const snapshotDigest = createHash("sha256").update(readFileNoFollow(snapshotPath)).digest("hex");
+      if (snapshotDigest !== row.digest || snapshotDigest !== snapshot.digest) return check("page-drift", "fail", `Authored snapshot digest mismatch: ${row.relative_path}`);
     }
   } catch (error) {
     return check("page-drift", "fail", `Cannot inspect page catalog: ${errorMessage(error)}`);
@@ -231,7 +304,9 @@ function checkScheduler(paths: VaultPaths): DoctorCheck {
       return true;
     };
     for (const cardId of cards) if (!visit(cardId)) return check("scheduler", "fail", "Card prerequisite graph contains a cycle");
-    return check("scheduler", "pass", `${cards.size} review card(s) have valid prerequisite relationships`);
+    const coverage = new SchedulerService(db, paths).validateCoverage();
+    if (!coverage.ok) return check("scheduler", "fail", `Eligible wiki pages have no active card bindings: ${coverage.missingPageIds.join(", ")}`);
+    return check("scheduler", "pass", `${cards.size} review card(s) have valid prerequisite relationships and wiki coverage`);
   } catch (error) {
     return check("scheduler", "fail", `Cannot inspect scheduler relationships: ${errorMessage(error)}`);
   } finally {
@@ -240,8 +315,13 @@ function checkScheduler(paths: VaultPaths): DoctorCheck {
 }
 
 function checkQuizzes(paths: VaultPaths): DoctorCheck {
-  const files = collectFiles(paths.quizzesRoot, ".md");
-  const projections = new Map<string, { quizId: string; revision: number; questionIds: string[]; absolutePath: string }>();
+  let files: string[];
+  try {
+    files = collectFiles(paths.quizzesRoot, ".md");
+  } catch (error) {
+    return check("quiz-projections", "fail", `Cannot traverse quiz projections: ${errorMessage(error)}`);
+  }
+  const projections = new Map<string, { quizId: string; revision: number; questionIds: string[]; absolutePath: string; markdown: string }>();
   for (const relativePath of files) {
     if (relativePath.startsWith("SYMLINK:")) return check("quiz-projections", "fail", `Quiz tree contains symlink: ${relativePath.slice(8)}`);
     const baseName = relativePath.split("/").at(-1)?.toLowerCase();
@@ -269,11 +349,13 @@ function checkQuizzes(paths: VaultPaths): DoctorCheck {
       revision: Number(identity[2]),
       questionIds: [...markdown.matchAll(/^## \d+\. ([^\n]+)$/gmu)].map((question) => question[1]!),
       absolutePath,
+      markdown,
     });
   }
   let db: ScholarDatabase | undefined;
   try {
     db = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    const quizService = new QuizService(db, paths, new SchedulerService(db, paths));
     const quizzes = db.all<{ quiz_id: string; date: string; revision: number; status: string; sheet_path: string | null }>("SELECT quiz_id, date, revision, status, sheet_path FROM quizzes ORDER BY date");
     for (const row of quizzes) {
       if (!/^\d{4}-\d{2}-\d{2}$/u.test(row.date) || !Number.isInteger(Number(row.revision)) || Number(row.revision) < 1) return check("quiz-projections", "fail", `Quiz identity is invalid: ${row.quiz_id}`);
@@ -284,6 +366,11 @@ function checkQuizzes(paths: VaultPaths): DoctorCheck {
         const expectedPath = join(paths.quizzesRoot, row.date.slice(0, 4), row.date.slice(5, 7), `${row.date}.md`);
         if (resolve(row.sheet_path) !== resolve(expectedPath) || !projection || projection.quizId !== row.quiz_id || projection.revision !== row.revision) return check("quiz-projections", "fail", `Quiz identity/projection mismatch: ${row.date}`);
         if (projection.questionIds.length !== questionRows.length || projection.questionIds.some((id, index) => id !== questionRows[index]?.question_id)) return check("quiz-projections", "fail", `Quiz question identity mismatch: ${row.date}`);
+        try {
+          quizService.parseSheet(projection.markdown);
+        } catch (error) {
+          return check("quiz-projections", "fail", `Quiz projection content does not match SQLite: ${row.date}: ${errorMessage(error)}`);
+        }
       } else if (projection) {
         return check("quiz-projections", "fail", `Quiz projection has no SQLite identity: ${row.date}`);
       }
@@ -299,23 +386,25 @@ function checkQuizzes(paths: VaultPaths): DoctorCheck {
 
 function checkDependencies(paths: VaultPaths): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
-  try {
-    const identity = gitDependencyIdentity(paths);
-    checks.push(identity.version ? check("git", "pass", identity.version) : check("git", "fail", "Git version could not be determined"));
-  } catch (error) {
-    checks.push(check("git", "fail", `Git unavailable: ${errorMessage(error)}`));
-  }
-  try {
-    const identity = qmdDependencyIdentity(paths);
-    checks.push(identity.version ? check("qmd", "pass", identity.version) : check("qmd", "warn", "qmd version could not be determined"));
-  } catch (error) {
-    checks.push(check("qmd", "warn", `qmd unavailable: ${errorMessage(error)}`));
-  }
-  try {
-    const identity = doclingDependencyIdentity(paths);
-    checks.push(identity.version ? check("docling", "pass", identity.version) : check("docling", "warn", "Docling version could not be determined"));
-  } catch (error) {
-    checks.push(check("docling", "warn", `Docling unavailable: ${errorMessage(error)}`));
+  const probes: readonly [string, () => { readonly executable: string; readonly version: string }][] = [
+    ["git", () => gitDependencyIdentity(paths)],
+    ["qmd", () => qmdDependencyIdentity(paths)],
+    ["docling", () => doclingDependencyIdentity(paths)],
+  ];
+  for (const [name, probe] of probes) {
+    const cached = dependencyCheckCache.get(name);
+    if (cached) {
+      checks.push(cached);
+      continue;
+    }
+    try {
+      const identity = probe();
+      const result = identity.version ? check(name, "pass", identity.version) : check(name, "fail", `${name} version could not be determined`);
+      if (result.status === "pass") dependencyCheckCache.set(name, result);
+      checks.push(result);
+    } catch (error) {
+      checks.push(check(name, "fail", `${name} unavailable: ${errorMessage(error)}`));
+    }
   }
   return checks;
 }
@@ -341,7 +430,9 @@ export function doctor(explicitPath?: string): DoctorReport {
   } catch (error) {
     return { ok: false, checkedAt, checks: [check("vault", "fail", errorMessage(error))] };
   }
-  const checks = [checkRoots(paths), ...checkDatabase(paths), checkPackets(paths), checkPages(paths), checkScheduler(paths), checkQuizzes(paths), ...checkDependencies(paths), ...checkExternalState(paths)];
+  const roots = checkRoots(paths);
+  if (roots.status === "fail") return { ok: false, checkedAt, checks: [roots] };
+  const checks = [roots, ...checkDatabase(paths), checkPackets(paths), checkPages(paths), checkScheduler(paths), checkQuizzes(paths), ...checkDependencies(paths), ...checkExternalState(paths)];
   return { ok: checks.every((item) => item.status !== "fail"), checkedAt, checks };
 }
 

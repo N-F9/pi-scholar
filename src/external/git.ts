@@ -3,8 +3,13 @@ import { runChild, runChildSync, type ChildResult, type ChildRunOptions } from "
 import type { VaultPaths } from "../vault.js";
 
 const GIT_TIMEOUT_MS = 120_000;
+const GIT_REVISION_TIMEOUT_MS = 5_000;
+const GIT_REVISION_OUTPUT_BYTES = 1024;
 const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]{1,160}$/u;
 const ARG_PATTERN = /^[A-Za-z0-9._/@:+-]+$/u;
+const SAFE_GIT_ASSIGNMENTS: readonly string[] = ["--porcelain=v2"];
+const SAFE_GIT_CONFIG = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"] as const;
+const SAFE_GIT_COMMIT_CONFIG = [...SAFE_GIT_CONFIG, "-c", "user.name=Pi Scholar", "-c", "user.email=pi-scholar@localhost"] as const;
 
 export interface GitStatus {
   readonly branch?: string;
@@ -32,43 +37,56 @@ function validateGitArg(value: string, label: string): void {
   if (!value || value.startsWith("-") || !ARG_PATTERN.test(value)) throw new Error(`invalid Git ${label}`);
 }
 
-function gitOptions(paths: VaultPaths, timeoutMs = GIT_TIMEOUT_MS): ChildRunOptions {
-  return { cwd: paths.vaultRoot, timeoutMs, env: { GIT_CONFIG_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0" } };
+function gitOptions(cwd: string, timeoutMs = GIT_TIMEOUT_MS): ChildRunOptions {
+  return { cwd, timeoutMs, env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" } };
 }
 
-function assertGitDirectory(paths: VaultPaths): void {
-  if (existsSync(`${paths.vaultRoot}/.git`)) {
-    const stat = lstatSync(`${paths.vaultRoot}/.git`);
-    if (stat.isSymbolicLink()) throw new Error(".git must not be a symlink");
+function assertGitDirectory(paths: VaultPaths, allowMissing = false): void {
+  if (!existsSync(`${paths.vaultRoot}/.git`)) {
+    if (allowMissing) return;
+    throw new Error("vault Git repository is missing");
   }
+  const stat = lstatSync(`${paths.vaultRoot}/.git`);
+  if (!stat.isDirectory()) throw new Error(".git must be a real directory");
 }
 
 function commandFailure(result: ChildResult, command: string): Error {
   return new Error(`${command} failed (${result.code ?? result.signal ?? "unknown"}): ${(result.stderr || result.stdout).trim()}`);
 }
 
+export async function gitRevision(root: string): Promise<string> {
+  const args = ["rev-parse", "HEAD"] as const;
+  validateGitCommand(args);
+  const result = await runChild("git", ["-C", root, ...SAFE_GIT_CONFIG, ...args], { ...gitOptions(root, GIT_REVISION_TIMEOUT_MS), maxOutputBytes: GIT_REVISION_OUTPUT_BYTES });
+  if (result.code !== 0) throw commandFailure(result, "git rev-parse");
+  return result.stdout.trim();
+}
+
 export function initializeRepository(paths: VaultPaths): void {
-  assertGitDirectory(paths);
-  const result = runChildSync("git", ["init", "--quiet"], gitOptions(paths));
+  assertGitDirectory(paths, true);
+  const result = runChildSync("git", [...SAFE_GIT_CONFIG, "init", "--quiet"], gitOptions(paths.vaultRoot));
   if (result.code !== 0) throw commandFailure(result, "git init");
+  assertGitDirectory(paths);
 }
 
 function validateGitCommand(args: readonly string[]): void {
   const command = args[0];
   if (!command || !["init", "status", "add", "diff", "commit", "push", "fetch", "rev-parse", "show", "ls-files"].includes(command)) throw new Error("unsupported Git operation");
   if (args.some((arg) => /[\u0000\u000a\u000d]/u.test(arg))) throw new Error("Git argv contains a control character");
-  if (args.some((arg) => arg === "--force" || arg === "--force-with-lease" || arg === "-f") || ["reset", "merge", "rebase", "checkout", "clean"].includes(command)) throw new Error("unsafe Git operation");
+  if (args.some((arg) => /^(?:--force(?:-with-lease)?(?:=|$)|-f(?:=|$))/u.test(arg)) || ["reset", "merge", "rebase", "checkout", "clean"].includes(command)) throw new Error("unsafe Git operation");
+  if (args.some((arg) => arg.startsWith("--") && arg.includes("=") && !SAFE_GIT_ASSIGNMENTS.includes(arg))) throw new Error("Git options must use separate argv values");
 }
 
 export async function runGit(paths: VaultPaths, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS): Promise<ChildResult> {
+  assertGitDirectory(paths);
   validateGitCommand(args);
-  for (const arg of args) if (arg.startsWith("--") && arg.includes("=")) throw new Error("Git options must use separate argv values");
-  return runChild("git", args, gitOptions(paths, timeoutMs));
+  return runChild("git", [...SAFE_GIT_CONFIG, ...args], gitOptions(paths.vaultRoot, timeoutMs));
 }
-
 export function runGitSync(paths: VaultPaths, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS): ChildResult {
+  assertGitDirectory(paths);
   validateGitCommand(args);
-  return runChildSync("git", args, gitOptions(paths, timeoutMs));
+  const config = args[0] === "commit" ? SAFE_GIT_COMMIT_CONFIG : SAFE_GIT_CONFIG;
+  return runChildSync("git", [...config, ...args], gitOptions(paths.vaultRoot, timeoutMs));
 }
 
 export function parseGitStatus(raw: string): GitStatus {
@@ -137,11 +155,11 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
 }
 
 export function gitDependencyIdentity(paths: VaultPaths): { readonly executable: string; readonly version: string; readonly workTree: boolean } {
-  const version = runChildSync("git", ["--version"], gitOptions(paths, 10_000));
-  const workTree = runGitSync(paths, ["rev-parse", "--is-inside-work-tree"]);
-  return {
-    executable: "git",
-    version: version.stdout.trim(),
-    workTree: workTree.code === 0 && workTree.stdout.trim() === "true",
-  };
+  const version = runChildSync("git", ["--version"], gitOptions(paths.vaultRoot, 10_000));
+  const versionText = version.stdout.trim();
+  if (version.code !== 0 || version.timedOut || version.signal !== null || !versionText) throw commandFailure(version, "git --version");
+  validateGitCommand(["rev-parse", "--is-inside-work-tree"]);
+  const workTree = runChildSync("git", [...SAFE_GIT_CONFIG, "rev-parse", "--is-inside-work-tree"], gitOptions(paths.vaultRoot, GIT_REVISION_TIMEOUT_MS));
+  if (workTree.code !== 0 || workTree.timedOut || workTree.signal !== null || workTree.stdout.trim() !== "true") throw commandFailure(workTree, "git rev-parse --is-inside-work-tree");
+  return { executable: version.executable, version: versionText, workTree: true };
 }

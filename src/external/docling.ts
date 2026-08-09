@@ -2,7 +2,9 @@ import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runChild, runChildSync, type ChildResult } from "./process.js";
 import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
+const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
 const DOCLING_TIMEOUT_MS = 300_000;
+const DOCLING_VERSION_PATTERN = /^(?:docling(?:\s+version)?\s*:?\s+)?v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/iu;
 
 export interface DoclingRequest {
   readonly inputRelativePath: string;
@@ -16,11 +18,13 @@ export interface DoclingResult {
   readonly extracted: Buffer;
 }
 
+export type DoclingSyncRunner = (paths: VaultPaths, args: readonly string[], timeoutMs?: number) => ChildResult;
+
 function validateDocumentPath(paths: VaultPaths, relativePath: string): string {
   const path = safeRelativePath(paths.workRoot, relativePath);
   const stat = lstatSync(path);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Docling input must be a regular file");
-  if (stat.size > 100 * 1024 * 1024) throw new Error("Docling input exceeds the 100 MiB source limit");
+  if (stat.size > MAX_SOURCE_BYTES) throw new Error("Docling input exceeds the 100 MiB source limit");
   return path;
 }
 
@@ -58,7 +62,7 @@ function findMarkdown(directory: string): string {
 function readExtracted(outputDirectory: string): Buffer {
   const stat = lstatSync(outputDirectory);
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Docling output directory is not a real directory");
-  return readFileNoFollow(findMarkdown(outputDirectory));
+  return readFileNoFollow(findMarkdown(outputDirectory), MAX_SOURCE_BYTES);
 }
 
 export function doclingArgs(paths: VaultPaths, request: DoclingRequest): { readonly inputPath: string; readonly outputDirectory: string; readonly args: readonly string[] } {
@@ -71,12 +75,16 @@ export function doclingArgs(paths: VaultPaths, request: DoclingRequest): { reado
   };
 }
 
+export function doclingEnvironment(paths: VaultPaths): Readonly<Record<string, string>> {
+  return { HOME: paths.workRoot, XDG_CACHE_HOME: join(paths.workRoot, "cache"), DOCLING_CACHE_DIR: paths.workRoot };
+}
+
 export async function convertWithDocling(paths: VaultPaths, request: DoclingRequest): Promise<DoclingResult> {
   const command = doclingArgs(paths, request);
   const result = await runChild("docling", command.args, {
     cwd: paths.workRoot,
     timeoutMs: request.timeoutMs ?? DOCLING_TIMEOUT_MS,
-    env: { DOCLING_CACHE_DIR: paths.workRoot },
+    env: doclingEnvironment(paths),
   });
   assertSuccessful(result);
   return { command: result, outputDirectory: command.outputDirectory, extracted: readExtracted(command.outputDirectory) };
@@ -87,13 +95,21 @@ export function convertWithDoclingSync(paths: VaultPaths, request: DoclingReques
   const result = runChildSync("docling", command.args, {
     cwd: paths.workRoot,
     timeoutMs: request.timeoutMs ?? DOCLING_TIMEOUT_MS,
-    env: { DOCLING_CACHE_DIR: paths.workRoot },
+    env: doclingEnvironment(paths),
   });
   assertSuccessful(result);
   return { command: result, outputDirectory: command.outputDirectory, extracted: readExtracted(command.outputDirectory) };
 }
 
-export function doclingDependencyIdentity(paths: VaultPaths): { readonly executable: string; readonly version: string } {
-  const result = runChildSync("docling", ["--version"], { cwd: paths.workRoot, timeoutMs: 10_000, env: { DOCLING_CACHE_DIR: paths.workRoot } });
-  return { executable: "docling", version: result.stdout.trim() || result.stderr.trim() };
+export function doclingDependencyIdentity(paths: VaultPaths, runner: DoclingSyncRunner = (target, args, timeoutMs = 10_000) => runChildSync("docling", args, { cwd: target.workRoot, timeoutMs, env: doclingEnvironment(target) })): { readonly executable: string; readonly version: string } {
+  const result = runner(paths, ["--version"], 10_000);
+  if (result.timedOut || result.signal || result.code !== 0) {
+    const detail = (result.stderr.trim() || result.stdout.trim() || result.signal || String(result.code ?? "unknown")).slice(0, 500);
+    throw new Error(`docling --version failed: ${detail}`);
+  }
+  const version = [...result.stdout.split(/\r?\n/u), ...result.stderr.split(/\r?\n/u)]
+    .map((line) => line.trim())
+    .find((line) => DOCLING_VERSION_PATTERN.test(line));
+  if (!version) throw new Error("docling --version returned an empty or malformed version");
+  return { executable: result.executable, version };
 }
