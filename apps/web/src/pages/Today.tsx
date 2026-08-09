@@ -23,7 +23,7 @@ import {
 } from "../api";
 import { Markdown } from "../components/Markdown";
 import { QuizResults, ReadOnlyQuestions } from "../components/QuizPanel";
-import { Badge, Button, Card, Spinner, StateView, Textarea } from "../components/ui";
+import { Button, Card, Spinner, StateView, Textarea } from "../components/ui";
 
 const quietOutcomes: Record<
   Exclude<QuizOutcome, "available" | "submitted" | "expired" | "failed">,
@@ -252,13 +252,6 @@ function QuizAnswerForm({
                 <div className="mt-3">
                   <Markdown source={question.prompt} />
                 </div>
-                <ul className="mt-4 flex flex-wrap gap-2" aria-label="Review cards tested">
-                  {question.cardIds.map((cardId) => (
-                    <li key={cardId}>
-                      <Badge>{cardId}</Badge>
-                    </li>
-                  ))}
-                </ul>
                 <fieldset className="mt-5" disabled={saveDraft.isPending || submission.isPending || revisionConflict}>
                   <legend className="sr-only">
                     Answer question {question.ordinal}: {question.prompt}

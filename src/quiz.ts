@@ -804,10 +804,7 @@ export class QuizService {
         "",
         cleanMarkdown(question.prompt),
         "",
-        `**Review cards:** ${question.cardIds.join(", ")}`,
       );
-      if (question.sourceRefs.length)
-        lines.push(`**Bound sections:** ${question.sourceRefs.map(cleanMarkdown).join(", ")}`, "");
       if (question.choices?.length) for (const choice of question.choices) lines.push(`- [ ] ${cleanMarkdown(choice)}`);
       lines.push("", "### Your answer", cleanMarkdown(answerText(answers?.[question.questionId] ?? "")), "");
       if (results) {
@@ -880,28 +877,18 @@ export class QuizService {
         Number(ordinalText) !== ordinal + 1
       )
         throw new ValidationError("Quiz sheet question identity is invalid");
-      const cardLine = /^\*\*Review cards:\*\*\s*(.+)$/im.exec(body);
-      const refsLine = /^\*\*Bound sections:\*\*\s*(.+)$/im.exec(body);
-      const cardText = cardLine?.[1];
-      const refsText = refsLine?.[1];
       const prompt = body
         .replace(/\n### Your answer[\s\S]*$/i, "")
-        .replace(/^\*\*Review cards:\*\*.*$/gim, "")
-        .replace(/^\*\*Bound sections:\*\*.*$/gim, "")
         .replace(/^- \[ \] .*$/gim, "")
         .trim();
       const choices = [...body.matchAll(/^- \[ \] (.+)$/gim)]
         .map((choice) => choice[1])
         .filter((choice): choice is string => choice !== undefined);
-      const cardIds = cardText ? cardText.split(/,\s*/u) : [];
-      const sourceRefs = refsText ? refsText.split(/,\s*/u) : [];
       if (
         questionId.trim() !== expected.questionId ||
         kind.toLowerCase() !== expected.kind ||
         cleanMarkdown(prompt) !== cleanMarkdown(expected.prompt) ||
-        JSON.stringify(choices.length ? choices : undefined) !== JSON.stringify(expected.choices) ||
-        JSON.stringify(cardIds) !== JSON.stringify(expected.cardIds) ||
-        JSON.stringify(sourceRefs) !== JSON.stringify(expected.sourceRefs)
+        JSON.stringify(choices.length ? choices : undefined) !== JSON.stringify(expected.choices)
       )
         throw new ValidationError("Quiz sheet question content does not match SQLite");
     }

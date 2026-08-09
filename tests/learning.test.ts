@@ -267,6 +267,9 @@ test("quiz seals revision-safe answers and settles differential grades idempoten
       },
     ],
   });
+  const learnerSheet = quiz.renderSheet(generated);
+  assert.equal(learnerSheet.includes("q-a"), false);
+  assert.equal(learnerSheet.includes("p1#%23a"), false);
   assert.throws(
     () => quiz.saveDraft(generated.date, generated.revision, { q: "\n\n## private rubric" }),
     /structural Markdown/,
