@@ -3,7 +3,6 @@ import { createWriteStream, lstatSync, realpathSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { type IncomingMessage, createServer as nodeCreateServer, type Server, type ServerResponse } from "node:http";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
-import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import busboy from "busboy";
 import { createApplication, type ScholarApplication } from "./application/application.js";
@@ -305,8 +304,26 @@ async function receiveMultipartUpload(
         mediaType = info.mimeType || undefined;
         file.on("limit", () => fail(multipartTooLarge()));
         const output = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
-        writePromise = pipeline(file, output).catch((error) => {
-          fail(error);
+        writePromise = new Promise<void>((resolveWrite) => {
+          let settled = false;
+          const finish = (): void => {
+            if (settled) return;
+            settled = true;
+            resolveWrite();
+          };
+          output.once("finish", finish);
+          output.once("error", (error) => {
+            fail(error);
+            file.unpipe(output);
+            file.resume();
+            finish();
+          });
+          file.once("error", (error) => {
+            fail(error);
+            output.destroy();
+            finish();
+          });
+          file.pipe(output);
         });
       });
       parser.on("filesLimit", () => fail(new ValidationError("multipart request contains multiple files")));

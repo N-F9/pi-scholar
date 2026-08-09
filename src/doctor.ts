@@ -19,7 +19,7 @@ import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import { QuizService } from "./quiz.js";
 import { localDate, SchedulerService } from "./scheduler.js";
-import { atomizeFileSync } from "./sources/source-chunks.js";
+import { validateFileEndpointsSync } from "./sources/source-chunks.js";
 import { hashFileSync } from "./sources/source-files.js";
 import { assertNoSymlinkPath, readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
 
@@ -367,10 +367,13 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         "manifest extracted digest",
       );
       if (extracted.digest !== extractedDigest) throw new Error(`Extracted digest mismatch: ${entry.name}`);
-      const atoms = atomizeFileSync(extractedPath);
       const chunkNames = readdirSync(join(packet, "chunks")).sort((left, right) => left.localeCompare(right));
       if (chunks.length === 0 || chunkNames.length !== chunks.length)
         throw new Error(`Chunk file set is incomplete: ${entry.name}`);
+      const planned = validateFileEndpointsSync(
+        extractedPath,
+        chunks.map((record, index) => aliasedInteger(record, ["endAtom", "atomEnd"], `chunks[${index}].endAtom`)),
+      );
       let atomCursor = 0;
       let byteCursor = 0;
       let chunkByteTotal = 0;
@@ -398,25 +401,22 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         const startByte = integer(record.startByte, `chunks[${index}].startByte`);
         const endByte = integer(record.endByte, `chunks[${index}].endByte`);
         const byteLength = aliasedInteger(record, ["byteLength", "bytes"], `chunks[${index}].byteLength`);
+        const plannedChunk = planned.chunks[index];
         if (
           startAtom !== atomCursor ||
           endAtom <= startAtom ||
-          endAtom > atoms.length ||
           startByte !== byteCursor ||
           endByte < startByte ||
           endByte - startByte !== chunk.size ||
-          endByte - startByte !== byteLength
+          endByte - startByte !== byteLength ||
+          !plannedChunk ||
+          plannedChunk.startLine - 1 !== startAtom ||
+          plannedChunk.endLine !== endAtom ||
+          plannedChunk.startByte !== startByte ||
+          plannedChunk.endByte !== endByte
         )
           throw new Error(`Chunk atom/byte range is not contiguous: ${entry.name}/${index}`);
-        const firstAtom = atoms[startAtom];
-        const lastAtom = atoms[endAtom - 1];
-        if (
-          !firstAtom ||
-          !lastAtom ||
-          firstAtom.startByte !== startByte ||
-          lastAtom.endByte !== endByte ||
-          !fileRangeEquals(extractedPath, startByte, endByte, chunkPath)
-        )
+        if (!fileRangeEquals(extractedPath, startByte, endByte, chunkPath))
           throw new Error(`Chunk atom/byte range does not match extraction: ${entry.name}/${index}`);
         if (chunk.digest !== digest(record.digest, `chunks[${index}].digest`))
           throw new Error(`Chunk digest mismatch: ${entry.name}/${index}`);
@@ -424,7 +424,11 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         byteCursor = endByte;
         chunkByteTotal += chunk.size;
       }
-      if (atomCursor !== atoms.length || byteCursor !== extracted.size || chunkByteTotal !== extracted.size)
+      if (
+        atomCursor !== planned.chunks.at(-1)?.endLine ||
+        byteCursor !== extracted.size ||
+        chunkByteTotal !== extracted.size
+      )
         throw new Error(`Chunk final totals/reconstruction mismatch: ${entry.name}`);
       const source = db.get<{
         source_id: string;

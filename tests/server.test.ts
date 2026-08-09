@@ -38,6 +38,7 @@ async function withServer(
   try {
     await run(`http://127.0.0.1:${(address as AddressInfo).port}`);
   } finally {
+    server.closeAllConnections();
     await server.closeGracefully();
   }
 }
@@ -447,6 +448,7 @@ describe("server browser boundary", () => {
           );
           request.once("error", reject);
           request.flushHeaders();
+          request.write(prefix.subarray(0, 2));
         });
         await Promise.race([
           spoolCreated.promise,
@@ -455,7 +457,7 @@ describe("server browser boundary", () => {
           }),
         ]);
         watcher.close();
-        request.write(prefix);
+        request.write(prefix.subarray(2));
         request.write("notes");
         await setImmediate();
         await setImmediate();

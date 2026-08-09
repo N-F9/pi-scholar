@@ -72,35 +72,6 @@ async function scanFile(path: string, visit: (byte: number, position: number) =>
   }
 }
 
-async function atomizeFile(path: string): Promise<AtomMetadata[]> {
-  const stat = await lstatNoFollow(path);
-  if (!stat.isFile()) throw new Error(`extraction must be a regular file: ${path}`);
-  if (stat.size === 0) return [];
-  const atoms: AtomMetadata[] = [];
-  let lineStart = 0;
-  let lineNumber = 1;
-  let finalSize = 0;
-  const finishLine = (end: number): void => {
-    atoms.push({
-      index: atoms.length,
-      startByte: lineStart,
-      endByte: end,
-      byteLength: end - lineStart,
-      startLine: lineNumber,
-      endLine: lineNumber,
-    });
-    lineStart = end;
-    lineNumber++;
-  };
-  await scanFile(path, (byte, position) => {
-    finalSize = position + 1;
-    if (byte === 10) finishLine(position + 1);
-  });
-  if (lineStart < finalSize) finishLine(finalSize);
-  if (!atoms.length) throw new Error("extraction is empty");
-  return atoms;
-}
-
 export async function planFileAtoms(path: string): Promise<AtomMetadata[]> {
   const stat = await lstatNoFollow(path);
   if (!stat.isFile()) throw new Error(`extraction must be a regular file: ${path}`);
@@ -139,22 +110,120 @@ export async function planFileAtoms(path: string): Promise<AtomMetadata[]> {
   };
   await scanFile(path, (byte, position) => {
     finalSize = position + 1;
-    if (byte === 10) finishLine(position + 1);
+    if (byte === 10) finishLine(finalSize);
   });
-  if (groupStart < finalSize) {
-    finishLine(finalSize);
-    if (groupStart < finalSize)
-      atoms.push({
-        index: atoms.length,
-        startByte: groupStart,
-        endByte: finalSize,
-        byteLength: finalSize - groupStart,
-        startLine: groupStartLine,
-        endLine: lineNumber - 1,
-      });
-  }
+  if (lastByte !== 10) finishLine(finalSize);
+  if (groupLines > 0)
+    atoms.push({
+      index: atoms.length,
+      startByte: groupStart,
+      endByte: finalSize,
+      byteLength: finalSize - groupStart,
+      startLine: groupStartLine,
+      endLine: lineNumber - 1,
+    });
   if (!atoms.length) throw new Error("extraction is empty");
   return atoms;
+}
+
+interface FileChunkScanner {
+  readonly chunks: AtomMetadata[];
+  visit(byte: number, position: number): void;
+  finish(): void;
+}
+
+function fileEndpointNumbers(proposed: readonly (number | ChunkPlanEndpoint)[] | undefined): number[] | undefined {
+  if (!proposed?.length) return undefined;
+  const endpoints = proposed.map((endpoint) =>
+    typeof endpoint === "number" ? endpoint : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index),
+  );
+  for (const endpoint of endpoints)
+    if (endpoint === undefined || !Number.isInteger(endpoint) || endpoint <= 0)
+      throw new Error("chunk endpoints must be increasing line endpoints");
+  for (let index = 1; index < endpoints.length; index++)
+    if (endpoints[index]! <= endpoints[index - 1]!)
+      throw new Error("chunk endpoints must be strictly increasing line endpoints");
+  return endpoints as number[];
+}
+
+function createFileChunkScanner(proposed: readonly (number | ChunkPlanEndpoint)[] | undefined): FileChunkScanner {
+  const endpoints = fileEndpointNumbers(proposed);
+  const chunks: AtomMetadata[] = [];
+  let lineCount = 0;
+  let chunkStartByte = 0;
+  let chunkStartLine = 1;
+  let scannedSize = 0;
+  let lastByte = -1;
+  let nextEndpoint = 0;
+  const finishLine = (endByte: number): void => {
+    const endLine = ++lineCount;
+    scannedSize = endByte;
+    lastByte = 10;
+    const endpoint = endpoints?.[nextEndpoint];
+    if (endpoint === endLine) {
+      chunks.push({
+        index: chunks.length,
+        startByte: chunkStartByte,
+        endByte,
+        byteLength: endByte - chunkStartByte,
+        startLine: chunkStartLine,
+        endLine,
+      });
+      chunkStartByte = endByte;
+      chunkStartLine = endLine + 1;
+      nextEndpoint++;
+    } else if (endpoint !== undefined && endpoint < endLine) {
+      throw new Error("chunk endpoints must be strictly increasing line endpoints");
+    }
+  };
+  return {
+    chunks,
+    visit(byte, position) {
+      scannedSize = position + 1;
+      lastByte = byte;
+      if (byte === 10) finishLine(position + 1);
+    },
+    finish() {
+      if (scannedSize > 0 && lastByte !== 10) {
+        const endLine = ++lineCount;
+        const endpoint = endpoints?.[nextEndpoint];
+        if (endpoint === endLine) {
+          chunks.push({
+            index: chunks.length,
+            startByte: chunkStartByte,
+            endByte: scannedSize,
+            byteLength: scannedSize - chunkStartByte,
+            startLine: chunkStartLine,
+            endLine,
+          });
+          chunkStartByte = scannedSize;
+          chunkStartLine = endLine + 1;
+          nextEndpoint++;
+        } else if (endpoint !== undefined && endpoint < endLine) {
+          throw new Error("chunk endpoints must be strictly increasing line endpoints");
+        }
+      }
+      if (!lineCount) {
+        if (endpoints?.length) throw new Error("chunk endpoints must cover all extraction lines");
+        return;
+      }
+      if (!endpoints) {
+        if (chunks.length === 0)
+          chunks.push({
+            index: 0,
+            startByte: 0,
+            endByte: scannedSize,
+            byteLength: scannedSize,
+            startLine: 1,
+            endLine: lineCount,
+          });
+        return;
+      }
+      if (endpoints.at(-1)! > lineCount) throw new Error("chunk endpoints must be increasing line endpoints");
+      if (nextEndpoint !== endpoints.length || endpoints.at(-1) !== lineCount)
+        throw new Error("chunk endpoints must cover all extraction lines");
+    },
+  };
 }
 async function copySpoolRange(
   input: Awaited<ReturnType<typeof openFile>>,
@@ -173,10 +242,14 @@ async function copySpoolRange(
   }
 }
 
-export async function normalizeMarkdownFile(source: string, target: string): Promise<void> {
+export async function normalizeMarkdownFile(source: string, target: string, collapseBlankRuns = true): Promise<void> {
   const inputStat = await lstatNoFollow(source);
   if (!inputStat.isFile()) throw new Error(`Markdown source must be a regular file: ${source}`);
   assertNoSymlinkPath(target);
+  if (!collapseBlankRuns) {
+    await copyFileNoFollow(source, target);
+    return;
+  }
   await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
   const output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   const spoolPath = join(dirname(target), `.${basename(target)}.${randomUUID()}.line`);
@@ -271,44 +344,6 @@ export async function normalizeMarkdownFile(source: string, target: string): Pro
   await output.close();
 }
 
-function atomizeFileSync(path: string): AtomMetadata[] {
-  const stat = lstatNoFollowSync(path);
-  if (!stat.isFile()) throw new Error(`extraction must be a regular file: ${path}`);
-  if (stat.size === 0) return [];
-  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
-  const atoms: AtomMetadata[] = [];
-  let lineStart = 0;
-  let lineNumber = 1;
-  let position = 0;
-  const finishLine = (end: number): void => {
-    atoms.push({
-      index: atoms.length,
-      startByte: lineStart,
-      endByte: end,
-      byteLength: end - lineStart,
-      startLine: lineNumber,
-      endLine: lineNumber,
-    });
-    lineStart = end;
-    lineNumber++;
-  };
-  try {
-    for (;;) {
-      const count = readSync(fd, buffer, 0, buffer.length, null);
-      if (!count) break;
-      for (let index = 0; index < count; index++, position++) {
-        if (buffer[index] === 10) finishLine(position + 1);
-      }
-    }
-  } finally {
-    closeSync(fd);
-  }
-  if (lineStart < position) finishLine(position);
-  if (!atoms.length) throw new Error("extraction is empty");
-  return atoms;
-}
-
 export function atomizeExtraction(extracted: string | Uint8Array): Array<AtomMetadata & { body: Buffer }> {
   const bytes = Buffer.from(extracted);
   return atomRowsFromBuffer(bytes).map((atom) => ({
@@ -366,26 +401,34 @@ export function validateChunkEndpoints(
 export async function validateFileEndpoints(
   path: string,
   proposed?: readonly (number | ChunkPlanEndpoint)[],
-): Promise<{ atoms: AtomMetadata[]; chunks: AtomMetadata[] }> {
-  const atoms = await atomizeFile(path);
-  const endpoints = endpointsFrom(proposed, atoms.length);
-  const chunks: AtomMetadata[] = [];
-  let startAtom = 0;
-  for (const [index, endAtom] of endpoints.entries()) {
-    const start = atoms[startAtom];
-    const end = atoms[endAtom - 1];
-    if (!start || !end) throw new Error("chunk endpoint is outside extraction");
-    chunks.push({
-      index,
-      startByte: start.startByte,
-      endByte: end.endByte,
-      byteLength: end.endByte - start.startByte,
-      startLine: start.startLine,
-      endLine: end.endLine,
-    });
-    startAtom = endAtom;
+): Promise<{ chunks: AtomMetadata[] }> {
+  const scanner = createFileChunkScanner(proposed);
+  await scanFile(path, (byte, position) => scanner.visit(byte, position));
+  scanner.finish();
+  return { chunks: scanner.chunks };
+}
+
+export function validateFileEndpointsSync(
+  path: string,
+  proposed?: readonly (number | ChunkPlanEndpoint)[],
+): { chunks: AtomMetadata[] } {
+  const stat = lstatNoFollowSync(path);
+  if (!stat.isFile()) throw new Error(`extraction must be a regular file: ${path}`);
+  const scanner = createFileChunkScanner(proposed);
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+  let position = 0;
+  try {
+    for (;;) {
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (!count) break;
+      for (let index = 0; index < count; index++, position++) scanner.visit(buffer[index]!, position);
+    }
+  } finally {
+    closeSync(fd);
   }
-  return { atoms, chunks };
+  scanner.finish();
+  return { chunks: scanner.chunks };
 }
 
 export async function writeFileChunks(
@@ -512,5 +555,3 @@ export function chunkExtraction(
 ): SourceChunk[] {
   return validateChunkEndpoints(extracted, endpoints);
 }
-
-export { atomizeFile, atomizeFileSync };

@@ -6,6 +6,7 @@ import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
+import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { SourceService, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
 import { isExecutableHtml, WikiService } from "../src/wiki.js";
@@ -79,6 +80,56 @@ describe("source admission mechanics", () => {
     expect(chunkBodies[1]?.toString()).toBe(lines.slice(boundary).join(""));
     expect(Buffer.concat(chunkBodies).equals(extracted)).toBe(true);
     db.close();
+  });
+  it("flushes a trailing-newline planning group without inventing an extra line", async () => {
+    const { paths, db, sources } = await fixture();
+    const lineCount = 2_051;
+    const text = Array.from({ length: lineCount }, (_, index) => `line-${index}\n`).join("");
+    await fs.writeFile(join(paths.inboxRoot, "odd-lines.txt"), text);
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const prepared = await sources.prepareClaim(await sources.claim(entry));
+    expect(prepared.atoms).toHaveLength(1_026);
+    expect(prepared.atoms.at(-1)).toMatchObject({
+      startLine: lineCount,
+      endLine: lineCount,
+      startByte: text.length - `line-${lineCount - 1}\n`.length,
+      endByte: text.length,
+    });
+    db.close();
+  });
+
+  it("validates newline-heavy files with metadata bounded by proposed chunks", async () => {
+    const { root, db } = await fixture();
+    const lineCount = 100_001;
+    const path = join(root, "newline-heavy.txt");
+    await fs.writeFile(path, "\n".repeat(lineCount));
+    const validated = await validateFileEndpoints(path, [25_000, 50_000, 75_000, lineCount]);
+    expect(Object.keys(validated)).toEqual(["chunks"]);
+    expect(validated.chunks).toHaveLength(4);
+    expect(validated.chunks.at(-1)).toMatchObject({
+      startLine: 75_001,
+      endLine: lineCount,
+      startByte: 75_000,
+      endByte: lineCount,
+    });
+    db.close();
+  });
+
+  it("preserves blank runs in native JavaScript and Python code", async () => {
+    const cases = [
+      ["literal.js", "const value = `first\n\n\nlast`;\n"],
+      ["literal.py", "value = '''first\n\n\nlast'''\n"],
+    ] as const;
+    for (const [name, code] of cases) {
+      const { paths, db, sources } = await fixture();
+      await fs.writeFile(join(paths.inboxRoot, name), code);
+      const [entry] = await sources.discover();
+      if (!entry) throw new Error("source entry was not discovered");
+      const result = await sources.admitClaim(await sources.claim(entry));
+      expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe(code);
+      db.close();
+    }
   });
   it("normalizes blank runs outside fences while preserving original bytes and fenced content", async () => {
     const { paths, db, sources } = await fixture();
@@ -349,6 +400,21 @@ describe("source admission mechanics", () => {
     await fs.mkdir(join(repository, "nested", ".git"), { recursive: true });
     await fs.writeFile(join(repository, "nested", ".git", "internal"), "internal\n");
     expect((await git(["add", "--", ".gitignore", "tracked.txt"])).code).toBe(0);
+    expect(
+      (
+        await git([
+          "-c",
+          "user.name=Pi Scholar",
+          "-c",
+          "user.email=pi-scholar@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ])
+      ).code,
+    ).toBe(0);
+    expect((await git(["rev-parse", "HEAD"])).stdout.trim()).not.toBe("revision");
     const sources = new SourceService(db, paths, { gitRevision: () => "revision" });
     const staged = await sources.stage({ path: repository });
     expect(staged.kind).toBe("repository");

@@ -1,6 +1,6 @@
 import { promises as fs, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomizeFile } from "./source-chunks.js";
+import { validateFileEndpoints } from "./source-chunks.js";
 import {
   canonical,
   compareFileRange,
@@ -182,10 +182,15 @@ export async function verifyRetainedPacket(
     extractedFile.digest !== extractedDigest
   )
     throw new Error("retained source extraction digest mismatch");
-  const atoms = await atomizeFile(extractedPath);
   const chunkNames = (await fs.readdir(chunksRoot)).sort((left, right) => left.localeCompare(right));
   if (!manifest.chunks.length || chunkNames.length !== manifest.chunks.length)
     throw new Error("retained source chunks are incomplete");
+  const planned = await validateFileEndpoints(
+    extractedPath,
+    manifest.chunks.map((chunk, index) =>
+      manifestInteger((chunk as unknown as Record<string, unknown>).endAtom, `chunks[${index}].endAtom`),
+    ),
+  );
   let nextAtom = 0;
   let nextByte = 0;
   for (const [index, chunk] of manifest.chunks.entries()) {
@@ -211,25 +216,24 @@ export async function verifyRetainedPacket(
     const startByte = manifestInteger(record.startByte, `chunks[${index}].startByte`);
     const endByte = manifestInteger(record.endByte, `chunks[${index}].endByte`);
     const byteLength = manifestInteger(record.byteLength, `chunks[${index}].byteLength`);
+    const plannedChunk = planned.chunks[index];
     if (
       startAtom !== atomStart ||
       endAtom !== atomEnd ||
       startAtom !== nextAtom ||
       endAtom <= startAtom ||
-      endAtom > atoms.length ||
       startByte !== nextByte ||
       endByte < startByte ||
       endByte - startByte !== chunkFile.size ||
-      endByte - startByte !== byteLength
+      endByte - startByte !== byteLength ||
+      !plannedChunk ||
+      plannedChunk.startLine - 1 !== startAtom ||
+      plannedChunk.endLine !== endAtom ||
+      plannedChunk.startByte !== startByte ||
+      plannedChunk.endByte !== endByte
     )
       throw new Error("retained source chunk coverage is invalid");
-    const firstAtom = atoms[startAtom];
-    const lastAtom = atoms[endAtom - 1];
     if (
-      !firstAtom ||
-      !lastAtom ||
-      firstAtom.startByte !== startByte ||
-      lastAtom.endByte !== endByte ||
       !(await compareFileRange(extractedPath, startByte, endByte, chunkPath)) ||
       chunkFile.digest !== manifestDigest(record.digest, `chunks[${index}].digest`)
     )
@@ -237,7 +241,7 @@ export async function verifyRetainedPacket(
     nextAtom = endAtom;
     nextByte = endByte;
   }
-  if (nextAtom !== atoms.length || nextByte !== extractedFile.size)
+  if (nextAtom !== planned.chunks.at(-1)?.endLine || nextByte !== extractedFile.size)
     throw new Error("retained source chunk reconstruction is incomplete");
   return manifest;
 }

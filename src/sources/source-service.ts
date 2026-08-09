@@ -663,17 +663,19 @@ export class SourceService {
     const repository = stat.isDirectory() && (await this.isRepository(source));
     const kind: SourceKind = repository ? "repository" : inferKind(source, stat);
     if (!repository && inferKind(name, stat) !== kind) throw new Error(`staging name kind must be ${kind}`);
-    let initialRevision: string | undefined;
-    if (repository) {
-      try {
-        initialRevision = await repositoryRevision(source);
-      } catch (error) {
-        if (!this.adapters.gitRevision) throw error;
-        initialRevision = await this.revision(source);
-      }
-    }
+    const gitRevision = this.adapters.gitRevision;
+    const revisionProvider = repository
+      ? typeof gitRevision === "function"
+        ? gitRevision
+        : gitRevision
+          ? (root: string) => gitRevision.revision(root)
+          : repositoryRevision
+      : undefined;
+    const readRevision = async (): Promise<string | undefined> =>
+      revisionProvider ? (await revisionProvider(source)) || undefined : undefined;
+    const initialRevision = repository ? await readRevision() : undefined;
     const files = repository ? await repositoryFiles(source) : undefined;
-    const beforeCopyRevision = repository ? await this.revision(source) : undefined;
+    const beforeCopyRevision = repository ? await readRevision() : undefined;
     if (repository && beforeCopyRevision !== initialRevision) throw new Error("repository changed during staging");
     if (repository && !initialRevision) throw new Error("repository revision is unavailable");
     if (!repository) await measurePath(source);
@@ -719,7 +721,7 @@ export class SourceService {
           const copiedFiles = await walkFiles(join(target, metadata!.payload), "", false);
           if (!sameFileContents(files ?? [], copiedFiles)) throw new Error("repository copy digest mismatch");
           const afterFiles = await repositoryFiles(source);
-          const afterRevision = await this.revision(source);
+          const afterRevision = await readRevision();
           if (afterRevision !== initialRevision || !sameFileSnapshots(files ?? [], afterFiles))
             throw new Error("repository changed during staging");
         }
@@ -899,7 +901,7 @@ export class SourceService {
       }
       const rawStat = await lstatNoFollow(rawExtracted);
       if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");
-      await normalizeMarkdownFile(rawExtracted, extractedAbsolute);
+      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code");
       await fs.rm(rawExtracted, { force: true });
       const extractedHash = await hashFile(extractedAbsolute);
       if (extractedHash.size === 0) throw new Error("empty extraction");
@@ -1142,15 +1144,14 @@ export class SourceService {
           mediaType,
         })),
         chunks: chunkFiles.map(({ index, startByte, endByte, digest }) => {
+          const plannedChunk = planned.chunks[index];
           const startAtom =
-            planned.chunks[index]?.index === index
-              ? planned.chunks[index]!.startByte === startByte
-                ? planned.atoms.findIndex((atom) => atom.startByte === startByte)
-                : -1
+            plannedChunk && plannedChunk.index === index && plannedChunk.startByte === startByte
+              ? plannedChunk.startLine - 1
               : -1;
           const endAtom =
-            planned.chunks[index]?.index === index
-              ? planned.atoms.findIndex((atom) => atom.endByte === endByte) + 1
+            plannedChunk && plannedChunk.index === index && plannedChunk.endByte === endByte
+              ? plannedChunk.endLine
               : -1;
           if (startAtom < 0 || endAtom <= startAtom) throw new Error("chunk atom mapping failed");
           return {
