@@ -451,6 +451,93 @@ describe("source admission mechanics", () => {
     );
     db.close();
   });
+  it("blocks removal while a cited page has an unsettled submitted quiz", async () => {
+    const { paths, db, sources, wiki } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const chunkId = result.manifest.chunks[0]?.chunkId;
+    if (!chunkId) throw new Error("source chunk is missing");
+    const page = await wiki.create({
+      path: "submitted-grounding.md",
+      body: `# Grounded\n\nGrounded at ${chunkId}.\n`,
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    const now = new Date().toISOString();
+    db.run("INSERT INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, 'citation')", [
+      result.sourceId,
+      pageId,
+      chunkId,
+    ]);
+    db.run(
+      "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', NULL, ?, NULL, NULL, NULL)",
+      ["quiz-submitted-removal", "2099-01-02", now],
+    );
+    db.run(
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?)",
+      ["question-submitted-removal", "quiz-submitted-removal", "short-answer", "Explain", "[]"],
+    );
+    db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
+      "question-submitted-removal",
+      pageId,
+      JSON.stringify("Explain"),
+      1,
+    ]);
+    db.run(
+      "INSERT INTO quiz_evidence (quiz_id, reference, page_id, relative_path, anchor, heading, page_digest, page_revision, text_digest, excerpt, excerpt_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        "quiz-submitted-removal",
+        "evidence-submitted-removal",
+        pageId,
+        page.page.relativePath,
+        "#grounded",
+        "Grounded",
+        page.page.digest,
+        page.page.revision,
+        "text-digest",
+        `Grounded at ${chunkId}.`,
+        "excerpt-digest",
+      ],
+    );
+    const openPreview = sources.removalPreview(result.sourceId);
+    db.run("UPDATE quizzes SET status = 'submitted', submitted_at = ? WHERE quiz_id = ?", [
+      now,
+      "quiz-submitted-removal",
+    ]);
+    await expect(sources.removeConfirmed(result.sourceId, openPreview.confirmationId)).rejects.toThrow(/stale/iu);
+    const preview = sources.removalPreview(result.sourceId);
+    const packetBefore = await fs.readFile(join(result.packetPath, "extracted.md"));
+    const sourceBefore = db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [
+      result.sourceId,
+    ]);
+    const pageBefore = db.get<{ status: string; revision: number }>(
+      "SELECT status, revision FROM pages WHERE page_id = ?",
+      [pageId],
+    );
+    const quizBefore = db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", [
+      "quiz-submitted-removal",
+    ]);
+    const dependenciesBefore = db.all<Record<string, unknown>>(
+      "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies WHERE source_id = ? ORDER BY page_id, chunk_id",
+      [result.sourceId],
+    );
+    await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(
+      /submitted quizzes without page settlement/iu,
+    );
+    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).equals(packetBefore)).toBe(true);
+    expect(await fs.lstat(result.packetPath)).toBeTruthy();
+    expect(db.get("SELECT status FROM sources WHERE source_id = ?", [result.sourceId])).toEqual(sourceBefore);
+    expect(db.get("SELECT status, revision FROM pages WHERE page_id = ?", [pageId])).toEqual(pageBefore);
+    expect(db.get("SELECT status FROM quizzes WHERE quiz_id = ?", ["quiz-submitted-removal"])).toEqual(quizBefore);
+    expect(
+      db.all<Record<string, unknown>>(
+        "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies WHERE source_id = ? ORDER BY page_id, chunk_id",
+        [result.sourceId],
+      ),
+    ).toEqual(dependenciesBefore);
+    db.close();
+  });
   it("restores an active packet from deterministic quarantine before recomputing removal confirmation", async () => {
     const { paths, db, sources } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "crash-active.txt"), "active\n");

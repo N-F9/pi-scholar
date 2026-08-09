@@ -22,7 +22,7 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture() {
+function fixture(options: { readonly maintenance?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
@@ -30,6 +30,7 @@ function fixture() {
   const app = new ScholarApplication({
     paths,
     db,
+    adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
     doctor: () => {
       calls.push("doctor");
       return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
@@ -434,6 +435,26 @@ async function gradingFixture() {
   const draft = app.quiz.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
   return { ...fixtureValue, date, pageId, questionId, quiz: app.quiz.get(date)!, draft };
 }
+async function prerequisiteFixture() {
+  const fixtureValue = fixture({ maintenance: true });
+  const { app } = fixtureValue;
+  const dependent = await app.wiki.create({
+    path: "dependent.md",
+    title: "Dependent",
+    body: "# Section\n\ndependent\n",
+    quizWorthiness: "eligible",
+  });
+  const prerequisite = await app.wiki.create({
+    path: "prerequisite.md",
+    title: "Prerequisite",
+    body: "# Section\n\nprerequisite\n",
+    quizWorthiness: "eligible",
+  });
+  app.scheduler.ensurePageLearning(dependent.page.pageId);
+  app.scheduler.ensurePageLearning(prerequisite.page.pageId);
+  app.scheduler.setPrerequisites(dependent.page.pageId, [prerequisite.page.pageId]);
+  return { ...fixtureValue, dependent: dependent.page, prerequisite: prerequisite.page };
+}
 
 function gradeFor(context: GradingContext, pageId: string, questionId: string, evidence: readonly string[]) {
   assert.ok(context.quiz);
@@ -626,6 +647,130 @@ describe("application wiki mutation quiz guards", () => {
       assert.notEqual(updated.page.digest, before.digest);
       assert.equal(updated.page.revision, before.revision + 1);
       assert.match(updated.markdown, /changed/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("application prerequisite mutation guards", () => {
+  it("rejects making a dependent page ineligible without mutating the page or edge", async () => {
+    const { app, db, dependent } = await prerequisiteFixture();
+    try {
+      const before = await app.wiki.get(dependent.pageId);
+      const beforePrerequisites = db.all<Record<string, unknown>>(
+        "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(app.updateNote(dependent.pageId, { quizWorthiness: "skip" }), /prerequisites/u);
+      const after = await app.wiki.get(dependent.pageId);
+      assert.equal(after.quizWorthiness, before.quizWorthiness);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+        ),
+        beforePrerequisites,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects making a prerequisite page unknown through maintenance without mutating the page or edge", async () => {
+    const { app, db, prerequisite } = await prerequisiteFixture();
+    try {
+      const before = await app.wiki.get(prerequisite.pageId);
+      const beforePrerequisites = db.all<Record<string, unknown>>(
+        "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(
+        app.applyMaintenance({
+          kind: "update-page",
+          pageId: prerequisite.pageId,
+          expectedDigest: before.digest,
+          body: "# Section\n\nchanged\n",
+          quizWorthiness: "unknown",
+        }),
+        /prerequisites/u,
+      );
+      const after = await app.wiki.get(prerequisite.pageId);
+      assert.equal(after.quizWorthiness, before.quizWorthiness);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+        ),
+        beforePrerequisites,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects ineligible resolve-issue corrections before preparing the page update", async () => {
+    const { app, db, dependent } = await prerequisiteFixture();
+    try {
+      const issue = await app.wiki.report({
+        pageId: dependent.pageId,
+        heading: "Section",
+        description: "Correct the section.",
+      });
+      const before = await app.wiki.get(dependent.pageId);
+      const beforePrerequisites = db.all<Record<string, unknown>>(
+        "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(
+        app.applyMaintenance({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: dependent.pageId,
+            expectedDigest: before.digest,
+            body: "# Section\n\ncorrected\n",
+            quizWorthiness: "skip",
+          },
+          resolution: "Corrected the section.",
+        }),
+        /prerequisites/u,
+      );
+      const after = await app.wiki.get(dependent.pageId);
+      assert.equal(after.quizWorthiness, before.quizWorthiness);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+        ),
+        beforePrerequisites,
+      );
+      assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, "open");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("does not over-block body-only or eligible updates on prerequisite pages", async () => {
+    const { app, db, prerequisite } = await prerequisiteFixture();
+    try {
+      const first = await app.wiki.get(prerequisite.pageId);
+      const bodyOnly = await app.updateNote(prerequisite.pageId, {
+        body: "# Section\n\nbody-only\n",
+      });
+      assert.equal(bodyOnly.page.quizWorthiness, first.quizWorthiness);
+      assert.equal(bodyOnly.page.revision, first.revision + 1);
+      const eligible = await app.updateNote(prerequisite.pageId, {
+        body: "# Section\n\neligible\n",
+        quizWorthiness: "eligible",
+      });
+      assert.equal(eligible.page.quizWorthiness, "eligible");
+      assert.equal(eligible.page.revision, bodyOnly.page.revision + 1);
+      assert.equal(db.all("SELECT page_id, prerequisite_page_id FROM page_prerequisites").length, 1);
     } finally {
       await app.close();
       db.close();
