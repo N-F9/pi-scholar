@@ -483,6 +483,8 @@ async function lifecycleFinish<T>(
 
 async function stage(app: ScholarApplication, params: Record<string, unknown>): Promise<unknown> {
   const input = { ...params };
+  for (const key of ["path", "filePath", "url", "name", "displayName", "originalName", "mediaType"] as const)
+    if (input[key] === "") delete input[key];
   if (typeof input.kind !== "string") {
     if (typeof input.url === "string") input.kind = "url";
     else if (typeof input.text === "string") input.kind = "pasted";

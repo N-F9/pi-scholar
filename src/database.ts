@@ -1,6 +1,23 @@
 import { lstatSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import type { VaultPaths } from "./vault.js";
+
+interface DatabaseHandle {
+  exec(sql: string): unknown;
+  prepare(sql: string): object;
+  close(): void;
+}
+
+type DatabaseConstructor = new (path: string, options: Record<string, unknown>) => DatabaseHandle;
+
+// Node and Bun expose different built-in SQLite modules, so this import is runtime-selected.
+const runningOnBun = "bun" in process.versions;
+const sqliteModule = (await import(runningOnBun ? "bun:sqlite" : "node:sqlite")) as unknown as {
+  readonly Database?: DatabaseConstructor;
+  readonly DatabaseSync?: DatabaseConstructor;
+};
+const selectedDatabase = runningOnBun ? sqliteModule.Database : sqliteModule.DatabaseSync;
+if (!selectedDatabase) throw new Error("SQLite runtime is unavailable");
+const SqliteDatabase: DatabaseConstructor = selectedDatabase;
 
 export type SqlValue = string | number | bigint | boolean | Uint8Array | null;
 export type SqlParameters = readonly unknown[] | Readonly<Record<string, SqlValue>>;
@@ -435,10 +452,10 @@ function bind(statement: object, parameters: SqlParameters | undefined, method: 
 
 export class ScholarDatabase {
   readonly path: string;
-  readonly #database: DatabaseSync;
+  readonly #database: DatabaseHandle;
   #transactionDepth = 0;
 
-  constructor(path: string, database: DatabaseSync) {
+  constructor(path: string, database: DatabaseHandle) {
     this.path = path;
     this.#database = database;
   }
@@ -600,7 +617,11 @@ export function openDatabase(input: string | VaultPaths, options: OpenDatabaseOp
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   validateDatabaseSidecars(path);
-  const database = new DatabaseSync(path, { readOnly, enableForeignKeyConstraints: true });
+  const database = new SqliteDatabase(
+    path,
+    runningOnBun ? { readonly: readOnly, create: !readOnly } : { readOnly, enableForeignKeyConstraints: true },
+  );
+  if (runningOnBun) database.exec("PRAGMA foreign_keys = ON");
   const db = new ScholarDatabase(path, database);
   if (!readOnly) db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
   if (options.initializeSchema ?? !readOnly) ensureSchema(db);

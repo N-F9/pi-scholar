@@ -121,7 +121,14 @@ test("pasted source is staged pending admission", async () => {
       "Call exactly one Scholar tool: scholar_add. Do not call any other tool.",
       "Use exactly the following JSON argument object; preserve the text value exactly after JSON decoding.",
       "After the call, answer concisely that the source is staged and pending admission.",
-      JSON.stringify({ kind: "pasted", text: fixtureText }),
+      JSON.stringify({
+        kind: "pasted",
+        text: fixtureText,
+        name: "plain-notes.txt",
+        displayName: "plain-notes.txt",
+        originalName: "plain-notes.txt",
+        mediaType: "text/plain",
+      }),
     ].join("\n");
 
     const actor = await runActor({ cwd: vault, prompt });
