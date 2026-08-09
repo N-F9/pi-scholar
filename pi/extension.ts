@@ -101,6 +101,7 @@ const sourceInput = Type.Object({
       Type.Literal("document"),
       Type.Literal("url"),
       Type.Literal("text"),
+      Type.Literal("pasted"),
       Type.Literal("note"),
       Type.Literal("code"),
       Type.Literal("directory"),
