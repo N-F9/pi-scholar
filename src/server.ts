@@ -307,7 +307,6 @@ async function receiveMultipartUpload(
         const output = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
         writePromise = pipeline(file, output).catch((error) => {
           fail(error);
-          throw error;
         });
       });
       parser.on("filesLimit", () => fail(new ValidationError("multipart request contains multiple files")));

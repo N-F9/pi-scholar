@@ -29,6 +29,32 @@ export const SOURCE_KINDS: readonly SourceKind[] = [
 ];
 export const INPUT_KINDS: readonly InputKind[] = [...SOURCE_KINDS, "upload", "pasted"];
 const IO_BUFFER_SIZE = 64 * 1024;
+async function writeFully(
+  handle: FileHandle,
+  buffer: Uint8Array,
+  offset = 0,
+  length = buffer.byteLength - offset,
+  position?: number,
+): Promise<void> {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    offset < 0 ||
+    length < 0 ||
+    offset + length > buffer.byteLength ||
+    (position !== undefined && (!Number.isSafeInteger(position) || position < 0))
+  )
+    throw new Error("invalid file write range");
+  let written = 0;
+  while (written < length) {
+    const result =
+      position === undefined
+        ? await handle.write(buffer, offset + written, length - written)
+        : await handle.write(buffer, offset + written, length - written, position + written);
+    if (result.bytesWritten <= 0) throw new Error("file write made no progress");
+    written += result.bytesWritten;
+  }
+}
 
 function provenanceUrl(url: URL): string {
   const safe = new URL(url.toString());
@@ -233,7 +259,7 @@ async function copyFileNoFollow(source: string, target: string): Promise<void> {
     for (;;) {
       const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
       if (!bytesRead) break;
-      await output.write(buffer, 0, bytesRead);
+      await writeFully(output!, buffer, 0, bytesRead);
     }
   } finally {
     await input.close();
@@ -263,7 +289,7 @@ async function copyFileRangeNoFollow(
       const want = Math.min(buffer.length, endByte - position);
       const { bytesRead } = await input.read(buffer, 0, want, position);
       if (!bytesRead) throw new Error("source ended while copying range");
-      await output.write(buffer, 0, bytesRead);
+      await writeFully(output!, buffer, 0, bytesRead);
       position += bytesRead;
     }
   } finally {
@@ -326,7 +352,15 @@ async function walkFiles(root: string, current = "", skipGit = true): Promise<Fi
   const stat = await lstatNoFollow(absolute);
   if (stat.isFile()) {
     const digest = await hashFile(absolute);
-    return [{ path: current || basename(root), absolutePath: absolute, size: digest.size, digest: digest.digest }];
+    return [
+      {
+        path: current || basename(root),
+        absolutePath: absolute,
+        size: digest.size,
+        digest: digest.digest,
+        identity: statIdentity(stat),
+      },
+    ];
   }
   if (!stat.isDirectory()) throw new Error(`unsupported filesystem entry: ${absolute}`);
   const files: FileSnapshot[] = [];
@@ -385,7 +419,7 @@ async function repositoryFiles(root: string): Promise<FileSnapshot[]> {
     const stat = await lstatNoFollow(absolutePath);
     if (!stat.isFile()) throw new Error(`repository entry is not a regular file: ${path}`);
     const digest = await hashFile(absolutePath);
-    files.push({ path, absolutePath, size: digest.size, digest: digest.digest });
+    files.push({ path, absolutePath, size: digest.size, digest: digest.digest, identity: statIdentity(stat) });
   }
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
@@ -589,6 +623,14 @@ async function snapshotPath(
 }
 async function writeTree(root: string, files: FileSnapshot[]): Promise<void> {
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  let requiredBytes = 0n;
+  for (const file of files) {
+    if (!Number.isSafeInteger(file.size) || file.size < 0) throw new Error("invalid source file size");
+    requiredBytes += BigInt(file.size);
+  }
+  const filesystem = await fs.statfs(root);
+  const availableBytes = BigInt(filesystem.bavail) * BigInt(filesystem.bsize);
+  if (requiredBytes > availableBytes) throw new Error("insufficient available space for source copy");
   for (const file of files) {
     const target = ensureWithin(root, join(root, validRelativePath(file.path)));
     await copyFileNoFollow(file.absolutePath, target);
@@ -659,5 +701,6 @@ export {
   walkFiles,
   wikiPathFor,
   workArtifactRelative,
+  writeFully,
   writeTree,
 };

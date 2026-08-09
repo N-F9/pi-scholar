@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
+import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
 import { SourceService, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -44,29 +45,38 @@ describe("source admission mechanics", () => {
     db.close();
   });
 
-  it("retains long native extraction and reconstructs planned chunks exactly", async () => {
+  it("retains bounded planning atoms while publishing an exact long-source line boundary", async () => {
     const { paths, db, sources } = await fixture();
-    const text = Array.from({ length: 20_000 }, (_, index) => `line-${index}\n`).join("");
+    const lineCount = 20_000;
+    const boundary = 12_345;
+    const lines = Array.from({ length: lineCount }, (_, index) =>
+      index === boundary - 1 ? "# Meaningful boundary\n" : `line-${index}\n`,
+    );
+    const text = lines.join("");
     await fs.writeFile(join(paths.inboxRoot, "long.txt"), text);
     const [entry] = await sources.discover();
     const claim = await sources.claim(entry);
     const prepared = await sources.prepareClaim(claim);
     expect(prepared.atoms.length).toBeLessThanOrEqual(2048);
-    const midpoint = Math.floor(prepared.atoms.length / 2);
+    const containingAtom = prepared.atoms.find(({ startLine, endLine }) => startLine < boundary && boundary < endLine);
+    expect(containingAtom).toBeDefined();
     const result = await sources.publishPreparedClaim({
       prepared,
       preparedId: prepared.preparedId,
       claimId: prepared.claimId,
       digest: prepared.digest,
-      endpoints: [midpoint, prepared.atoms.length],
+      endpoints: [boundary, lineCount],
     });
     const extracted = await fs.readFile(join(result.packetPath, "extracted.md"));
     expect(extracted.toString()).toBe(text);
     const chunkBodies = await Promise.all(
-      (await fs.readdir(join(result.packetPath, "chunks"))).map((name) =>
-        fs.readFile(join(result.packetPath, "chunks", name)),
-      ),
+      (await fs.readdir(join(result.packetPath, "chunks")))
+        .sort()
+        .map((name) => fs.readFile(join(result.packetPath, "chunks", name))),
     );
+    const firstChunk = lines.slice(0, boundary).join("");
+    expect(chunkBodies[0]?.toString()).toBe(firstChunk);
+    expect(chunkBodies[1]?.toString()).toBe(lines.slice(boundary).join(""));
     expect(Buffer.concat(chunkBodies).equals(extracted)).toBe(true);
     db.close();
   });
@@ -83,6 +93,21 @@ describe("source admission mechanics", () => {
     expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
     db.close();
   });
+  it("rejects packets without the exact normalizer declaration", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "missing-normalizer.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const claim = await sources.claim(entry);
+    const result = await sources.admitClaim(claim);
+    const manifestPath = join(result.packetPath, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    delete manifest.normalizer;
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await expect(sources.admitClaim(claim)).rejects.toThrow(/normalizer/iu);
+    expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status).toBe("fail");
+    db.close();
+  }, 15_000);
 
   it("prepares immutable work artifacts and publishes only the bound claim", async () => {
     const { paths, db, sources } = await fixture();
@@ -209,6 +234,39 @@ describe("source admission mechanics", () => {
     }
   });
 
+  it("fetches bracketed IPv6 loopback URLs", async ({ skip }) => {
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.end("ipv6-loopback\n");
+    });
+    const available = await new Promise<boolean>((resolve, reject) => {
+      server.once("error", (error: NodeJS.ErrnoException) => {
+        if (error.code === "EAFNOSUPPORT" || error.code === "EADDRNOTAVAIL") resolve(false);
+        else reject(error);
+      });
+      server.listen(0, "::1", () => resolve(true));
+    });
+    if (!available) {
+      skip();
+      return;
+    }
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string")
+        throw new Error("IPv6 loopback server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        const staged = await sources.stage({ url: `http://[::1]:${address.port}/ipv6-loopback.txt` });
+        expect((await fs.readFile(join(staged.absolutePath, "payload"))).toString()).toBe("ipv6-loopback\n");
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
   it("uses a unique exclusive work directory for concurrent prepares", async () => {
     const { paths, db, sources } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "concurrent.txt"), "same\n");
@@ -312,6 +370,25 @@ describe("source admission mechanics", () => {
     const claim = await sources.claim(entry);
     expect(claim.snapshot.revision).toBe("revision");
     expect(claim.snapshot.files.map((file) => file.path)).toEqual([".gitignore", "tracked.txt"]);
+    db.close();
+  });
+  it("rejects repository staging when the revision changes after copying", async () => {
+    const { root, paths, db } = await fixture();
+    const repository = join(root, "changing-repository");
+    await fs.mkdir(repository);
+    const git = (args: string[]) => runChild("git", args, { cwd: repository, timeoutMs: 10_000 });
+    expect((await git(["init", "--quiet"])).code).toBe(0);
+    await fs.writeFile(join(repository, "tracked.txt"), "tracked\n");
+    let revisionCalls = 0;
+    const sources = new SourceService(db, paths, {
+      gitRevision: () => {
+        revisionCalls += 1;
+        return revisionCalls < 3 ? "revision" : "changed";
+      },
+    });
+    await expect(sources.stage({ path: repository })).rejects.toThrow(/repository changed/iu);
+    expect(await fs.readdir(paths.inboxRoot)).toHaveLength(0);
+    expect(revisionCalls).toBeGreaterThanOrEqual(3);
     db.close();
   });
 

@@ -86,6 +86,8 @@ export interface PreparedAdmissionAtom {
   readonly startByte: number;
   readonly endByte: number;
   readonly byteLength: number;
+  readonly startLine: number;
+  readonly endLine: number;
 }
 
 export interface PreparedAdmission {

@@ -12,6 +12,7 @@ import {
   lstatNoFollow,
   lstatNoFollowSync,
   walkFiles,
+  writeFully,
 } from "./source-files.js";
 import type { ChunkPlanEndpoint, DoclingResult, SourceChunk, TreeSnapshot } from "./source-service.js";
 
@@ -22,6 +23,8 @@ export interface AtomMetadata {
   startByte: number;
   endByte: number;
   byteLength: number;
+  startLine: number;
+  endLine: number;
 }
 export interface FileDoclingResult {
   extractedPath: string;
@@ -31,32 +34,23 @@ export interface FileDoclingResult {
 
 function atomRowsFromBuffer(extracted: Buffer): AtomMetadata[] {
   if (extracted.length === 0) return [];
-  let lineCount = 0;
-  for (const byte of extracted) if (byte === 10) lineCount++;
-  if (extracted.at(-1) !== 10) lineCount++;
-  const groupSize = Math.max(1, Math.ceil(lineCount / MAX_ATOMS));
   const atoms: AtomMetadata[] = [];
   let lineStart = 0;
-  let groupStart = 0;
-  let groupLines = 0;
+  let lineNumber = 1;
   const finishLine = (end: number): void => {
-    groupLines++;
-    if (groupLines >= groupSize) {
-      atoms.push({ index: atoms.length, startByte: groupStart, endByte: end, byteLength: end - groupStart });
-      groupStart = end;
-      groupLines = 0;
-    }
+    atoms.push({
+      index: atoms.length,
+      startByte: lineStart,
+      endByte: end,
+      byteLength: end - lineStart,
+      startLine: lineNumber,
+      endLine: lineNumber,
+    });
     lineStart = end;
+    lineNumber++;
   };
   for (let index = 0; index < extracted.length; index++) if (extracted[index] === 10) finishLine(index + 1);
   if (lineStart < extracted.length) finishLine(extracted.length);
-  if (groupStart < extracted.length)
-    atoms.push({
-      index: atoms.length,
-      startByte: groupStart,
-      endByte: extracted.length,
-      byteLength: extracted.length - groupStart,
-    });
   return atoms;
 }
 
@@ -82,37 +76,83 @@ async function atomizeFile(path: string): Promise<AtomMetadata[]> {
   const stat = await lstatNoFollow(path);
   if (!stat.isFile()) throw new Error(`extraction must be a regular file: ${path}`);
   if (stat.size === 0) return [];
+  const atoms: AtomMetadata[] = [];
+  let lineStart = 0;
+  let lineNumber = 1;
+  let finalSize = 0;
+  const finishLine = (end: number): void => {
+    atoms.push({
+      index: atoms.length,
+      startByte: lineStart,
+      endByte: end,
+      byteLength: end - lineStart,
+      startLine: lineNumber,
+      endLine: lineNumber,
+    });
+    lineStart = end;
+    lineNumber++;
+  };
+  await scanFile(path, (byte, position) => {
+    finalSize = position + 1;
+    if (byte === 10) finishLine(position + 1);
+  });
+  if (lineStart < finalSize) finishLine(finalSize);
+  if (!atoms.length) throw new Error("extraction is empty");
+  return atoms;
+}
+
+export async function planFileAtoms(path: string): Promise<AtomMetadata[]> {
+  const stat = await lstatNoFollow(path);
+  if (!stat.isFile()) throw new Error(`extraction must be a regular file: ${path}`);
+  if (stat.size === 0) return [];
   let lineCount = 0;
   let lastByte = -1;
   await scanFile(path, (byte) => {
-    lineCount += byte === 10 ? 1 : 0;
+    if (byte === 10) lineCount++;
     lastByte = byte;
   });
   if (lastByte !== 10) lineCount++;
   const groupSize = Math.max(1, Math.ceil(lineCount / MAX_ATOMS));
   const atoms: AtomMetadata[] = [];
   let groupStart = 0;
+  let groupStartLine = 1;
   let groupLines = 0;
+  let lineNumber = 1;
+  let finalSize = 0;
   const finishLine = (end: number): void => {
+    const endLine = lineNumber;
     groupLines++;
     if (groupLines >= groupSize) {
-      atoms.push({ index: atoms.length, startByte: groupStart, endByte: end, byteLength: end - groupStart });
+      atoms.push({
+        index: atoms.length,
+        startByte: groupStart,
+        endByte: end,
+        byteLength: end - groupStart,
+        startLine: groupStartLine,
+        endLine,
+      });
       groupStart = end;
+      groupStartLine = endLine + 1;
       groupLines = 0;
     }
+    lineNumber++;
   };
-  let lineStart = 0;
-  let finalSize = 0;
   await scanFile(path, (byte, position) => {
     finalSize = position + 1;
-    if (byte === 10) {
-      finishLine(position + 1);
-      lineStart = position + 1;
-    }
+    if (byte === 10) finishLine(position + 1);
   });
-  if (lineStart < finalSize) finishLine(finalSize);
-  if (groupStart < finalSize)
-    atoms.push({ index: atoms.length, startByte: groupStart, endByte: finalSize, byteLength: finalSize - groupStart });
+  if (groupStart < finalSize) {
+    finishLine(finalSize);
+    if (groupStart < finalSize)
+      atoms.push({
+        index: atoms.length,
+        startByte: groupStart,
+        endByte: finalSize,
+        byteLength: finalSize - groupStart,
+        startLine: groupStartLine,
+        endLine: lineNumber - 1,
+      });
+  }
   if (!atoms.length) throw new Error("extraction is empty");
   return atoms;
 }
@@ -128,7 +168,7 @@ async function copySpoolRange(
     const want = Math.min(buffer.length, end - position);
     const { bytesRead } = await input.read(buffer, 0, want, position);
     if (!bytesRead) throw new Error("normalization spool ended unexpectedly");
-    await output.write(buffer, 0, bytesRead);
+    await writeFully(output, buffer, 0, bytesRead);
     position += bytesRead;
   }
 }
@@ -209,7 +249,7 @@ export async function normalizeMarkdownFile(source: string, target: string): Pro
     for (;;) {
       const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
       if (!bytesRead) break;
-      await spoolWriter.write(buffer, 0, bytesRead);
+      await writeFully(spoolWriter, buffer, 0, bytesRead);
       for (let index = 0; index < bytesRead; index++) {
         const byte = buffer[index]!;
         if (byte === 10) await finishLine(position + index + 1);
@@ -237,54 +277,34 @@ function atomizeFileSync(path: string): AtomMetadata[] {
   if (stat.size === 0) return [];
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
-  let lineCount = 0;
-  let lastByte = -1;
+  const atoms: AtomMetadata[] = [];
+  let lineStart = 0;
+  let lineNumber = 1;
+  let position = 0;
+  const finishLine = (end: number): void => {
+    atoms.push({
+      index: atoms.length,
+      startByte: lineStart,
+      endByte: end,
+      byteLength: end - lineStart,
+      startLine: lineNumber,
+      endLine: lineNumber,
+    });
+    lineStart = end;
+    lineNumber++;
+  };
   try {
     for (;;) {
       const count = readSync(fd, buffer, 0, buffer.length, null);
       if (!count) break;
-      for (let index = 0; index < count; index++) {
-        const byte = buffer[index]!;
-        lineCount += byte === 10 ? 1 : 0;
-        lastByte = byte;
+      for (let index = 0; index < count; index++, position++) {
+        if (buffer[index] === 10) finishLine(position + 1);
       }
     }
   } finally {
     closeSync(fd);
   }
-  if (lastByte !== 10) lineCount++;
-  const groupSize = Math.max(1, Math.ceil(lineCount / MAX_ATOMS));
-  const atoms: AtomMetadata[] = [];
-  let groupStart = 0;
-  let groupLines = 0;
-  const finishLine = (end: number): void => {
-    groupLines++;
-    if (groupLines >= groupSize) {
-      atoms.push({ index: atoms.length, startByte: groupStart, endByte: end, byteLength: end - groupStart });
-      groupStart = end;
-      groupLines = 0;
-    }
-  };
-  const second = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  let position = 0;
-  let lineStart = 0;
-  try {
-    for (;;) {
-      const count = readSync(second, buffer, 0, buffer.length, null);
-      if (!count) break;
-      for (let index = 0; index < count; index++, position++) {
-        if (buffer[index] === 10) {
-          finishLine(position + 1);
-          lineStart = position + 1;
-        }
-      }
-    }
-  } finally {
-    closeSync(second);
-  }
-  if (lineStart < stat.size) finishLine(stat.size);
-  if (groupStart < stat.size)
-    atoms.push({ index: atoms.length, startByte: groupStart, endByte: stat.size, byteLength: stat.size - groupStart });
+  if (lineStart < position) finishLine(position);
   if (!atoms.length) throw new Error("extraction is empty");
   return atoms;
 }
@@ -300,15 +320,18 @@ export function atomizeExtraction(extracted: string | Uint8Array): Array<AtomMet
 function endpointsFrom(proposed: readonly (number | ChunkPlanEndpoint)[] | undefined, atomCount: number): number[] {
   const endpoints = proposed?.length
     ? proposed.map((endpoint) =>
-        typeof endpoint === "number" ? endpoint : (endpoint.endAtom ?? endpoint.end ?? endpoint.index),
+        typeof endpoint === "number"
+          ? endpoint
+          : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index),
       )
     : [atomCount];
   for (const endpoint of endpoints)
     if (endpoint === undefined || !Number.isInteger(endpoint) || endpoint <= 0 || endpoint > atomCount)
-      throw new Error("chunk endpoints must be increasing atom endpoints");
-  if (endpoints.at(-1) !== atomCount) throw new Error("chunk endpoints must cover the extraction");
+      throw new Error("chunk endpoints must be increasing line endpoints");
+  if (endpoints.at(-1) !== atomCount) throw new Error("chunk endpoints must cover all extraction lines");
   for (let index = 1; index < endpoints.length; index++)
-    if (endpoints[index]! <= endpoints[index - 1]!) throw new Error("chunk endpoints must be strictly increasing");
+    if (endpoints[index]! <= endpoints[index - 1]!)
+      throw new Error("chunk endpoints must be strictly increasing line endpoints");
   return endpoints as number[];
 }
 
@@ -352,7 +375,14 @@ export async function validateFileEndpoints(
     const start = atoms[startAtom];
     const end = atoms[endAtom - 1];
     if (!start || !end) throw new Error("chunk endpoint is outside extraction");
-    chunks.push({ index, startByte: start.startByte, endByte: end.endByte, byteLength: end.endByte - start.startByte });
+    chunks.push({
+      index,
+      startByte: start.startByte,
+      endByte: end.endByte,
+      byteLength: end.endByte - start.startByte,
+      startLine: start.startLine,
+      endLine: end.endLine,
+    });
     startAtom = endAtom;
   }
   return { atoms, chunks };
@@ -426,7 +456,7 @@ export async function writeNativeExtraction(snapshot: TreeSnapshot, target: stri
   }
   const output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   const write = async (bytes: Uint8Array): Promise<void> => {
-    await output.write(Buffer.from(bytes));
+    await writeFully(output, Buffer.from(bytes));
   };
   const append = async (source: string): Promise<void> => {
     const input = await openFile(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -435,7 +465,7 @@ export async function writeNativeExtraction(snapshot: TreeSnapshot, target: stri
       for (;;) {
         const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
         if (!bytesRead) break;
-        await output.write(buffer, 0, bytesRead);
+        await writeFully(output, buffer, 0, bytesRead);
       }
     } finally {
       await input.close();

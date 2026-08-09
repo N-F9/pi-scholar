@@ -1,17 +1,21 @@
 import { strict as assert } from "node:assert";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
   symlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
+import { type ClientRequest, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay, setImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import type { QuizRecord } from "../src/contracts.js";
@@ -388,6 +392,97 @@ describe("server browser boundary", () => {
       rmSync(workRoot, { recursive: true, force: true });
     }
   });
+  it("returns an HTTP error and removes the spool when output fails before multipart completion", async () => {
+    let calls = 0;
+    const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));
+    const application = {
+      paths: { workRoot },
+      stageSource: async () => {
+        calls += 1;
+        return { source: {} };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    const boundary = "pi-scholar-output-failure";
+    const prefix = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="kind"\r\n\r\nupload\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="notes.txt"\r\n` +
+        "Content-Type: text/plain\r\n\r\n",
+    );
+    const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    const spoolCreated = Promise.withResolvers<void>();
+    const watcher = watch(workRoot, (_event, filename) => {
+      if (!filename?.toString().startsWith("http-upload-")) return;
+      try {
+        mkdirSync(join(workRoot, filename.toString(), "upload"));
+        spoolCreated.resolve();
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) spoolCreated.reject(error);
+      }
+    });
+    process.on("unhandledRejection", onUnhandled);
+    let request: ClientRequest | undefined;
+    try {
+      await withServer(application, async (base) => {
+        const responseStatus = new Promise<number>((resolve, reject) => {
+          request = httpRequest(
+            `${base}/api/v1/sources`,
+            {
+              method: "POST",
+              headers: sameOriginHeaders(base, {
+                "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                Connection: "close",
+                "Sec-Fetch-Site": "same-origin",
+                "X-Pi-Scholar-Request": "1",
+              }),
+            },
+            (response) => {
+              response.resume();
+              response.once("end", () => resolve(response.statusCode ?? 0));
+            },
+          );
+          request.once("error", reject);
+          request.flushHeaders();
+        });
+        await Promise.race([
+          spoolCreated.promise,
+          delay(2_000).then(() => {
+            throw new Error("multipart spool was not created");
+          }),
+        ]);
+        watcher.close();
+        request.write(prefix);
+        request.write("notes");
+        await setImmediate();
+        await setImmediate();
+        assert.deepEqual(unhandled, []);
+        request.end(suffix);
+        assert.equal(
+          await Promise.race([
+            responseStatus,
+            delay(2_000).then(() => {
+              throw new Error("multipart failure response was not received");
+            }),
+          ]),
+          400,
+        );
+        await setImmediate();
+        assert.deepEqual(unhandled, []);
+        request.destroy();
+      });
+      assert.equal(calls, 0);
+      assert.deepEqual(readdirSync(workRoot), []);
+    } finally {
+      request?.destroy();
+      watcher.close();
+      process.off("unhandledRejection", onUnhandled);
+      rmSync(workRoot, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("rejects unknown and mismatched source payload kinds before staging", async () => {
     let calls = 0;

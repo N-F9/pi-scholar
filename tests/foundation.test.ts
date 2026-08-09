@@ -12,6 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative } from "node:path";
 import { describe, it } from "vitest";
@@ -30,6 +31,7 @@ import {
   qmdSearch,
 } from "../src/external/qmd.js";
 import { QuizService } from "../src/quiz.js";
+import { writeFully } from "../src/sources/source-files.js";
 import { SourceService } from "../src/sources/source-service.js";
 import {
   acquireWriterLock,
@@ -693,5 +695,26 @@ describe("vault foundation", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = { vaultRoot: root } as VaultPaths;
     assert.throws(() => gitDependencyIdentity(paths), /git rev-parse --is-inside-work-tree failed/u);
+  });
+  it("completes every byte when a file handle short-writes", async () => {
+    const chunks: number[] = [];
+    const handle = {
+      write: async (
+        _buffer: Uint8Array,
+        _offset: number,
+        length: number,
+      ): Promise<{ bytesWritten: number; buffer: Uint8Array }> => {
+        const bytesWritten = Math.min(2, length);
+        chunks.push(bytesWritten);
+        return { bytesWritten, buffer: _buffer };
+      },
+    } as unknown as FileHandle;
+    const bytes = Buffer.from("short writes must not lose bytes");
+    await writeFully(handle, bytes);
+    assert.equal(
+      chunks.reduce((sum, size) => sum + size, 0),
+      bytes.byteLength,
+    );
+    assert.ok(chunks.length > 1);
   });
 });

@@ -15,11 +15,11 @@ import { QuizService } from "../quiz.js";
 import { safeRelativePath, type VaultPaths } from "../vault.js";
 import {
   atomizeExtraction,
-  atomizeFile,
   chunkExtraction,
   nativeExtraction,
   normalizeDoclingResult,
   normalizeMarkdownFile,
+  planFileAtoms,
   reconstructChunks,
   validateChunkEndpoints,
   validateFileEndpoints,
@@ -49,7 +49,6 @@ import {
   SOURCE_KINDS,
   safeChildPath,
   sameIdentity,
-  sanitizedSourceUri,
   snapshotPath,
   stagedMetadata,
   statIdentity,
@@ -59,6 +58,7 @@ import {
   walkFiles,
   wikiPathFor,
   workArtifactRelative,
+  writeFully,
   writeTree,
 } from "./source-files.js";
 import { parseManifest, parsePreparedMetadata, verifyRetainedPacket } from "./source-packets.js";
@@ -98,6 +98,7 @@ export interface FileSnapshot {
   size: number;
   digest: string;
   absolutePath: string;
+  identity?: PhysicalIdentity;
 }
 export interface PhysicalIdentity {
   device: string;
@@ -238,6 +239,7 @@ export interface DoclingResult {
   attachments?: Array<{ path: string; bytes: Uint8Array | string }>;
 }
 export interface ChunkPlanEndpoint {
+  endLine?: number;
   endAtom?: number;
   end?: number;
   index?: number;
@@ -268,7 +270,7 @@ async function requestSourceToFile(
   const pathname = `${url.pathname || "/"}${url.search}`;
   const options = {
     protocol: url.protocol,
-    hostname: url.hostname,
+    hostname: url.hostname.startsWith("[") && url.hostname.endsWith("]") ? url.hostname.slice(1, -1) : url.hostname,
     port: url.port || undefined,
     path: pathname,
     method: "GET",
@@ -310,7 +312,8 @@ async function requestSourceToFile(
       let output: FileHandle | undefined;
       try {
         output = await fs.open(target, "wx", 0o600);
-        for await (const chunk of response) await output.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        for await (const chunk of response)
+          await writeFully(output, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         await output.close();
         output = undefined;
         if (!settled) {
@@ -355,6 +358,30 @@ function sourceRecord(row: Row): Record<string, unknown> {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+function fileSnapshotRecord(file: FileSnapshot): {
+  path: string;
+  size: number;
+  digest: string;
+  identity?: PhysicalIdentity;
+} {
+  return { path: file.path, size: file.size, digest: file.digest, identity: file.identity };
+}
+function sameFileSnapshots(left: FileSnapshot[], right: FileSnapshot[]): boolean {
+  return (
+    canonical(left.map(fileSnapshotRecord).sort((a, b) => a.path.localeCompare(b.path))) ===
+    canonical(right.map(fileSnapshotRecord).sort((a, b) => a.path.localeCompare(b.path)))
+  );
+}
+function sameFileContents(left: FileSnapshot[], right: FileSnapshot[]): boolean {
+  return (
+    canonical(
+      left.map(({ path, size, digest }) => ({ path, size, digest })).sort((a, b) => a.path.localeCompare(b.path)),
+    ) ===
+    canonical(
+      right.map(({ path, size, digest }) => ({ path, size, digest })).sort((a, b) => a.path.localeCompare(b.path)),
+    )
+  );
 }
 export class SourceService {
   readonly db: ScholarDatabase;
@@ -637,29 +664,21 @@ export class SourceService {
     const kind: SourceKind = repository ? "repository" : inferKind(source, stat);
     if (!repository && inferKind(name, stat) !== kind) throw new Error(`staging name kind must be ${kind}`);
     let initialRevision: string | undefined;
-    let verifiedGitRevision = false;
     if (repository) {
       try {
         initialRevision = await repositoryRevision(source);
-        verifiedGitRevision = true;
       } catch (error) {
         if (!this.adapters.gitRevision) throw error;
         initialRevision = await this.revision(source);
       }
     }
     const files = repository ? await repositoryFiles(source) : undefined;
-    if (repository && verifiedGitRevision) {
-      const finalRevision = await repositoryRevision(source);
-      if (initialRevision !== finalRevision) throw new Error("repository changed during staging");
-    }
+    const beforeCopyRevision = repository ? await this.revision(source) : undefined;
+    if (repository && beforeCopyRevision !== initialRevision) throw new Error("repository changed during staging");
     if (repository && !initialRevision) throw new Error("repository revision is unavailable");
     if (!repository) await measurePath(source);
     if (request.kind !== undefined && request.kind !== kind) throw new Error(`path source kind must be ${kind}`);
-    const revision = repository
-      ? this.adapters.gitRevision
-        ? await this.revision(source)
-        : initialRevision
-      : undefined;
+    const revision = repository ? initialRevision : undefined;
     const metadata = repository
       ? (() => {
           const originalName = validRelativePath(request.originalName ?? name);
@@ -696,6 +715,14 @@ export class SourceService {
       try {
         if (repository) await copyRepositoryNoSecrets(target, files ?? [], metadata!);
         else await copyPathNoFollow(source, target);
+        if (repository) {
+          const copiedFiles = await walkFiles(join(target, metadata!.payload), "", false);
+          if (!sameFileContents(files ?? [], copiedFiles)) throw new Error("repository copy digest mismatch");
+          const afterFiles = await repositoryFiles(source);
+          const afterRevision = await this.revision(source);
+          if (afterRevision !== initialRevision || !sameFileSnapshots(files ?? [], afterFiles))
+            throw new Error("repository changed during staging");
+        }
       } catch (error) {
         if (!targetExisted) {
           try {
@@ -877,7 +904,7 @@ export class SourceService {
       const extractedHash = await hashFile(extractedAbsolute);
       if (extractedHash.size === 0) throw new Error("empty extraction");
       const attachmentSnapshots = await walkFiles(attachmentsRoot, "", false);
-      const atoms = await atomizeFile(extractedAbsolute);
+      const atoms = await planFileAtoms(extractedAbsolute);
       const prepared: PreparedAdmission = {
         preparedId,
         claimId: claim.claimId,
@@ -1041,7 +1068,7 @@ export class SourceService {
     const extractedHash = await hashFile(extractedPath);
     if (extractedHash.size !== prepared.extractedByteLength || extractedHash.digest !== prepared.extractedDigest)
       throw new Error("prepared extraction digest mismatch");
-    const actualAtoms = await atomizeFile(extractedPath);
+    const actualAtoms = await planFileAtoms(extractedPath);
     if (canonical(actualAtoms) !== canonical(prepared.atoms)) throw new Error("prepared atom index mismatch");
     const preparedAttachmentsRoot = ensureWithin(preparedRoot, join(preparedRoot, "attachments"));
     const preparedAttachmentFiles = await walkFiles(preparedAttachmentsRoot, "", false);
@@ -1053,13 +1080,13 @@ export class SourceService {
     if (canonical(preparedAttachmentRecords) !== canonical(prepared.attachments))
       throw new Error("prepared attachment digest mismatch");
     const planned = await validateFileEndpoints(extractedPath, input.endpoints);
-    const existing = await this.normalizeExistingPacket(claim, {});
+    const existing = await this.normalizeExistingPacket(claim);
     if (existing) {
       this.completedPrepared.set(prepared.preparedId, { prepared: input.prepared, result: existing });
       await this.cleanupPrepared(prepared.preparedId).catch(() => undefined);
       return existing;
     }
-    const sourceId = this.sourceIdFor(claim, {});
+    const sourceId = this.sourceIdFor(claim);
     const packet = join(this.sources(), sourceId);
     const temporary = join(this.work(), `packet-${sourceId}-${randomUUID()}`);
     await fs.mkdir(temporary, { recursive: false, mode: 0o700 });
@@ -1183,22 +1210,18 @@ export class SourceService {
       return undefined;
     }
   }
-  private sourceIdFor(
-    claim: SourceClaim,
-    options: { mediaType?: string; originalName?: string; url?: string },
-  ): string {
+  private sourceIdFor(claim: SourceClaim): string {
     const metadata = claim.snapshot.metadata;
-    const sourceUri = options.url === undefined ? metadata?.sourceUri : sanitizedSourceUri(options.url);
     return deterministicUuid(
       canonical({
         scope: "source",
         digest: claim.snapshot.digest,
         revision: claim.snapshot.revision,
         kind: claim.snapshot.kind,
-        sourceUri,
+        sourceUri: metadata?.sourceUri,
         displayName: metadata?.displayName ?? claim.entry.relativePath,
-        originalName: options.originalName ?? metadata?.originalName ?? claim.entry.relativePath,
-        mediaType: options.mediaType ?? metadata?.mediaType,
+        originalName: metadata?.originalName ?? claim.entry.relativePath,
+        mediaType: metadata?.mediaType,
         requestedKind: metadata?.requestedKind,
         repositoryRevision: metadata?.repositoryRevision,
       }),
@@ -1218,11 +1241,8 @@ export class SourceService {
       return false;
     }
   }
-  private async normalizeExistingPacket(
-    claim: SourceClaim,
-    options: { mediaType?: string; originalName?: string; url?: string },
-  ): Promise<AdmissionResult | undefined> {
-    const sourceId = this.sourceIdFor(claim, options);
+  private async normalizeExistingPacket(claim: SourceClaim): Promise<AdmissionResult | undefined> {
+    const sourceId = this.sourceIdFor(claim);
     const packet = join(this.sources(), sourceId);
     try {
       const stat = await lstatNoFollow(packet);
@@ -1240,17 +1260,17 @@ export class SourceService {
     claim: SourceClaim,
     options: {
       endpoints?: Array<number | ChunkPlanEndpoint>;
-      mediaType?: string;
-      originalName?: string;
-      url?: string;
     } = {},
   ): Promise<AdmissionResult> {
-    const existing = await this.normalizeExistingPacket(claim, options);
+    const existing = await this.normalizeExistingPacket(claim);
     if (existing) return existing;
     const prepared = await this.prepareClaim(claim);
     const endpoints = options.endpoints?.map((endpoint) => {
-      const value = typeof endpoint === "number" ? endpoint : (endpoint.endAtom ?? endpoint.end ?? endpoint.index);
-      if (value === undefined) throw new Error("chunk endpoint is missing");
+      const value =
+        typeof endpoint === "number"
+          ? endpoint
+          : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index);
+      if (value === undefined) throw new Error("chunk line endpoint is missing");
       return value;
     });
     return this.publishPreparedClaim({

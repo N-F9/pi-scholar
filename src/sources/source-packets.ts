@@ -29,12 +29,11 @@ function parseManifestValue(raw: unknown): SourceManifest {
   requiredString(record, "originalDigest");
   const normalizer = record.normalizer;
   if (
-    normalizer !== undefined &&
-    (normalizer === null ||
-      typeof normalizer !== "object" ||
-      Array.isArray(normalizer) ||
-      (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
-      (normalizer as Record<string, unknown>).version !== "1")
+    normalizer === null ||
+    typeof normalizer !== "object" ||
+    Array.isArray(normalizer) ||
+    (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
+    (normalizer as Record<string, unknown>).version !== "1"
   )
     throw new Error("invalid source manifest normalizer");
   if (!Array.isArray(record.files) || !Array.isArray(record.chunks)) throw new Error("invalid source manifest files");
@@ -301,9 +300,11 @@ export function parsePreparedMetadata(raw: unknown): PersistedPreparedAdmission 
     const startByte = integerField(item, "startByte");
     const endByte = integerField(item, "endByte");
     const byteLength = integerField(item, "byteLength");
-    if (endByte < startByte || endByte - startByte !== byteLength)
+    const startLine = integerField(item, "startLine");
+    const endLine = integerField(item, "endLine");
+    if (endByte < startByte || endByte - startByte !== byteLength || startLine < 1 || endLine < startLine)
       throw new Error("invalid prepared metadata atom bounds");
-    return { index, startByte, endByte, byteLength };
+    return { index, startByte, endByte, byteLength, startLine, endLine };
   });
   if (atoms.length > 2048) throw new Error("invalid prepared metadata atom count");
   const entryRelativePath = validRelativePath(requiredString(record, "entryRelativePath"));

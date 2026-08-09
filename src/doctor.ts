@@ -225,12 +225,11 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       >;
       const normalizer = manifest.normalizer;
       if (
-        normalizer !== undefined &&
-        (normalizer === null ||
-          typeof normalizer !== "object" ||
-          Array.isArray(normalizer) ||
-          (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
-          (normalizer as Record<string, unknown>).version !== "1")
+        normalizer === null ||
+        typeof normalizer !== "object" ||
+        Array.isArray(normalizer) ||
+        (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
+        (normalizer as Record<string, unknown>).version !== "1"
       )
         throw new Error(`Invalid manifest normalizer: ${entry.name}`);
       if (manifest.id !== entry.name || manifest.sourceId !== entry.name)
