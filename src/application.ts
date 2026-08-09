@@ -1966,11 +1966,14 @@ export class ScholarApplication {
       references.add(item.reference);
       byPage.set(item.pageId, references);
     }
-    const singlePageCoverage = new Set<string>();
+    const singlePageCoverage = new Map<string, number>();
     for (const question of questions) {
       if (!question.pages.length) throw new ValidationError("Every quiz question must cover a wiki page");
       if (!question.sourceRefs.length) throw new ValidationError("Every quiz question requires source evidence");
-      if (question.pages.length === 1) singlePageCoverage.add(question.pages[0]!.pageId);
+      if (question.pages.length === 1) {
+        const pageId = question.pages[0]!.pageId.trim();
+        singlePageCoverage.set(pageId, (singlePageCoverage.get(pageId) ?? 0) + 1);
+      }
       for (const page of question.pages) {
         if (!selected.has(page.pageId))
           throw new ValidationError(`Quiz question references an ineligible page: ${page.pageId}`);
@@ -1982,8 +1985,8 @@ export class ScholarApplication {
         throw new ValidationError("Quiz question references unknown source evidence");
     }
     for (const page of selectedPages) {
-      if (!singlePageCoverage.has(page.pageId))
-        throw new ValidationError(`Eligible page lacks a single-page quiz question: ${page.pageId}`);
+      if (singlePageCoverage.get(page.pageId) !== 1)
+        throw new ValidationError(`Every selected page requires exactly one single-page question: ${page.pageId}`);
     }
   }
   async publishQuiz(input: QuizPublicationInput): Promise<QuizDetailRecord> {
