@@ -40,10 +40,14 @@ describe("Pi package lifecycle", () => {
 
   it("registers public and typed internal Scholar tools without a process launcher", () => {
     const tools: string[] = [];
+    const toolModes = new Map<string, string | undefined>();
     const commands: string[] = [];
     const events: string[] = [];
     const pi = {
-      registerTool: (tool: { readonly name: string }) => tools.push(tool.name),
+      registerTool: (tool: { readonly name: string; readonly executionMode?: string }) => {
+        tools.push(tool.name);
+        toolModes.set(tool.name, tool.executionMode);
+      },
       registerCommand: (name: string) => commands.push(name),
       on: (event: string) => events.push(event),
     } as unknown as ExtensionAPI;
@@ -65,6 +69,22 @@ describe("Pi package lifecycle", () => {
       "scholar_settle_grade",
       "scholar_status",
     ]);
+    assert.deepEqual([...toolModes].filter(([, mode]) => mode === "sequential").map(([name]) => name).sort(), [
+      "scholar_add",
+      "scholar_admit_source",
+      "scholar_apply_maintenance",
+      "scholar_finish_maintenance",
+      "scholar_get_admission_context",
+      "scholar_get_grading_context",
+      "scholar_get_maintenance_context",
+      "scholar_get_quiz_context",
+      "scholar_note",
+      "scholar_publish_quiz",
+      "scholar_remove_source",
+      "scholar_settle_grade",
+    ]);
+    assert.equal(toolModes.get("scholar_search"), undefined);
+    assert.equal(toolModes.get("scholar_status"), undefined);
     assert.deepEqual([...commands].sort(), ["add", "issue", "scholar-status"]);
     assert.deepEqual(events, ["session_shutdown"]);
   });

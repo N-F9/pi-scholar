@@ -15,6 +15,7 @@ Install the package and initialize a vault:
 
 ```sh
 npm install -g pi-scholar
+pi install npm:pi-scholar
 pi-scholar init /absolute/path/to/vault
 pi-scholar doctor /absolute/path/to/vault
 ```

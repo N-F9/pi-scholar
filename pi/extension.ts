@@ -579,6 +579,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_add",
     label: "scholar_add",
     description: "Stage a typed source in the Pi Scholar inbox.",
+    executionMode: "sequential",
     parameters: sourceInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return call(ctx, _signal, onUpdate, "Staging source", (app) => stage(app, asRecord(params)));
@@ -588,6 +589,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_note",
     label: "scholar_note",
     description: "Create a guarded product-authored wiki note.",
+    executionMode: "sequential",
     parameters: noteInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return call(ctx, _signal, onUpdate, "Writing guarded note", (app) => note(app, asRecord(params)));
@@ -596,6 +598,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_remove_source",
     label: "scholar_remove_source",
+    executionMode: "sequential",
     description: "Preview source dependents, then remove only after explicit confirmation.",
     parameters: removalInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -638,6 +641,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_get_admission_context",
     label: "scholar_get_admission_context",
+    executionMode: "sequential",
     description: "List and claim the current stable source-admission context.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
@@ -647,6 +651,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_admit_source",
     label: "scholar_admit_source",
+    executionMode: "sequential",
     description: "Publish one claimed source packet with validated chunk endpoints.",
     parameters: admissionInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -656,6 +661,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_get_maintenance_context",
     label: "scholar_get_maintenance_context",
+    executionMode: "sequential",
     description: "Read the current bounded wiki-maintenance context.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
@@ -666,6 +672,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_apply_maintenance",
     label: "scholar_apply_maintenance",
+    executionMode: "sequential",
     description: "Apply one guarded wiki/card maintenance proposal.",
     parameters: maintenanceInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -675,6 +682,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_finish_maintenance",
     label: "scholar_finish_maintenance",
+    executionMode: "sequential",
     description: "Finish a wiki-maintenance context after submitting all bounded proposals, including none.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
@@ -684,6 +692,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_get_quiz_context",
     label: "scholar_get_quiz_context",
+    executionMode: "sequential",
     description: "Read the current local-date quiz context and initialization guard.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -694,6 +703,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_publish_quiz",
     label: "scholar_publish_quiz",
     description: "Publish one validated daily quiz proposal or explicit skip.",
+    executionMode: "sequential",
     parameters: quizInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily-quiz", (app) => app.publishQuiz(params as QuizPublicationInput));
@@ -702,6 +712,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_get_grading_context",
     label: "scholar_get_grading_context",
+    executionMode: "sequential",
     description: "Read the current sealed quiz revision and submission context.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -711,6 +722,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "scholar_settle_grade",
     label: "scholar_settle_grade",
+    executionMode: "sequential",
     description: "Settle one validated sealed quiz grading result.",
     parameters: gradeInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
