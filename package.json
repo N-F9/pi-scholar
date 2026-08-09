@@ -33,7 +33,7 @@
     ]
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.19.0"
   },
   "scripts": {
     "clean": "node -e \"const { rmSync } = require('node:fs'); for (const path of ['dist', 'apps/web/dist']) rmSync(path, { recursive: true, force: true })\"",
@@ -55,11 +55,11 @@
     "ts-fsrs": "5.4.1"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
     "@tailwindcss/vite": "4.3.3",
     "@types/node": "26.2.0",
     "@types/react": "19.2.18",

@@ -6,8 +6,8 @@ Pi Scholar is a local-first Markdown wiki and daily review application for Pi. T
 
 Requirements:
 
-- Node.js `>=22.13.0`.
-- Pi coding agent with the `@mariozechner/pi-coding-agent` and `typebox` peer packages available to the Pi runtime.
+- Node.js `>=22.19.0`.
+- Pi coding agent with the `@earendil-works/pi-coding-agent` and `typebox` peer packages available to the Pi runtime.
 - Git and Docling on `PATH` for the vault's required version checks and supported source extraction; qmd on `PATH` for semantic ranking.
 - A provider configured through Pi's normal provider environment (for example, set only the provider key required by the selected Pi model, such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). Keep credentials in the service environment; never put them in vault files, arguments, cron text, or logs.
 

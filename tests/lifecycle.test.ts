@@ -7,7 +7,7 @@ import { describe, it } from "vitest";
 import { openDatabase } from "../src/database.js";
 import { parseCliArgs } from "../src/cli.js";
 import { WorkflowCoordinator } from "../src/workflows.js";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import piScholarExtension from "../pi/extension.ts";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
