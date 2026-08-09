@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -18,7 +18,7 @@ function requireFile(path, label, executable = false) {
     if (!statSync(path).isFile()) throw new Error("not a regular file");
     accessSync(path, executable ? constants.X_OK : constants.R_OK);
   } catch (error) {
-    throw new Error(`Pi eval prerequisite unavailable (${label}): ${path}: ${error.message}`);
+    throw new Error(`Pi Scholar eval prerequisite unavailable (${label}): ${path}: ${error.message}`);
   }
 }
 
@@ -27,11 +27,40 @@ function requireDirectory(path, label) {
     if (!statSync(path).isDirectory()) throw new Error("not a directory");
     accessSync(path, constants.R_OK);
   } catch (error) {
-    throw new Error(`Pi eval prerequisite unavailable (${label}): ${path}: ${error.message}`);
+    throw new Error(`Pi Scholar eval prerequisite unavailable (${label}): ${path}: ${error.message}`);
   }
 }
 
-requireFile(piBinary, "pinned Pi executable", true);
+function readRuntime(role) {
+  const name = `PI_EVAL_${role.toUpperCase()}`;
+  const value = process.env[name] === undefined ? "pi" : process.env[name].trim();
+  if (value !== "pi" && value !== "omp")
+    throw new Error(
+      `Pi Scholar eval prerequisite invalid (${name}): expected pi or omp, received ${JSON.stringify(value)}`,
+    );
+  return value;
+}
+
+function executableOnPath(name) {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = resolve(directory || process.cwd(), name);
+    try {
+      if (statSync(candidate).isFile()) {
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  throw new Error(`Pi Scholar eval prerequisite unavailable (OMP executable): ${name} not found on PATH`);
+}
+
+const actorRuntime = readRuntime("actor");
+const judgeRuntime = readRuntime("judge");
+const selectedRuntimes = new Set([actorRuntime, judgeRuntime]);
+if (selectedRuntimes.has("pi")) requireFile(piBinary, "pinned Pi executable", true);
+const ompBinary = selectedRuntimes.has("omp") ? executableOnPath("omp") : undefined;
 requireFile(extensionPath, "Scholar extension");
 requireDirectory(skillsPath, "Scholar skills");
 
@@ -41,6 +70,34 @@ function roleFlags(role) {
     ["--provider", process.env[`${prefix}PROVIDER`]?.trim()],
     ["--model", process.env[`${prefix}MODEL`]?.trim()],
   ].flatMap(([flag, value]) => (value ? [flag, value] : []));
+}
+
+const ompOverlay = `disabledProviders:
+  - native
+  - claude
+  - codex
+  - gemini
+  - opencode
+  - github
+  - agents
+  - agents-md
+plan:
+  defaultOnStartup: false
+advisor:
+  enabled: false
+memory:
+  backend: off
+`;
+
+async function withOmpOverlay(operation) {
+  const root = await mkdtemp(join(tmpdir(), "pi-scholar-omp-config-"));
+  const path = join(root, "config.yaml");
+  try {
+    await writeFile(path, ompOverlay, { mode: 0o600 });
+    return await operation(path);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 function diagnostic(buffer) {
@@ -69,10 +126,10 @@ function parseJsonEvents(stdout) {
     try {
       event = JSON.parse(rawLine);
     } catch (error) {
-      throw new Error(`Malformed Pi JSONL on stdout line ${index + 1}: ${error.message}`);
+      throw new Error(`Malformed eval JSONL on stdout line ${index + 1}: ${error.message}`);
     }
     if (!event || typeof event !== "object" || Array.isArray(event))
-      throw new Error(`Pi stdout line ${index + 1} is not a JSON object`);
+      throw new Error(`Eval stdout line ${index + 1} is not a JSON object`);
     if (
       event.type === "auto_retry_start" ||
       event.type === "summarization_retry_attempt_start" ||
@@ -86,9 +143,10 @@ function parseJsonEvents(stdout) {
       continue;
     }
     if (event.type === "tool_execution_start") {
-      if (typeof event.toolCallId !== "string" || !event.toolCallId) throw new Error("Pi tool start has no toolCallId");
-      if (typeof event.toolName !== "string" || !event.toolName) throw new Error("Pi tool start has no toolName");
-      if (seenToolCallIds.has(event.toolCallId)) throw new Error(`Duplicate Pi tool start: ${event.toolCallId}`);
+      if (typeof event.toolCallId !== "string" || !event.toolCallId)
+        throw new Error("Eval tool start has no toolCallId");
+      if (typeof event.toolName !== "string" || !event.toolName) throw new Error("Eval tool start has no toolName");
+      if (seenToolCallIds.has(event.toolCallId)) throw new Error(`Duplicate eval tool start: ${event.toolCallId}`);
       seenToolCallIds.add(event.toolCallId);
       const call = { name: event.toolName, args: event.args };
       starts.set(event.toolCallId, call);
@@ -97,24 +155,33 @@ function parseJsonEvents(stdout) {
     }
     if (event.type === "tool_execution_end") {
       const call = starts.get(event.toolCallId);
-      if (!call) throw new Error(`Unmatched Pi tool end: ${String(event.toolCallId)}`);
+      if (!call) throw new Error(`Unmatched eval tool end: ${String(event.toolCallId)}`);
       if (event.toolName !== call.name)
-        throw new Error(`Pi tool name changed for ${event.toolCallId}: ${call.name} -> ${String(event.toolName)}`);
-      if (typeof event.isError !== "boolean") throw new Error(`Pi tool end has invalid isError: ${event.toolCallId}`);
-      if (event.isError) throw new Error(`Pi tool failed: ${call.name}`);
-      if (!Object.hasOwn(event, "result")) throw new Error(`Pi tool end has no result: ${event.toolCallId}`);
+        throw new Error(`Eval tool name changed for ${event.toolCallId}: ${call.name} -> ${String(event.toolName)}`);
+      if (typeof event.isError !== "boolean") throw new Error(`Eval tool end has invalid isError: ${event.toolCallId}`);
+      if (event.isError) {
+        const message = Array.isArray(event.result?.content)
+          ? event.result.content
+              .filter((block) => block?.type === "text" && typeof block.text === "string")
+              .map((block) => block.text)
+              .join("")
+              .slice(0, 1024)
+          : "";
+        throw new Error(`Eval tool failed: ${call.name}${message ? `: ${message}` : ""}`);
+      }
+      if (!Object.hasOwn(event, "result")) throw new Error(`Eval tool end has no result: ${event.toolCallId}`);
       call.result = event.result;
       starts.delete(event.toolCallId);
     }
   }
 
-  if (starts.size > 0) throw new Error(`Incomplete Pi tool calls: ${[...starts.keys()].join(", ")}`);
-  if (!lastAssistant) throw new Error("Pi emitted no final assistant message");
+  if (starts.size > 0) throw new Error(`Incomplete eval tool calls: ${[...starts.keys()].join(", ")}`);
+  if (!lastAssistant) throw new Error("Eval runtime emitted no final assistant message");
   if (["error", "aborted"].includes(lastAssistant.stopReason))
     throw new Error(
-      `Pi final assistant message ${lastAssistant.stopReason}: ${lastAssistant.errorMessage ?? "no reason"}`,
+      `Eval final assistant message ${lastAssistant.stopReason}: ${lastAssistant.errorMessage ?? "no reason"}`,
     );
-  if (!Array.isArray(lastAssistant.content)) throw new Error("Pi final assistant message has invalid content");
+  if (!Array.isArray(lastAssistant.content)) throw new Error("Eval final assistant message has invalid content");
 
   return {
     answer: lastAssistant.content
@@ -170,29 +237,60 @@ function runProcess(command, args, cwd) {
 }
 
 export async function runActor({ cwd, prompt }) {
-  const result = await runProcess(
-    piBinary,
-    [
-      "-p",
-      "--mode",
-      "json",
-      "--no-session",
-      "--approve",
-      "--no-extensions",
-      "-e",
-      extensionPath,
-      "--no-skills",
-      "--skill",
-      skillsPath,
-      "--no-builtin-tools",
-      "--no-context-files",
-      "--no-prompt-templates",
-      "--no-themes",
-      ...roleFlags("actor"),
-      prompt,
-    ],
-    cwd,
-  );
+  let result;
+  if (actorRuntime === "pi") {
+    result = await runProcess(
+      piBinary,
+      [
+        "-p",
+        "--mode",
+        "json",
+        "--no-session",
+        "--approve",
+        "--no-extensions",
+        "-e",
+        extensionPath,
+        "--no-skills",
+        "--skill",
+        skillsPath,
+        "--no-builtin-tools",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--no-themes",
+        ...roleFlags("actor"),
+        prompt,
+      ],
+      cwd,
+    );
+  } else {
+    result = await withOmpOverlay((config) =>
+      runProcess(
+        ompBinary,
+        [
+          "-p",
+          "--mode",
+          "json",
+          "--no-session",
+          "--no-title",
+          "--no-prewalk",
+          "--approval-mode",
+          "yolo",
+          "--no-tools",
+          "--no-extensions",
+          "--extension",
+          repoRoot,
+          "--skills",
+          "source-admission,wiki-maintenance,daily-quiz,quiz-grader",
+          "--no-rules",
+          "--config",
+          config,
+          ...roleFlags("actor"),
+          prompt,
+        ],
+        cwd,
+      ),
+    );
+  }
   return { answer: result.answer, toolCalls: result.toolCalls };
 }
 
@@ -205,26 +303,54 @@ export async function runJudge({ rubric, evidence }) {
 
   const cwd = await mkdtemp(join(tmpdir(), "pi-scholar-judge-"));
   try {
-    const result = await runProcess(
-      piBinary,
-      [
-        "-p",
-        "--mode",
-        "json",
-        "--no-session",
-        "--no-tools",
-        "--no-extensions",
-        "--no-skills",
-        "--no-context-files",
-        "--no-prompt-templates",
-        "--no-themes",
-        ...roleFlags("judge"),
-        "--system-prompt",
-        judgeInstructions,
-        prompt,
-      ],
-      cwd,
-    );
+    let result;
+    if (judgeRuntime === "pi") {
+      result = await runProcess(
+        piBinary,
+        [
+          "-p",
+          "--mode",
+          "json",
+          "--no-session",
+          "--no-tools",
+          "--no-extensions",
+          "--no-skills",
+          "--no-context-files",
+          "--no-prompt-templates",
+          "--no-themes",
+          ...roleFlags("judge"),
+          "--system-prompt",
+          judgeInstructions,
+          prompt,
+        ],
+        cwd,
+      );
+    } else {
+      result = await withOmpOverlay((config) =>
+        runProcess(
+          ompBinary,
+          [
+            "-p",
+            "--mode",
+            "json",
+            "--no-session",
+            "--no-title",
+            "--no-prewalk",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+            "--config",
+            config,
+            ...roleFlags("judge"),
+            "--system-prompt",
+            judgeInstructions,
+            prompt,
+          ],
+          cwd,
+        ),
+      );
+    }
     if (result.toolCalls.length > 0) throw new Error("Judge attempted a tool call");
     if (result.assistantMessages !== 1) throw new Error("Judge emitted more than one assistant response");
     if (result.retried) throw new Error("Judge retried");
