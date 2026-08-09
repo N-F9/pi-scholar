@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ScholarApplication } from "../src/application.js";
 import { openDatabase } from "../src/database.js";
 import { runChild } from "../src/external/process.js";
-import { reconstructChunks, SourceService, validateChunkEndpoints } from "../src/sources.js";
+import { pinnedSourceLookup, reconstructChunks, SourceService, validateChunkEndpoints } from "../src/sources.js";
 import { initVault } from "../src/vault.js";
 import { isExecutableHtml, WikiService } from "../src/wiki.js";
 
@@ -124,6 +124,20 @@ describe("source admission mechanics", () => {
     expect(await fs.readdir(paths.sourcesRoot)).toHaveLength(0);
     expect(await fs.readdir(paths.inboxRoot)).toEqual(["rollback.txt"]);
     await sources.cleanupPrepared(prepared.preparedId);
+  });
+
+  it("pins resolved source addresses for both Node lookup callback modes", () => {
+    const lookup = pinnedSourceLookup("93.184.216.34", 4);
+    lookup("example.com", { all: false }, (error, result, family) => {
+      expect(error).toBeNull();
+      expect(result).toBe("93.184.216.34");
+      expect(family).toBe(4);
+    });
+    lookup("example.com", { all: true }, (error, result, family) => {
+      expect(error).toBeNull();
+      expect(result).toEqual([{ address: "93.184.216.34", family: 4 }]);
+      expect(family).toBeUndefined();
+    });
   });
 
   it("strips URL secrets from staged and published provenance while fetching the full URL transiently", async () => {
