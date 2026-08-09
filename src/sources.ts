@@ -4,7 +4,7 @@ import { constants, promises as fs, lstatSync, readFileSync, type Stats } from "
 import { open as openFile } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
 import {
   basename,
   dirname,
@@ -344,6 +344,16 @@ interface SourceHttpResponse {
   bytes?: Buffer;
   mediaType?: string;
 }
+export function pinnedSourceLookup(address: string, family: 4 | 6): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [{ address, family }]);
+      return;
+    }
+    callback(null, address, family);
+  };
+}
+
 function requestSource(url: URL, address: SafeAddress): Promise<SourceHttpResponse> {
   const { promise, resolve: resolveRequest, reject: rejectRequest } = Promise.withResolvers<SourceHttpResponse>();
   let request: ClientRequest | undefined;
@@ -362,11 +372,7 @@ function requestSource(url: URL, address: SafeAddress): Promise<SourceHttpRespon
     path: pathname,
     method: "GET",
     agent: false,
-    lookup: (
-      _hostname: string,
-      _options: object,
-      callback: (error: NodeJS.ErrnoException | null, address: string, family: number) => void,
-    ) => callback(null, address.address, address.family),
+    lookup: pinnedSourceLookup(address.address, address.family),
   };
   const onResponse = (response: IncomingMessage): void => {
     const status = response.statusCode ?? 0;
