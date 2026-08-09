@@ -542,3 +542,58 @@ describe("quiz grading workflow lifecycle", () => {
     }
   });
 });
+
+describe("application wiki mutation quiz guards", () => {
+  it("blocks an update covered by an open quiz without changing the page", async () => {
+    const { app, db, pageId } = await gradingFixture();
+    try {
+      const before = await app.wiki.get(pageId);
+      await assert.rejects(app.updateNote(pageId, { body: "# Section\n\nchanged\n" }), /unresolved quiz/u);
+      const after = await app.wiki.get(pageId);
+      assert.equal(after.content, before.content);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("blocks an update covered by a submitted but unsettled quiz without changing the page", async () => {
+    const { app, db, date, pageId, draft } = await gradingFixture();
+    try {
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      assert.equal(sealed.quiz.status, "submitted");
+      assert.equal(db.all("SELECT 1 FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      const before = await app.wiki.get(pageId);
+      await assert.rejects(app.updateNote(pageId, { body: "# Section\n\nchanged\n" }), /unresolved quiz/u);
+      const after = await app.wiki.get(pageId);
+      assert.equal(after.content, before.content);
+      assert.equal(after.digest, before.digest);
+      assert.equal(after.revision, before.revision);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("allows an update after the covered quiz is settled", async () => {
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
+    const owner = randomUUID();
+    try {
+      await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const context = await app.getGradingContext({ date }, owner);
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(evidence);
+      await app.settleGrade(gradeFor(context, pageId, questionId, [evidence]), owner);
+      const before = await app.wiki.get(pageId);
+      const updated = await app.updateNote(pageId, { body: "# Section\n\nchanged\n" });
+      assert.notEqual(updated.page.digest, before.digest);
+      assert.equal(updated.page.revision, before.revision + 1);
+      assert.match(updated.markdown, /changed/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
