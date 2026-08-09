@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { constants, promises as fs, type Stats } from "node:fs";
-import { open as openFile } from "node:fs/promises";
+import { closeSync, constants, promises as fs, fstatSync, lstatSync, openSync, readSync, type Stats } from "node:fs";
+import { type FileHandle, open as openFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { runChild } from "../external/process.js";
 import { assertNoSymlinkPath, safeRelativePath } from "../vault.js";
 import type {
@@ -15,7 +17,6 @@ import type {
   VaultPathsLike,
 } from "./source-service.js";
 
-export const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
 export const ENVELOPE_NAME = ".pi-scholar-source.json";
 export const SOURCE_KINDS: readonly SourceKind[] = [
   "document",
@@ -27,6 +28,8 @@ export const SOURCE_KINDS: readonly SourceKind[] = [
   "repository",
 ];
 export const INPUT_KINDS: readonly InputKind[] = [...SOURCE_KINDS, "upload", "pasted"];
+const IO_BUFFER_SIZE = 64 * 1024;
+
 function provenanceUrl(url: URL): string {
   const safe = new URL(url.toString());
   safe.username = "";
@@ -60,10 +63,9 @@ function canonical(value: unknown): string {
     if (input instanceof Uint8Array) return Buffer.from(input).toString("base64");
     if (Array.isArray(input)) return input.map((item) => normalizeValue(item));
     if (typeof input === "object") {
-      const record = input as Record<string, unknown>;
       const normalized: Record<string, unknown> = {};
-      for (const key of Object.keys(record).sort((a, b) => a.localeCompare(b))) {
-        const nested = record[key];
+      for (const key of Object.keys(input as Record<string, unknown>).sort((a, b) => a.localeCompare(b))) {
+        const nested = (input as Record<string, unknown>)[key];
         if (nested !== undefined) normalized[key] = normalizeValue(nested);
       }
       return normalized;
@@ -93,14 +95,31 @@ function vaultRootFor(paths: VaultPathsLike): string {
   if (typeof root !== "string") throw new Error("vault root is required");
   return root;
 }
+function pathFor(paths: VaultPathsLike, name: "inbox" | "sources" | "work" | "quizzes"): string {
+  const explicit =
+    name === "inbox"
+      ? (paths.inbox ?? paths.inboxRoot)
+      : name === "sources"
+        ? (paths.sources ?? paths.sourcesRoot)
+        : name === "work"
+          ? (paths.work ?? paths.workRoot)
+          : paths.quizzesRoot;
+  if (typeof explicit === "string") return explicit;
+  const root = paths.root ?? paths.vaultRoot;
+  if (typeof root !== "string") throw new Error("vault root is required");
+  return join(root, name === "work" ? ".pi-scholar/work" : name);
+}
+function wikiPathFor(paths: VaultPathsLike): string {
+  if (typeof paths.wikiRoot === "string") return paths.wikiRoot;
+  return join(vaultRootFor(paths), "wiki");
+}
 function workArtifactRelative(paths: VaultPathsLike, target: string): string {
   const absolute = resolve(target);
   const work = resolve(pathFor(paths, "work"));
   const workRelative = relative(work, absolute).replaceAll("\\", "/");
   if (!workRelative || workRelative === ".." || workRelative.startsWith("../") || isAbsolute(workRelative))
     throw new Error("prepared path escapes work");
-  const vaultRelative = relative(resolve(vaultRootFor(paths)), absolute).replaceAll("\\", "/");
-  return validRelativePath(vaultRelative);
+  return validRelativePath(relative(resolve(vaultRootFor(paths)), absolute).replaceAll("\\", "/"));
 }
 function resolveWorkArtifact(paths: VaultPathsLike, requested: string): string {
   const absolute = safeRelativePath(vaultRootFor(paths), validRelativePath(requested));
@@ -120,46 +139,177 @@ function statIdentity(stat: Stats): PhysicalIdentity {
       : String(Math.round(stat.mtimeMs * 1_000_000));
   return { device: String(stat.dev), inode: String(stat.ino), mode: stat.mode, size: stat.size, mtimeNs };
 }
-function pathFor(paths: VaultPathsLike, name: "inbox" | "sources" | "work" | "quizzes"): string {
-  const explicit =
-    name === "inbox"
-      ? (paths.inbox ?? paths.inboxRoot)
-      : name === "sources"
-        ? (paths.sources ?? paths.sourcesRoot)
-        : name === "work"
-          ? (paths.work ?? paths.workRoot)
-          : paths.quizzesRoot;
-  if (typeof explicit === "string") return explicit;
-  const root = paths.root ?? paths.vaultRoot;
-  if (typeof root !== "string") throw new Error("vault root is required");
-  return join(root, name === "work" ? ".pi-scholar/work" : name);
-}
-function wikiPathFor(paths: VaultPathsLike): string {
-  const explicit = paths.wikiRoot;
-  if (typeof explicit === "string") return explicit;
-  const root = paths.root ?? paths.vaultRoot;
-  if (typeof root !== "string") throw new Error("vault root is required");
-  return join(root, "wiki");
-}
 async function lstatNoFollow(path: string): Promise<Stats> {
   assertNoSymlinkPath(path);
   const stat = await fs.lstat(path);
   if (stat.isSymbolicLink()) throw new Error(`symlink rejected: ${path}`);
   return stat;
 }
+function lstatNoFollowSync(path: string): Stats {
+  assertNoSymlinkPath(path);
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) throw new Error(`symlink rejected: ${path}`);
+  return stat;
+}
+
 async function readNoFollow(path: string): Promise<Buffer> {
   assertNoSymlinkPath(path);
   const handle = await openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error(`not a regular file: ${path}`);
-    const bytes = Buffer.from(await handle.readFile());
-    if (bytes.byteLength > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-    return bytes;
+    return Buffer.from(await handle.readFile());
   } finally {
     await handle.close();
   }
 }
+
+async function hashFile(path: string): Promise<{ size: number; digest: string }> {
+  assertNoSymlinkPath(path);
+  const handle = await openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+  let size = 0;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`not a regular file: ${path}`);
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      size += bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  return { size, digest: hash.digest("hex") };
+}
+function hashFileSync(path: string): { size: number; digest: string } {
+  assertNoSymlinkPath(path);
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+  let size = 0;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`not a regular file: ${path}`);
+    for (;;) {
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      size += bytesRead;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { size, digest: hash.digest("hex") };
+}
+
+async function copyReadableToFile(
+  readable: NodeJS.ReadableStream | ReadableStream<Uint8Array>,
+  target: string,
+): Promise<void> {
+  assertNoSymlinkPath(target);
+  await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const handle = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  try {
+    const stream = readable instanceof Readable ? readable : Readable.fromWeb(readable as ReadableStream<Uint8Array>);
+    await pipeline(stream, handle.createWriteStream());
+  } finally {
+    await handle.close();
+  }
+}
+async function copyFileNoFollow(source: string, target: string): Promise<void> {
+  assertNoSymlinkPath(source);
+  assertNoSymlinkPath(target);
+  const input = await openFile(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let output: FileHandle | undefined;
+  try {
+    const stat = await input.stat();
+    if (!stat.isFile()) throw new Error(`not a regular file: ${source}`);
+    await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+    for (;;) {
+      const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      await output.write(buffer, 0, bytesRead);
+    }
+  } finally {
+    await input.close();
+    await output?.close();
+  }
+}
+async function copyFileRangeNoFollow(
+  source: string,
+  target: string,
+  startByte: number,
+  endByte: number,
+): Promise<void> {
+  if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte) || startByte < 0 || endByte < startByte)
+    throw new Error("invalid file range");
+  assertNoSymlinkPath(source);
+  assertNoSymlinkPath(target);
+  const input = await openFile(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let output: FileHandle | undefined;
+  try {
+    const stat = await input.stat();
+    if (!stat.isFile() || endByte > stat.size) throw new Error(`file range is outside source: ${source}`);
+    await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+    let position = startByte;
+    while (position < endByte) {
+      const want = Math.min(buffer.length, endByte - position);
+      const { bytesRead } = await input.read(buffer, 0, want, position);
+      if (!bytesRead) throw new Error("source ended while copying range");
+      await output.write(buffer, 0, bytesRead);
+      position += bytesRead;
+    }
+  } finally {
+    await input.close();
+    await output?.close();
+  }
+}
+async function compareFileRange(source: string, startByte: number, endByte: number, target: string): Promise<boolean> {
+  if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte) || startByte < 0 || endByte < startByte)
+    throw new Error("invalid file range");
+  assertNoSymlinkPath(source);
+  assertNoSymlinkPath(target);
+  const input = await openFile(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const output = await openFile(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+  const other = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+  try {
+    const sourceStat = await input.stat();
+    const targetStat = await output.stat();
+    if (
+      !sourceStat.isFile() ||
+      !targetStat.isFile() ||
+      endByte > sourceStat.size ||
+      targetStat.size !== endByte - startByte
+    )
+      return false;
+    let position = startByte;
+    let targetPosition = 0;
+    while (position < endByte) {
+      const want = Math.min(buffer.length, endByte - position);
+      const [sourceRead, targetRead] = await Promise.all([
+        input.read(buffer, 0, want, position),
+        output.read(other, 0, want, targetPosition),
+      ]);
+      if (sourceRead.bytesRead !== want || targetRead.bytesRead !== want) return false;
+      if (!buffer.subarray(0, want).equals(other.subarray(0, want))) return false;
+      position += want;
+      targetPosition += want;
+    }
+    return true;
+  } finally {
+    await input.close();
+    await output.close();
+  }
+}
+
 async function measurePath(path: string): Promise<number> {
   const stat = await lstatNoFollow(path);
   if (stat.isFile()) return stat.size;
@@ -168,16 +318,15 @@ async function measurePath(path: string): Promise<number> {
   for (const name of (await fs.readdir(path)).sort((a, b) => a.localeCompare(b))) {
     if (name === ".git") continue;
     total += await measurePath(join(path, name));
-    if (total > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
   }
   return total;
 }
 async function walkFiles(root: string, current = "", skipGit = true): Promise<FileSnapshot[]> {
-  const absolute = join(root, current);
+  const absolute = current ? join(root, current) : root;
   const stat = await lstatNoFollow(absolute);
   if (stat.isFile()) {
-    const bytes = await readNoFollow(absolute);
-    return [{ path: current.replaceAll("\\", "/"), size: bytes.byteLength, digest: digestBytes(bytes), bytes }];
+    const digest = await hashFile(absolute);
+    return [{ path: current || basename(root), absolutePath: absolute, size: digest.size, digest: digest.digest }];
   }
   if (!stat.isDirectory()) throw new Error(`unsupported filesystem entry: ${absolute}`);
   const files: FileSnapshot[] = [];
@@ -185,8 +334,6 @@ async function walkFiles(root: string, current = "", skipGit = true): Promise<Fi
     if (skipGit && name === ".git") continue;
     validRelativePath(join(current, name));
     files.push(...(await walkFiles(root, join(current, name), skipGit)));
-    if (files.reduce((sum, file) => sum + file.size, 0) > MAX_SOURCE_BYTES)
-      throw new Error("source exceeds 100 MiB limit");
   }
   return files;
 }
@@ -222,29 +369,23 @@ async function repositoryRevision(root: string): Promise<string> {
   return revision;
 }
 async function repositoryFiles(root: string): Promise<FileSnapshot[]> {
-  const result = await repositoryGit(root, "ls-files", MAX_SOURCE_BYTES + 1);
+  const result = await repositoryGit(root, "ls-files", 64 * 1024 * 1024);
   if (result.timedOut || result.code !== 0)
     throw new Error(`git file listing failed (${result.code ?? result.signal ?? "unknown"})`);
-  if (Buffer.byteLength(result.stdout, "utf8") >= MAX_SOURCE_BYTES)
-    throw new Error("repository file listing exceeds 100 MiB limit");
   const files: FileSnapshot[] = [];
   const seen = new Set<string>();
-  let total = 0;
   for (const rawPath of result.stdout.split("\0")) {
     if (!rawPath) continue;
-    const normalized = rawPath;
-    if (normalized.split("/").includes(".git")) continue;
-    if (/[\u0000-\u001f\u007f]/u.test(normalized)) throw new Error("repository file path contains control characters");
-    const path = validRelativePath(normalized);
+    if (rawPath.split("/").includes(".git")) continue;
+    if (/[\u0000-\u001f\u007f]/u.test(rawPath)) throw new Error("repository file path contains control characters");
+    const path = validRelativePath(rawPath);
     if (seen.has(path)) continue;
     seen.add(path);
-    const absolute = ensureWithin(root, join(root, path));
-    const stat = await lstatNoFollow(absolute);
+    const absolutePath = ensureWithin(root, join(root, path));
+    const stat = await lstatNoFollow(absolutePath);
     if (!stat.isFile()) throw new Error(`repository entry is not a regular file: ${path}`);
-    const bytes = await readNoFollow(absolute);
-    total += bytes.byteLength;
-    if (total > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-    files.push({ path, size: bytes.byteLength, digest: digestBytes(bytes), bytes });
+    const digest = await hashFile(absolutePath);
+    files.push({ path, absolutePath, size: digest.size, digest: digest.digest });
   }
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
@@ -317,11 +458,9 @@ function textualUrl(claim: SourceClaim, mediaType?: string): boolean {
     extname(claim.entry.metadata?.originalName ?? claim.entry.relativePath).toLowerCase(),
   );
 }
-function treeDigest(files: FileSnapshot[], identity: PhysicalIdentity, revision?: string): string {
+function treeDigest(files: FileSnapshot[], revision?: string): string {
   return digestBytes(
-    Buffer.from(
-      canonical({ identity, revision, files: files.map(({ path, size, digest }) => ({ path, size, digest })) }),
-    ),
+    Buffer.from(canonical({ revision, files: files.map(({ path, size, digest }) => ({ path, size, digest })) })),
   );
 }
 function requiredString(record: Record<string, unknown>, key: string): string {
@@ -388,12 +527,11 @@ function parseMetadata(raw: string): StageMetadata {
   for (const key of ["originalName", "sourceUri", "mediaType", "repositoryRevision"] as const) {
     const item = record[key];
     if (item !== undefined) {
-      if (typeof item !== "string" || item.includes("\0") || /[\u0000-\u001f\u007f]/u.test(item))
+      if (typeof item !== "string" || /[\u0000-\u001f\u007f]/u.test(item))
         throw new Error("invalid staged source metadata");
       metadata[key] = key === "sourceUri" ? sanitizedSourceUri(item) : item;
     }
   }
-  validRelativePath(metadata.payload);
   return metadata;
 }
 async function stagedMetadata(path: string): Promise<StageMetadata | undefined> {
@@ -426,28 +564,23 @@ async function snapshotPath(
 ): Promise<TreeSnapshot> {
   const stat = await lstatNoFollow(path);
   const identity = statIdentity(stat);
-  const files = stat.isDirectory()
+  let files = stat.isDirectory()
     ? kind === "repository" && !metadata
       ? await repositoryFiles(path)
       : await walkFiles(path)
-    : [{ path: basename(path), size: 0, digest: "", bytes: Buffer.alloc(0) }];
-  if (!stat.isDirectory()) {
-    const first = files[0];
-    if (!first) throw new Error("source file snapshot is empty");
-    const bytes = await readNoFollow(path);
-    first.bytes = bytes;
-    first.size = bytes.byteLength;
-    first.digest = digestBytes(bytes);
+    : await walkFiles(path, "", false);
+  if (!stat.isDirectory() && metadata?.originalName && files.length === 1) {
+    const file = files[0]!;
+    files = [{ ...file, path: validRelativePath(metadata.originalName) }];
   }
   const bytes = files.reduce((sum, file) => sum + file.size, 0);
-  if (bytes > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
   const finalKind = kind ?? (stat.isDirectory() ? "directory" : inferKind(path, stat));
   return {
     root: path,
     relativePath: validRelativePath(relativePath),
     kind: finalKind,
     identity,
-    digest: treeDigest(files, identity, revision),
+    digest: treeDigest(files, revision),
     bytes,
     files,
     revision,
@@ -458,13 +591,7 @@ async function writeTree(root: string, files: FileSnapshot[]): Promise<void> {
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   for (const file of files) {
     const target = ensureWithin(root, join(root, validRelativePath(file.path)));
-    await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    const handle = await openFile(target, "wx", 0o600);
-    try {
-      await handle.writeFile(file.bytes);
-    } finally {
-      await handle.close();
-    }
+    await copyFileNoFollow(file.absolutePath, target);
   }
 }
 async function copyPathNoFollow(source: string, target: string): Promise<void> {
@@ -485,14 +612,7 @@ async function copyPathNoFollow(source: string, target: string): Promise<void> {
     }
     return;
   }
-  const bytes = await readNoFollow(source);
-  await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
-  const handle = await openFile(target, "wx", 0o600);
-  try {
-    await handle.writeFile(bytes);
-  } finally {
-    await handle.close();
-  }
+  await copyFileNoFollow(source, target);
 }
 async function copyRepositoryNoSecrets(target: string, files: FileSnapshot[], metadata: StageMetadata): Promise<void> {
   await fs.mkdir(target, { recursive: false, mode: 0o700 });
@@ -502,13 +622,20 @@ async function copyRepositoryNoSecrets(target: string, files: FileSnapshot[], me
 
 export {
   canonical,
+  compareFileRange,
+  copyFileNoFollow,
+  copyFileRangeNoFollow,
   copyPathNoFollow,
+  copyReadableToFile,
   copyRepositoryNoSecrets,
   deterministicUuid,
   digestBytes,
   ensureWithin,
+  hashFile,
+  hashFileSync,
   inferKind,
   lstatNoFollow,
+  lstatNoFollowSync,
   measurePath,
   parseMetadata,
   pathFor,

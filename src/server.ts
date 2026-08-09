@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { createWriteStream, lstatSync, realpathSync } from "node:fs";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { type IncomingMessage, createServer as nodeCreateServer, type Server, type ServerResponse } from "node:http";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import busboy from "busboy";
 import { createApplication, type ScholarApplication } from "./application/application.js";
 import type {
   ApiEnvelope,
@@ -20,7 +22,13 @@ import { localDate, RevisionConflictError, ValidationError } from "./scheduler.j
 import { resolveVault, type VaultPaths } from "./vault.js";
 
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
-const MAX_MULTIPART_BYTES = 100 * 1024 * 1024 + MAX_JSON_BYTES;
+const MULTIPART_FIELD_BYTES = 64 * 1024;
+const MULTIPART_FIELD_NAMES: Record<string, true> = {
+  kind: true,
+  displayName: true,
+  mediaType: true,
+  originalName: true,
+};
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const SOURCE_KINDS = ["document", "url", "text", "note", "code", "directory", "repository"] as const;
@@ -57,11 +65,19 @@ export interface ScholarServer extends Server {
   readonly closeGracefully: () => Promise<void>;
 }
 
-interface MultipartPart {
+interface RequestOptions {
+  readonly host: string;
+  readonly maxJsonBytes: number;
+  readonly maxMultipartBytes?: number;
+}
+
+interface MultipartUpload {
+  readonly spoolRoot: string;
+  readonly filePath: string;
   readonly name: string;
-  readonly filename?: string;
-  readonly contentType?: string;
-  readonly bytes: Buffer;
+  readonly originalName: string;
+  readonly displayName: string;
+  readonly mediaType?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -205,60 +221,130 @@ async function bodyBuffer(req: IncomingMessage, limit: number): Promise<Buffer> 
   }
   return Buffer.concat(chunks, length);
 }
-function headerValue(headers: Buffer): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const line of headers.toString("utf8").split("\r\n")) {
-    const separator = line.indexOf(":");
-    if (separator <= 0) throw new ValidationError("multipart header is malformed");
-    const key = line.slice(0, separator).trim().toLocaleLowerCase();
-    const value = line.slice(separator + 1).trim();
-    if (!key || /[\u0000-\u001f\u007f]/u.test(value)) throw new ValidationError("multipart header is malformed");
-    result[key] = value;
-  }
-  return result;
-}
-function parseDisposition(value: string): { name: string; filename?: string } {
-  const match = /^form-data;\s*name="([A-Za-z0-9_.-]{1,80})"(?:;\s*filename="([^"]{0,255})")?$/u.exec(value);
-  if (!match) throw new ValidationError("multipart content disposition is malformed");
-  const filename = match[2];
+function multipartFilename(value: string): string {
+  const filename = value || "upload";
   if (
-    filename !== undefined &&
-    (filename.includes("/") || filename.includes("\\") || /[\u0000-\u001f\u007f]/u.test(filename))
+    filename.length > 255 ||
+    filename.includes("/") ||
+    filename.includes("\\") ||
+    /[\u0000-\u001f\u007f]/u.test(filename)
   )
     throw new ValidationError("multipart filename is unsafe");
-  return { name: match[1]!, ...(filename !== undefined ? { filename } : {}) };
+  return filename;
 }
-function parseMultipart(body: Buffer, boundary: string): MultipartPart[] {
-  if (!boundary || boundary.length > 200 || /[\u0000-\u001f\u007f]/u.test(boundary))
-    throw new ValidationError("multipart boundary is invalid");
-  const marker = Buffer.from(`--${boundary}`);
-  const first = body.indexOf(marker);
-  if (first !== 0) throw new ValidationError("multipart body is malformed");
-  const parts: MultipartPart[] = [];
-  let cursor = marker.length;
-  while (cursor < body.length) {
-    if (body.subarray(cursor, cursor + 2).equals(Buffer.from("--"))) break;
-    if (!body.subarray(cursor, cursor + 2).equals(Buffer.from("\r\n")))
-      throw new ValidationError("multipart delimiter is malformed");
-    cursor += 2;
-    const headerEnd = body.indexOf(Buffer.from("\r\n\r\n"), cursor);
-    if (headerEnd < 0) throw new ValidationError("multipart headers are malformed");
-    const headers = headerValue(body.subarray(cursor, headerEnd));
-    cursor = headerEnd + 4;
-    const next = body.indexOf(marker, cursor);
-    if (next < 0 || next < 2 || !body.subarray(next - 2, next).equals(Buffer.from("\r\n")))
-      throw new ValidationError("multipart part is unterminated");
-    const disposition = parseDisposition(headers["content-disposition"] ?? "");
-    parts.push({
-      name: disposition.name,
-      ...(disposition.filename !== undefined ? { filename: disposition.filename } : {}),
-      ...(headers["content-type"] ? { contentType: headers["content-type"] } : {}),
-      bytes: Buffer.from(body.subarray(cursor, next - 2)),
+
+function multipartTooLarge(): Error {
+  return Object.assign(new Error("request body exceeds configured limit"), {
+    code: "BODY_TOO_LARGE",
+    status: 413,
+  });
+}
+
+async function receiveMultipartUpload(
+  req: IncomingMessage,
+  workRoot: string,
+  maxFileBytes?: number,
+): Promise<MultipartUpload> {
+  const spoolRoot = await mkdtemp(join(workRoot, "http-upload-"));
+  const filePath = join(spoolRoot, "upload");
+  try {
+    await chmod(spoolRoot, 0o700);
+    const fields = new Map<string, string>();
+    let fileSeen = false;
+    let filename: string | undefined;
+    let mediaType: string | undefined;
+    let writePromise: Promise<void> | undefined;
+    let failure: unknown;
+
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const parser = busboy({
+        headers: req.headers,
+        limits: {
+          fieldSize: MULTIPART_FIELD_BYTES,
+          fields: Object.keys(MULTIPART_FIELD_NAMES).length,
+          ...(maxFileBytes === undefined ? {} : { fileSize: maxFileBytes + 1 }),
+          parts: Object.keys(MULTIPART_FIELD_NAMES).length + 1,
+        },
+      });
+      const fail = (error: unknown): void => {
+        failure ??= error;
+      };
+      const requestError = (error: Error): void => {
+        fail(error);
+        parser.destroy(error);
+      };
+      req.once("error", requestError);
+      parser.on("field", (name, value, info) => {
+        if (failure) return;
+        if (info.nameTruncated || info.valueTruncated)
+          return fail(new ValidationError("multipart field exceeds configured limit"));
+        if (!Object.hasOwn(MULTIPART_FIELD_NAMES, name))
+          return fail(new ValidationError(`unsupported multipart field: ${name}`));
+        if (fields.has(name)) return fail(new ValidationError("multipart field is repeated"));
+        fields.set(name, value);
+      });
+      parser.on("file", (name, file, info) => {
+        if (failure || name !== "file" || fileSeen) {
+          file.resume();
+          if (!failure)
+            fail(
+              name !== "file"
+                ? new ValidationError(`unsupported multipart file field: ${name}`)
+                : new ValidationError("multipart request contains multiple files"),
+            );
+          return;
+        }
+        fileSeen = true;
+        try {
+          filename = multipartFilename(info.filename);
+        } catch (error) {
+          fail(error);
+          file.resume();
+          return;
+        }
+        mediaType = info.mimeType || undefined;
+        file.on("limit", () => fail(multipartTooLarge()));
+        const output = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
+        writePromise = pipeline(file, output).catch((error) => {
+          fail(error);
+          throw error;
+        });
+      });
+      parser.on("filesLimit", () => fail(new ValidationError("multipart request contains multiple files")));
+      parser.on("fieldsLimit", () => fail(new ValidationError("multipart request contains too many fields")));
+      parser.on("partsLimit", () => fail(new ValidationError("multipart request contains too many parts")));
+      parser.on("error", fail);
+      parser.on("close", () => {
+        req.off("error", requestError);
+        void (async () => {
+          try {
+            await writePromise;
+          } catch (error) {
+            fail(error);
+          }
+          if (failure) rejectPromise(failure);
+          else resolvePromise();
+        })();
+      });
+      req.pipe(parser);
     });
-    cursor = next + marker.length;
+
+    if (!fileSeen || !filename || fields.get("kind") !== "upload")
+      throw new ValidationError("multipart upload requires kind=upload and file");
+    const requestedMediaType = fields.get("mediaType") ?? mediaType;
+    await chmod(filePath, 0o600);
+    return {
+      spoolRoot,
+      filePath,
+      name: filename,
+      originalName: fields.get("originalName") ?? filename,
+      displayName: fields.get("displayName") ?? filename,
+      ...(requestedMediaType === undefined ? {} : { mediaType: requestedMediaType }),
+    };
+  } catch (error) {
+    await rm(spoolRoot, { recursive: true, force: true });
+    throw error;
   }
-  if (parts.length === 0) throw new ValidationError("multipart body has no parts");
-  return parts;
 }
 async function readStaticFile(path: string): Promise<Buffer> {
   const target = lstatSync(path);
@@ -373,7 +459,7 @@ async function handleRequest(
   res: ServerResponse,
   app: ScholarApplication,
   staticRoot: string,
-  options: Required<Pick<ServerOptions, "host" | "maxJsonBytes" | "maxMultipartBytes">>,
+  options: RequestOptions,
 ): Promise<void> {
   const requestId = randomUUID();
   securityHeaders(res);
@@ -479,7 +565,7 @@ async function apiRoute(
   app: ScholarApplication,
   url: URL,
   requestId: string,
-  options: Required<Pick<ServerOptions, "maxJsonBytes" | "maxMultipartBytes">>,
+  options: RequestOptions,
 ): Promise<void> {
   const path = url.pathname;
   const method = req.method!;
@@ -502,37 +588,24 @@ async function apiRoute(
       });
     const type = contentType(req);
     if (type === "multipart/form-data") {
-      const raw = await bodyBuffer(req, options.maxMultipartBytes);
-      const boundary = /boundary=(?:"([^"]+)"|([^;]+))/u.exec(String(req.headers["content-type"] ?? ""));
-      const parts = parseMultipart(raw, boundary?.[1] ?? boundary?.[2] ?? "");
-      const fields = new Map<string, string>();
-      let file: MultipartPart | undefined;
-      for (const part of parts) {
-        if (part.filename !== undefined) {
-          if (file) throw new ValidationError("multipart request contains multiple files");
-          file = part;
-        } else {
-          if (fields.has(part.name)) throw new ValidationError("multipart field is repeated");
-          fields.set(part.name, part.bytes.toString("utf8"));
+      const upload = await receiveMultipartUpload(req, app.paths.workRoot, options.maxMultipartBytes);
+      const staged = await (async () => {
+        try {
+          return await app.stageSource(
+            {
+              kind: "upload",
+              filePath: upload.filePath,
+              name: upload.name,
+              originalName: upload.originalName,
+              displayName: upload.displayName,
+              ...(upload.mediaType === undefined ? {} : { mediaType: upload.mediaType }),
+            },
+            { origin: "browser" },
+          );
+        } finally {
+          await rm(upload.spoolRoot, { recursive: true, force: true });
         }
-      }
-      if (!file || fields.get("kind") !== "upload")
-        throw new ValidationError("multipart upload requires kind=upload and file");
-      for (const key of fields.keys())
-        if (!["kind", "displayName", "mediaType", "originalName"].includes(key))
-          throw new ValidationError(`unsupported multipart field: ${key}`);
-      const uploadName = file.filename || "upload";
-      const staged = await app.stageSource(
-        {
-          kind: "upload",
-          bytes: file.bytes,
-          name: uploadName,
-          originalName: fields.get("originalName") ?? uploadName,
-          displayName: fields.get("displayName") ?? uploadName,
-          mediaType: fields.get("mediaType") ?? file.contentType,
-        },
-        { origin: "browser" },
-      );
+      })();
       sendJson(res, 200, publicSourceResponse(staged), requestId);
       return;
     }
@@ -867,11 +940,11 @@ export function createServer(options: ServerOptions = {}): ScholarServer {
     });
   const host = "127.0.0.1";
   const staticRoot = resolve(options.staticRoot ?? join(dirname(fileURLToPath(import.meta.url)), "../apps/web/dist"));
-  const requestOptions = {
+  const requestOptions: RequestOptions = {
     host,
     maxJsonBytes: options.maxJsonBytes ?? MAX_JSON_BYTES,
-    maxMultipartBytes: options.maxMultipartBytes ?? MAX_MULTIPART_BYTES,
-  } as const;
+    ...(options.maxMultipartBytes === undefined ? {} : { maxMultipartBytes: options.maxMultipartBytes }),
+  };
   const server = nodeCreateServer((req, res) => {
     void handleRequest(req, res, application, staticRoot, requestOptions);
   }) as ScholarServer;

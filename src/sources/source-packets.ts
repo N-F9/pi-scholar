@@ -1,9 +1,10 @@
 import { promises as fs, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomizeExtraction } from "./source-chunks.js";
+import { atomizeFile } from "./source-chunks.js";
 import {
   canonical,
-  digestBytes,
+  compareFileRange,
+  hashFile,
   lstatNoFollow,
   parseMetadata,
   readNoFollow,
@@ -26,6 +27,16 @@ function parseManifestValue(raw: unknown): SourceManifest {
   const record = raw as Record<string, unknown>;
   requiredString(record, "sourceId");
   requiredString(record, "originalDigest");
+  const normalizer = record.normalizer;
+  if (
+    normalizer !== undefined &&
+    (normalizer === null ||
+      typeof normalizer !== "object" ||
+      Array.isArray(normalizer) ||
+      (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
+      (normalizer as Record<string, unknown>).version !== "1")
+  )
+    throw new Error("invalid source manifest normalizer");
   if (!Array.isArray(record.files) || !Array.isArray(record.chunks)) throw new Error("invalid source manifest files");
   if (record.attachments === undefined) record.attachments = [];
   if (!Array.isArray(record.attachments)) throw new Error("invalid source manifest attachments");
@@ -159,24 +170,23 @@ export async function verifyRetainedPacket(
   const extractedPath = join(packet, "extracted.md");
   const extractedStat = await lstatNoFollow(extractedPath);
   if (!extractedStat.isFile()) throw new Error("source extraction must be a regular file");
-  const extracted = await readNoFollow(extractedPath);
+  const extractedFile = await hashFile(extractedPath);
   const extractedLength = manifestInteger(manifest.extractedByteLength, "extractedByteLength");
   if (
     manifestInteger(manifest.extractionBytes, "extractionBytes") !== extractedLength ||
-    extractedLength !== extracted.byteLength
+    extractedLength !== extractedFile.size
   )
     throw new Error("retained source extraction length mismatch");
   const extractedDigest = manifestDigest(manifest.extractedDigest, "extractedDigest");
   if (
     manifestDigest(manifest.extractionDigest, "extractionDigest") !== extractedDigest ||
-    digestBytes(extracted) !== extractedDigest
+    extractedFile.digest !== extractedDigest
   )
     throw new Error("retained source extraction digest mismatch");
-  const atoms = atomizeExtraction(extracted);
+  const atoms = await atomizeFile(extractedPath);
   const chunkNames = (await fs.readdir(chunksRoot)).sort((left, right) => left.localeCompare(right));
   if (!manifest.chunks.length || chunkNames.length !== manifest.chunks.length)
     throw new Error("retained source chunks are incomplete");
-  const chunkBodies: Buffer[] = [];
   let nextAtom = 0;
   let nextByte = 0;
   for (const [index, chunk] of manifest.chunks.entries()) {
@@ -186,7 +196,7 @@ export async function verifyRetainedPacket(
     const chunkPath = join(chunksRoot, expectedName);
     const chunkStat = await lstatNoFollow(chunkPath);
     if (!chunkStat.isFile()) throw new Error("source chunk must be a regular file");
-    const body = await readNoFollow(chunkPath);
+    const chunkFile = await hashFile(chunkPath);
     if (
       manifestInteger(record.index, `chunks[${index}].index`) !== index ||
       manifestInteger(record.ordinal, `chunks[${index}].ordinal`) !== index ||
@@ -201,6 +211,7 @@ export async function verifyRetainedPacket(
     const atomEnd = manifestInteger(record.atomEnd, `chunks[${index}].atomEnd`);
     const startByte = manifestInteger(record.startByte, `chunks[${index}].startByte`);
     const endByte = manifestInteger(record.endByte, `chunks[${index}].endByte`);
+    const byteLength = manifestInteger(record.byteLength, `chunks[${index}].byteLength`);
     if (
       startAtom !== atomStart ||
       endAtom !== atomEnd ||
@@ -209,8 +220,8 @@ export async function verifyRetainedPacket(
       endAtom > atoms.length ||
       startByte !== nextByte ||
       endByte < startByte ||
-      endByte - startByte !== body.byteLength ||
-      endByte - startByte !== manifestInteger(record.byteLength, `chunks[${index}].byteLength`)
+      endByte - startByte !== chunkFile.size ||
+      endByte - startByte !== byteLength
     )
       throw new Error("retained source chunk coverage is invalid");
     const firstAtom = atoms[startAtom];
@@ -220,15 +231,14 @@ export async function verifyRetainedPacket(
       !lastAtom ||
       firstAtom.startByte !== startByte ||
       lastAtom.endByte !== endByte ||
-      !body.equals(extracted.subarray(startByte, endByte)) ||
-      digestBytes(body) !== manifestDigest(record.digest, `chunks[${index}].digest`)
+      !(await compareFileRange(extractedPath, startByte, endByte, chunkPath)) ||
+      chunkFile.digest !== manifestDigest(record.digest, `chunks[${index}].digest`)
     )
       throw new Error("retained source chunk digest mismatch");
-    chunkBodies.push(body);
     nextAtom = endAtom;
     nextByte = endByte;
   }
-  if (nextAtom !== atoms.length || nextByte !== extracted.byteLength || !Buffer.concat(chunkBodies).equals(extracted))
+  if (nextAtom !== atoms.length || nextByte !== extractedFile.size)
     throw new Error("retained source chunk reconstruction is incomplete");
   return manifest;
 }
@@ -295,6 +305,7 @@ export function parsePreparedMetadata(raw: unknown): PersistedPreparedAdmission 
       throw new Error("invalid prepared metadata atom bounds");
     return { index, startByte, endByte, byteLength };
   });
+  if (atoms.length > 2048) throw new Error("invalid prepared metadata atom count");
   const entryRelativePath = validRelativePath(requiredString(record, "entryRelativePath"));
   const entryIdentity = identityField(record.entryIdentity, "entryIdentity");
   const snapshotIdentity = identityField(record.snapshotIdentity, "snapshotIdentity");

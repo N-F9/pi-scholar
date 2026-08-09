@@ -47,6 +47,7 @@ export interface SourceManifest {
   readonly mediaType?: string;
   readonly capturedAt: IsoDateTime;
   readonly converter?: { readonly name: string; readonly version: string };
+  readonly normalizer: { readonly name: "markdown-blank-lines"; readonly version: "1" };
   readonly originalByteLength: number;
   readonly extractedByteLength: number;
   readonly originalDigest: string;

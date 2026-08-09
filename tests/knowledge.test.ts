@@ -1,15 +1,11 @@
 import { promises as fs } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { runChild } from "../src/external/process.js";
-import {
-  pinnedSourceLookup,
-  reconstructChunks,
-  SourceService,
-  validateChunkEndpoints,
-} from "../src/sources/source-service.js";
+import { SourceService, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
 import { isExecutableHtml, WikiService } from "../src/wiki.js";
 
@@ -54,11 +50,37 @@ describe("source admission mechanics", () => {
     await fs.writeFile(join(paths.inboxRoot, "long.txt"), text);
     const [entry] = await sources.discover();
     const claim = await sources.claim(entry);
-    const result = await sources.admitClaim(claim, { endpoints: [10_000, 20_000] });
+    const prepared = await sources.prepareClaim(claim);
+    expect(prepared.atoms.length).toBeLessThanOrEqual(2048);
+    const midpoint = Math.floor(prepared.atoms.length / 2);
+    const result = await sources.publishPreparedClaim({
+      prepared,
+      preparedId: prepared.preparedId,
+      claimId: prepared.claimId,
+      digest: prepared.digest,
+      endpoints: [midpoint, prepared.atoms.length],
+    });
     const extracted = await fs.readFile(join(result.packetPath, "extracted.md"));
     expect(extracted.toString()).toBe(text);
-    const chunks = validateChunkEndpoints(extracted, [10_000, 20_000]);
-    expect(reconstructChunks(chunks).equals(extracted)).toBe(true);
+    const chunkBodies = await Promise.all(
+      (await fs.readdir(join(result.packetPath, "chunks"))).map((name) =>
+        fs.readFile(join(result.packetPath, "chunks", name)),
+      ),
+    );
+    expect(Buffer.concat(chunkBodies).equals(extracted)).toBe(true);
+    db.close();
+  });
+  it("normalizes blank runs outside fences while preserving original bytes and fenced content", async () => {
+    const { paths, db, sources } = await fixture();
+    const original = "before\n\n\n```\ninside\n\n\n```\n\n\nafter\n";
+    await fs.writeFile(join(paths.inboxRoot, "normalize.md"), original);
+    const [entry] = await sources.discover();
+    const result = await sources.admitClaim(await sources.claim(entry));
+    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).toString()).toBe(
+      "before\n\n```\ninside\n\n\n```\n\nafter\n",
+    );
+    expect((await fs.readFile(join(result.packetPath, "original", "normalize.md"))).toString()).toBe(original);
+    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
     db.close();
   });
 
@@ -131,20 +153,6 @@ describe("source admission mechanics", () => {
     await sources.cleanupPrepared(prepared.preparedId);
   });
 
-  it("pins resolved source addresses for both Node lookup callback modes", () => {
-    const lookup = pinnedSourceLookup("93.184.216.34", 4);
-    lookup("example.com", { all: false }, (error, result, family) => {
-      expect(error).toBeNull();
-      expect(result).toBe("93.184.216.34");
-      expect(family).toBe(4);
-    });
-    lookup("example.com", { all: true }, (error, result, family) => {
-      expect(error).toBeNull();
-      expect(result).toEqual([{ address: "93.184.216.34", family: 4 }]);
-      expect(family).toBeUndefined();
-    });
-  });
-
   it("strips URL secrets from staged and published provenance while fetching the full URL transiently", async () => {
     const { paths, db } = await fixture();
     let fetchedUrl = "";
@@ -159,6 +167,7 @@ describe("source admission mechanics", () => {
     const [entry] = await sources.discover();
     const result = await sources.admitClaim(await sources.claim(entry));
     expect(result.manifest.sourceUri).toBe("https://example.com/path/remote.txt");
+    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
     expect(JSON.stringify(result.manifest)).not.toMatch(/secret|token|fragment/iu);
     expect(
       db.get<Record<string, unknown>>("SELECT source_uri FROM sources WHERE source_id = ?", [result.sourceId])
@@ -167,17 +176,37 @@ describe("source admission mechanics", () => {
     db.close();
   });
 
-  it("rejects private URL destinations and caps fetched streams before staging", async () => {
-    const privateFixture = await fixture();
-    await expect(privateFixture.sources.stage({ url: "http://127.0.0.1/private.txt" })).rejects.toThrow(
-      /private|special/iu,
-    );
-    privateFixture.db.close();
-    const capped = await fixture();
-    const oversized = new Uint8Array(100 * 1024 * 1024 + 1);
-    const sources = new SourceService(capped.db, capped.paths, { fetchUrl: async () => ({ bytes: oversized }) });
-    await expect(sources.stage({ url: "https://example.com/large.txt" })).rejects.toThrow(/100 MiB/iu);
-    capped.db.close();
+  it("accepts loopback URLs and disk-backed uploads without a fixed size cap", async () => {
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.setHeader("content-length", "9");
+      response.end("loopback\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("loopback server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        const stagedUrl = await sources.stage({ url: `http://127.0.0.1:${address.port}/loopback.txt` });
+        expect((await fs.readFile(join(stagedUrl.absolutePath, "payload"))).toString()).toBe("loopback\n");
+        const largePath = join(paths.workRoot, "large.txt");
+        await fs.writeFile(largePath, "x");
+        const largeSize = 100 * 1024 * 1024 + 1;
+        await fs.truncate(largePath, largeSize);
+        const stagedUpload = await sources.stage({ kind: "upload", filePath: largePath, originalName: "large.txt" });
+        expect((await fs.stat(join(stagedUpload.absolutePath, "payload"))).size).toBe(largeSize);
+        expect((await fs.stat(largePath)).size).toBe(largeSize);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it("uses a unique exclusive work directory for concurrent prepares", async () => {
@@ -346,7 +375,9 @@ describe("source admission mechanics", () => {
       "stale diagnostic",
       result.sourceId,
     ]);
-    const reactivated = await sources.admitClaim(claim);
+    await fs.writeFile(join(paths.inboxRoot, "reactivate.txt"), "evidence\n");
+    const [replacement] = await sources.discover();
+    const reactivated = await sources.admitClaim(await sources.claim(replacement));
     const row = db.get<{
       status: string;
       error_code: string | null;

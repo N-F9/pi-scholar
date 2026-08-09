@@ -1,19 +1,34 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import type { QuizRecord } from "../src/contracts.js";
-import { startServer } from "../src/server.js";
+import { type ServerOptions, startServer } from "../src/server.js";
 
 async function withServer(
   application: ScholarApplication,
   run: (base: string) => Promise<void>,
   staticRoot?: string,
+  serverOptions: Pick<ServerOptions, "maxMultipartBytes"> = {},
 ): Promise<void> {
-  const server = await startServer({ application, port: 0, ...(staticRoot ? { staticRoot } : {}) });
+  const server = await startServer({
+    application,
+    port: 0,
+    ...(staticRoot ? { staticRoot } : {}),
+    ...serverOptions,
+  });
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   try {
@@ -143,13 +158,20 @@ describe("server browser boundary", () => {
   it("requires JSON for mutations while allowing same-origin JSON and multipart uploads", async () => {
     let issueCalls = 0;
     let sourceCalls = 0;
+    let receivedFilePath: string | undefined;
+    const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));
     const application = {
+      paths: { workRoot },
       reportIssue: async () => {
         issueCalls += 1;
         return issue;
       },
-      stageSource: async () => {
+      stageSource: async (request: { readonly filePath: string; readonly name: string }) => {
         sourceCalls += 1;
+        receivedFilePath = request.filePath;
+        assert.equal(request.name, "notes.txt");
+        assert.equal(readFileSync(request.filePath, "utf8"), "notes");
+        assert.equal(statSync(request.filePath).mode & 0o777, 0o600);
         return { source: {} };
       },
       listSources: async () => ({
@@ -168,50 +190,205 @@ describe("server browser boundary", () => {
       close: async () => undefined,
     } as unknown as ScholarApplication;
 
-    await withServer(application, async (base) => {
-      const textResponse = await fetch(`${base}/api/v1/wiki/issues`, {
-        method: "POST",
-        headers: sameOriginHeaders(base, {
-          "Content-Type": "text/plain",
-          "Sec-Fetch-Site": "same-origin",
-          "X-Pi-Scholar-Request": "1",
-        }),
-        body: JSON.stringify({ kind: "incorrect", description: "wrong type" }),
-      });
-      assert.equal(textResponse.status, 415);
-      assert.equal(issueCalls, 0);
+    try {
+      await withServer(application, async (base) => {
+        const textResponse = await fetch(`${base}/api/v1/wiki/issues`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, {
+            "Content-Type": "text/plain",
+            "Sec-Fetch-Site": "same-origin",
+            "X-Pi-Scholar-Request": "1",
+          }),
+          body: JSON.stringify({ kind: "incorrect", description: "wrong type" }),
+        });
+        assert.equal(textResponse.status, 415);
+        assert.equal(issueCalls, 0);
 
-      const jsonResponse = await fetch(`${base}/api/v1/wiki/issues`, {
-        method: "POST",
-        headers: sameOriginHeaders(base, {
-          "Content-Type": "application/json",
-          "Sec-Fetch-Site": "same-origin",
-          "X-Pi-Scholar-Request": "1",
-        }),
-        body: JSON.stringify({ kind: "incorrect", description: "valid" }),
-      });
-      assert.equal(jsonResponse.status, 200);
-      assert.equal(issueCalls, 1);
-      const sourceListResponse = await fetch(`${base}/api/v1/sources`);
-      const sourceListEnvelope = (await sourceListResponse.json()) as {
-        data: { sources: Array<Record<string, unknown>> };
-      };
-      assert.equal(sourceListResponse.status, 200);
-      assert.equal("manifestPath" in sourceListEnvelope.data.sources[0]!, false);
+        const jsonResponse = await fetch(`${base}/api/v1/wiki/issues`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, {
+            "Content-Type": "application/json",
+            "Sec-Fetch-Site": "same-origin",
+            "X-Pi-Scholar-Request": "1",
+          }),
+          body: JSON.stringify({ kind: "incorrect", description: "valid" }),
+        });
+        assert.equal(jsonResponse.status, 200);
+        assert.equal(issueCalls, 1);
+        const sourceListResponse = await fetch(`${base}/api/v1/sources`);
+        const sourceListEnvelope = (await sourceListResponse.json()) as {
+          data: { sources: Array<Record<string, unknown>> };
+        };
+        assert.equal(sourceListResponse.status, 200);
+        assert.equal("manifestPath" in sourceListEnvelope.data.sources[0]!, false);
 
-      const form = new FormData();
-      form.set("kind", "upload");
-      form.set("displayName", "notes");
-      form.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
-      const multipartResponse = await fetch(`${base}/api/v1/sources`, {
-        method: "POST",
-        headers: sameOriginHeaders(base, { "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
-        body: form,
+        const form = new FormData();
+        form.set("kind", "upload");
+        form.set("displayName", "notes");
+        form.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
+        const multipartResponse = await fetch(`${base}/api/v1/sources`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, { "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
+          body: form,
+        });
+        assert.equal(multipartResponse.status, 200);
+        assert.equal(sourceCalls, 1);
       });
-      assert.equal(multipartResponse.status, 200);
-      assert.equal(sourceCalls, 1);
-    });
+      assert.ok(receivedFilePath);
+      assert.equal(existsSync(receivedFilePath), false);
+      assert.deepEqual(readdirSync(workRoot), []);
+    } finally {
+      rmSync(workRoot, { recursive: true, force: true });
+    }
   });
+
+  it("accepts a streamed multipart file beyond the former default cap", async () => {
+    let observedSize = 0;
+    const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));
+    const application = {
+      paths: { workRoot },
+      stageSource: async (request: { readonly filePath: string }) => {
+        observedSize = statSync(request.filePath).size;
+        return { source: {} };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    const boundary = "pi-scholar-stream";
+    const prefix = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="kind"\r\n\r\nupload\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="large.bin"\r\n` +
+        "Content-Type: application/octet-stream\r\n\r\n",
+    );
+    const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const payloadSize = 101 * 1024 * 1024 + 1;
+    const chunk = new Uint8Array(1024 * 1024);
+    chunk.fill(65);
+    let remaining = payloadSize;
+    let suffixSent = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(prefix);
+      },
+      pull(controller) {
+        if (remaining > 0) {
+          const size = Math.min(remaining, chunk.byteLength);
+          controller.enqueue(chunk.subarray(0, size));
+          remaining -= size;
+          return;
+        }
+        if (!suffixSent) {
+          suffixSent = true;
+          controller.enqueue(suffix);
+          controller.close();
+        }
+      },
+    });
+    try {
+      await withServer(application, async (base) => {
+        const response = await fetch(`${base}/api/v1/sources`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Sec-Fetch-Site": "same-origin",
+            "X-Pi-Scholar-Request": "1",
+          }),
+          body,
+          duplex: "half",
+        } as RequestInit & { duplex: "half" });
+        assert.equal(response.status, 200);
+      });
+      assert.equal(observedSize, payloadSize);
+      assert.deepEqual(readdirSync(workRoot), []);
+    } finally {
+      rmSync(workRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects malformed, repeated, and multiple multipart parts without retaining spools", async () => {
+    let calls = 0;
+    const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));
+    const application = {
+      paths: { workRoot },
+      stageSource: async () => {
+        calls += 1;
+        return { source: {} };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    try {
+      await withServer(application, async (base) => {
+        const post = (body: BodyInit, contentType?: string) =>
+          fetch(`${base}/api/v1/sources`, {
+            method: "POST",
+            headers: sameOriginHeaders(base, {
+              ...(contentType ? { "Content-Type": contentType } : {}),
+              "Sec-Fetch-Site": "same-origin",
+              "X-Pi-Scholar-Request": "1",
+            }),
+            body,
+          });
+        const unknown = new FormData();
+        unknown.set("kind", "upload");
+        unknown.set("unexpected", "no");
+        unknown.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
+        assert.equal((await post(unknown)).status, 400);
+        const repeated = new FormData();
+        repeated.append("kind", "upload");
+        repeated.append("kind", "upload");
+        repeated.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
+        assert.equal((await post(repeated)).status, 400);
+        const multiple = new FormData();
+        multiple.set("kind", "upload");
+        multiple.append("file", new Blob(["notes"], { type: "text/plain" }), "one.txt");
+        multiple.append("file", new Blob(["notes"], { type: "text/plain" }), "two.txt");
+        assert.equal((await post(multiple)).status, 400);
+        assert.equal((await post("not multipart", "multipart/form-data; boundary=broken")).status, 400);
+      });
+      assert.equal(calls, 0);
+      assert.deepEqual(readdirSync(workRoot), []);
+    } finally {
+      rmSync(workRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces an explicitly configured multipart file limit and cleans failed uploads", async () => {
+    let calls = 0;
+    const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));
+    const application = {
+      paths: { workRoot },
+      stageSource: async () => {
+        calls += 1;
+        return { source: {} };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    try {
+      await withServer(
+        application,
+        async (base) => {
+          const form = new FormData();
+          form.set("kind", "upload");
+          form.append("file", new Blob(["1234"], { type: "text/plain" }), "large.txt");
+          const response = await fetch(`${base}/api/v1/sources`, {
+            method: "POST",
+            headers: sameOriginHeaders(base, {
+              "Sec-Fetch-Site": "same-origin",
+              "X-Pi-Scholar-Request": "1",
+            }),
+            body: form,
+          });
+          assert.equal(response.status, 413);
+        },
+        undefined,
+        { maxMultipartBytes: 3 },
+      );
+      assert.equal(calls, 0);
+      assert.deepEqual(readdirSync(workRoot), []);
+    } finally {
+      rmSync(workRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects unknown and mismatched source payload kinds before staging", async () => {
     let calls = 0;
     const application = {
