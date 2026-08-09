@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createApplication } from "./application.js";
+import { createApplication } from "./application/application.js";
 import { openDatabase } from "./database.js";
 import { doctor } from "./doctor.js";
 import { localCheckpointCommit } from "./external/git.js";

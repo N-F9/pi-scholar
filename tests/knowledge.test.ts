@@ -1,10 +1,15 @@
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ScholarApplication } from "../src/application.js";
+import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { runChild } from "../src/external/process.js";
-import { pinnedSourceLookup, reconstructChunks, SourceService, validateChunkEndpoints } from "../src/sources.js";
+import {
+  pinnedSourceLookup,
+  reconstructChunks,
+  SourceService,
+  validateChunkEndpoints,
+} from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
 import { isExecutableHtml, WikiService } from "../src/wiki.js";
 
@@ -228,7 +233,7 @@ describe("source admission mechanics", () => {
     db.close();
   });
 
-  it("rejects incoherent source payload kinds and symlinked path ancestors", async () => {
+  it("rejects incoherent source payload kinds and symlinked paths", async () => {
     const { root, paths, db, sources } = await fixture();
     await expect(sources.stage({ url: "https://example.com/source.txt", kind: "text" })).rejects.toThrow(
       /URL source kind/iu,
@@ -240,7 +245,7 @@ describe("source admission mechanics", () => {
     await expect(sources.stage({ path: outside, kind: "note" })).rejects.toThrow(/path source kind/iu);
     const linkedDirectory = join(root, "linked-directory");
     await fs.symlink(root, linkedDirectory);
-    await expect(sources.stage({ path: join(linkedDirectory, "outside.txt") })).rejects.toThrow(/symlink ancestor/iu);
+    await expect(sources.stage({ path: join(linkedDirectory, "outside.txt") })).rejects.toThrow(/symlink/iu);
     expect(await fs.readdir(paths.inboxRoot)).toHaveLength(0);
     db.close();
   });

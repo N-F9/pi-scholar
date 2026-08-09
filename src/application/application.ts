@@ -14,7 +14,6 @@ import type {
   HealthResult,
   MaintenanceContext,
   MaintenanceInput,
-  MaintenanceIssuePageInput,
   MaintenanceResult,
   PageLearningRecord,
   PageRecord,
@@ -33,7 +32,6 @@ import type {
   QuizQuestionResultRecord,
   QuizReadingRecord,
   QuizRecord,
-  ReviewRating,
   SettingsFacts,
   SettingsRecord,
   SettingsUpdateRequest,
@@ -48,30 +46,70 @@ import type {
   WikiPageLearningProjection,
   WikiPageResult,
   WorkflowRecord,
-} from "./contracts.js";
-import { openDatabase, type ScholarDatabase, transaction } from "./database.js";
-import { doctor as runDoctor } from "./doctor.js";
-import { convertWithDocling } from "./external/docling.js";
-import { type GitCheckpointResult, type GitPushResult, localCheckpointCommit, safePush } from "./external/git.js";
-import { qmdSearch, runQmd } from "./external/qmd.js";
-import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "./quiz.js";
-import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "./scheduler.js";
+} from "../contracts.js";
+import { openDatabase, type ScholarDatabase, transaction } from "../database.js";
+import { doctor as runDoctor } from "../doctor.js";
+import { convertWithDocling } from "../external/docling.js";
+import {
+  type GitCheckpointResult,
+  type GitPushResult,
+  gitStatus,
+  localCheckpointCommit,
+  safePush,
+} from "../external/git.js";
+import { qmdSearch, runQmd } from "../external/qmd.js";
+import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
+import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
 import {
   type SourceStageRequest as MechanicsSourceStageRequest,
   type SourceAdapters,
   type SourceClaim,
   SourceService,
-} from "./sources.js";
-import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths, withWriterLock } from "./vault.js";
-import { parseWikiMarkdown, type WikiAdapters, type WikiPage, WikiService } from "./wiki.js";
-import { parseWikiSections } from "./wiki-sections.js";
+} from "../sources/source-service.js";
+import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths, withWriterLock } from "../vault.js";
+import { parseWikiMarkdown, type WikiAdapters, WikiService } from "../wiki.js";
+import { parseWikiSections } from "../wiki-sections.js";
 import {
   BrowserMutationWorker,
   WorkflowCoordinator,
   type WorkflowFinishOptions,
   type WorkflowKind,
   type WorkflowUpdateInput,
-} from "./workflows.js";
+} from "../workflows.js";
+import {
+  asAnswers,
+  decodeAdmissionInput,
+  decodeGrade,
+  decodeMaintenanceInput,
+  decodeQuizPublication,
+  decodeReading,
+  exact,
+  isRecord,
+  jsonValue,
+  requiredString,
+} from "./decoders.js";
+import {
+  gradingReplayKey,
+  gradingSubmissionId,
+  parseQuizGraderBinding,
+  parseQuizGraderPayload,
+  QUIZ_GRADER_LEASE_MS,
+  quizGraderBindingText,
+  quizGraderPayload,
+  quizGraderPayloadText,
+} from "./grader-binding.js";
+import {
+  answersObject,
+  type PublicWorkflowRecord,
+  pageRecord,
+  publicQuiz,
+  publicQuizDetail,
+  publicSource,
+  publicWorkflow,
+  quizOutcome,
+  recordToIssue,
+  sourceRecord,
+} from "./projections.js";
 
 export interface ApplicationMutationContext {
   readonly origin?: "browser" | "pi" | "cli" | "internal";
@@ -146,19 +184,8 @@ interface MaintenanceRollbackSnapshot {
   readonly snapshotEntries: readonly string[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
-}
-function jsonValue(value: unknown): unknown {
-  if (typeof value !== "string") return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
 }
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -177,55 +204,6 @@ function boundedUtf8(value: string, maxBytes: number): string {
   }
   return value.slice(0, end);
 }
-interface ReplayReading {
-  readonly pageId: string;
-  readonly anchor: string;
-  readonly heading?: string;
-}
-interface ReplayPage {
-  readonly pageId: string;
-  readonly rating: ReviewRating | string;
-  readonly feedback?: string;
-  readonly evidence?: readonly string[];
-  readonly readings?: readonly ReplayReading[];
-}
-interface ReplayQuestion {
-  readonly questionId: string;
-  readonly feedback?: string;
-}
-function replayReadings(values: readonly ReplayReading[]): ReplayReading[] {
-  const seen = new Set<string>();
-  return [...values]
-    .filter((reading) => {
-      const key = `${reading.pageId}#${reading.anchor}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((left, right) => `${left.pageId}#${left.anchor}`.localeCompare(`${right.pageId}#${right.anchor}`));
-}
-function gradingReplayKey(questions: readonly ReplayQuestion[], pages: readonly ReplayPage[]): string {
-  return JSON.stringify({
-    questions: questions
-      .map((question) => ({
-        questionId: question.questionId,
-        feedback: (question.feedback ?? "").trim(),
-      }))
-      .sort((left, right) => left.questionId.localeCompare(right.questionId)),
-    pages: pages
-      .map((page) => ({
-        pageId: page.pageId,
-        rating: page.rating,
-        feedback: (page.feedback ?? "").trim(),
-        evidence: (page.evidence ?? [])
-          .map((item) => item.trim())
-          .filter(Boolean)
-          .sort(),
-        readings: replayReadings(page.readings ?? []),
-      }))
-      .sort((left, right) => left.pageId.localeCompare(right.pageId)),
-  });
-}
 function mutationFinalizationError(stage: "checkpoint" | "doctor" | "commit" | "rollback", cause: unknown): Error {
   return Object.assign(new Error(`mutation applied but ${stage} failed: ${errorMessage(cause)}`), {
     code: "MUTATION_APPLIED_FINALIZATION_FAILED",
@@ -240,55 +218,6 @@ function isAppliedFinalizationFailure(error: unknown): boolean {
     isRecord(candidate.details) &&
     candidate.details.applied === true
   );
-}
-function sourceRecord(value: Record<string, unknown>): SourceRecord {
-  return {
-    sourceId: String(value.sourceId ?? value.source_id),
-    kind: String(value.kind) as SourceRecord["kind"],
-    status: String(value.status) as SourceRecord["status"],
-    displayName: String(value.displayName ?? value.display_name),
-    ...((value.originalName ?? value.original_name)
-      ? { originalName: String(value.originalName ?? value.original_name) }
-      : {}),
-    ...((value.sourceUri ?? value.source_uri) ? { sourceUri: String(value.sourceUri ?? value.source_uri) } : {}),
-    ...((value.mediaType ?? value.media_type) ? { mediaType: String(value.mediaType ?? value.media_type) } : {}),
-    ...((value.repositoryRevision ?? value.repository_revision)
-      ? { repositoryRevision: String(value.repositoryRevision ?? value.repository_revision) }
-      : {}),
-    ...((value.capturedAt ?? value.captured_at) ? { capturedAt: String(value.capturedAt ?? value.captured_at) } : {}),
-    ...(value.digest ? { digest: String(value.digest) } : {}),
-    ...((value.manifestPath ?? value.manifest_path)
-      ? { manifestPath: String(value.manifestPath ?? value.manifest_path) }
-      : {}),
-    ...((value.errorCode ?? value.error_code) ? { errorCode: String(value.errorCode ?? value.error_code) } : {}),
-    ...((value.errorMessage ?? value.error_message)
-      ? { errorMessage: String(value.errorMessage ?? value.error_message) }
-      : {}),
-    createdAt: String(value.createdAt ?? value.created_at),
-    updatedAt: String(value.updatedAt ?? value.updated_at),
-  };
-}
-function publicSource(source: SourceRecord): PublicSourceRecord {
-  const { manifestPath: _manifestPath, ...record } = source;
-  return record;
-}
-type PublicWorkflowRecord = Omit<WorkflowRecord, "message"> & { readonly message?: string };
-function publicWorkflow(workflow: WorkflowRecord): PublicWorkflowRecord {
-  if (workflow.kind !== "quiz-grader") return workflow;
-  const { message: _message, ...record } = workflow;
-  return record;
-}
-function pageRecord(value: WikiPage): PageRecord {
-  return {
-    pageId: value.pageId,
-    relativePath: value.relativePath,
-    title: value.title,
-    digest: value.digest,
-    revision: value.revision,
-    status: value.status,
-    quizWorthiness: value.quizWorthiness,
-    updatedAt: value.updatedAt,
-  };
 }
 function defaultSourceAdapters(paths: VaultPaths, overrides?: SourceAdapters): SourceAdapters {
   const docling =
@@ -338,362 +267,6 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
     },
   };
   return { ...overrides, qmd };
-}
-const QUIZ_GRADER_BINDING_PREFIX = "quiz-grader:";
-const QUIZ_GRADER_BINDING_VERSION_PREFIX = `${QUIZ_GRADER_BINDING_PREFIX}v1:`;
-// ponytail: fixed 15-minute lease; add heartbeats only when grader runtime needs longer work.
-const QUIZ_GRADER_LEASE_MS = 15 * 60 * 1000;
-type QuizGraderBinding = { readonly quizId: string; readonly ownerHash: string };
-type QuizGraderPayload = { readonly date: string; readonly revision: number; readonly submissionId: string };
-function gradingSubmissionId(quiz: Pick<QuizRecord, "quizId" | "revision">): string {
-  return `${quiz.quizId}:r${quiz.revision}`;
-}
-function quizGraderPayload(quiz: Pick<QuizRecord, "date" | "quizId" | "revision">): QuizGraderPayload {
-  return { date: quiz.date, revision: quiz.revision, submissionId: gradingSubmissionId(quiz) };
-}
-function quizGraderPayloadText(quiz: Pick<QuizRecord, "date" | "quizId" | "revision">): string {
-  return JSON.stringify(quizGraderPayload(quiz));
-}
-function parseQuizGraderPayload(value: unknown): QuizGraderPayload | undefined {
-  if (typeof value !== "string") return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    return undefined;
-  }
-  if (
-    !isRecord(parsed) ||
-    Object.keys(parsed).length !== 3 ||
-    !Object.keys(parsed).every((key) => ["date", "revision", "submissionId"].includes(key))
-  )
-    return undefined;
-  const date = parsed.date;
-  const revision = parsed.revision;
-  const submissionId = parsed.submissionId;
-  return typeof date === "string" &&
-    typeof revision === "number" &&
-    Number.isInteger(revision) &&
-    revision > 0 &&
-    typeof submissionId === "string" &&
-    submissionId
-    ? { date, revision, submissionId }
-    : undefined;
-}
-function quizGraderBindingText(quizId: string, ownerHash: string): string {
-  return `${QUIZ_GRADER_BINDING_VERSION_PREFIX}${JSON.stringify({ quizId, ownerHash })}`;
-}
-function parseQuizGraderBinding(value: unknown): QuizGraderBinding | undefined {
-  if (typeof value !== "string" || !value.startsWith(QUIZ_GRADER_BINDING_VERSION_PREFIX)) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value.slice(QUIZ_GRADER_BINDING_VERSION_PREFIX.length));
-  } catch {
-    return undefined;
-  }
-  if (
-    !isRecord(parsed) ||
-    Object.keys(parsed).length !== 2 ||
-    !Object.keys(parsed).every((key) => ["quizId", "ownerHash"].includes(key))
-  )
-    return undefined;
-  return typeof parsed.quizId === "string" &&
-    parsed.quizId &&
-    typeof parsed.ownerHash === "string" &&
-    /^[0-9a-f]{64}$/u.test(parsed.ownerHash)
-    ? { quizId: parsed.quizId, ownerHash: parsed.ownerHash }
-    : undefined;
-}
-function recordToIssue(row: Record<string, unknown>): WikiIssueRecord {
-  return {
-    issueId: String(row.issue_id),
-    ...(row.page_id ? { pageId: String(row.page_id) } : {}),
-    ...(row.heading ? { heading: String(row.heading) } : {}),
-    ...(row.page_digest ? { pageDigest: String(row.page_digest) } : {}),
-    kind: String(row.kind) as WikiIssueRecord["kind"],
-    description: String(row.description),
-    status: String(row.status) as WikiIssueRecord["status"],
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    ...(row.resolution ? { resolution: String(row.resolution) } : {}),
-  };
-}
-function answersObject(answers: readonly QuizAnswerInput[]): Record<string, string | readonly string[]> {
-  const result: Record<string, string | readonly string[]> = {};
-  for (const answer of answers) result[answer.questionId] = answer.answer;
-  return result;
-}
-function quizOutcome(
-  quiz: QuizRecord | undefined,
-): "available" | "submitted" | "expired" | "skipped" | "failed" | "not-yet-run" | "maintenance-day" {
-  if (!quiz) return "not-yet-run";
-  return quiz.status === "open" ? "available" : quiz.status;
-}
-function publicQuiz(quiz: QuizRecord): PublicQuizRecord {
-  const { sheetPath: _sheetPath, ...withoutSheetPath } = quiz;
-  return {
-    ...withoutSheetPath,
-    questions: quiz.questions.map(
-      ({ pages: _pages, sourceRefs: _sourceRefs, ...question }) =>
-        Object.fromEntries(
-          Object.entries(question).filter(([key]) => key !== "answerKey" && key !== "criterion" && key !== "weight"),
-        ) as unknown as PublicQuizRecord["questions"][number],
-    ),
-  };
-}
-function publicQuizDetail(quiz: QuizDetailRecord): PublicQuizDetailRecord {
-  return {
-    ...publicQuiz(quiz),
-    answers: quiz.answers,
-    questionResults: quiz.questionResults,
-    pageResults: quiz.pageResults,
-    grades: quiz.grades,
-    readings: quiz.readings,
-  };
-}
-function asAnswers(value: unknown): QuizAnswerInput[] {
-  if (!Array.isArray(value)) return [];
-  return (value as unknown[]).flatMap((item): QuizAnswerInput[] => {
-    if (!isRecord(item) || typeof item.questionId !== "string") return [];
-    const answer = item.answer;
-    if (typeof answer === "string") return [{ questionId: item.questionId, answer }];
-    if (Array.isArray(answer) && answer.every((part) => typeof part === "string"))
-      return [{ questionId: item.questionId, answer: [...answer] }];
-    return [];
-  });
-}
-function exact(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
-  if (Object.keys(value).some((key) => !allowed.includes(key)))
-    throw new ValidationError(`${label} has unsupported fields`);
-}
-function requiredString(value: Record<string, unknown>, key: string, label = key): string {
-  const result = value[key];
-  if (typeof result !== "string" || !result.trim()) throw new ValidationError(`${label} must be a nonempty string`);
-  return result;
-}
-function optionalString(value: Record<string, unknown>, key: string, label = key): string | undefined {
-  if (value[key] === undefined) return undefined;
-  return requiredString(value, key, label);
-}
-function requiredInteger(value: Record<string, unknown>, key: string, label = key): number {
-  const result = value[key];
-  if (!Number.isInteger(result)) throw new ValidationError(`${label} must be an integer`);
-  return result as number;
-}
-function decodeMaintenancePage(value: unknown): MaintenanceIssuePageInput {
-  if (!isRecord(value)) throw new ValidationError("resolve-issue page must be an object");
-  exact(value, ["pageId", "expectedDigest", "title", "body", "quizWorthiness"], "resolve-issue page");
-  const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
-  if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
-    throw new ValidationError("quizWorthiness is invalid");
-  return {
-    pageId: requiredString(value, "pageId"),
-    expectedDigest: requiredString(value, "expectedDigest"),
-    ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
-    ...(value.body === undefined
-      ? {}
-      : {
-          body:
-            typeof value.body === "string"
-              ? value.body
-              : (() => {
-                  throw new ValidationError("body must be a string");
-                })(),
-        }),
-    ...(quizWorthiness === undefined ? {} : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
-  };
-}
-function optionalInteger(value: Record<string, unknown>, key: string, label = key): number | undefined {
-  if (value[key] === undefined) return undefined;
-  return requiredInteger(value, key, label);
-}
-function stringArray(value: unknown, label: string): string[] {
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim()))
-    throw new ValidationError(`${label} must be an array of nonempty strings`);
-  return value.map((item) => String(item));
-}
-function objectArray(value: unknown, label: string): Record<string, unknown>[] {
-  if (!Array.isArray(value) || value.some((item) => !isRecord(item)))
-    throw new ValidationError(`${label} must be an array of objects`);
-  return value as Record<string, unknown>[];
-}
-function decodeAdmissionInput(value: unknown): AdmissionPublicationInput {
-  if (!isRecord(value)) throw new ValidationError("admission publication must be an object");
-  exact(value, ["claimId", "preparedId", "digest", "endpoints"], "admission publication");
-  const endpoints =
-    value.endpoints === undefined
-      ? undefined
-      : Array.isArray(value.endpoints) && value.endpoints.every((item) => Number.isInteger(item) && Number(item) >= 0)
-        ? value.endpoints.map((item) => Number(item))
-        : (() => {
-            throw new ValidationError("endpoints must be an array of nonnegative integers");
-          })();
-  return {
-    claimId: requiredString(value, "claimId"),
-    preparedId: requiredString(value, "preparedId"),
-    digest: requiredString(value, "digest"),
-    ...(endpoints ? { endpoints } : {}),
-  };
-}
-function decodeMaintenanceInput(value: unknown): MaintenanceInput {
-  if (!isRecord(value)) throw new ValidationError("maintenance proposal must be an object");
-  const kind = requiredString(value, "kind") as MaintenanceInput["kind"];
-  switch (kind) {
-    case "create-page": {
-      exact(value, ["kind", "path", "title", "body", "quizWorthiness"], "create-page");
-      const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
-      if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
-        throw new ValidationError("quizWorthiness is invalid");
-      return {
-        kind,
-        path: requiredString(value, "path"),
-        ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
-        body:
-          typeof value.body === "string"
-            ? value.body
-            : (() => {
-                throw new ValidationError("body must be a string");
-              })(),
-        ...(quizWorthiness === undefined ? {} : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
-      };
-    }
-    case "update-page": {
-      exact(value, ["kind", "pageId", "expectedDigest", "title", "body", "quizWorthiness"], "update-page");
-      const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
-      if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
-        throw new ValidationError("quizWorthiness is invalid");
-      return {
-        kind,
-        pageId: requiredString(value, "pageId"),
-        expectedDigest: requiredString(value, "expectedDigest"),
-        ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
-        ...(value.body === undefined
-          ? {}
-          : {
-              body:
-                typeof value.body === "string"
-                  ? value.body
-                  : (() => {
-                      throw new ValidationError("body must be a string");
-                    })(),
-            }),
-        ...(quizWorthiness === undefined ? {} : { quizWorthiness: quizWorthiness as "eligible" | "skip" | "unknown" }),
-      };
-    }
-    case "rename-page":
-      exact(value, ["kind", "pageId", "expectedDigest", "path"], "rename-page");
-      return {
-        kind,
-        pageId: requiredString(value, "pageId"),
-        expectedDigest: requiredString(value, "expectedDigest"),
-        path: requiredString(value, "path"),
-      };
-    case "prerequisites": {
-      exact(value, ["kind", "pageId", "expectedRevision", "prerequisitePageIds"], "prerequisites");
-      const expectedRevision = optionalInteger(value, "expectedRevision");
-      return {
-        kind,
-        pageId: requiredString(value, "pageId"),
-        prerequisitePageIds: stringArray(value.prerequisitePageIds, "prerequisitePageIds"),
-        ...(expectedRevision === undefined ? {} : { expectedRevision }),
-      };
-    }
-    case "resolve-issue":
-      exact(value, ["kind", "issueId", "page", "resolution"], "resolve-issue");
-      return {
-        kind,
-        issueId: requiredString(value, "issueId"),
-        page: decodeMaintenancePage(value.page),
-        resolution: requiredString(value, "resolution"),
-      };
-    default:
-      throw new ValidationError(`unsupported maintenance kind: ${kind}`);
-  }
-}
-function decodeQuestion(value: unknown): QuizQuestionProposal {
-  if (!isRecord(value)) throw new ValidationError("quiz question must be an object");
-  exact(value, ["kind", "prompt", "choices", "pages", "sourceRefs", "answerKey"], "quiz question");
-  const pages = objectArray(value.pages, "pages").map((item) => {
-    exact(item, ["pageId", "criterion", "weight"], "quiz question page");
-    const weight = item.weight;
-    if (typeof weight !== "number" || !Number.isFinite(weight) || weight <= 0)
-      throw new ValidationError("quiz page weight must be a positive number");
-    return { pageId: requiredString(item, "pageId"), criterion: requiredString(item, "criterion"), weight };
-  });
-  const choices = value.choices === undefined ? undefined : stringArray(value.choices, "choices");
-  const kind = requiredString(value, "kind") as QuizQuestionProposal["kind"];
-  if (kind !== "short-answer" && kind !== "multiple-choice") throw new ValidationError("quiz question kind is invalid");
-  return {
-    kind,
-    prompt: requiredString(value, "prompt"),
-    pages,
-    sourceRefs: stringArray(value.sourceRefs, "sourceRefs"),
-    ...(choices ? { choices } : {}),
-    ...(value.answerKey === undefined ? {} : { answerKey: value.answerKey as QuizQuestionProposal["answerKey"] }),
-  };
-}
-function decodeQuizPublication(value: unknown): QuizPublicationInput {
-  if (!isRecord(value)) throw new ValidationError("quiz publication must be an object");
-  const status = requiredString(value, "status");
-  if (status === "published") {
-    exact(value, ["status", "date", "questions"], "quiz publication");
-    return {
-      status,
-      date: requiredString(value, "date"),
-      questions: objectArray(value.questions, "questions").map(decodeQuestion),
-    };
-  }
-  if (status === "skipped") {
-    exact(value, ["status", "date", "reason"], "quiz skip");
-    return { status, date: requiredString(value, "date"), reason: requiredString(value, "reason") };
-  }
-  throw new ValidationError("quiz publication status is invalid");
-}
-function decodeReading(value: unknown): { pageId: string; anchor: string; heading?: string } {
-  if (!isRecord(value)) throw new ValidationError("reading must be an object");
-  exact(value, ["pageId", "anchor", "heading"], "reading");
-  const heading = optionalString(value, "heading");
-  return {
-    pageId: requiredString(value, "pageId"),
-    anchor: requiredString(value, "anchor"),
-    ...(heading === undefined ? {} : { heading }),
-  };
-}
-function decodeGrade(value: unknown): GradeSettlementInput {
-  if (!isRecord(value)) throw new ValidationError("grade settlement must be an object");
-  exact(value, ["requestId", "date", "revision", "submissionId", "questions", "pages"], "grade settlement");
-  const questions = objectArray(value.questions, "questions").map((question) => {
-    exact(question, ["questionId", "feedback"], "graded question");
-    const feedback = optionalString(question, "feedback");
-    return {
-      questionId: requiredString(question, "questionId"),
-      ...(feedback === undefined ? {} : { feedback }),
-    };
-  });
-  const pages = objectArray(value.pages, "pages").map((page) => {
-    exact(page, ["pageId", "rating", "feedback", "evidence", "readings"], "graded page");
-    const feedback = optionalString(page, "feedback");
-    const readings =
-      page.readings === undefined ? undefined : objectArray(page.readings, "readings").map(decodeReading);
-    const rating = requiredString(page, "rating") as ReviewRating;
-    if (rating !== "Again" && rating !== "Hard" && rating !== "Good" && rating !== "Easy")
-      throw new ValidationError("rating is invalid");
-    return {
-      pageId: requiredString(page, "pageId"),
-      rating,
-      feedback,
-      evidence: stringArray(page.evidence, "evidence"),
-      ...(readings === undefined ? {} : { readings }),
-    };
-  });
-  return {
-    requestId: requiredString(value, "requestId"),
-    date: requiredString(value, "date"),
-    revision: requiredInteger(value, "revision"),
-    submissionId: requiredString(value, "submissionId"),
-    questions,
-    pages,
-  };
 }
 export class ScholarApplication {
   readonly paths: VaultPaths;
@@ -1437,7 +1010,7 @@ export class ScholarApplication {
       message: "Git state unavailable",
     };
     try {
-      const status = (await import("./external/git.js")).gitStatus(this.paths);
+      const status = gitStatus(this.paths);
       git = {
         branch: status.branch,
         upstream: status.upstream,

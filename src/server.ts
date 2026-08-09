@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { type IncomingMessage, createServer as nodeCreateServer, type Server, type ServerResponse } from "node:http";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApplication, type ScholarApplication } from "./application.js";
+import { createApplication, type ScholarApplication } from "./application/application.js";
 import type {
   ApiEnvelope,
   JsonValue,

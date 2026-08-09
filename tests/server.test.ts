@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
-import { ScholarApplication } from "../src/application.js";
+import { ScholarApplication } from "../src/application/application.js";
 import type { QuizRecord } from "../src/contracts.js";
 import { startServer } from "../src/server.js";
 

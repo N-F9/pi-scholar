@@ -106,7 +106,7 @@ function assertDirectory(path: string, label: string, create = false): void {
   }
 }
 
-function assertNoSymlinkComponents(path: string): void {
+export function assertNoSymlinkPath(path: string): void {
   const absolute = resolve(path);
   const parsed = win32.parse(absolute);
   let current = parsed.root || sep;
@@ -173,7 +173,7 @@ function createPaths(vaultRoot: string, config: VaultConfig): VaultPaths {
 }
 
 function validateVaultLayout(paths: VaultPaths): void {
-  assertNoSymlinkComponents(paths.vaultRoot);
+  assertNoSymlinkPath(paths.vaultRoot);
   assertDirectory(paths.vaultRoot, "vault root");
   for (const [name, path] of [
     [".pi-scholar", paths.metadataRoot],
@@ -186,7 +186,7 @@ function validateVaultLayout(paths: VaultPaths): void {
     ["qmd", paths.qmdRoot],
     ["work", paths.workRoot],
   ] as const) {
-    assertNoSymlinkComponents(path);
+    assertNoSymlinkPath(path);
     assertDirectory(path, name);
   }
   const configStat = lstatSync(paths.vaultConfigPath);
@@ -201,7 +201,7 @@ function validateVaultLayout(paths: VaultPaths): void {
 
 function findVault(start: string): VaultPaths {
   rejectControls(start, "vault path");
-  assertNoSymlinkComponents(start);
+  assertNoSymlinkPath(start);
   let current = resolve(start);
   try {
     if (!statSync(current).isDirectory()) current = dirname(current);
@@ -261,11 +261,12 @@ export function safeRelativePath(root: string | VaultPaths, requestedPath: strin
   if (!containment || containment.startsWith(`..${sep}`) || isAbsolute(containment)) {
     throw new PathSafetyError(`path escapes trusted root: ${requestedPath}`);
   }
-  assertNoSymlinkComponents(rootAbsolute);
-  assertNoSymlinkComponents(candidate);
+  assertNoSymlinkPath(rootAbsolute);
+  assertNoSymlinkPath(candidate);
   return candidate;
 }
 export function readFileNoFollow(path: string, maxBytes?: number): Buffer {
+  assertNoSymlinkPath(path);
   const stat = lstatSync(path);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new PathSafetyError(`regular file required: ${path}`);
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -282,7 +283,7 @@ export function readFileNoFollow(path: string, maxBytes?: number): Buffer {
 
 export function atomicWriteFile(path: string, data: string | Uint8Array, mode = 0o600): void {
   rejectControls(path, "file path");
-  assertNoSymlinkComponents(dirname(path));
+  assertNoSymlinkPath(dirname(path));
   const directory = dirname(path);
   assertDirectory(directory, "file parent");
   if (existsSync(path)) {
@@ -317,7 +318,7 @@ function ensureDirectory(path: string, label: string): void {
     assertDirectory(path, label);
     return;
   }
-  assertNoSymlinkComponents(dirname(path));
+  assertNoSymlinkPath(dirname(path));
   mkdirSync(path, { recursive: false, mode: 0o700 });
 }
 
@@ -389,10 +390,10 @@ function seedDefaultSettings(paths: VaultPaths): void {
 export function initVault(requestedRoot = process.cwd()): VaultPaths {
   rejectControls(requestedRoot, "vault path");
   const vaultRoot = resolve(requestedRoot);
-  assertNoSymlinkComponents(vaultRoot);
+  assertNoSymlinkPath(vaultRoot);
   if (existsSync(vaultRoot)) assertDirectory(vaultRoot, "vault root");
   else {
-    assertNoSymlinkComponents(dirname(vaultRoot));
+    assertNoSymlinkPath(dirname(vaultRoot));
     mkdirSync(vaultRoot, { recursive: true, mode: 0o700 });
   }
 
