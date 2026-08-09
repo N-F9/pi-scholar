@@ -18,7 +18,7 @@ These instructions apply to the entire repository. Treat `pi-scholar.md` as the 
 ## Change discipline
 
 - Prefer existing modules and host/platform features over new abstractions or dependencies.
-- Make clean cutovers: update callers, contracts, API guards, tests, and docs together; remove obsolete paths instead of leaving compatibility shims.
+- Pi Scholar has not been released. Do not preserve backward compatibility: make clean cutovers, update callers, contracts, API guards, tests, and docs together, and remove obsolete APIs, schemas, aliases, migrations, and shims.
 - Preserve path containment, no-follow file access, transactionality, idempotency, and revision checks.
 - Do not edit generated `dist/` files by hand.
 - Do not access credentials, deploy, push, or modify remote services unless the user explicitly requests it.
