@@ -184,7 +184,7 @@ export interface SourceManifest extends Omit<ContractSourceManifest, "converter"
   stagedMetadata?: StageMetadata;
   capturedAt: string;
   converter?: { name: string; version: string };
-  normalizer: { name: "markdown-blank-lines"; version: "1" };
+  normalizer: { name: "markdown-blank-lines"; version: "2" };
   originalBytes: number;
   originalByteLength: number;
   originalDigest: string;
@@ -1197,7 +1197,7 @@ export class SourceService {
         stagedMetadata: prepared.metadata,
         capturedAt,
         converter: prepared.converter,
-        normalizer: { name: "markdown-blank-lines", version: "1" },
+        normalizer: { name: "markdown-blank-lines", version: "2" },
         originalBytes: claim.snapshot.bytes,
         originalByteLength: claim.snapshot.bytes,
         originalDigest: claim.snapshot.digest,
@@ -1298,6 +1298,7 @@ export class SourceService {
         revision: claim.snapshot.revision,
         kind: claim.snapshot.kind,
         sourceUri: metadata?.sourceUri,
+        normalizer: { name: "markdown-blank-lines", version: "2" },
         displayName: metadata?.displayName ?? claim.entry.relativePath,
         originalName: metadata?.originalName ?? claim.entry.relativePath,
         mediaType: metadata?.mediaType,

@@ -311,29 +311,23 @@ export class WikiService {
     ]);
     if (!snapshot) return undefined;
     const path = this.snapshotPath(rowToPage(row));
-    const content = readFileNoFollow(path).toString("utf8");
+    const bytes = readFileNoFollow(path);
     const recordedDigest = String(snapshot.digest);
-    if (recordedDigest !== row.digest || digest(content) !== recordedDigest) return undefined;
+    if (recordedDigest !== row.digest || digest(bytes) !== recordedDigest) return undefined;
     return {
       digest: recordedDigest,
       revision: Number(snapshot.revision),
-      content,
+      content: bytes.toString("utf8"),
     };
   }
   private async authoredPage(page: WikiPage): Promise<(WikiPage & { content: string }) | undefined> {
     if (page.status !== "active") return undefined;
     try {
-      const current = await this.get(page.pageId);
+      const currentBytes = await this.readExact(page.relativePath);
       const snapshot = this.authored(page.pageId);
-      const currentDigest = digest(current.content);
-      if (
-        !snapshot ||
-        currentDigest !== snapshot.digest ||
-        currentDigest !== page.digest ||
-        current.status !== "active"
-      )
-        return undefined;
-      return current;
+      const currentDigest = digest(currentBytes);
+      if (!snapshot || currentDigest !== snapshot.digest || currentDigest !== page.digest) return undefined;
+      return { ...page, content: currentBytes.toString("utf8") };
     } catch {
       return undefined;
     }
@@ -577,16 +571,14 @@ export class WikiService {
     const page = rowToPage(row);
     const location = normalizePagePath(this.paths, input.path ?? page.relativePath);
     if (location.relativePath !== page.relativePath) throw new Error("page path changes must use rename");
-    const current = await fs.readFile(location.absolutePath, "utf8");
-    const currentParsed = parseOkfConcept(current);
-    if (currentParsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
+    const currentBytes = await this.readExact(location.relativePath);
     const expected = input.expectedDigest ?? page.digest;
-    const currentDigest = digest(current);
+    const currentDigest = digest(currentBytes);
     if (expected !== currentDigest) throw new Error("page changed since it was read");
     const authored = currentDigest !== page.digest ? this.authored(pageId) : undefined;
     if (currentDigest !== page.digest && (!authored || authored.digest !== page.digest))
       throw new Error("product-authored snapshot is unavailable");
-    const parsed = authored ? parseOkfConcept(authored.content) : currentParsed;
+    const parsed = authored ? parseOkfConcept(authored.content) : parseOkfConcept(currentBytes.toString("utf8"));
     if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
     const body = input.body ?? parsed.body;
     const title =
@@ -641,9 +633,8 @@ export class WikiService {
       next.page.revision !== page.revision + 1
     )
       throw new Error("prepared wiki update is stale");
-    const priorPageBytes = await fs.readFile(location.absolutePath);
-    const current = priorPageBytes.toString("utf8");
-    if (digest(current) !== next.expectedDigest) throw new Error("page changed since it was prepared");
+    const priorPageBytes = await this.readExact(location.relativePath);
+    if (digest(priorPageBytes) !== next.expectedDigest) throw new Error("page changed since it was prepared");
     const snapshotPath = this.snapshotPath(page);
     const priorSnapshotRow = dbGet<SnapshotRow>(this.db, "SELECT * FROM authored_snapshots WHERE relative_path = ?", [
       page.relativePath,
@@ -916,7 +907,7 @@ export class WikiService {
   }
   async readExact(requestedPath: string): Promise<Buffer> {
     const location = normalizePagePath(this.paths, requestedPath);
-    return fs.readFile(location.absolutePath);
+    return readFileNoFollow(location.absolutePath);
   }
   async semanticSearch(query: string, limit?: number): Promise<unknown[]> {
     return this.search(query, { mode: "semantic", limit });
@@ -1094,11 +1085,15 @@ export class WikiService {
     return issue;
   }
   async inspectDrift(pageId: string): Promise<DriftReport> {
-    const page = await this.get(pageId);
+    const row = this.catalog(pageId);
+    if (!row) throw new Error("page not found");
+    const page = rowToPage(row);
+    const currentBytes = await this.readExact(page.relativePath);
+    const currentContent = currentBytes.toString("utf8");
     const snapshot = this.authored(pageId);
     if (!snapshot) throw new Error("product-authored snapshot is unavailable");
     const authoredDigest = snapshot.digest;
-    const currentDigest = digest(page.content);
+    const currentDigest = digest(currentBytes);
     const contentDrifted = authoredDigest !== currentDigest;
     const drifted = page.status === "drifted" || contentDrifted;
     const currentPage = {
@@ -1110,7 +1105,7 @@ export class WikiService {
       drifted,
       authoredDigest,
       currentDigest,
-      diff: contentDrifted ? simpleDiff(snapshot.content, page.content) : "",
+      diff: contentDrifted ? simpleDiff(snapshot.content, currentContent) : "",
       choices: ["record-issue", "restore"],
     };
   }

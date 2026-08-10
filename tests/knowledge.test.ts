@@ -191,19 +191,19 @@ describe("source admission mechanics", () => {
       "before\n\n```\ninside\n\n\n```\n\nafter\n",
     );
     expect((await fs.readFile(join(result.packetPath, "original", "normalize.md"))).toString()).toBe(original);
-    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
+    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "2" });
     db.close();
   });
-  it("rejects packets without the exact normalizer declaration", async () => {
+  it("rejects packets with an obsolete normalizer declaration", async () => {
     const { paths, db, sources } = await fixture();
-    await fs.writeFile(join(paths.inboxRoot, "missing-normalizer.txt"), "evidence\n");
+    await fs.writeFile(join(paths.inboxRoot, "obsolete-normalizer.txt"), "evidence\n");
     const [entry] = await sources.discover();
     if (!entry) throw new Error("source entry was not discovered");
     const claim = await sources.claim(entry);
     const result = await sources.admitClaim(claim);
     const manifestPath = join(result.packetPath, "manifest.json");
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
-    delete manifest.normalizer;
+    manifest.normalizer = { name: "markdown-blank-lines", version: "1" };
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     await expect(sources.admitClaim(claim)).rejects.toThrow(/normalizer/iu);
     expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status).toBe("fail");
@@ -293,7 +293,7 @@ describe("source admission mechanics", () => {
     const [entry] = await sources.discover();
     const result = await sources.admitClaim(await sources.claim(entry));
     expect(result.manifest.sourceUri).toBe("https://example.com/path/remote.txt");
-    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
+    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "2" });
     expect(JSON.stringify(result.manifest)).not.toMatch(/secret|token|fragment/iu);
     expect(
       db.get<Record<string, unknown>>("SELECT source_uri FROM sources WHERE source_id = ?", [result.sourceId])
@@ -1281,12 +1281,19 @@ describe("wiki mechanics", () => {
       const created = await app.wiki.create({
         path: "tampered-snapshot.md",
         title: "Stable",
-        body: "Authored baseline.",
+        body: "Authored baseline. \uFFFD",
       });
       const pagePath = join(paths.wikiRoot, created.page.relativePath);
       const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
       const externalPage = created.content.replace("Authored baseline.", "External page.");
-      const tamperedSnapshot = created.content.replace("Authored baseline.", "Tampered snapshot.");
+      const authoredBytes = Buffer.from(created.content);
+      const replacementOffset = authoredBytes.indexOf(Buffer.from("\uFFFD"));
+      if (replacementOffset < 0) throw new Error("replacement character is missing");
+      const tamperedSnapshot = Buffer.concat([
+        authoredBytes.subarray(0, replacementOffset),
+        Buffer.from([0x80]),
+        authoredBytes.subarray(replacementOffset + Buffer.byteLength("\uFFFD")),
+      ]);
       await fs.writeFile(pagePath, externalPage);
       await fs.writeFile(snapshotPath, tamperedSnapshot);
       const repair = {
@@ -1300,7 +1307,7 @@ describe("wiki mechanics", () => {
         app.applyWikiChange({ kind: "update-page", pageId: created.page.pageId, ...repair }),
       ).rejects.toThrow(/product-authored snapshot/u);
       expect(await fs.readFile(pagePath, "utf8")).toBe(externalPage);
-      expect(await fs.readFile(snapshotPath, "utf8")).toBe(tamperedSnapshot);
+      expect((await fs.readFile(snapshotPath)).equals(tamperedSnapshot)).toBe(true);
       expect(
         db.get<{ status: string }>("SELECT status FROM pages WHERE page_id = ?", [created.page.pageId])?.status,
       ).toBe("active");

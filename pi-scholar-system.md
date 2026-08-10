@@ -318,7 +318,7 @@ rows, removes the matching inbox entry, and finalizes through
 
 The manifest records the original and extracted digests and lengths, source
 provenance, converter identity where applicable, the normalizer
-`markdown-blank-lines` version 1, attachments, and chunk ranges. Originals are
+`markdown-blank-lines` version 2, attachments, and chunk ranges. Originals are
 preserved exactly. Derived Markdown blank runs are normalized in a
 fence-aware pass outside fenced code when normalization is enabled; fenced
 content is not rewritten by that blank-line pass. Packet verification is

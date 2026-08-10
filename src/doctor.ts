@@ -240,7 +240,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         typeof normalizer !== "object" ||
         Array.isArray(normalizer) ||
         (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
-        (normalizer as Record<string, unknown>).version !== "1"
+        (normalizer as Record<string, unknown>).version !== "2"
       )
         throw new Error(`Invalid manifest normalizer: ${entry.name}`);
       if (manifest.id !== entry.name || manifest.sourceId !== entry.name)

@@ -62,8 +62,8 @@ import {
   localCheckpointCommit,
   safePush,
 } from "../external/git.js";
-import { qmdRefresh, qmdSearch } from "../external/qmd.js";
-import { okfFootnoteLabels, removeOkfFootnoteDefinitions } from "../okf.js";
+import { qmdRefresh, qmdScopeCheck, qmdSearch } from "../external/qmd.js";
+import { okfCitationText, okfFootnoteLabels, removeOkfFootnoteDefinitions } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
 import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
 import {
@@ -270,6 +270,8 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
         readonly ignoredPaths?: readonly string[];
       },
     ) => {
+      const scope = qmdScopeCheck(paths, undefined, options?.ignoredPaths);
+      if (!scope.ok) throw new Error(`qmd semantic index is unavailable: ${scope.message}`);
       const result = await qmdSearch(paths, query, options?.limit);
       if (result.timedOut || result.signal || result.code !== 0)
         throw new Error(
@@ -446,6 +448,13 @@ export class ScholarApplication {
     const authorized = new Set<string>();
     for (const { manifest } of await this.sources.publishedPackets())
       for (const chunk of manifest.chunks) authorized.add(chunk.chunkId);
+    if (
+      [body, authoredBody].some(
+        (markdown) =>
+          markdown !== undefined && /^ {0,3}#{1,6}(?:[ \t]+#*[ \t]*)?\r?$/mu.test(okfCitationText(markdown)),
+      )
+    )
+      throw new ValidationError("source-grounded ingest sections require non-empty headings");
     const sections = (markdown: string): IngestSection[] => {
       const parsed = parseWikiSections(markdown, "");
       const first = parsed[0];
@@ -457,8 +466,8 @@ export class ScholarApplication {
     const sectionText = (markdown: string, section: IngestSection): string =>
       markdown.slice(section.startOffset, section.endOffset);
     const withoutDefinitions = (text: string): string => {
-      const { definitions } = okfFootnoteLabels(text);
-      return removeOkfFootnoteDefinitions(text, definitions);
+      const managed = okfFootnoteLabels(text).definitions.filter((label) => authorized.has(label));
+      return removeOkfFootnoteDefinitions(text, managed).trimEnd();
     };
     const substantive = (markdown: string, section: IngestSection): boolean => {
       const text = sectionText(markdown, section);
@@ -697,6 +706,7 @@ export class ScholarApplication {
         const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
         try {
           await this.wiki.refreshProjections();
+          await this.wiki.refreshQmdIndex().catch(() => undefined);
         } catch (error) {
           throw mutationFinalizationError("projection", error, true);
         }
@@ -1320,7 +1330,6 @@ export class ScholarApplication {
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     },
   ): string {
-    const current = parseWikiMarkdown(currentContent);
     const authoredBytes = readFileNoFollow(join(this.paths.metadataRoot, "snapshots", "wiki", `${pageId}.md`));
     const recorded = this.db.get<{ readonly page_digest: string; readonly snapshot_digest: string }>(
       "SELECT pages.digest AS page_digest, authored_snapshots.digest AS snapshot_digest FROM pages JOIN authored_snapshots ON authored_snapshots.relative_path = pages.relative_path WHERE pages.page_id = ?",
@@ -1333,14 +1342,24 @@ export class ScholarApplication {
     )
       throw new ValidationError("product-authored snapshot failed verification");
     const authored = parseWikiMarkdown(authoredBytes.toString("utf8"));
-    const missing = [
-      current.body !== authored.body && proposed.body === undefined ? "body" : undefined,
-      current.frontmatter.title !== authored.frontmatter.title && proposed.title === undefined ? "title" : undefined,
-      current.frontmatter["quiz-worthiness"] !== authored.frontmatter["quiz-worthiness"] &&
-      proposed.quizWorthiness === undefined
-        ? "quizWorthiness"
-        : undefined,
-    ].filter((field): field is string => field !== undefined);
+    let missing: string[];
+    try {
+      const current = parseWikiMarkdown(currentContent);
+      missing = [
+        current.body !== authored.body && proposed.body === undefined ? "body" : undefined,
+        current.frontmatter.title !== authored.frontmatter.title && proposed.title === undefined ? "title" : undefined,
+        current.frontmatter["quiz-worthiness"] !== authored.frontmatter["quiz-worthiness"] &&
+        proposed.quizWorthiness === undefined
+          ? "quizWorthiness"
+          : undefined,
+      ].filter((field): field is string => field !== undefined);
+    } catch {
+      missing = [
+        proposed.body === undefined ? "body" : undefined,
+        proposed.title === undefined ? "title" : undefined,
+        proposed.quizWorthiness === undefined ? "quizWorthiness" : undefined,
+      ].filter((field): field is string => field !== undefined);
+    }
     if (missing.length)
       throw new ValidationError(`drifted page repair must explicitly provide changed fields: ${missing.join(", ")}`);
     return authored.body;
@@ -1546,6 +1565,16 @@ export class ScholarApplication {
     await this.wiki.refreshQmdIndex();
     const doctor = this.doctorFn(this.paths.vaultRoot);
     if (!doctor.ok) throw new ValidationError("doctor checks failed");
+    const finalDrifted = await this.liveDriftDigests();
+    const introducedAfterChecks = [...finalDrifted.keys()].filter((pageId) => !allowedDrift.has(pageId));
+    if (introducedAfterChecks.length)
+      throw new ValidationError(`Wiki mutation introduced live drift: ${introducedAfterChecks.join(", ")}`);
+    for (const [pageId, expectedDigest] of allowedDrift) {
+      if (pageId !== targetPageId && finalDrifted.get(pageId) !== expectedDigest)
+        throw new ValidationError(`Preexisting wiki drift changed during mutation: ${pageId}`);
+    }
+    if (targetPageId && finalDrifted.has(targetPageId))
+      throw new ValidationError(`Wiki mutation did not repair target drift: ${targetPageId}`);
     return { lint, doctor };
   }
   private async applyWikiChangeDecoded(
@@ -1587,13 +1616,12 @@ export class ScholarApplication {
           case "update-page": {
             this.assertPageMutationAllowed(proposal.pageId, proposal.quizWorthiness);
             const current = await this.wiki.get(proposal.pageId);
-            if (sha256(current.content) !== proposal.expectedDigest)
+            if (sha256(await this.wiki.readExact(current.relativePath)) !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
             const body = proposal.body;
-            const parsed = parseWikiMarkdown(current.content);
             const authoredBody = preexistingDrift.has(proposal.pageId)
               ? this.assertDriftRepairFields(proposal.pageId, current.content, proposal)
-              : parsed.body;
+              : parseWikiMarkdown(current.content).body;
             const bodyChanged = body !== undefined && body !== authoredBody;
             if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body, authoredBody);
             const updated = await this.wiki.update(proposal.pageId, proposal);
@@ -1653,15 +1681,15 @@ export class ScholarApplication {
             const current = await this.wiki.get(issue.pageId);
             if (issue.pageDigest !== undefined && issue.pageDigest !== current.digest)
               throw new RevisionConflictError("The issue page version is stale");
-            if (sha256(current.content) !== proposal.page.expectedDigest)
+            if (sha256(await this.wiki.readExact(current.relativePath)) !== proposal.page.expectedDigest)
               throw new RevisionConflictError("The issue page digest is stale");
-            const parsed = parseWikiMarkdown(current.content);
             const body = proposal.page.body;
             const authoredBody = preexistingDrift.has(issue.pageId)
               ? this.assertDriftRepairFields(issue.pageId, current.content, proposal.page)
-              : parsed.body;
+              : parseWikiMarkdown(current.content).body;
             const bodyChanged = body !== undefined && body !== authoredBody;
             const pageChanged =
+              preexistingDrift.has(issue.pageId) ||
               bodyChanged ||
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
               (proposal.page.quizWorthiness !== undefined && proposal.page.quizWorthiness !== current.quizWorthiness);
