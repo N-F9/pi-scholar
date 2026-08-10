@@ -240,7 +240,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         typeof normalizer !== "object" ||
         Array.isArray(normalizer) ||
         (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
-        (normalizer as Record<string, unknown>).version !== "1"
+        (normalizer as Record<string, unknown>).version !== "2"
       )
         throw new Error(`Invalid manifest normalizer: ${entry.name}`);
       if (manifest.id !== entry.name || manifest.sourceId !== entry.name)
@@ -931,6 +931,21 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
     (relativePath) =>
       relativePath.startsWith("SYMLINK:") || (!relativePath.startsWith(".snapshots/") && relativePath !== ".snapshots"),
   );
+  const knownDriftedPaths = new Set<string>();
+  try {
+    const catalogDb = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    try {
+      for (const row of catalogDb.all<{ readonly relative_path: string }>(
+        "SELECT relative_path FROM pages WHERE status = 'drifted'",
+      ))
+        knownDriftedPaths.add(row.relative_path);
+    } finally {
+      catalogDb.close();
+    }
+  } catch {
+    /* the authoritative page check below reports catalog availability */
+  }
+  const seenKnownDriftedPaths = new Set<string>();
   const ids = new Map<string, string>();
   const concepts: WikiConcept[] = [];
   let rootIndex: IndexEntry[] = [];
@@ -948,6 +963,10 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
       markdown = readFileNoFollow(absolutePath).toString("utf8");
     } catch (error) {
       return [check("page-ids", "fail", `Cannot read wiki page ${relativePath}: ${errorMessage(error)}`)];
+    }
+    if (knownDriftedPaths.has(relativePath) && relativePath !== "index.md" && relativePath !== "log.md") {
+      seenKnownDriftedPaths.add(relativePath);
+      continue;
     }
     const baseName = relativePath.split("/").at(-1);
     try {
@@ -1129,8 +1148,15 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
         ];
     }
     for (const row of rows) {
+      if (row.status === "drifted") {
+        if (!seenKnownDriftedPaths.has(row.relative_path))
+          return [
+            check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+            check("page-drift", "fail", `Page catalog has no matching drifted wiki artifact: ${row.relative_path}`),
+          ];
+      }
       if (row.status === "retired") continue;
-      if (ids.get(row.page_id) !== row.relative_path)
+      if (row.status !== "drifted" && ids.get(row.page_id) !== row.relative_path)
         return [
           check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
           check("page-drift", "fail", `Page catalog has no matching wiki artifact: ${row.relative_path}`),
@@ -1176,7 +1202,11 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
   }
   return [
     check("okf", "pass", okfMessage),
-    check("page-ids", "pass", `${ids.size} wiki page(s) have unique stable IDs and bidirectional catalog entries`),
+    check(
+      "page-ids",
+      "pass",
+      `${ids.size + seenKnownDriftedPaths.size} wiki page(s) have unique stable IDs and bidirectional catalog entries`,
+    ),
   ];
 }
 
@@ -1378,6 +1408,22 @@ function checkDependencies(paths: VaultPaths): DoctorCheck[] {
   return checks;
 }
 
+function cataloguedQmdIgnorePaths(paths: VaultPaths): readonly string[] | undefined {
+  let db: ScholarDatabase | undefined;
+  try {
+    db = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    return db
+      .all<{ readonly relative_path: string }>(
+        "SELECT relative_path FROM pages WHERE status = 'drifted' ORDER BY relative_path",
+      )
+      .map(({ relative_path }) => relative_path);
+  } catch {
+    return undefined;
+  } finally {
+    db?.close();
+  }
+}
+
 function checkExternalState(paths: VaultPaths, qmdDependency?: DoctorCheck): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
   if (qmdDependency?.status !== "pass") {
@@ -1389,7 +1435,7 @@ function checkExternalState(paths: VaultPaths, qmdDependency?: DoctorCheck): Doc
       ),
     );
   } else {
-    const qmdScope = qmdScopeCheck(paths);
+    const qmdScope = qmdScopeCheck(paths, undefined, cataloguedQmdIgnorePaths(paths));
     checks.push(
       qmdScope.ok
         ? check("qmd-scope", "pass", qmdScope.message)

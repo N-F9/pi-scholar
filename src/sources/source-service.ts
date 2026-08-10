@@ -3,7 +3,7 @@ import { promises as fs, readFileSync, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   PreparedAdmission as ContractPreparedAdmission,
   SourceKind as ContractSourceKind,
@@ -23,8 +23,9 @@ import { QuizService } from "../quiz.js";
 import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
 import {
   atomizeExtraction,
+  chunkEndpointNumber,
   chunkExtraction,
-  nativeExtraction,
+  type ExtractionFileBoundary,
   normalizeDoclingResult,
   normalizeMarkdownFile,
   planFileAtoms,
@@ -183,7 +184,7 @@ export interface SourceManifest extends Omit<ContractSourceManifest, "converter"
   stagedMetadata?: StageMetadata;
   capturedAt: string;
   converter?: { name: string; version: string };
-  normalizer: { name: "markdown-blank-lines"; version: "1" };
+  normalizer: { name: "markdown-blank-lines"; version: "2" };
   originalBytes: number;
   originalByteLength: number;
   originalDigest: string;
@@ -247,10 +248,7 @@ export interface DoclingResult {
   attachments?: Array<{ path: string; bytes: Uint8Array | string }>;
 }
 export interface ChunkPlanEndpoint {
-  endLine?: number;
-  endAtom?: number;
-  end?: number;
-  index?: number;
+  endLine: number;
 }
 
 const MAX_SOURCE_REDIRECTS = 5;
@@ -533,23 +531,37 @@ export class SourceService {
       return { mediaType: response.mediaType, name: basename(current.pathname) || undefined };
     }
   }
+  private async privateStageRoot(): Promise<string> {
+    await fs.mkdir(this.work(), { recursive: true, mode: 0o700 });
+    const stat = await lstatNoFollow(this.work());
+    if (!stat.isDirectory()) throw new Error("work root must be a real directory");
+    return fs.mkdtemp(join(this.work(), ".source-stage-"));
+  }
+  private async publishEnvelopeStage(
+    stageRoot: string,
+    metadata: StageMetadata,
+  ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
+    const name = `${randomUUID()}.pi-scholar`;
+    const target = safeRelativePath(this.inbox(), name);
+    await fs.writeFile(join(stageRoot, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await fs.rename(stageRoot, target);
+    return { relativePath: name, absolutePath: target, kind: metadata.kind, metadata };
+  }
   private async stageEnvelope(
     metadata: StageMetadata,
     bytes: Uint8Array,
   ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
-    const name = `${randomUUID()}.pi-scholar`;
-    const target = safeRelativePath(this.inbox(), name);
-    await fs.mkdir(target, { recursive: false, mode: 0o700 });
+    const stageRoot = await this.privateStageRoot();
     try {
-      const metadataPath = join(target, ENVELOPE_NAME);
-      const payloadPath = join(target, metadata.payload);
-      await fs.writeFile(metadataPath, `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-      await fs.writeFile(payloadPath, Buffer.from(bytes), { flag: "wx", mode: 0o600 });
+      await fs.writeFile(join(stageRoot, metadata.payload), Buffer.from(bytes), { flag: "wx", mode: 0o600 });
+      return await this.publishEnvelopeStage(stageRoot, metadata);
     } catch (error) {
-      await fs.rm(target, { recursive: true, force: true });
+      await fs.rm(stageRoot, { recursive: true, force: true });
       throw error;
     }
-    return { relativePath: name, absolutePath: target, kind: metadata.kind, metadata };
   }
   async stage(
     request: SourceStageRequest,
@@ -592,10 +604,8 @@ export class SourceService {
           fetched.bytes,
         );
       }
-      const name = `${randomUUID()}.pi-scholar`;
-      const target = safeRelativePath(this.inbox(), name);
-      const payloadPath = join(target, "payload");
-      await fs.mkdir(target, { recursive: false, mode: 0o700 });
+      const stageRoot = await this.privateStageRoot();
+      const payloadPath = join(stageRoot, "payload");
       try {
         const fetched = await this.defaultFetch(parsed, payloadPath);
         const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
@@ -617,10 +627,9 @@ export class SourceService {
           mediaType,
           payload: "payload",
         };
-        await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-        return { relativePath: name, absolutePath: target, kind: "url", metadata };
+        return await this.publishEnvelopeStage(stageRoot, metadata);
       } catch (error) {
-        await fs.rm(target, { recursive: true, force: true });
+        await fs.rm(stageRoot, { recursive: true, force: true });
         throw error;
       }
     }
@@ -695,17 +704,21 @@ export class SourceService {
         mediaType: request.mediaType,
         payload: "payload",
       };
-      const name = `${randomUUID()}.pi-scholar`;
-      const target = safeRelativePath(this.inbox(), name);
-      await fs.mkdir(target, { recursive: false, mode: 0o700 });
+      const stageRoot = await this.privateStageRoot();
       try {
-        await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-        await copyFileNoFollow(source, join(target, metadata.payload));
+        await fs.writeFile(join(stageRoot, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        await copyFileNoFollow(source, join(stageRoot, metadata.payload));
+        const name = `${randomUUID()}.pi-scholar`;
+        const target = safeRelativePath(this.inbox(), name);
+        await fs.rename(stageRoot, target);
+        return { relativePath: name, absolutePath: target, kind, metadata };
       } catch (error) {
-        await fs.rm(target, { recursive: true, force: true });
+        await fs.rm(stageRoot, { recursive: true, force: true });
         throw error;
       }
-      return { relativePath: name, absolutePath: target, kind, metadata };
     }
     const input = request.path ?? request.filePath;
     if (!input) throw new Error("source input is required");
@@ -913,6 +926,15 @@ export class SourceService {
       const mediaType = claim.snapshot.metadata?.mediaType;
       const useDocling =
         claim.snapshot.kind === "document" || (claim.snapshot.kind === "url" && !textualUrl(claim, mediaType));
+      const preserveBlankRuns =
+        claim.snapshot.kind === "directory" || claim.snapshot.kind === "repository"
+          ? new Set(
+              claim.snapshot.files
+                .filter((file) => ![".md", ".markdown"].includes(extname(file.path).toLowerCase()))
+                .map((file) => file.path),
+            )
+          : undefined;
+      let fileBoundaries: ExtractionFileBoundary[] | undefined;
       let converter: { name: string; version: string } | undefined;
       if (useDocling) {
         if (!this.adapters.docling) throw new Error("Docling adapter is required for document extraction");
@@ -952,11 +974,11 @@ export class SourceService {
             absolutePath: ensureWithin(originalRoot, join(originalRoot, validRelativePath(file.path))),
           })),
         };
-        await writeNativeExtraction(copiedSnapshot, rawExtracted);
+        fileBoundaries = await writeNativeExtraction(copiedSnapshot, rawExtracted, preserveBlankRuns);
       }
       const rawStat = await lstatNoFollow(rawExtracted);
       if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");
-      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code");
+      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code", fileBoundaries);
       await fs.rm(rawExtracted, { force: true });
       const extractedHash = await hashFile(extractedAbsolute);
       if (extractedHash.size === 0) throw new Error("empty extraction");
@@ -1175,7 +1197,7 @@ export class SourceService {
         stagedMetadata: prepared.metadata,
         capturedAt,
         converter: prepared.converter,
-        normalizer: { name: "markdown-blank-lines", version: "1" },
+        normalizer: { name: "markdown-blank-lines", version: "2" },
         originalBytes: claim.snapshot.bytes,
         originalByteLength: claim.snapshot.bytes,
         originalDigest: claim.snapshot.digest,
@@ -1276,6 +1298,7 @@ export class SourceService {
         revision: claim.snapshot.revision,
         kind: claim.snapshot.kind,
         sourceUri: metadata?.sourceUri,
+        normalizer: { name: "markdown-blank-lines", version: "2" },
         displayName: metadata?.displayName ?? claim.entry.relativePath,
         originalName: metadata?.originalName ?? claim.entry.relativePath,
         mediaType: metadata?.mediaType,
@@ -1324,10 +1347,7 @@ export class SourceService {
     if (existing) return existing;
     const prepared = await this.prepareClaim(claim);
     const endpoints = options.endpoints?.map((endpoint) => {
-      const value =
-        typeof endpoint === "number"
-          ? endpoint
-          : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index);
+      const value = chunkEndpointNumber(endpoint);
       if (value === undefined) throw new Error("chunk line endpoint is missing");
       return value;
     });
@@ -1362,7 +1382,7 @@ export class SourceService {
             entry.metadata?.displayName ?? entry.relativePath,
             entry.metadata?.originalName ?? entry.relativePath,
             claim?.snapshot.digest ?? entry.digest ?? null,
-            "ADMISSION_FAILED",
+            "EXTRACT_FAILED",
             message,
             now,
             sourceId,
@@ -1384,7 +1404,7 @@ export class SourceService {
             now,
             claim?.snapshot.digest ?? entry.digest ?? null,
             null,
-            "ADMISSION_FAILED",
+            "EXTRACT_FAILED",
             message,
             now,
             now,
@@ -1392,7 +1412,7 @@ export class SourceService {
         );
     });
   }
-  recordAdmissionFailure(entry: InboxEntry, error: unknown, claim?: SourceClaim): void {
+  recordExtractFailure(entry: InboxEntry, error: unknown, claim?: SourceClaim): void {
     this.recordFailure(entry, error, claim);
   }
   async admitClaims(
@@ -1985,5 +2005,5 @@ export class SourceService {
   }
 }
 
-export { atomizeExtraction, chunkExtraction, nativeExtraction, reconstructChunks, validateChunkEndpoints };
+export { atomizeExtraction, chunkExtraction, reconstructChunks, validateChunkEndpoints };
 export const sha256 = digestBytes;

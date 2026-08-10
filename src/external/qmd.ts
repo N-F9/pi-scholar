@@ -1,6 +1,8 @@
-import { lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
-import { VAULT_ID_PATTERN, type VaultPaths } from "../vault.js";
+import { randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, posix, resolve } from "node:path";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { assertNoSymlinkPath, readFileNoFollow, VAULT_ID_PATTERN, type VaultPaths } from "../vault.js";
 import { type ChildResult, runChild, runChildSync } from "./process.js";
 
 const QMD_TIMEOUT_MS = 120_000;
@@ -22,6 +24,9 @@ export interface QmdSearchResult {
 }
 
 export type QmdSyncRunner = (paths: VaultPaths, args: readonly string[], timeoutMs?: number) => ChildResult;
+export interface QmdIndexOptions {
+  readonly ignoredPaths?: readonly string[];
+}
 
 export type QmdAsyncRunner = (paths: VaultPaths, args: readonly string[], timeoutMs?: number) => Promise<ChildResult>;
 
@@ -35,7 +40,128 @@ export function qmdCollection(paths: VaultPaths): QmdCollection {
 }
 
 export function qmdEnvironment(paths: VaultPaths): Readonly<Record<string, string>> {
-  return { HOME: paths.qmdRoot, XDG_CACHE_HOME: join(paths.qmdRoot, "cache"), QMD_HOME: paths.qmdRoot };
+  return {
+    HOME: paths.qmdRoot,
+    XDG_CACHE_HOME: join(paths.qmdRoot, "cache"),
+    XDG_CONFIG_HOME: join(paths.qmdRoot, ".config"),
+    QMD_HOME: paths.qmdRoot,
+  };
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function qmdConfigPath(paths: VaultPaths): string {
+  return join(paths.qmdRoot, ".config", "qmd", "index.yml");
+}
+
+function loadQmdConfig(paths: VaultPaths): { readonly path: string; readonly config: Record<string, unknown> } {
+  const path = qmdConfigPath(paths);
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(readFileNoFollow(path).toString("utf8"));
+  } catch (error) {
+    throw new Error(`qmd collection config is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.collections)) throw new Error("qmd collection config is malformed");
+  return { path, config: parsed };
+}
+
+const QMD_GLOB_META = new Set(["\\", "*", "?", "(", ")", "[", "]", "{", "}", "!", "+", "@"]);
+
+function exactQmdIgnorePath(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !value ||
+    value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/u.test(value) ||
+    !value.endsWith(".md") ||
+    isAbsolute(value) ||
+    posix.normalize(value) !== value ||
+    value === "." ||
+    value === ".." ||
+    value.startsWith("../") ||
+    value.includes("/../") ||
+    value.startsWith("/")
+  )
+    throw new Error("qmd ignore entries must be exact normalized wiki Markdown paths");
+  return value;
+}
+
+function qmdIgnorePattern(path: string): string {
+  return path.replace(/[*?()[\]{}!+@]/gu, (character) => `\\${character}`);
+}
+
+function decodeQmdIgnorePattern(value: unknown): string {
+  if (typeof value !== "string" || !value) throw new Error("qmd collection ignore list is malformed");
+  let path = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (character !== "\\") {
+      path += character;
+      continue;
+    }
+    const escaped = value[++index];
+    if (escaped === undefined || !QMD_GLOB_META.has(escaped))
+      throw new Error("qmd collection ignore list must contain exact escaped wiki paths");
+    path += escaped;
+  }
+  return path;
+}
+
+function normalizedQmdIgnorePaths(paths: readonly string[] | undefined, configured = false): string[] {
+  const unique = new Set<string>();
+  for (const value of paths ?? []) {
+    const path = exactQmdIgnorePath(configured ? decodeQmdIgnorePattern(value) : value);
+    const pattern = qmdIgnorePattern(path);
+    if (configured && value !== pattern)
+      throw new Error("qmd collection ignore entries must use exact escaped wiki paths");
+    unique.add(pattern);
+  }
+  return [...unique].sort();
+}
+
+function qmdCollectionConfig(
+  paths: VaultPaths,
+  collectionName: string,
+): { readonly path: string; readonly config: Record<string, unknown>; readonly collection: Record<string, unknown> } {
+  const loaded = loadQmdConfig(paths);
+  const collectionValue = loaded.config.collections;
+  if (!isRecord(collectionValue) || !isRecord(collectionValue[collectionName]))
+    throw new Error(`qmd collection config is missing ${collectionName}`);
+  return { ...loaded, collection: collectionValue[collectionName] };
+}
+
+function configuredQmdIgnorePaths(paths: VaultPaths, collectionName: string): string[] {
+  const { collection } = qmdCollectionConfig(paths, collectionName);
+  const configured = collection.ignore;
+  if (configured === undefined) return [];
+  if (!Array.isArray(configured)) throw new Error("qmd collection ignore list is malformed");
+  return normalizedQmdIgnorePaths(configured, true);
+}
+
+function writeQmdIgnorePaths(paths: VaultPaths, collectionName: string, ignoredPaths: readonly string[]): void {
+  const expected = normalizedQmdIgnorePaths(ignoredPaths);
+  const loaded = qmdCollectionConfig(paths, collectionName);
+  const collections = loaded.config.collections;
+  if (!isRecord(collections)) throw new Error("qmd collection config is malformed");
+  const current = collections[collectionName];
+  if (!isRecord(current)) throw new Error(`qmd collection config is missing ${collectionName}`);
+  const nextCollection = { ...current };
+  if (expected.length) nextCollection.ignore = expected;
+  else delete nextCollection.ignore;
+  const nextConfig = { ...loaded.config, collections: { ...collections, [collectionName]: nextCollection } };
+  const configDirectory = dirname(loaded.path);
+  assertNoSymlinkPath(configDirectory);
+  mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+  const temporary = join(configDirectory, `.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, stringifyYaml(nextConfig), { flag: "wx", mode: 0o600 });
+    renameSync(temporary, loaded.path);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
 }
 
 function assertQmdScope(paths: VaultPaths, candidateRoot: string): void {
@@ -117,6 +243,13 @@ export async function runQmd(
     maxOutputBytes: QMD_OUTPUT_BYTES,
     env: qmdEnvironment(paths),
   });
+}
+
+export async function qmdRefresh(paths: VaultPaths, options: QmdIndexOptions = {}): Promise<ChildResult> {
+  const collection = qmdCollection(paths);
+  assertQmdScope(paths, collection.root);
+  writeQmdIgnorePaths(paths, collection.name, options.ignoredPaths ?? []);
+  return runQmd(paths, ["update"]);
 }
 
 export function runQmdSync(paths: VaultPaths, args: readonly string[], timeoutMs = QMD_TIMEOUT_MS): ChildResult {
@@ -201,6 +334,7 @@ function parseCollectionMetadata(stdout: string): QmdCollectionMetadata | undefi
 export function qmdScopeCheck(
   paths: VaultPaths,
   runner: QmdSyncRunner = runQmdSync,
+  expectedIgnoredPaths?: readonly string[],
 ): { readonly ok: boolean; readonly collection: QmdCollection; readonly message: string } {
   const collection = qmdCollection(paths);
   try {
@@ -220,6 +354,12 @@ export function qmdScopeCheck(
     assertQmdScope(paths, metadata.path);
     if (metadata.pattern !== collection.include)
       throw new Error(`qmd collection pattern must be exactly ${collection.include}`);
+    if (expectedIgnoredPaths !== undefined) {
+      const expected = normalizedQmdIgnorePaths(expectedIgnoredPaths);
+      const configured = configuredQmdIgnorePaths(paths, collection.name);
+      if (configured.length !== expected.length || configured.some((path, index) => path !== expected[index]))
+        throw new Error("qmd collection ignore list does not exactly match catalogued drifted wiki paths");
+    }
     return { ok: true, collection, message: "qmd collection is exactly the vault wiki with Markdown-only scope" };
   } catch (error) {
     return { ok: false, collection, message: error instanceof Error ? error.message : String(error) };

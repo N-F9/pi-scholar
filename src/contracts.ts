@@ -51,7 +51,7 @@ export interface SourceManifest {
   readonly mediaType?: string;
   readonly capturedAt: IsoDateTime;
   readonly converter?: { readonly name: string; readonly version: string };
-  readonly normalizer: { readonly name: "markdown-blank-lines"; readonly version: "1" };
+  readonly normalizer: { readonly name: "markdown-blank-lines"; readonly version: "2" };
   readonly originalByteLength: number;
   readonly extractedByteLength: number;
   readonly originalDigest: string;
@@ -541,6 +541,8 @@ export interface SettingsFacts {
   readonly localDate: LocalDate;
   readonly pendingInboxCount: number;
   readonly openIssueCount: number;
+  readonly lastIngestAt?: IsoDateTime;
+  readonly lastIngestResult?: string;
   readonly lastLintAt?: IsoDateTime;
   readonly lastLintResult?: string;
   readonly recentChanges: readonly string[];

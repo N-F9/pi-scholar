@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { decodeExtractPublicationInput } from "../src/application/decoders.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
+import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
 import { WikiService } from "../src/wiki.js";
@@ -36,7 +37,7 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture(options: { readonly maintenance?: boolean } = {}) {
+function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
@@ -45,10 +46,12 @@ function fixture(options: { readonly maintenance?: boolean } = {}) {
     paths,
     db,
     adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
-    doctor: () => {
-      calls.push("doctor");
-      return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
-    },
+    doctor: options.realDoctor
+      ? doctor
+      : () => {
+          calls.push("doctor");
+          return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
+        },
     commit: (_paths, subject) => {
       calls.push(`commit:${subject}`);
       return { committed: true, subject };
@@ -60,6 +63,21 @@ function fixture(options: { readonly maintenance?: boolean } = {}) {
     checkpoint();
   };
   return { app, db, paths, calls };
+}
+
+async function publishedChunkId(app: ScholarApplication): Promise<string> {
+  await app.stageSource({ kind: "text", text: "ingest evidence\n", name: "ingest-evidence.txt" });
+  const claim = (await app.getExtractContext()).claims[0];
+  if (!claim) throw new Error("extract claim is missing");
+  await app.publishExtraction({
+    claimId: claim.claimId,
+    preparedId: claim.preparedId,
+    digest: claim.digest,
+    endpoints: [1],
+  });
+  const chunk = (await app.getIngestContext()).sources[0]?.chunks[0];
+  if (!chunk) throw new Error("published source chunk is missing");
+  return chunk.chunkId;
 }
 
 describe("durable application writes", () => {
@@ -217,6 +235,10 @@ describe("durable application writes", () => {
       const wikiCandidate: unknown = Reflect.get(app, "wiki");
       assert.ok(wikiCandidate instanceof WikiService);
       const wiki = wikiCandidate;
+      let qmdRefreshes = 0;
+      wiki.refreshQmdIndex = async () => {
+        qmdRefreshes += 1;
+      };
       const refreshProjections = wiki.refreshProjections.bind(wiki);
       wiki.refreshProjections = async () => {
         throw new Error("injected projection failure");
@@ -234,6 +256,7 @@ describe("durable application writes", () => {
         wiki.refreshProjections = refreshProjections;
       }
       await app.removeSource(admitted.sourceId, preview.confirmationId);
+      assert.equal(qmdRefreshes, 1);
       assert.equal((await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8")).includes("grounded.md"), false);
       assert.equal((await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8")).includes("grounded.md"), false);
       const report = doctor(paths.vaultRoot);
@@ -1245,6 +1268,543 @@ describe("application prerequisite mutation guards", () => {
       assert.equal(eligible.page.quizWorthiness, "eligible");
       assert.equal(eligible.page.revision, bodyOnly.page.revision + 1);
       assert.equal(db.all("SELECT page_id, prerequisite_page_id FROM page_prerequisites").length, 1);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("application capability boundaries", () => {
+  it("requires an immutable citation for ingest page edits but not generic lint edits", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const created = await app.createNote({
+        path: "ingest-citation.md",
+        body: "# Ingest citation\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const proposal = {
+        kind: "update-page" as const,
+        pageId: created.page.pageId,
+        expectedDigest: created.page.digest,
+        body: "# Ingest citation\n\nUpdated without a citation.\n",
+      };
+      await assert.rejects(app.applyIngestChange(proposal), /immutable source chunk citation/u);
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Original/u);
+
+      const lint = await app.applyWikiChange(proposal);
+      assert.equal(lint.page?.pageId, created.page.pageId);
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Updated without a citation/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("repairs multiple live-drift pages sequentially without over-blocking unrelated drift", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const first = await app.createNote({
+        path: "drift-first.md",
+        body: "# First\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const second = await app.createNote({
+        path: "drift-second.md",
+        body: "# Second\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
+      await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
+      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
+      const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: first.page.pageId,
+          expectedDigest: firstDrift.currentDigest,
+          title: "First repaired",
+        }),
+        /body/u,
+      );
+      (app as unknown as { doctorFn: typeof doctor }).doctorFn = doctor;
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: first.page.pageId,
+        expectedDigest: firstDrift.currentDigest,
+        body: "# First\n\nRepaired.\n",
+      });
+      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
+      assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, true);
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: second.page.pageId,
+        expectedDigest: secondDrift.currentDigest,
+
+        body: "# Second\n\nRepaired.\n",
+      });
+      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
+      assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  }, 15_000);
+  it("repairs malformed byte drift from the verified authored snapshot", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const created = await app.createNote({
+        path: "malformed-drift.md",
+        body: "# Authored\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const malformed = Buffer.concat([
+        Buffer.from("---\nid: broken\ntitle: [\n---\nMalformed.\n"),
+        Buffer.from([0x80]),
+      ]);
+      await fs.writeFile(join(paths.wikiRoot, created.page.relativePath), malformed);
+      const drift = await app.wiki.inspectDrift(created.page.pageId);
+      assert.equal(drift.currentDigest, createHash("sha256").update(malformed).digest("hex"));
+
+      const repaired = await app.applyWikiChange({
+        kind: "update-page",
+        pageId: created.page.pageId,
+        expectedDigest: drift.currentDigest,
+        title: "Repaired",
+        body: "# Repaired\n\nCorrected.\n",
+        quizWorthiness: "skip",
+      });
+      assert.equal(repaired.page?.title, "Repaired");
+      assert.equal((await app.wiki.inspectDrift(created.page.pageId)).drifted, false);
+      assert.equal(doctor(paths.vaultRoot).ok, true);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("rechecks unrelated drift after asynchronous qmd maintenance", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const first = await app.createNote({
+        path: "race-first.md",
+        body: "# First\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const second = await app.createNote({
+        path: "race-second.md",
+        body: "# Second\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
+      await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
+      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
+      const secondPath = join(paths.wikiRoot, second.page.relativePath);
+      const qmd = app.wiki.adapters.qmd as { index: () => Promise<void> };
+      let indexes = 0;
+      qmd.index = async () => {
+        indexes += 1;
+        if (indexes === 3) await fs.appendFile(secondPath, "\nConcurrent second edit.\n");
+      };
+
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: first.page.pageId,
+          expectedDigest: firstDrift.currentDigest,
+          body: "# First\n\nRepaired.\n",
+        }),
+        /Preexisting wiki drift changed during mutation/u,
+      );
+      assert.match(await fs.readFile(secondPath, "utf8"), /Concurrent second edit/u);
+      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, true);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("resolves directly drifted linked issues with separate authored and live digest guards", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const created = await app.createNote({
+        path: "resolve-drifted-issue.md",
+        body: "# Resolve drifted issue\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const staleIssue = await app.wiki.report({
+        pageId: created.page.pageId,
+        heading: "Resolve drifted issue",
+        description: "Correct the authored revision.",
+      });
+      const authoredRevision = await app.updateNote(created.page.pageId, {
+        body: "# Resolve drifted issue\n\nAuthored revision.\n",
+      });
+      const validIssue = await app.wiki.report({
+        pageId: created.page.pageId,
+        heading: "Resolve drifted issue",
+        description: "Correct the direct edit.",
+      });
+      await fs.appendFile(join(paths.wikiRoot, created.page.relativePath), "\nExternal direct edit.\n");
+      const drift = await app.wiki.inspectDrift(created.page.pageId);
+      const correctedBody = "# Resolve drifted issue\n\nCorrected.\n";
+
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "resolve-issue",
+          issueId: staleIssue.issueId,
+          page: { pageId: created.page.pageId, expectedDigest: drift.currentDigest, body: correctedBody },
+          resolution: "Corrected the authored revision.",
+        }),
+        /issue page version is stale/u,
+      );
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "resolve-issue",
+          issueId: validIssue.issueId,
+          page: { pageId: created.page.pageId, expectedDigest: authoredRevision.page.digest, body: correctedBody },
+          resolution: "Corrected the direct edit.",
+        }),
+        /issue page digest is stale/u,
+      );
+
+      const resolved = await app.applyWikiChange({
+        kind: "resolve-issue",
+        issueId: validIssue.issueId,
+        page: { pageId: created.page.pageId, expectedDigest: drift.currentDigest, body: correctedBody },
+        resolution: "Corrected the direct edit.",
+      });
+      assert.equal(resolved.issue?.status, "resolved");
+      assert.equal((await app.wiki.get(created.page.pageId)).status, "active");
+      assert.equal((await app.wiki.inspectDrift(created.page.pageId)).drifted, false);
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Corrected/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("leaves unrelated drift bytes outside a targeted checkpoint", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const first = await app.createNote({
+        path: "checkpoint-first.md",
+        body: "# First\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const second = await app.createNote({
+        path: "checkpoint-second.md",
+        body: "# Second\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      localCheckpointCommit(paths, "test: baseline");
+      await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
+      await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
+      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
+      const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      (app as unknown as { commitFn: typeof localCheckpointCommit }).commitFn = localCheckpointCommit;
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: first.page.pageId,
+        expectedDigest: firstDrift.currentDigest,
+        body: "# First\n\nRepaired.\n",
+      });
+      const afterFirst = gitStatus(paths);
+      assert.equal(afterFirst.raw.includes(second.page.relativePath), true);
+      assert.equal(afterFirst.raw.includes(first.page.relativePath), false);
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: second.page.pageId,
+        expectedDigest: secondDrift.currentDigest,
+        body: "# Second\n\nRepaired.\n",
+      });
+      assert.equal(gitStatus(paths).clean, true);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  }, 15_000);
+
+  it("refuses retirement with open or reopened linked issues without changing page bytes", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      for (const status of ["open", "reopened"] as const) {
+        const created = await app.createNote({
+          path: `blocked-retire-${status}.md`,
+          body: `# Blocked ${status}\n`,
+          quizWorthiness: "skip",
+        });
+        const issue = await app.wiki.report({
+          pageId: created.page.pageId,
+          heading: "Blocked",
+          description: "Keep this page until corrected.",
+        });
+        if (status === "reopened") await app.wiki.patchIssue(issue.issueId, { status });
+        const pagePath = join(paths.wikiRoot, created.page.relativePath);
+        const beforeBytes = await fs.readFile(pagePath);
+        await assert.rejects(
+          app.applyWikiChange({
+            kind: "retire-page",
+            pageId: created.page.pageId,
+            expectedDigest: created.page.digest,
+          }),
+          /open or reopened linked issue/u,
+        );
+        assert.equal((await fs.readFile(pagePath)).equals(beforeBytes), true);
+        const after = await app.wiki.get(created.page.pageId);
+        assert.equal(after.status, "active");
+        assert.equal(after.digest, created.page.digest);
+        assert.equal(after.revision, created.page.revision);
+        assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, status);
+      }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("persists EXTRACT_FAILED when extraction publication validation fails", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      await app.stageSource({ kind: "text", text: "extract me\n", name: "extract-failure.txt" });
+      const claim = (await app.getExtractContext()).claims[0];
+      if (!claim) throw new Error("extract claim is missing");
+      await fs.appendFile(join(paths.vaultRoot, claim.extractedPath), "\nTampered extraction.\n");
+      await assert.rejects(
+        app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        }),
+      );
+      const failure = db.get<{ status: string; error_code: string | null }>(
+        "SELECT status, error_code FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
+      );
+      assert.equal(failure?.status, "failed");
+      assert.equal(failure?.error_code, "EXTRACT_FAILED");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("reports successful ingest and lint facts independently", async () => {
+    const { app, db } = fixture();
+    try {
+      const ingest = await app.beginWorkflow("ingest");
+      await app.finishWorkflow(ingest.workflow.requestId, "succeeded", {
+        message: "ingest complete",
+      });
+      const lint = await app.beginWorkflow("lint");
+      const lintResult = await app.finishWorkflow(lint.workflow.requestId, "succeeded", {
+        message: "lint complete",
+      });
+      const failedIngest = await app.beginWorkflow("ingest");
+      const failedIngestResult = await app.finishWorkflow(failedIngest.workflow.requestId, "failed", {
+        message: "ingest failed",
+        errorCode: "INGEST_FAILED",
+        errorMessage: "source packet unavailable",
+      });
+
+      const facts = (await app.getSettings()).settings.facts;
+      assert.equal(facts.lastIngestAt, failedIngestResult.workflow.finishedAt);
+      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): source packet unavailable");
+      assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
+      assert.equal(facts.lastLintResult, "lint complete");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("ingest section-local citation boundaries", () => {
+  it("requires an authorized citation in every substantive created section", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "create-page",
+          path: "ingest-create-plain-rejected.md",
+          body: "Uncited plain prose without a heading.\n",
+        }),
+        /immutable source chunk citation/u,
+      );
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "create-page",
+          path: "ingest-create-rejected.md",
+          body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
+        }),
+        /immutable source chunk citation/u,
+      );
+      const created = await app.applyIngestChange({
+        kind: "create-page",
+        path: "ingest-create-accepted.md",
+        body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
+      });
+      assert.equal(created.page?.relativePath, "ingest-create-accepted.md");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("requires citations in changed update sections instead of reusing unchanged cited sections", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      const original = await app.createNote({
+        path: "ingest-update.md",
+        body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nOriginal unsupported text.\n`,
+        quizWorthiness: "skip",
+      });
+      const rejectedBody = `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nUpdated unsupported text.\n`;
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: original.page.pageId,
+          expectedDigest: original.page.digest,
+          body: rejectedBody,
+        }),
+        /immutable source chunk citation/u,
+      );
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Original unsupported text/u);
+      const accepted = await app.applyIngestChange({
+        kind: "update-page",
+        pageId: original.page.pageId,
+        expectedDigest: original.page.digest,
+        body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nUpdated support [^${chunkId}].\n`,
+      });
+      assert.equal(accepted.page?.pageId, original.page.pageId);
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Updated support/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("treats ordinary footnote definitions as substantive changed evidence", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      await publishedChunkId(app);
+      const original = await app.createNote({
+        path: "ingest-ordinary-footnote.md",
+        body: "# Notes\n\nStable statement [^note].\n\n[^note]: Original note.\n",
+        quizWorthiness: "skip",
+      });
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: original.page.pageId,
+          expectedDigest: original.page.digest,
+          body: "# Notes\n\nStable statement [^note].\n\n[^note]: Unsupported replacement.\n",
+        }),
+        /immutable source chunk citation/u,
+      );
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Original note/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("pairs slug-colliding headings without inventing section changes", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      const original = await app.createNote({
+        path: "ingest-colliding-headings.md",
+        body: `# A\n\nOriginal support [^${chunkId}].\n\n# A-1\n\nUnchanged literal section.\n\n# A\n\nUnchanged duplicate section.\n`,
+        quizWorthiness: "skip",
+      });
+      const updated = await app.applyIngestChange({
+        kind: "update-page",
+        pageId: original.page.pageId,
+        expectedDigest: original.page.digest,
+        body: `# A\n\nUpdated support [^${chunkId}].\n\n# A-1\n\nUnchanged literal section.\n\n# A\n\nUnchanged duplicate section.\n`,
+      });
+      assert.equal(updated.page?.pageId, original.page.pageId);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("rejects empty headings that could merge uncited ingest claims", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "create-page",
+          path: "ingest-empty-heading.md",
+          body: `# Grounded\r\n\r\nClaim [^${chunkId}].\r\n\r\n##\r\n\r\nUnsupported claim.\r\n`,
+        }),
+        /non-empty headings/u,
+      );
+      const existing = await app.createNote({
+        path: "authored-empty-heading.md",
+        body: `# Grounded\n\nClaim [^${chunkId}].\n\n##\n\nOriginal unsupported claim.\n`,
+        quizWorthiness: "skip",
+      });
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: existing.page.pageId,
+          expectedDigest: existing.page.digest,
+          body: `# Grounded\n\nClaim [^${chunkId}].\n\nChanged unsupported claim.\n`,
+        }),
+        /non-empty headings/u,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("requires citations in changed resolve-issue sections instead of reusing unchanged cited sections", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      const original = await app.createNote({
+        path: "ingest-resolve.md",
+        body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nOriginal unsupported text.\n`,
+        quizWorthiness: "skip",
+      });
+      const issue = await app.wiki.report({
+        pageId: original.page.pageId,
+        pageDigest: original.page.digest,
+        heading: "Changed",
+        kind: "incorrect",
+        description: "Correct the changed section.",
+      });
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: original.page.pageId,
+            expectedDigest: original.page.digest,
+            body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nCorrected unsupported text.\n`,
+          },
+          resolution: "Correction needs source evidence.",
+        }),
+        /immutable source chunk citation/u,
+      );
+      assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, "open");
+      const resolved = await app.applyIngestChange({
+        kind: "resolve-issue",
+        issueId: issue.issueId,
+        page: {
+          pageId: original.page.pageId,
+          expectedDigest: original.page.digest,
+          body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nCorrected support [^${chunkId}].\n`,
+        },
+        resolution: "Correction is grounded in the cited source chunk.",
+      });
+      assert.equal(resolved.issue?.status, "resolved");
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Corrected support/u);
     } finally {
       await app.close();
       db.close();

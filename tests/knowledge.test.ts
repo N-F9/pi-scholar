@@ -6,7 +6,7 @@ import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
-import { parseOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
+import { parseOkfConcept, serializeOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -132,6 +132,55 @@ describe("source admission mechanics", () => {
       db.close();
     }
   });
+  it("preserves code blank runs inside native directory extraction", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "embedded");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "example.js"), "const value = 1;\n\n\nconst next = 2;\n");
+    await fs.writeFile(join(directory, "notes.md"), "before\n\n\nafter\n");
+    const ruby = ["message = <<~TEXT", "first", "", "", "last", "TEXT", ""].join("\n");
+    await fs.writeFile(join(directory, "example.rb"), ruby);
+    const staged = await sources.stage({ path: directory });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("embedded directory was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
+    expect(extracted).toContain("--- FILE: example.js ---\nconst value = 1;\n\n\nconst next = 2;\n");
+    expect(extracted).toContain(`--- FILE: example.rb ---\n${ruby}`);
+    expect(extracted).toContain("--- FILE: notes.md ---\nbefore\n\nafter\n");
+    expect(staged.kind).toBe("directory");
+    db.close();
+  });
+  it("resets Markdown fence normalization at native file boundaries", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "fence-boundaries");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "first.md"), "before\n\n\n```\ninside\n");
+    await fs.writeFile(join(directory, "second.md"), "before\n\n\nafter\n");
+    await sources.stage({ path: directory });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("fence-boundaries directory was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
+    expect(extracted).toContain("--- FILE: first.md ---\nbefore\n\n```\ninside\n");
+    expect(extracted).toContain("--- FILE: second.md ---\nbefore\n\nafter\n");
+    db.close();
+  });
+  it("preserves code blank runs after marker-looking text inside a multiline body", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "marker-body");
+    await fs.mkdir(directory);
+    const code = ["const value = `first", "--- END FILE: notes.md ---", "", "", "last`;", ""].join("\n");
+    await fs.writeFile(join(directory, "example.js"), code);
+    await fs.writeFile(join(directory, "notes.md"), "notes\n");
+    await sources.stage({ path: directory });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("marker-body directory was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
+    expect(extracted).toContain(`--- FILE: example.js ---\n${code}`);
+    db.close();
+  });
   it("normalizes blank runs outside fences while preserving original bytes and fenced content", async () => {
     const { paths, db, sources } = await fixture();
     const original = "before\n\n\n```\ninside\n\n\n```\n\n\nafter\n";
@@ -142,19 +191,19 @@ describe("source admission mechanics", () => {
       "before\n\n```\ninside\n\n\n```\n\nafter\n",
     );
     expect((await fs.readFile(join(result.packetPath, "original", "normalize.md"))).toString()).toBe(original);
-    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
+    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "2" });
     db.close();
   });
-  it("rejects packets without the exact normalizer declaration", async () => {
+  it("rejects packets with an obsolete normalizer declaration", async () => {
     const { paths, db, sources } = await fixture();
-    await fs.writeFile(join(paths.inboxRoot, "missing-normalizer.txt"), "evidence\n");
+    await fs.writeFile(join(paths.inboxRoot, "obsolete-normalizer.txt"), "evidence\n");
     const [entry] = await sources.discover();
     if (!entry) throw new Error("source entry was not discovered");
     const claim = await sources.claim(entry);
     const result = await sources.admitClaim(claim);
     const manifestPath = join(result.packetPath, "manifest.json");
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
-    delete manifest.normalizer;
+    manifest.normalizer = { name: "markdown-blank-lines", version: "1" };
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
     await expect(sources.admitClaim(claim)).rejects.toThrow(/normalizer/iu);
     expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status).toBe("fail");
@@ -244,13 +293,44 @@ describe("source admission mechanics", () => {
     const [entry] = await sources.discover();
     const result = await sources.admitClaim(await sources.claim(entry));
     expect(result.manifest.sourceUri).toBe("https://example.com/path/remote.txt");
-    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "1" });
+    expect(result.manifest.normalizer).toEqual({ name: "markdown-blank-lines", version: "2" });
     expect(JSON.stringify(result.manifest)).not.toMatch(/secret|token|fragment/iu);
     expect(
       db.get<Record<string, unknown>>("SELECT source_uri FROM sources WHERE source_id = ?", [result.sourceId])
         ?.source_uri,
     ).toBe("https://example.com/path/remote.txt");
     db.close();
+  });
+  it("keeps streamed URL envelopes private until the payload is complete", async () => {
+    const firstChunk = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.write("partial\n", () => firstChunk.resolve());
+      void release.promise.then(() => response.end("complete\n"));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("URL test server address is unavailable");
+    const { paths, db } = await fixture();
+    const sources = new SourceService(db, paths);
+    const pending = sources.stage({ url: `http://127.0.0.1:${address.port}/stream.txt` });
+    try {
+      await firstChunk.promise;
+      expect(await sources.discover()).toEqual([]);
+      expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+      release.resolve();
+      const staged = await pending;
+      expect(await fs.readFile(join(staged.absolutePath, "payload"), "utf8")).toBe("partial\ncomplete\n");
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      db.close();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it("accepts loopback URLs and disk-backed uploads without a fixed size cap", async () => {
@@ -462,6 +542,8 @@ describe("source admission mechanics", () => {
   it("rejects incomplete endpoint plans and unsafe staging", async () => {
     const { root, paths, db, sources } = await fixture();
     expect(() => validateChunkEndpoints("a\nb\n", [1])).toThrow();
+    expect(() => validateChunkEndpoints("a\nb\n", [{ endAtom: 2 } as never])).toThrow();
+    expect(() => validateChunkEndpoints("a\nb\n", [{ endLine: 2, index: 2 } as never])).toThrow();
     await fs.writeFile(join(root, "outside.txt"), "outside");
     await expect(sources.stage({ path: join(root, "outside.txt"), name: "../escape.txt" })).rejects.toThrow();
     await fs.symlink(join(root, "outside.txt"), join(paths.inboxRoot, "link.txt"));
@@ -1102,6 +1184,235 @@ describe("wiki mechanics", () => {
     db.close();
   });
 
+  it("ignores citation-shaped literals in HTML comments", async () => {
+    const { db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const created = await wiki.create({
+      path: "comment-literals.md",
+      body: `Visible.\n\n<!-- [^${sourceId}:0] -->\n<!-- [^${sourceId}:1]: invisible -->\n`,
+    });
+    const parsed = parseOkfConcept(created.content);
+    expect(parsed.frontmatter.sources).toBeUndefined();
+    expect(parsed.body).toContain(`<!-- [^${sourceId}:0] -->`);
+    expect(parsed.body).toContain(`<!-- [^${sourceId}:1]: invisible -->`);
+    db.close();
+  });
+
+  it("rejects blank page titles before mutating canonical state", async () => {
+    const { paths, db, wiki } = await fixture();
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const initialIndex = await fs.readFile(indexPath);
+    const initialLog = await fs.readFile(logPath);
+    await expect(wiki.create({ path: "blank-explicit.md", title: " \t", body: "should not persist" })).rejects.toThrow(
+      /title/u,
+    );
+    await expect(wiki.create({ path: "_-_.md", body: "path-derived title is blank" })).rejects.toThrow(/title/u);
+    expect(await wiki.list()).toEqual([]);
+    expect((await fs.readFile(indexPath)).equals(initialIndex)).toBe(true);
+    expect((await fs.readFile(logPath)).equals(initialLog)).toBe(true);
+    const created = await wiki.create({ path: "title-update.md", title: "Stable", body: "original" });
+    const pagePath = join(paths.wikiRoot, created.page.relativePath);
+    const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
+    const beforePage = await fs.readFile(pagePath);
+    const beforeSnapshot = await fs.readFile(snapshotPath);
+    const beforeIndex = await fs.readFile(indexPath);
+    const beforeLog = await fs.readFile(logPath);
+    const beforeCatalog = db.get<Record<string, unknown>>("SELECT * FROM pages WHERE page_id = ?", [
+      created.page.pageId,
+    ]);
+    await expect(
+      wiki.update(created.page.pageId, { title: " \n", expectedDigest: created.page.digest }),
+    ).rejects.toThrow(/title/u);
+    expect((await fs.readFile(pagePath)).equals(beforePage)).toBe(true);
+    expect((await fs.readFile(snapshotPath)).equals(beforeSnapshot)).toBe(true);
+    expect((await fs.readFile(indexPath)).equals(beforeIndex)).toBe(true);
+    expect((await fs.readFile(logPath)).equals(beforeLog)).toBe(true);
+    expect(db.get<Record<string, unknown>>("SELECT * FROM pages WHERE page_id = ?", [created.page.pageId])).toEqual(
+      beforeCatalog,
+    );
+    db.close();
+  });
+  it("repairs a directly drifted blank title through a guarded ingest update", async () => {
+    const { paths, db } = await fixture();
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      doctor,
+      commit: (_paths, subject) => ({ committed: false, subject }),
+    });
+    try {
+      const created = await app.wiki.create({ path: "drift-title.md", title: "Stable", body: "authored" });
+      const pagePath = join(paths.wikiRoot, created.page.relativePath);
+      const parsed = parseOkfConcept(await fs.readFile(pagePath, "utf8"));
+      parsed.frontmatter.title = " \t";
+      parsed.frontmatter.externallyAdded = "must not persist";
+      const drifted = serializeOkfConcept(parsed.frontmatter, parsed.body);
+      await fs.writeFile(pagePath, drifted);
+      const result = await app.applyIngestChange({
+        kind: "update-page",
+        pageId: created.page.pageId,
+        expectedDigest: sha256(drifted),
+        title: "Repaired",
+      });
+      expect(result.page?.title).toBe("Repaired");
+      const repaired = await app.wiki.get(created.page.pageId);
+      expect(repaired.status).toBe("active");
+      expect(parseOkfConcept(repaired.content).frontmatter.externallyAdded).toBeUndefined();
+      const report = doctor(paths.vaultRoot);
+      expect(report.ok).toBe(true);
+      expect(report.checks.find((check) => check.name === "okf")?.status).toBe("pass");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("rejects drift repair when the authored snapshot bytes are tampered", async () => {
+    const { paths, db } = await fixture();
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      doctor,
+      commit: (_paths, subject) => ({ committed: false, subject }),
+    });
+    try {
+      const created = await app.wiki.create({
+        path: "tampered-snapshot.md",
+        title: "Stable",
+        body: "Authored baseline. \uFFFD",
+      });
+      const pagePath = join(paths.wikiRoot, created.page.relativePath);
+      const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
+      const externalPage = created.content.replace("Authored baseline.", "External page.");
+      const authoredBytes = Buffer.from(created.content);
+      const replacementOffset = authoredBytes.indexOf(Buffer.from("\uFFFD"));
+      if (replacementOffset < 0) throw new Error("replacement character is missing");
+      const tamperedSnapshot = Buffer.concat([
+        authoredBytes.subarray(0, replacementOffset),
+        Buffer.from([0x80]),
+        authoredBytes.subarray(replacementOffset + Buffer.byteLength("\uFFFD")),
+      ]);
+      await fs.writeFile(pagePath, externalPage);
+      await fs.writeFile(snapshotPath, tamperedSnapshot);
+      const repair = {
+        body: "Explicit repair.",
+        title: "Repaired",
+        expectedDigest: sha256(externalPage),
+      };
+
+      await expect(app.wiki.prepareUpdate(created.page.pageId, repair)).rejects.toThrow(/product-authored snapshot/u);
+      await expect(
+        app.applyWikiChange({ kind: "update-page", pageId: created.page.pageId, ...repair }),
+      ).rejects.toThrow(/product-authored snapshot/u);
+      expect(await fs.readFile(pagePath, "utf8")).toBe(externalPage);
+      expect((await fs.readFile(snapshotPath)).equals(tamperedSnapshot)).toBe(true);
+      expect(
+        db.get<{ status: string }>("SELECT status FROM pages WHERE page_id = ?", [created.page.pageId])?.status,
+      ).toBe("active");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("rejects a second edit to preexisting non-target drift during repair", async () => {
+    const { paths, db } = await fixture();
+    let mutateOther = false;
+    let otherPath = "";
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: {
+        wiki: {
+          qmd: {
+            search: () => [],
+            index: async () => {
+              if (!mutateOther) return;
+              mutateOther = false;
+              await fs.appendFile(otherPath, "\nsecond unsupported edit");
+            },
+          },
+        },
+      },
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: false, subject }),
+    });
+    try {
+      const target = await app.wiki.create({ path: "repair-target.md", body: "authored target" });
+      const other = await app.wiki.create({ path: "repair-other.md", body: "authored other" });
+      const targetPath = join(paths.wikiRoot, target.page.relativePath);
+      otherPath = join(paths.wikiRoot, other.page.relativePath);
+      await fs.appendFile(targetPath, "\nfirst unsupported edit");
+      await fs.appendFile(otherPath, "\nfirst unsupported edit");
+      const targetContent = await fs.readFile(targetPath, "utf8");
+      mutateOther = true;
+      await expect(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: target.page.pageId,
+          expectedDigest: sha256(targetContent),
+          body: "corrected target",
+        }),
+      ).rejects.toThrow(/Preexisting wiki drift changed during mutation/u);
+      expect(await fs.readFile(targetPath, "utf8")).toBe(targetContent);
+      expect(
+        db.get<{ status: string }>("SELECT status FROM pages WHERE page_id = ?", [target.page.pageId])?.status,
+      ).toBe("active");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects orphan managed footnote definitions before persistence", async () => {
+    const { paths, db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Grounding source", "a".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, "b".repeat(64)],
+    );
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const initialIndex = await fs.readFile(indexPath);
+    const initialLog = await fs.readFile(logPath);
+    const pagePath = join(paths.wikiRoot, "orphan-managed.md");
+    await expect(
+      wiki.create({ path: "orphan-managed.md", body: `[^${sourceId}:0]: orphan evidence\n` }),
+    ).rejects.toThrow(/orphan managed footnote definition/u);
+    expect(await wiki.list()).toEqual([]);
+    await expect(fs.access(pagePath)).rejects.toThrow();
+    expect((await fs.readFile(indexPath)).equals(initialIndex)).toBe(true);
+    expect((await fs.readFile(logPath)).equals(initialLog)).toBe(true);
+    db.close();
+  });
+
+  it("escapes inline delimiters in generated projection labels", async () => {
+    const { paths, db, wiki } = await fixture();
+    const title = "*Title_ `code` ~[literal] <tag> &";
+    const description = "_Description* `code` ~[literal] <tag> &";
+    await wiki.create({
+      path: "literal-labels.md",
+      title,
+      body: "Body.",
+      frontmatter: { description },
+    });
+    const escapedTitle = ["\\*Title\\_", "\\`code\\`", "\\~&#91;literal&#93;", "&lt;tag&gt;", "&amp;"].join(" ");
+    const escapedDescription = ["\\_Description\\*", "\\`code\\`", "\\~&#91;literal&#93;", "&lt;tag&gt;", "&amp;"].join(
+      " ",
+    );
+    const index = await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8");
+    const log = await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8");
+    expect(index).toContain(`* [${escapedTitle}](literal-labels.md) - ${escapedDescription}`);
+    expect(log).toContain(`* **Update**: [${escapedTitle}](literal-labels.md) - ${escapedDescription}`);
+    db.close();
+  });
+
   it("encodes generated links, resolves absolute bundle links, and validates UTC log dates", async () => {
     const { paths, db, wiki } = await fixture();
     const target = await wiki.create({
@@ -1262,6 +1573,25 @@ describe("wiki mechanics", () => {
     await expect(wiki.resolveDrift(created.page.pageId, "restore")).rejects.toThrow(
       /semantic drift requires maintenance correction/u,
     );
+    db.close();
+  });
+  it("excludes catalogued drift from semantic qmd candidates", async () => {
+    const { paths, db, wiki } = await fixture();
+    await wiki.create({ path: "semantic-active.md", body: "active text" });
+    const drifted = await wiki.create({ path: "[x].md", body: "drifted text" });
+    await fs.appendFile(join(paths.wikiRoot, "[x].md"), "\nunsupported edit");
+    db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
+    let ignoredPaths: readonly string[] | undefined;
+    const semantic = new WikiService(db, paths, {
+      qmd: {
+        search: (_query, options) => {
+          ignoredPaths = options?.ignoredPaths;
+          return [{ path: "[x].md" }, { path: "semantic-active.md" }];
+        },
+      },
+    });
+    expect(await semantic.semanticSearch("text")).toEqual([{ path: "semantic-active.md" }]);
+    expect(ignoredPaths).toEqual(["[x].md"]);
     db.close();
   });
 

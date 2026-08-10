@@ -1,4 +1,5 @@
 import { lstatSync, type Stats } from "node:fs";
+import { relative, resolve, sep } from "node:path";
 import type { VaultPaths } from "../vault.js";
 import { type ChildResult, type ChildRunOptions, runChild, runChildSync } from "./process.js";
 
@@ -169,15 +170,31 @@ function validateSubject(subject: string): void {
   if (!SUBJECT_PATTERN.test(subject) || subject.trim() !== subject) throw new Error("invalid Git commit subject");
 }
 
-export function localCheckpointCommit(paths: VaultPaths, subject: string): GitCheckpointResult {
+export function localCheckpointCommit(
+  paths: VaultPaths,
+  subject: string,
+  excludedPaths: readonly string[] = [],
+): GitCheckpointResult {
   validateSubject(subject);
   assertGitDirectory(paths);
-  let result = runGitSync(paths, ["add", "--all", "--", "."]);
+  const exclusions = excludedPaths.map((path) => {
+    const pathspec = relative(paths.vaultRoot, resolve(path)).split(sep).join("/");
+    if (!pathspec || pathspec === ".." || pathspec.startsWith("../") || pathspec.startsWith("/"))
+      throw new Error("Git exclusion path escapes vault");
+    return pathspec;
+  });
+  if (exclusions.length) {
+    const stagedExcluded = runGitSync(paths, ["diff", "--cached", "--quiet", "--", ...exclusions]);
+    if (stagedExcluded.code === 1) throw new Error("Git checkpoint has pre-staged excluded changes");
+    if (stagedExcluded.code !== 0) throw commandFailure(stagedExcluded, "git diff");
+  }
+  const pathspecs = [".", ...exclusions.map((path) => `:(exclude,literal)${path}`)];
+  let result = runGitSync(paths, ["add", "--all", "--", ...pathspecs]);
   if (result.code !== 0) throw commandFailure(result, "git add");
-  result = runGitSync(paths, ["diff", "--cached", "--quiet"]);
+  result = runGitSync(paths, ["diff", "--cached", "--quiet", "--", ...pathspecs]);
   if (result.code === 0) return { committed: false, subject };
   if (result.code !== 1) throw commandFailure(result, "git diff");
-  result = runGitSync(paths, ["commit", "--no-gpg-sign", "-m", subject]);
+  result = runGitSync(paths, ["commit", "--no-gpg-sign", "--only", "-m", subject, "--", ...pathspecs]);
   if (result.code !== 0) throw commandFailure(result, "git commit");
   const commitIdResult = runGitSync(paths, ["rev-parse", "HEAD"]);
   if (commitIdResult.code !== 0) throw commandFailure(commitIdResult, "git rev-parse");

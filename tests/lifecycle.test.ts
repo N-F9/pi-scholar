@@ -33,6 +33,7 @@ type FakeLifecycleApp = {
   publishQuiz: (input: unknown) => Promise<unknown>;
   publishExtraction: (input: unknown) => Promise<unknown>;
   applyWikiChange: (input: unknown) => Promise<unknown>;
+  applyIngestChange: (input: unknown) => Promise<unknown>;
   finishWorkflow: (requestId: string, status: string, options?: unknown) => Promise<unknown>;
   updateWorkflow: (requestId: string, options: unknown) => Promise<unknown>;
 };
@@ -84,6 +85,7 @@ function fakeLifecycleApp(
     publishQuiz: async () => ({}),
     publishExtraction,
     applyWikiChange: async () => ({}),
+    applyIngestChange: async () => ({}),
     finishWorkflow: async (_requestId, status, options) => {
       finishes.push({ status, options });
       return {};
@@ -370,6 +372,42 @@ describe("Pi package lifecycle", () => {
       fixture.app.finishes.map(({ status }) => status),
       ["failed"],
     );
+  });
+  it("replays extraction after applied and unapplied initial progress failures", async () => {
+    for (const applied of [false, true]) {
+      const only = claim(`claim-context-update-${applied}`, `prepared-context-update-${applied}`);
+      const context = { claims: [only] };
+      const fixture = fakeLifecycleApp(context, async (input) => ({
+        sourceId: (input as { readonly claimId: string }).claimId,
+        manifest: {},
+        removedInbox: true,
+      }));
+      const update = fixture.app.updateWorkflow.bind(fixture.app);
+      let failUpdate = true;
+      fixture.app.updateWorkflow = async (requestId, options) => {
+        if (failUpdate) {
+          failUpdate = false;
+          const error = new Error("injected context update failure");
+          if (applied) Object.assign(error, { details: { applied: true } });
+          throw error;
+        }
+        return update(requestId, options);
+      };
+      await assert.rejects(
+        invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root),
+        /injected context update failure/u,
+      );
+      assert.deepEqual(fixture.app.finishes, []);
+      const replay = (await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root)) as {
+        readonly details: unknown;
+      };
+      assert.deepEqual(replay.details, context);
+      await invoke(fixture.tools, "scholar_publish_extraction", { ...only, endpoints: [1] }, fixture.root);
+      assert.deepEqual(
+        fixture.app.finishes.map(({ status }) => status),
+        ["succeeded"],
+      );
+    }
   });
 
   it("retains a publication failure through later successful claims", async () => {

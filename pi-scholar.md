@@ -1,97 +1,83 @@
 # Pi Scholar design
 
-**Status:** Draft for implementation  
-**Date:** 2026-08-04  
+**Status:** Implemented  
+**Date:** 2026-08-10  
 **Product and package name:** `pi-scholar`
 
 ## Decision summary
 
-Pi Scholar is one standalone Pi package for collecting knowledge into a sourced Markdown wiki and learning that wiki through a small daily quiz. It accepts documents, URLs, pasted source text, direct notes, code files, directories, and Git repositories. Files and directories placed directly in `inbox/` are discovered by the `extract` skill. Documents use Docling; already-textual and repository inputs retain their native structure. A model may choose semantic chunk boundaries, but host mechanics retain every source byte and validate complete reconstruction.
+Pi Scholar is one standalone, local-first Pi package for collecting knowledge into a sourced Markdown wiki and learning that wiki through a daily review session. It accepts documents, URLs, pasted source text, direct notes, code files, directories, and Git repositories. Files and directories placed directly in `inbox/` are discovered by the `extract` skill. Documents use Docling; already-textual and repository inputs retain their native structure. A model may choose semantic chunk boundaries, but host mechanics retain every source byte, normalize only derived Markdown, and validate complete reconstruction.
 
-The product centers the proven Cribrum loop:
+The product borrows the useful Cribrum loop, but the following are independent capabilities and durable invariants, not an automatic workflow:
 
-1. extract stable source inputs into immutable packets;
-2. ingest verified packets into source-grounded wiki changes;
-3. lint the final wiki through the organizer and repair workflow;
-4. ensure one page-level FSRS learning record for every eligible wiki page and retain the page prerequisite DAG;
-5. select prerequisite-unblocked pages due today, then generate one bounded daily quiz from ephemeral questions;
-6. collect and grade answers;
-7. apply one bundled page rating and one page review transition per covered page, transactionally;
-8. show the exact wiki pages and headings worth rereading;
-9. commit each completed mutation locally, then push accumulated commits only when the user schedules or invokes `pi-scholar sync`.
+1. `extract` turns stable source inputs into verified immutable packets;
+2. `ingest` uses published packet manifests and verified chunk paths plus the current non-retired wiki and issue context for guarded source-grounded wiki changes;
+3. `lint` performs full or targeted final organizer and repair work over the current wiki;
+4. `daily` exposes every compact due, prerequisite-unblocked, non-drifted candidate, lets the model choose a varied related subset, retrieves evidence for that subset, and targets a 15–45 minute session with roughly 30 minutes as a mental median;
+5. the chosen ephemeral questions may have any count, may cover a page more than once, and use only `free-response` or `multiple-choice`;
+6. browser submission seals an answer revision, while the separately scheduled `quiz-grader` settles it;
+7. grading writes one bundled page result, rating, review, and FSRS transition for every covered page, transactionally;
+8. results show the exact wiki pages and headings worth rereading;
+9. each completed durable mutation commits locally, while only an explicit `pi-scholar sync` push sends existing local commits to the configured remote.
 
 Users schedule the installed Pi CLI directly. Each cron entry names exactly one packaged Scholar skill and uses Pi's non-interactive, no-context flags; Pi Scholar never launches Pi, owns a scheduler, or chooses a weekday/time. The five independently scheduled skills are:
 
-- `extract`, which processes the current stable source queue sequentially in that Pi session and publishes immutable packets;
-- `ingest`, which reads only published, verified packets plus every non-retired page (active or drifted) and the supplied issue context, then submits guarded source-grounded wiki changes;
-- `lint`, which reads every non-retired page (active or drifted) and the issue context and submits guarded organizer or repair changes;
-- `daily`, which expires earlier unsubmitted quizzes, then proposes today's eligible quiz or an explicit skip, while refusing generation during initialization;
-- `quiz-grader`, which settles sealed pending browser submissions.
+- `extract`, which processes the current stable source queue sequentially in that Pi session and publishes verified immutable packets;
+- `ingest`, which reads only published, verified packet manifests and chunk paths plus every non-retired page and issue record, then submits guarded source-grounded wiki changes;
+- `lint`, which accepts a full or targeted scope, reads every non-retired page and issue record, and submits guarded final organizer or repair changes;
+- `daily`, which expires earlier unsubmitted quizzes, exposes all current due/prerequisite-unblocked/non-drifted candidates, retrieves evidence for the model's varied related subset, and targets the 15–45 minute session shape while refusing generation during initialization;
+- `quiz-grader`, which settles sealed answer revisions.
 
-Browser submission seals and queues grading; it does not start a Pi process. A separately scheduled `pi-scholar sync` pushes accumulated local commits. Every successful durable operation flows through `ScholarApplication`, which owns validation, the short writer lock, one SQLite checkpoint, final doctor, and one local commit.
+Browser submission seals and queues grading; it does not start a Pi process and does not grade. A separately scheduled `pi-scholar sync` pushes accumulated local commits. Every successful durable operation flows through the `ScholarApplication` application entry point, which owns validation, the short writer lock, one SQLite checkpoint, final doctor, and one local commit.
 
 Pi Scholar does not expose Engram-style tutoring, courses, coaching, capstones, transfer exercises, learner-model controls, threshold explorables, or generated learning diagrams. It borrows only the useful learning policies: retrieval practice, distributed practice, interleaving, source-grounded questions, and isolated grading.
 
 Application code is TypeScript. Pi supplies the agent runtime, extensions, native tools, and packaged Markdown skills. `ts-fsrs` supplies FSRS v6. Node owns SQLite, the loopback server, the worker, and the web application. Docling remains a required external Python command; qmd and Git remain validated external commands. There is no Python application side.
 
-The browser application is part of the product. It uses React, Vite, shadcn/ui, Tailwind, React Router, and TanStack Query to present quizzes, notes, source staging, history, workflow status, and initialization settings. It is served by the same loopback server and reached from a phone through a user-managed private tunnel. Pi Scholar adds no public-user or multi-user account system.
+The browser application is part of the product. It uses React, Vite, Tailwind, React Router, and TanStack Query to present quizzes, notes, source staging, history, workflow status, and initialization settings. The server itself binds loopback. An operator may place Tailscale or another private tunnel, reverse proxy, authentication layer, DNS, or network policy outside Pi Scholar for phone access; those are external operator context, not a Pi Scholar feature, dependency, identity, or trust boundary. Pi Scholar adds no public-user or multi-user account system.
 
 ## Product shape
 
 ```mermaid
 flowchart TD
-    Inputs[Documents, URLs, text, notes, code, repositories] --> Capture[Prepared source inputs]
-    Capture --> ExtractSkill[extract\nstable queue, immutable packets]
-    ExtractSkill --> Docling[Docling for document formats]
-    ExtractSkill --> Native[Lossless text, code, and Git capture]
-    Docling --> Packets[Immutable source packets]
-    Native --> Packets
-    Packets --> IngestSkill[ingest\nsource-grounded wiki changes]
-    IngestSkill --> Wiki[Linked Markdown wiki]
-    Wiki --> Qmd[qmd semantic ranking]
-    Wiki --> Exact[Pi read, grep, find, and bounded shell tools]
-    Cron[User-owned independent cron entries] --> Pi[Installed Pi CLI\none explicit skill per entry]
-    Pi --> ExtractSkill
-    Pi --> IngestSkill
-    Pi --> LintSkill[lint\nfinal organizer and repair]
-    Pi --> DailySkill[daily\nquiz or skip]
-    Pi --> GradeSkill[quiz-grader\nsealed submissions]
-    Wiki --> LintSkill
-    LintSkill --> Wiki
-    Qmd --> LintSkill
-    Exact --> LintSkill
-    Qmd --> DailySkill
-    Exact --> DailySkill
-    DailySkill --> Quiz
-    Quiz --> Web[Responsive web application]
-    Web --> Seal[Seal and queue submission]
-    Seal --> GradeSkill
-    GradeSkill --> FSRS[SQLite and ts-fsrs]
-    FSRS --> Readings[Linked wiki readings]
-    Wiki --> Commit[Local Git commits]
-    Quiz --> Commit
-    GradeSkill --> Commit
-    SyncCron[User-owned sync cron] --> Sync[pi-scholar sync]
-    Sync --> Push[Push accumulated commits]
-    Commit --> Push
+    Operator["Operator-owned independent schedules"] --> Extract["extract"]
+    Operator --> Ingest["ingest"]
+    Operator --> Lint["lint"]
+    Operator --> Daily["daily"]
+    Operator --> Grader["quiz-grader"]
+    Operator --> Sync["pi-scholar sync"]
+    Interactive["Interactive Pi"] --> Application["ScholarApplication application entry point"]
+    Browser["Browser client"] --> Application
+    Extract --> Application
+    Ingest --> Application
+    Lint --> Application
+    Daily --> Application
+    Grader --> Application
+    Sync --> Application
+    Application --> State["Durable local state: SQLite, sources, wiki, quizzes, Git commits"]
+    Application --> Qmd["Derived qmd index"]
+    Application --> Work["Private ignored .pi-scholar/work scratch"]
+    Sync --> Push["Push existing local commits"]
+    Push --> Remote["Configured remote"]
 ```
 
-The product has two user-visible layers behind one application boundary:
+Every independently scheduled workflow reads current durable state and submits any proposal or publication through `ScholarApplication`; no workflow launches another workflow or Pi process. `pi-scholar sync` is the only path from existing local commits to the configured remote. qmd and `.pi-scholar/work/` are derived or transient and never canonical.
+
+The product has two user-visible layers behind one application entry point:
 
 1. **Knowledge:** extract, immutable packets, ingest, wiki notes, links, native navigation, qmd ranking, and lint repair.
 2. **Review:** daily quiz sheets, answer submission, grading, FSRS scheduling, results, and linked wiki readings.
 
 SQLite, files, qmd, Git, Pi, and the web client have distinct ownership. None is a parallel product authority.
-
 ## Goals
 
 1. Turn local and remote material into durable, inspectable knowledge.
 2. Support PDFs, EPUBs, Markdown, text, HTML, XML, JSON, DOCX, URLs, pasted text, direct notes, code files, directories, and Git repositories without truncating accepted inputs or requiring one command per inbox entry.
 3. Use Docling for document conversion and native text/Git handling where Docling adds no value.
 4. Let the model choose coherent source boundaries while the host proves lossless reconstruction and provenance.
-5. Preserve direct human prose and keep model-authored knowledge as self-contained, textbook-depth OKF-compatible Markdown under `wiki/`, not abstract-only summaries.
+5. Preserve direct human prose and keep model-authored knowledge as self-contained, textbook-depth strict OKF v0.2 Markdown under `wiki/`, not abstract-only summaries.
 6. Let Pi use native exact and lexical operations in addition to qmd semantic ranking.
-7. Cover quiz-worthy knowledge in the whole eligible stable wiki through page-level learning and one small daily quiz.
+7. Cover quiz-worthy knowledge in the whole eligible stable wiki through page-level learning and one model-sized daily review session.
 8. Apply retrieval practice, spacing, and topic interleaving without exposing a tutoring or curriculum product.
 9. Keep questions, grading, historical results, and recommended readings traceable to wiki pages and immutable source chunks.
 10. Provide a responsive browser interface for quizzes and note reading on desktop and phone.
@@ -104,7 +90,7 @@ SQLite, files, qmd, Git, Pi, and the web client have distinct ownership. None is
 
 - Interactive tutoring, courses, coaching, learner-model configuration, capstones, transfer exercises, threshold explorables, or separate learning diagrams.
 - A second learning artifact hierarchy beyond dated quiz sheets.
-- A public or multi-user server, account database, or Pi Scholar-managed tunnel.
+- A public or multi-user server, account database, or Pi Scholar-managed tunnel; external tunnels, reverse proxies, authentication, DNS, and network policy remain operator-owned context.
 - Server-side rendering, serverless deployment, or a Next.js application.
 - Network filesystems or concurrent uncoordinated writers.
 - Live donor plugins, donor storage compatibility, donor-user importers, or migration commands.
@@ -122,7 +108,7 @@ This design was checked against these executable-source baselines on 2026-08-04:
 
 | Donor | Revision | Retained | Rejected |
 |---|---|---|---|
-| [pi-llm-wiki](https://github.com/zosmaai/pi-llm-wiki) | `a4c9da4b4694` | Pi-native knowledge experience, strict OKF parsing, Markdown links, deterministic projections, guardrails, and useful TypeScript fixtures | Its storage, direct final-path capture, 24,000-character ingest slice, custom embedding sidecar, in-process task runtime, and separate orchestration |
+| [pi-llm-wiki](https://github.com/zosmaai/pi-llm-wiki) | `a4c9da4b4694` | Pi-native knowledge experience, strict OKF parsing, Markdown links, deterministic projections, guardrails, and useful TypeScript fixtures | Its storage, direct final-path capture, fixed ingest slice, custom embedding sidecar, in-process task runtime, and separate orchestration |
 | [Engram](https://github.com/nagisanzenin/engram) | `d0a61cd67130` | Retrieval practice, distributed practice, topic interleaving, isolated assessment, and useful FSRS/receipt fixtures | Its JSON/JSONL home, tutoring dialogue, learner model, confidence UI, coaching, capstones, transfer, threshold explorables, and skill-orchestrated state authority |
 | [Cribrum](https://github.com/N-F9/cribrum-lite) | `f54da48676c7` | Safe admission, Docling boundary, lossless atomization, model-selected endpoints, wiki catalog rules, SQLite workflow and grading patterns, qmd scope, mixed quiz sheets, responsive quiz/note UI behavior, process containment, locks, and Git synchronization semantics | Its exact paths and schema, Python/model framework, current package split, and donor compatibility |
 
@@ -134,7 +120,7 @@ The cutover rules are:
 2. Use `ts-fsrs` for the native schedule and retain only Engram's evidence-backed learning policies, not its product surface.
 3. Follow Cribrum's source-to-wiki-to-daily workflow and deterministic safety boundaries, adapted into the TypeScript vault and API, with lint as the final organizer and repair workflow.
 4. Keep qmd rooted only at `wiki/`, while allowing Pi's native exact and lexical tools to inspect accepted material.
-5. Keep source extraction, packet ingest, lint repair, quiz generation, grading, and Git synchronization behind one application facade.
+5. Keep source extraction, packet ingest, lint repair, quiz generation, grading, and Git synchronization behind one `ScholarApplication` application entry point.
 6. Preserve required donor licenses and attribution for adapted code. No donor data importer ships.
 
 ## Supported deployment and trust boundary
@@ -143,7 +129,7 @@ Pi Scholar supports one local operating-system user, one active physical vault p
 
 `pi-scholar init [path]` creates a vault explicitly. Runtime resolution uses an explicit path first, then walks from the current directory to the nearest `.pi-scholar/vault.json`. `vault.json` stores a format version and host-minted vault ID, not an absolute path, so moving the complete vault does not require identity repair.
 
-The server binds loopback. A user-managed private tunnel owns phone reachability and access control. The browser and API remain one origin through that tunnel; Pi Scholar does not add accounts, public-host discovery, or permissive CORS.
+The server binds loopback and serves one same-origin browser/API boundary. An operator may put Tailscale or another private tunnel, reverse proxy, authentication layer, DNS, or network policy in front of it, but that configuration is external context—not a Pi Scholar integration, identity source, trust boundary, dependency, or feature. Pi Scholar does not add accounts, public-host discovery, or permissive CORS.
 
 Trusted local state:
 
@@ -162,6 +148,7 @@ Untrusted inputs:
 - user-authored Markdown, Mermaid, and HTML.
 
 Every untrusted value crosses a validating host boundary before it can choose a path, mutate durable state, update a schedule, enter semantic context, or appear in a public response.
+HTTP(S) URL admission accepts user-supplied local, private, loopback, link-local, metadata, and Tailscale destinations under local-user/model trust. The host does not maintain a destination classifier as an SSRF trust boundary. It still enforces HTTP(S), redirect-loop limits, finite request timeouts, streaming or disk-backed reads, and available-space checks. URL response bytes remain untrusted evidence.
 
 ## Canonical vault
 
@@ -190,12 +177,14 @@ Git adds `.git/`. Pi Scholar adds no other product content root.
 
 - `vault.json` owns the vault ID and format version.
 - `state.sqlite` owns source extraction/ingestion/removal status, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and initialization mode.
-- `qmd/` is derived external-command state and may be rebuilt.
-- `work/` contains bounded transient request files and child-process output.
+- `qmd/` is derived external-command state and may be rebuilt; it is never authority.
+- `work/` is private, ignored scratch for prepared admission snapshots, temporary packet publication, Docling output/cache isolation, quarantined removal bytes, and wiki-change rollback snapshots. It is never knowledge or Git content.
 
 A derived sibling operating-system lock coordinates writers beside the physical vault. It is held only for short validated SQLite/file mutations, final doctor, Git checkpointing, and the independently scheduled sync push—not while Pi skills or Docling perform long semantic work. After acquiring it, the application revalidates every relevant identity and revision before writing. The lock is not a vault artifact or recovery input.
 
-SQLite sidecars, qmd data, and transient work are ignored by Git. Every successful mutating transaction checkpoints SQLite before its local Git commit.
+Successful operations clean their private work artifacts. Failed operations use rollback data where needed; crash remnants never override SQLite or published durable artifacts. Recovery stays behind `ScholarApplication`, doctor, and an idempotent retry, not by treating a leftover work file as state.
+
+SQLite sidecars, qmd data, and `.pi-scholar/work/` are ignored by Git. Every successful mutating transaction checkpoints SQLite before its local Git commit.
 
 ### `inbox/`: automatic pending source queue
 
@@ -220,27 +209,29 @@ sources/<source-id>/
 └── attachments/
 ```
 
-- `manifest.json` records identity, source kind, original name or URL, optional repository revision, media type, capture time, converter identity/version, byte lengths, SHA-256 digests, file manifest, and ordered chunks.
-- `original/` retains the accepted original bytes or repository tree. Pasted text is materialized as a text file.
-- `extracted.md` is the complete normalized document extraction or deterministic textual/repository presentation used for chunk planning.
+- `manifest.json` records identity, source kind, original name or URL, optional repository revision, media type, capture time, converter identity/version, the fence-aware derived-Markdown normalizer identity/version, byte lengths, SHA-256 digests, file manifest, and ordered chunks.
+- `original/` retains accepted original bytes or the repository tree unchanged. Pasted text is materialized as a text file.
+- `extracted.md` is the complete derived document extraction or deterministic textual/repository presentation used for chunk planning. Redundant blank-line runs are normalized only here, outside fenced code; originals remain byte-for-byte unchanged.
 - `chunks/` contains contiguous, ordered, semantically coherent slices. Each ingest context chunk carries a verified absolute path derived from its published packet as `<packetPath>/chunks/<ordinal+1 padded to 4>.md`.
 - `attachments/` retains local assets exported by a converter.
 
-Packets are immutable while retained. Recapturing changed material creates a new packet. A user may request removal of an obsolete or unwanted packet through a confirmation-bound workflow: Pi Scholar first shows every dependent wiki claim, page evidence, and current artifact, then removes or revises them atomically with the packet. Historical page review records remain, and ordinary removal does not erase bytes from existing Git history; a true privacy purge requires explicit operator-run Git history rewriting outside Pi Scholar.
+Packets are immutable while retained. Recapturing changed material creates a new packet. Removal begins only from an explicit operator request; extraction and publication never remove a packet automatically. The confirmation-bound workflow first shows every dependent wiki claim, page evidence, and current artifact, then removes or revises them atomically with the packet. Historical page review records remain, and ordinary removal does not erase bytes from existing Git history; a true privacy purge requires explicit operator-run Git history rewriting outside Pi Scholar.
 
 ### `wiki/`: notes and source-grounded knowledge
 
-`wiki/` contains inspectable, product-authored OKF-compatible Markdown:
+`wiki/` is an inspectable, product-authored, strict OKF v0.2 bundle:
 
 - direct notes;
 - source-grounded textbook chapters and focused concept pages rather than abstract-only summaries;
 - concepts, entities, procedures, requirements, and cases;
 - cross-source syntheses;
-- deterministic indexes and dated logs;
-- standard Markdown links and source-chunk citations;
+- valid YAML frontmatter with a non-empty `type` on every concept page;
+- a reserved root `index.md` declaring `okf_version: "0.2"` and a reserved `log.md` with newest-first `## YYYY-MM-DD` groups;
+- standard Markdown links, OKF `sources` entries, keyed footnote provenance, and immutable packet/chunk identity;
+- deterministic indexes, backlinks, catalogs, and dated logs;
 - optional inline Mermaid where a relationship genuinely benefits from a diagram.
 
-Model-authored source pages teach their bounded topic without requiring the source to be open. They define terminology and symbols, explain central mechanisms step by step, retain relevant equations, algorithms, architecture, examples, and empirical values, and discuss supported assumptions, tradeoffs, and limitations. Depth follows the source rather than a fixed word count. Claims cite the nearest relevant immutable source chunks; direct human-authored prose is not expanded or rewritten without a bounded request.
+OKF parsing and serialization preserve valid unknown and nested frontmatter fields. Model-authored source pages teach their bounded topic without requiring the source to be open. They define terminology and symbols, explain central mechanisms step by step, retain relevant equations, algorithms, architecture, examples, and empirical values, and discuss supported assumptions, tradeoffs, and limitations. Depth follows the source rather than a fixed word count. Claims retain exact immutable packet/chunk provenance; direct human-authored prose is not expanded or rewritten without a bounded request.
 
 Every published page receives a host-minted immutable page ID in frontmatter. The catalog maps that ID to the current path, and page learning is keyed by that stable ID rather than by path or heading. Moving or renaming a page therefore preserves its learning state and review history. Duplicate or missing IDs fail doctor. Folder hierarchy remains organization, not a type system.
 
@@ -264,41 +255,42 @@ Questions are generated for a quiz and are not a durable question bank. There ar
 | Notes and source-grounded knowledge | Markdown under `wiki/` plus the SQLite page-ID catalog |
 | Human-readable quiz, answers, results, and corrections | Dated Markdown under `quizzes/` |
 | Source extraction/ingestion/removal, page identity, wiki issues, page learning, prerequisites, page review history, daily quiz outcomes and revisions, question/page records, page results, and workflows | `.pi-scholar/state.sqlite` |
-| Semantic ranking | qmd collection rooted at `wiki/` |
+| Semantic ranking | qmd collection rooted at `wiki/` (derived, rebuildable) |
 | Exact and lexical navigation | Validated physical files plus Pi native tools |
 | Version history and remote synchronization | Git and optional Git LFS |
 
-qmd indexes `wiki/**/*.md` only. It never indexes `sources/` or `quizzes/`. qmd unavailability disables semantic ranking, not exact reads, grep, find, normal Markdown navigation, or safe repository inspection. Native lookup is a separate exact/lexical path, never mislabeled as a semantic fallback.
+qmd indexes active product-authored `wiki/**/*.md` only; catalogued drift paths are exact collection ignores. It never indexes `sources/` or `quizzes/`, and qmd output never becomes canonical state. `.pi-scholar/work/` is private transient/rollback/Docling scratch and never canonical state or Git content. qmd unavailability disables semantic ranking, not exact reads, grep, find, normal Markdown navigation, or safe repository inspection. Native lookup is a separate exact/lexical path, never mislabeled as a semantic fallback.
 
 ## Runtime architecture
 
 Pi Scholar is a TypeScript application and Pi package. Users, not Pi Scholar, start semantic work:
 
 ```mermaid
-flowchart LR
-    Interactive[Interactive Pi] --> Extension[Pi Scholar extension]
-    Cron[User-owned cron entry] --> Pi[Installed Pi CLI\none explicit Scholar skill]
-    Pi --> Extract[extract]
-    Pi --> Ingest[ingest]
-    Pi --> Lint[lint]
-    Pi --> Daily[daily]
-    Pi --> Grader[quiz-grader]
-    Web[React web client] --> Server[Loopback TypeScript server]
-    Extension --> App[ScholarApplication]
-    Extract --> App
-    Ingest --> App
-    Lint --> App
-    Daily --> App
-    Grader --> App
-    Server --> App
-    App --> Mechanics[Deterministic TypeScript mechanics]
-    App --> SQLite[node:sqlite and ts-fsrs]
-    App --> External[Validated external adapters]
-    External --> Docling[Docling]
-    External --> Qmd[qmd]
-    External --> Git[Git and Git LFS]
-    SyncCron[User-owned sync cron] --> Sync[pi-scholar sync]
-    Sync --> Git
+flowchart TD
+    Operator["Operator-owned independent schedules"] --> Extract["extract"]
+    Operator --> Ingest["ingest"]
+    Operator --> Lint["lint"]
+    Operator --> Daily["daily"]
+    Operator --> Grader["quiz-grader"]
+    Operator --> Sync["pi-scholar sync"]
+    Interactive["Interactive Pi"] --> Extension["Pi Scholar extension"]
+    Browser["React browser client"] --> Server["Loopback TypeScript server"]
+    Extract --> Application["ScholarApplication application entry point"]
+    Ingest --> Application
+    Lint --> Application
+    Daily --> Application
+    Grader --> Application
+    Extension --> Application
+    Server --> Application
+    Sync --> Application
+    Application --> Mechanics["Deterministic TypeScript mechanics"]
+    Application --> Durable["SQLite, vault files, and local Git commits"]
+    Application --> External["Validated external adapters"]
+    External --> Docling["Docling"]
+    External --> Qmd["qmd"]
+    External --> Git["Git and Git LFS"]
+    Sync --> Push["Push existing local commits"]
+    Push --> Remote["Configured remote"]
 ```
 
 `ScholarApplication` is the single durable boundary. It validates current state, supplies typed host-tool contexts and proposal/publish operations, owns short lock ordering and every supported product-owned mutation, sequences mechanics and model judgment, writes bounded workflow progress, checkpoints SQLite once, runs final doctor, and creates one local Git commit for each successful durable mutation that changes bytes. Read-only and no-op operations do not commit. Pi skills, interactive extension tools, HTTP, and the sync CLI do not implement parallel file or SQLite writers.
@@ -320,11 +312,11 @@ Pi's built-in `read`, `grep`, `find`, and bounded shell tool remain available fo
 
 Semantic workflows are inspectable Pi skills under `skills/*/SKILL.md`. The initial set is deliberately small:
 
-- `extract`: read the current stable source context, process entries sequentially in canonical order, choose coherent semantic chunk boundaries with complete lossless coverage, use host claims and per-source idempotency, isolate failures, reconcile complete coverage, and publish immutable packets;
-- `ingest`: consume only published, verified packets and every non-retired page (active or drifted) plus issue records, create or revise self-contained textbook-depth source pages, preserve direct human prose, maintain page learning coverage and prerequisites, and submit guarded changes;
-- `lint`: inspect every non-retired page (active or drifted) and issue records, identify stale or broken knowledge, and submit guarded final organizer and repair changes;
-- `daily`: expire earlier unsubmitted quizzes, refuse generation while initialization is enabled, and otherwise select prerequisite-unblocked pages due today and generate the dated grounded quiz or record an explicit skip;
-- `quiz-grader`: inspect sealed pending submissions, preserve question feedback, settle one bundled page grade per covered page, and select wiki readings through the facade.
+- `extract`: read the current stable source context, process entries sequentially in canonical order, choose coherent semantic chunk boundaries with complete lossless coverage, use host claims and per-source idempotency, isolate failures, reconcile complete coverage, and publish verified immutable packets;
+- `ingest`: consume only published, verified packet manifests and chunk paths plus every non-retired page and issue record, create or revise self-contained textbook-depth source pages, preserve direct human prose, maintain page learning coverage and prerequisites, and submit guarded changes;
+- `lint`: inspect every non-retired page and issue record in a full or targeted scope, identify stale or broken knowledge, and submit guarded final organizer or repair changes;
+- `daily`: expose every compact due, prerequisite-unblocked, non-drifted candidate, let the model choose a varied related subset, retrieve selected page evidence, target 15–45 minutes with roughly 30 minutes as a mental median, and generate any-count `free-response`/`multiple-choice` quiz or explicit skip;
+- `quiz-grader`: inspect sealed pending answer revisions, preserve question feedback, settle one bundled page grade per covered page, and select wiki readings through the application entry point.
 
 Users can inspect these Markdown files and invoke them through Pi's `/skill:<name>` interface where appropriate. Skills describe semantic workflow; they do not own durable state or bypass host validation.
 
@@ -341,9 +333,9 @@ The prompt is static. Source text, learner text, credentials, and arbitrary mode
 The five jobs are independent:
 
 1. `extract` snapshots stable entries once, then processes that snapshot sequentially. The host claims each physical identity and digest, publishes or records a source-specific failure, and continues with the next entry.
-2. `ingest` reads published, verified packets plus every non-retired page (active or drifted) and issue records, then submits guarded source-grounded wiki changes; the host validates page identity, direct page evidence, prerequisite DAG changes, and doctor.
-3. `lint` reads every non-retired page (active or drifted) and issue records, then submits guarded final organizer or repair changes; the host validates page identity, revisions, lint, and doctor.
-4. `daily` expires earlier unsubmitted quizzes before checking initialization, then publishes today's eligible quiz or a typed no-eligible/initialization outcome. Initialization blocks generation but does not schedule or suppress extract, ingest, or lint.
+2. `ingest` reads published, verified packet manifests and chunk paths plus every non-retired page (including drifted pages) and current issue records, then submits guarded source-grounded wiki changes; the host validates page identity, direct page evidence, prerequisite DAG changes, and doctor.
+3. `lint` reads every non-retired page (including drifted pages) and current issue records in either full or targeted scope, then submits guarded final organizer or repair changes; the host validates page identity, revisions, lint, and doctor.
+4. `daily` expires earlier unsubmitted quizzes before checking initialization, then exposes every due, prerequisite-unblocked, active, eligible, non-drifted candidate. The model chooses a varied related subset, requests evidence for those page IDs, and sizes any-count questions for the 15–45 minute session target. Initialization blocks generation but does not schedule or suppress extract, ingest, lint, grading, or sync.
 5. `quiz-grader` reads sealed pending browser submissions and settles them. Browser submission only seals and queues; it never starts Pi or grades directly.
 
 Model work runs without holding the sibling writer lock. Once a skill has a validated durable mutation, `ScholarApplication` performs the short checkpoint sequence and local commit. `pi-scholar sync` is the separate push-only boundary; no semantic skill invocation performs a push.
@@ -372,19 +364,19 @@ Mechanics contains no prompts or semantic judgment. `node:sqlite` is hidden behi
 | Input | Adapter |
 |---|---|
 | PDF, EPUB, DOCX, PPTX, XLSX, HTML, images, and other supported document formats | Guarded Docling conversion |
-| URL | Validated fetch followed by the appropriate document or textual adapter |
+| URL | HTTP(S) fetch that accepts local, private, loopback, link-local, metadata, and Tailscale destinations under local-user/model trust, with timeout, redirect, streaming, and disk-backed transport mechanics, followed by the appropriate document or textual adapter |
 | Markdown, plain text, XML, JSON, and pasted source text | Lossless textual extraction |
 | Direct note | Guarded write to `wiki/`; no fake source packet |
 | Code file | Lossless textual extraction retaining language and path |
 | Directory or Git repository | Native file/Git walker retaining paths, file digests, revision, and repository structure |
 
-Repository extraction respects explicit size bounds and excludes Git internals, ignored files unless explicitly requested, unsupported devices, symlinks, and binary content not deliberately retained. Code boundaries follow files, symbols, modules, and coherent subsystems rather than document headings.
+Repository extraction has no product-level source-size cap. It uses streaming or disk-backed reads with available-space, timeout, process-output, and model-context bounds, and excludes Git internals, ignored files unless explicitly requested, unsupported devices, symlinks, and binary content not deliberately retained. Code boundaries follow files, symbols, modules, and coherent subsystems rather than document headings.
 
 ### Extraction flow
 
 1. Discover a stable inbox entry or materialize a typed input there.
-2. Copy it through validated no-follow reads into private work, compute its complete file/tree manifest and digest, and claim that snapshot.
-3. Validate the snapshot's type, size, containment, and authorization.
+2. Copy it through validated no-follow streaming or disk-backed reads into private work, compute its complete file/tree manifest and digest, and claim that snapshot.
+3. Validate the snapshot's type, containment, authorization, available space, and operational time bounds.
 4. Retain the original bytes or repository tree in a prepared packet.
 5. Convert document formats through Docling; preserve already-textual inputs natively.
 6. Reject empty, truncated, timed-out, malformed, or unsupported conversion without removing the pending input.
@@ -393,7 +385,7 @@ Repository extraction respects explicit size bounds and excludes Git internals, 
 9. Validate complete coverage and publish the packet through a temporary directory and atomic rename.
 10. Remove the pending inbox entry only if publication succeeded and its current physical identity and digest still match the claim.
 
-No path takes only the first N characters. Long sources use hierarchical planning over the complete atom stream. A coherent presentation may remain one chunk; a book may split at sustained conceptual, argumentative, procedural, chapter, or reference transitions.
+No path takes only the first N characters and no fixed product-level source-size limit exists. Long sources use hierarchical planning over the complete atom stream, subject only to available-space, timeout, process-output, and model-context bounds. A coherent presentation may remain one chunk; a book may split at sustained conceptual, argumentative, procedural, chapter, or reference transitions.
 
 ### Chunk contract
 
@@ -409,19 +401,13 @@ Chunk bodies are evidence, not summaries. Wiki claims cite exact packet and chun
 
 ## Wiki and retrieval behavior
 
-The common knowledge path is:
+There is no automatic knowledge pipeline. The independently scheduled workflows share current durable state:
 
-```text
-capture or note
-  → extract and chunk when applicable
-  → publish an immutable source packet
-  → ingest packet evidence into grounded wiki changes
-  → lint the final wiki and repair organization
-  → update deterministic catalog, links, index, and log
-  → refresh qmd when wiki bytes changed
-  → doctor
-  → local Git commit
-```
+- `extract` discovers stable inbox entries and publishes verified immutable packets; it does not launch `ingest`.
+- `ingest` reads verified packet manifests/chunk paths plus every non-retired page and issue record, then proposes guarded source-grounded changes.
+- `lint` reads the complete non-retired wiki and issue context in full or targeted scope and proposes final organizer or repair changes.
+- Deterministic catalog, links, index, log, qmd refresh, doctor, and local commit are `ScholarApplication` postconditions for a successful durable mutation.
+- `daily`, `quiz-grader`, and `pi-scholar sync` are independently scheduled and do not depend on a workflow-to-workflow launch edge.
 
 Rules:
 
@@ -429,22 +415,23 @@ Rules:
 2. Users report wiki corrections through `/scholar-issue`; direct physical wiki edits are unsupported in the first iteration.
 3. Imported text is evidence, never host or model instruction.
 4. Grounded claims cite immutable source chunks.
-5. Models propose paths and links; the host validates containment, reserved names, page identity, and source authorization.
+5. Models propose paths and links; the host validates containment, reserved names, page identity, source authorization, and the unsupported-symlink rule at the shared I/O boundary.
 6. Standard Markdown links are canonical.
-7. Deterministic indexes, backlinks, catalogs, and dated logs are projections.
-8. qmd supplies semantic ranking only and indexes only the wiki.
-9. Pi may use native read, grep, find, bounded shell operations, and exact Markdown navigation throughout accepted vault material.
-10. qmd failure is visible for semantic queries but does not disable exact or lexical operations.
-11. URL discovery must be explicit, fetched safely, and extracted and published before it grounds durable knowledge or questions.
-12. Mermaid may appear inside a wiki page when useful, with adjacent explanatory prose and no raw executable HTML or network actions.
+7. `wiki/` is strict OKF v0.2: root `index.md` declares `okf_version: "0.2"`, `log.md` uses newest-first date groups, concept frontmatter has a non-empty `type`, and unknown/nested valid fields survive round trips.
+8. Deterministic indexes, backlinks, catalogs, and dated logs are projections.
+9. qmd supplies semantic ranking only and indexes only the wiki.
+10. Pi may use native read, grep, find, bounded shell operations, and exact Markdown navigation throughout accepted vault material.
+11. qmd failure is visible for semantic queries but does not disable exact or lexical operations.
+12. URL discovery must be explicit; HTTP(S) fetch accepts local/private/Tailscale destinations under local-user/model trust while retaining timeout, redirect, streaming, and disk-backed transport mechanics before a URL grounds durable knowledge or questions.
+13. Mermaid may appear inside a wiki page when useful, with adjacent explanatory prose and no raw executable HTML or network actions.
 
 ## Daily quiz model
 
-### Page-level learning and schema v3
+### Page-level learning and schema v4
 
 The scheduler unit is a **wiki page**. Every eligible page has one `page_learning` row keyed by its stable `page_id` and one `ts-fsrs` state. Page creation and eligibility ensure that row exists. A page rename keeps the same ID and learning history. Drifted or retired pages are excluded from selection while their page learning and review history remain available for inspection.
 
-Schema v3 is the clean pre-release page-oriented cutover. `.pi-scholar/state.sqlite` stores:
+Schema v4 is the current page-oriented schema. `.pi-scholar/state.sqlite` stores:
 
 - `page_learning`: one FSRS schedule/state per `page_id`;
 - `page_prerequisites`: directed `(page_id, prerequisite_page_id)` edges;
@@ -454,9 +441,9 @@ Schema v3 is the clean pre-release page-oriented cutover. `.pi-scholar/state.sql
 - `quiz_evidence`: keyed by quiz/reference and containing direct page/section snapshots only;
 - quiz identity/revisions, ephemeral question records, wiki issues, workflows, and initialization state.
 
-`wiki_issues` is page-oriented. There are no compatibility aliases, views, migrations, deprecated review paths, or parallel legacy review schema. `SchedulerService` remains the file/class name but is page-oriented: `ensurePageLearning`, `getPageLearning`, `listPageLearning`, `setPrerequisites(pageId, ids, expectedRevision?)`, `listPrerequisites(pageId)`, `validateCoverage`, `eligiblePages`, `selectDuePages`, `pageHistory`, and `transitionPage`/`transitionPageInTransaction`.
+`wiki_issues` is page-oriented. There are no compatibility aliases, views, migrations, deprecated review paths, or parallel legacy review schema. `SchedulerService` is page-oriented, not a cron, process, or job scheduler: `ensurePageLearning`, `getPageLearning`, `listPageLearning`, `setPrerequisites(pageId, ids, expectedRevision?)`, `listPrerequisites(pageId)`, `validateCoverage`, `eligiblePages`, `pageHistory`, and `transitionPage`/`transitionPageInTransaction`.
 
-The exported page contracts are `ReviewRating`, `PageLearningRecord` (`pageId`, `initialDueAt`, `dueAt`, `fsrsState`, `stability`, `difficulty`, `reps`, `lapses`, `scheduledDays`, optional `lastReviewAt`, `revision`, `createdAt`, `updatedAt`), `PagePrerequisiteRecord` (`pageId`, `prerequisitePageId`), `PageReviewRecord` (`reviewId`, `pageId`, `quizId`, `submissionId`, `revision`, `rating`, `reviewedAt`, `stateBefore`, `stateAfter`, `settlementId`), `QuizQuestionPageRecord` (`pageId`, `criterion`, `weight`), `QuizPageResultRecord` (`resultId`, `quizId`, `pageId`, `rating`, `feedback`, `reviewId`, `evidence`, `readings`), page-oriented `QuizGradeRecord` (`gradeId`, `quizId`, `pageId`, `rating`, `feedback`, `gradedAt`, optional `reviewId`), and `GradePageInput` (`pageId`, `rating`, optional `feedback`, `evidence`, optional `readings`).
+The exported page contracts are `ReviewRating`, `PageLearningRecord` (`pageId`, `initialDueAt`, `dueAt`, `fsrsState`, `stability`, `difficulty`, `reps`, `lapses`, `scheduledDays`, optional `lastReviewAt`, `revision`, `createdAt`, `updatedAt`), `PagePrerequisiteRecord` (`pageId`, `prerequisitePageId`), `PageReviewRecord` (`reviewId`, `pageId`, `quizId`, `submissionId`, `revision`, `rating`, `reviewedAt`, `stateBefore`, `stateAfter`, `settlementId`), `QuizQuestionPageRecord` (`pageId`, `criterion`, `weight`), `QuizPageResultRecord` (`resultId`, `quizId`, `pageId`, `rating`, `feedback`, `reviewId`, `evidence`, `readings`), page-oriented `QuizGradeRecord` (`gradeId`, `quizId`, `pageId`, `rating`, `feedback`, `gradedAt`, optional `reviewId`), and `GradePageInput`.
 
 ### Page prerequisites
 
@@ -464,23 +451,20 @@ Ingest and lint may propose directed prerequisite edges between pages. The host 
 
 ### Selection and page evidence
 
-Whenever the user-scheduled `daily` skill runs, it first expires every earlier unsubmitted quiz as a read-only artifact without changing FSRS. It then refuses quiz generation while initialization is enabled. Otherwise it selects only pages whose `page_learning` due date is today or earlier and whose prerequisites are all in FSRS `Review`. It interleaves eligible pages and follows the bounded shape: at most four questions total and no more than two synthesis questions. If no page is eligible, it creates no quiz sheet and records an explicit no-eligible-pages outcome; it never generates filler questions for blocked, drifted, retired, or unscheduled pages.
+Whenever the user-scheduled `daily` skill runs, it first expires every earlier unsubmitted quiz as a read-only artifact without changing FSRS. It then refuses quiz generation while initialization is enabled. Otherwise the host exposes every compact candidate whose page is due today or earlier, whose prerequisites are all in FSRS `Review`, whose page is active and quiz-eligible, and whose current bytes are not drifted. The model chooses a varied, related subset; there is no fixed page, question, or synthesis count. If no candidate is available, it creates no quiz sheet and records an explicit no-eligible-pages outcome.
 
-The host snapshots all relevant wiki sections directly for each covered page and authorizes source references for those snapshots. `quiz_evidence` stores these page/section snapshots keyed by quiz/reference; the Markdown sheet never carries page, source, evidence, rubric, answer-key, or FSRS metadata. Page evidence is direct and host-authorized rather than a many-to-many section artifact.
+After the model chooses page IDs, it requests direct evidence for those pages through the application entry point. `quiz_evidence` stores the page/section snapshots keyed by quiz/reference; the Markdown sheet never carries page, source, evidence, rubric, answer-key, or FSRS metadata. The session target is 15–45 minutes with roughly 30 minutes as a mental median, subject to technical context and transport bounds rather than a pedagogical item cap.
 
 ### Ephemeral questions
 
-Questions are generated for one quiz and are not a durable question bank. Each selected page must occur in exactly one single-page question. The generator may add bounded synthesis questions covering related pages within the existing four-question and two-synthesis limits; synthesis does not create another schedule or rating for a page.
+Questions are generated for one quiz and are not a durable question bank. Any count and mix may be used inside the time/context bounds, and multiple questions may sample different sections or skills from the same page. Every question is evidence-bound through its `pages: QuizQuestionPageRecord[]`; a page receives one bundled result and schedule transition later even when several questions cover it.
 
-Questions may be:
+The only question kinds are:
 
-- multiple choice with real selectable options;
-- short free recall;
-- long explanation;
-- procedure or worked application;
-- bounded synthesis across related pages.
+- `multiple-choice`, with real selectable choices;
+- `free-response`, covering recall, explanation, procedure, worked application, or cross-page synthesis.
 
-`QuizQuestionRecord` and `QuizQuestionProposal` carry `pages: QuizQuestionPageRecord[]` plus internal `sourceRefs`; they contain no review-artifact fields. Each page entry supplies an evidence-backed criterion and display weight. Proposals do not provide question IDs. The host mints opaque UUID question IDs and validates page eligibility, direct evidence, criteria, weights, mode, budget, revision, and answer-hiding constraints.
+`QuizQuestionRecord` and `QuizQuestionProposal` carry `pages: QuizQuestionPageRecord[]` plus internal `sourceRefs`; they contain no review-artifact fields. Each page entry supplies an evidence-backed criterion and display weight. Proposals do not provide question IDs. The host mints opaque UUID question IDs and validates selected-page eligibility, direct evidence, criteria, weights, kind-specific shape, revision, answer hiding, and technical payload/context bounds; it does not impose a fixed learning-policy count.
 
 ### Quiz sheet and submission
 
@@ -495,13 +479,13 @@ The dated sheet under `quizzes/` is the primary inspectable learning artifact, n
 - At the next scheduled invocation, every earlier unsubmitted quiz becomes an expired read-only artifact. Expiration records no grade and changes no FSRS state.
 - Results and readings are absent until grading has committed them.
 
-`QuizContext.eligiblePages` contains page learning records. `QuizDetailRecord` exposes `pageResults`, never a second per-artifact result collection.
+`QuizContext.candidates` contains every compact due/prerequisite-unblocked/non-drifted candidate summary. `QuizDetailRecord` exposes `pageResults`, never a second per-artifact result collection.
 
 ### Grading and scheduling
 
-Final submission of the current open quiz validates the displayed questions, distinctness, expected revision, and answer visibility, then seals the exact answer revision and queues it for grading through the application facade. Browser submission never launches Pi and never mutates FSRS.
+Final submission of the current open quiz validates the displayed questions, distinctness, expected revision, and answer visibility, then seals the exact answer revision and queues it for the separately scheduled `quiz-grader` through the application entry point. Browser submission never launches Pi, grades, or mutates FSRS.
 
-The user-scheduled `quiz-grader` skill reads sealed pending submissions in a fresh Pi context. It sees the exact ephemeral questions, learner answers, per-page criteria, and authorized direct page/source evidence, but no question-generation transcript or future answers. It preserves question-level feedback while returning exactly one `ReviewRating` (`Again`, `Hard`, `Good`, or `Easy`) for every covered page. The rating is a bundled judgment for the page, regardless of how many questions mention that page.
+The user-scheduled `quiz-grader` skill reads sealed pending submissions in a fresh Pi context. It sees the exact ephemeral questions, learner answers, per-page criteria, and authorized direct page/source evidence, but no question-generation transcript or future answers. It preserves question-level feedback while returning exactly one `ReviewRating` (`Again`, `Hard`, `Good`, or `Easy`) for every covered page. The rating is a bundled judgment for the page, regardless of how many questions mention or sample that page.
 
 `GradeSettlementInput` contains the exact `questions` list (question ID plus feedback only) and exact `pages` list (one `GradePageInput` per covered page). `GradingResult` keeps `questions` and `pages` separate. The host validates workflow ownership, authorized evidence, criteria, coverage, ratings, revision, and sealed-submission identity without substituting a deterministic score formula.
 
@@ -519,7 +503,7 @@ A miss schedules future retrieval for that page through FSRS. There is no tutor 
 
 ## Web application
 
-The same TypeScript server serves a built React application. The frontend uses Vite, shadcn/ui, Tailwind, React Router, and TanStack Query. Next.js is deliberately excluded because the private local application needs neither SSR nor a second server runtime.
+The same TypeScript server serves a built React application. The frontend uses Vite, Tailwind, React Router, and TanStack Query. Next.js is deliberately excluded because the private local application needs neither SSR nor a second server runtime.
 
 Primary navigation:
 
@@ -569,7 +553,7 @@ There is no scheduled-run command. The CLI is bootstrap, diagnostics, serving, a
 
 ## Loopback API
 
-The server is the sole browser boundary and calls the same application facade as Pi tools and directly scheduled skills.
+The server is the sole browser boundary and calls the same `ScholarApplication` application entry point as Pi tools and directly scheduled skills.
 
 Core routes:
 
@@ -620,9 +604,9 @@ CRON_TZ=Etc/UTC
 
 # Example schedule fields are illustrative; choose them independently.
 13 02 * * 2 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/extract/SKILL.md --no-context-files --no-session -p "Process the current stable extract context sequentially and publish each immutable source packet through Scholar tools." >> /absolute/path/to/pi-scholar-logs/extract.log 2>&1
-27 03 * * 2 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/ingest/SKILL.md --no-context-files --no-session -p "Review the current ingest context and submit guarded source-grounded wiki changes through Scholar tools." >> /absolute/path/to/pi-scholar-logs/ingest.log 2>&1
-41 05 * * 4 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/lint/SKILL.md --no-context-files --no-session -p "Inspect the final wiki with lint and submit guarded organizer or repair changes through Scholar tools." >> /absolute/path/to/pi-scholar-logs/lint.log 2>&1
-07 11 * * 1 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Use today's local-date daily context to publish today's bounded quiz or explicit skip unless initialization blocks generation through Scholar tools." >> /absolute/path/to/pi-scholar-logs/daily.log 2>&1
+27 03 * * 2 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/ingest/SKILL.md --no-context-files --no-session -p "Review the current ingest context, including verified packet manifests and chunk paths plus every non-retired wiki page and issue, and submit guarded source-grounded changes through Scholar tools." >> /absolute/path/to/pi-scholar-logs/ingest.log 2>&1
+41 05 * * 4 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/lint/SKILL.md --no-context-files --no-session -p "Inspect the final wiki and issue context in full or targeted scope and submit guarded organizer or repair changes through Scholar tools." >> /absolute/path/to/pi-scholar-logs/lint.log 2>&1
+07 11 * * 1 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Use today's local-date daily context to expose every eligible candidate, choose a varied related subset, retrieve evidence, and publish a 15–45 minute any-count quiz or explicit skip unless initialization blocks generation through Scholar tools." >> /absolute/path/to/pi-scholar-logs/daily.log 2>&1
 29 16 * * 6 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/quiz-grader/SKILL.md --no-context-files --no-session -p "Settle sealed pending quiz submissions through Scholar tools." >> /absolute/path/to/pi-scholar-logs/quiz-grader.log 2>&1
 53 23 * * 0 cd /absolute/path/to/vault && /absolute/path/to/pi-scholar sync >> /absolute/path/to/pi-scholar-logs/sync.log 2>&1
 ```
@@ -634,9 +618,9 @@ The entries are independent:
 | Entry | Work |
 |---|---|
 | `extract` | Snapshot the current stable source queue and publish immutable packets sequentially with per-source host idempotency and failure isolation |
-| `ingest` | Build guarded source-grounded wiki changes from published verified packets and every non-retired page |
-| `lint` | Inspect the final wiki and propose guarded organizer and repair changes across every non-retired page |
-| `daily` | Expire earlier unsubmitted quizzes, enforce initialization, then publish today's eligible quiz or an explicit skip |
+| `ingest` | Build guarded source-grounded wiki changes from published verified packet manifests and chunk paths plus every non-retired page and issue record |
+| `lint` | Inspect the final wiki and issue context in full or targeted scope and propose guarded organizer or repair changes |
+| `daily` | Expire earlier unsubmitted quizzes, enforce initialization, expose every compact due, prerequisite-unblocked, non-drifted candidate, choose a varied related subset, and publish a 15–45 minute any-count quiz or explicit skip |
 | `quiz-grader` | Settle sealed pending browser submissions with one identity-bearing transaction per submission |
 | `pi-scholar sync` | Push accumulated local commits and perform no semantic work |
 
@@ -675,10 +659,10 @@ Recovery stays operation-specific and idempotent: source publication reuses its 
 ## Security and integrity invariants
 
 1. Model-selected paths and identities are proposals, never authority.
-2. Paths reject absolute input, traversal, normalization aliases, control characters, wrong types, and symlinks.
+2. Paths reject absolute input, traversal, normalization aliases, control characters, wrong types, and symlinks; symlinks are unsupported at the shared I/O boundary.
 3. Native operations revalidate physical containment and file identity at use time.
 4. Source, note, learner, and model text never appears in cron command arguments, shell command strings, or logs.
-5. Docling, qmd, Git, and Git-LFS commands use validated argv, closed environments, pinned executable identity, private scratch, finite timeouts, process-tree termination, and bounded diagnostics.
+5. Docling, qmd, Git, and Git-LFS commands use validated argv, closed environments, pinned executable identity, `.pi-scholar/work/` private scratch, finite timeouts, process-tree termination, and bounded diagnostics.
 6. Every direct Pi cron invocation supplies `--no-extensions -e <package>/pi/extension.ts --no-skills --skill <one SKILL.md> --no-context-files --no-session -p <static prompt>`; no package component starts or supervises another Pi process.
 7. Secrets never enter the vault, HTTP output, cron arguments, quiz sheets, test artifacts, or Git history.
 8. Imported source text is evidence, not executable instruction.
@@ -734,25 +718,37 @@ pi-scholar/
 │   ├── daily/SKILL.md
 │   └── quiz-grader/SKILL.md
 ├── src/
-│   ├── application.ts
+│   ├── application/
+│   │   ├── application.ts
+│   │   ├── decoders.ts
+│   │   ├── projections.ts
+│   │   └── grader-binding.ts
 │   ├── contracts.ts
-│   ├── vault.ts
-│   ├── sources.ts
-│   ├── wiki.ts
+│   ├── database.ts
+│   ├── doctor.ts
+│   ├── external/
+│   │   ├── docling.ts
+│   │   ├── git.ts
+│   │   ├── process.ts
+│   │   └── qmd.ts
+│   ├── index.ts
 │   ├── quiz.ts
 │   ├── scheduler.ts
-│   ├── doctor.ts
-│   ├── workflows.ts
 │   ├── server.ts
-│   └── external/
-│       ├── docling.ts
-│       ├── qmd.ts
-│       └── git.ts
+│   ├── sources/
+│   │   ├── source-chunks.ts
+│   │   ├── source-files.ts
+│   │   ├── source-packets.ts
+│   │   └── source-service.ts
+│   ├── vault.ts
+│   ├── wiki-sections.ts
+│   ├── wiki.ts
+│   └── workflows.ts
 ├── apps/web/
 └── tests/
 ```
 
-- The Pi extension and server call one `ScholarApplication` facade.
+- The Pi extension and server call one `ScholarApplication` application entry point.
 - Semantic workflows are packaged Markdown skills started by interactive Pi or user-owned direct Pi cron entries.
 - Deterministic mechanics and contracts are framework-independent TypeScript.
 - `scheduler.ts` owns page-learning state, due predicates, page prerequisite eligibility, and page transitions only; it is not a cron, process, or job scheduler.
@@ -770,44 +766,6 @@ pi-scholar/
 - Persistence owns SQLite transactions and append-only review history; mechanics owns validation and transitions; skills own semantic sequencing; projections own no facts.
 
 
-## Implementation sequence
-
-Every stage ends in a runnable vertical path.
-
-### Stage 0: pin donor evidence
-
-- Preserve exact donor revisions, licenses, and only the fixtures needed for retained behavior.
-- Record rejected donor behavior as non-requirements, not compatibility work.
-
-### Stage 1: one TypeScript vault
-
-- Create the Pi package and extension.
-- Implement the five-root vault, stable page IDs, path safety, SQLite schema, short publish/checkpoint locks, doctor, local Git commits, push-only `sync`, and external-edit detection/recovery.
-- Prove one guarded note mutation, one `/scholar-issue` report, and both explicit drift-resolution choices through `ScholarApplication`.
-
-### Stage 2: complete knowledge path
-
-- Add document, URL, pasted text, code, directory, and repository extraction plus the `extract`, `ingest`, and `lint` skills.
-- Add automatic inbox discovery and private snapshotting, sequential processing of the current stable queue in one direct Pi session, per-source host claims and idempotency, Docling and lossless native adapters, immutable packets, confirmation-bound source removal, semantic chunk planning, source-grounded wiki publication, native lookup, qmd ranking, links, index/log, and final lint repair.
-- Prove that two hundred direct inbox entries need no per-item commands or source-count cutoff, the extract session processes each stable entry in canonical order, source failures do not block siblings, a long book is never truncated, and confirmed removal updates every current dependent artifact.
-
-### Stage 3: complete daily quiz path
-
-- Add `ts-fsrs`, one `page_learning` record per eligible page, the page prerequisite DAG, direct page evidence snapshots, due-page selection, ephemeral questions, expiring unsubmitted quizzes, initialization blocking, minimal opaque quiz comments, revision-safe drafts and sealed final submission, one bundled page rating per covered page, transactional page results, immutable page reviews, and linked wiki readings.
-- Prove prerequisite blocking/unblocking, page rename stability, drift/retirement exclusion with preserved history, empty-due-day skipping, prior-quiz expiration, one single-page question per selected page, synthesis limits, sealed-submission grading retry, one FSRS transition per covered page, miss rescheduling, and no duplicate settlement.
-
-### Stage 4: responsive web application
-
-- Add the Vite/React/shadcn interface for Today with typed quiz outcomes and explicit final submission, read-only Notes with page learning/prerequisite details, issue, and drift-resolution controls, Add with source-removal preview/confirmation, History, Workflows, Settings, and Health.
-- Exercise the built application on desktop and mobile viewports, including multiple-choice controls, no-quiz statuses, page learning and prerequisites, draft versus sealed submission, Notes issue creation and auto-resolution, both drift choices, source-removal confirmation, expired read-only quizzes, and user-only initialization disablement without a readiness label.
-
-### Stage 5: direct skills and lifecycle
-
-- Finalize the packaged `extract`, `ingest`, `lint`, `daily`, and `quiz-grader` skills and their typed Scholar host tools.
-- Document and exercise independent user-owned cron entries that invoke installed Pi directly with exactly one skill and the required no-context flags; keep extract sequential with per-source failure isolation, ingest source-grounded and proposal-guarded, lint the final organizer/repair workflow, daily quiz generation initialization-guarded, and grading queue-driven after browser sealing.
-- Add the small server FIFO worker, short mutation locks, local commits, independently scheduled `pi-scholar sync`, idempotent interruption handling, Git retry behavior, provider environment guidance, logs, and doctor runbook. There is no Pi launcher, process planner, or fixed weekday policy.
-- Exercise independent empty/large inbox, ingest, lint, daily, grading, and sync invocations plus installed-package behavior with real Pi, qmd, Docling, Git, and a private-tunnel browser path.
-
 ## Acceptance criteria
 
 1. `pi install` provides one TypeScript package with the extension, five inspectable Markdown skills, CLI, server, and web assets.
@@ -824,7 +782,7 @@ Every stage ends in a runnable vertical path.
 12. Every eligible stable knowledge-bearing page has one `page_learning` FSRS record; control pages and explicitly skipped pages are not selected.
 13. Page prerequisites form a validated DAG, and both new and due pages remain blocked until every prerequisite is in FSRS `Review`.
 14. Page creation/rename preserves the stable page ID; drift and retirement exclude selection while preserving page learning and review history.
-15. `daily` expires earlier unsubmitted quizzes, refuses generation during initialization, creates no sheet when no page is eligible, and never invents filler questions. Every selected page occurs in exactly one single-page question; synthesis stays within the four-question/two-synthesis limits.
+15. `daily` expires earlier unsubmitted quizzes, refuses generation during initialization, creates no sheet when no page is eligible, exposes every compact due/prerequisite-unblocked/non-drifted candidate, lets the model choose a varied related subset and retrieve direct evidence, targets 15–45 minutes with roughly 30 minutes as a mental median, permits any question count including multiple questions per page, and supports only `free-response` and `multiple-choice`.
 16. A user-scheduled `extract` invocation processes its current stable queue sequentially in canonical order, and host claims, idempotency, and per-source failure isolation ensure one malformed entry does not block its siblings.
 17. `extract`, `ingest`, `lint`, `daily`, and `quiz-grader` have independent user-owned cron entries; no weekday/time policy, ordering rule, process planner, or package-launched Pi process exists.
 18. Initialization starts enabled, only the user can disable it, and it blocks quiz generation without selecting or changing extract, ingest, lint, grading, or sync schedules.
@@ -836,21 +794,9 @@ Every stage ends in a runnable vertical path.
 24. One identity-bearing SQLite transaction settles one `page_results` row and one `page_reviews` transition per covered page, preserves separate question feedback, and cannot apply a duplicate settlement.
 25. Results show concise corrections and direct links to exact wiki pages and headings.
 26. Issues raised through Pi or Notes close automatically only after the guarded page correction, prerequisite/learning update, qmd, lint, doctor, log, and local commit succeed; users may reopen them.
-27. The Vite/React/shadcn web application displays typed Today outcomes, Notes with page learning and prerequisites, issue and drift controls, Add with removal preview/confirmation, and read-only expired History responsively.
-28. The server remains loopback and same-origin; a private tunnel owns phone access without creating a Pi Scholar user system.
+27. The Vite/React web application displays typed Today outcomes, Notes with page learning and prerequisites, issue and drift controls, Add with removal preview/confirmation, and read-only expired History responsively.
+28. The server remains loopback and same-origin; any private tunnel, reverse proxy, authentication, DNS, or network policy for operator access is external context and does not create a Pi Scholar user system.
 29. Every completed high-level durable mutation that changes durable bytes creates one local commit; ignored inbox staging and browser drafts do not. `pi-scholar sync` is separately schedulable and pushes accumulated commits without semantic work.
 30. Doctor is the sole read-only integrity and dependency check and does not mutate corrupt state.
-31. Path traversal, symlinks, malformed links, prompt injection, untrusted model paths, secret-bearing external-command environments, duplicate grades, arbitrary HTTP shell access, automatic Git force/reset/merge, and silent direct-edit acceptance are rejected at their boundaries.
+31. Path traversal, unsupported symlinks at the shared I/O boundary, malformed links, prompt injection, untrusted model paths, secret-bearing external-command environments, duplicate grades, arbitrary HTTP shell access, automatic Git force/reset/merge, and silent direct-edit acceptance are rejected at their boundaries.
 
-## Remaining implementation choices
-
-These choices do not change the architecture:
-
-1. npm scope and repository owner.
-2. Default loopback port and the private tunnel's same-origin proxy configuration.
-3. Source extraction size limits and the Git-LFS threshold for retained originals.
-4. Initial enabled document formats beyond PDF, EPUB, Markdown, text, HTML, XML, JSON, and DOCX.
-5. Initial page selection policy, maximum quiz length, and default `ts-fsrs` parameters.
-6. qmd collection name, cron timezone, absolute install/vault paths, provider environment, and log-retention policy chosen by the user.
-
-Resolve these from executable spikes and fixtures, not generic configuration or compatibility layers.

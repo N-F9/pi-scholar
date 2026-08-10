@@ -10,45 +10,53 @@ Test the packed artifact rather than loading the repository directly:
 2. Install the tarball under a temporary npm prefix.
 3. Point `PI_CODING_AGENT_DIR` at a temporary directory.
 4. Install the temporary package with `pi install <package-path>`.
-5. Confirm `pi list` discovers one extension and the four declared skills.
-6. Start Pi in RPC mode and invoke `/scholar-status`.
+5. Confirm `pi list` discovers one extension and the five declared skills: `extract`, `ingest`, `lint`, `daily`, and `quiz-grader`.
+6. Start Pi in RPC mode and invoke `/scholar-add`, `/scholar-issue`, `/scholar-status`, and `/scholar-lint`.
 
-Pass when Pi loads without startup errors, recognizes the Scholar command, registers all package resources, and needs no file omitted from the tarball.
+Pass when Pi loads without startup errors, exposes all four namespaced commands, registers all five skills and package resources, and needs no file omitted from the tarball.
 
 ## End-to-end product validation
 
-Use real Git, qmd, Docling, and a configured Pi provider with a small source whose correct facts are known.
+Use real Git, qmd, Docling, and a configured Pi provider with a source whose correct facts are known.
 
-1. Initialize the disposable vault and run `pi-scholar doctor`.
-2. Add the source and run source admission.
-3. Confirm a multi-section source is chunked at coherent section or topic boundaries with lossless full coverage.
-4. Run guarded wiki maintenance and confirm each model-authored page teaches the source's central terminology, mechanisms, equations or algorithms, concrete examples, empirical results, and supported limitations at textbook depth rather than restating the abstract.
-5. Confirm published wiki claims cite valid source chunks near the claims they support.
-6. Find a known phrase and concept through search.
-7. Confirm schema v3 has the page-oriented learning, prerequisite, review, question-page, page-result, and quiz-evidence authorities with no compatibility views or migrations; every eligible page has one `page_learning` FSRS record, page IDs remain stable across rename, and prerequisite edges form an acyclic graph that blocks due pages until prerequisites reach FSRS `Review`.
-8. Generate a daily quiz and confirm it selects due pages, covers each selected page in exactly one single-page question, permits no more than four questions or two synthesis questions, snapshots direct page evidence, and mints opaque question UUIDs without accepting proposal IDs.
-9. Inspect the quiz Markdown and confirm visible headings are numeric, the only comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`, and no page/source/evidence/rubric/answer-key/FSRS metadata appears before grading.
-10. Submit answers and grade the sealed revision. Confirm question feedback is retained separately while exactly one bundled rating, page result, and page review transition are written per covered page regardless of question count.
-11. Restart Pi Scholar and confirm durable page learning, prerequisites, quiz identity, results, and history remain available.
-12. Rerun the workflow and confirm it does not duplicate canonical artifacts or settle the same submission twice.
-13. Inspect Git history and confirm each durable operation produced a coherent commit.
+1. Initialize the disposable vault and run `pi-scholar doctor`. Require schema v4, the strict OKF v0.2 wiki, regular-file path safety, and no compatibility schema or migration path.
+2. Stage a representative source with `/scholar-add` or the supported inbox path. Exercise streamed or disk-backed capture with a source large enough to use those paths; verify there is no fixed product source-size cutoff, only free-space, operation-time, model/context, and transport bounds. Preserve the original bytes.
+3. Run `extract` and confirm it snapshots a stable queue, processes entries sequentially, and publishes verified immutable packets. Check manifest identity/provenance/digests, lossless complete chunk coverage, exact packet/chunk paths, and fence-aware blank-line normalization in derived Markdown while originals remain unchanged.
+4. Exercise an HTTP(S) source on a destination allowed by local-user/model trust, including a local, private, or operator-routed Tailscale destination. Confirm timeout, redirect, and streaming protections still apply; the tunnel or network route is external operator context, not a Pi Scholar integration.
+5. Run `ingest` from its supplied verified packet/chunk paths plus every non-retired wiki page and issue (including drifted pages). Submit guarded source-driven changes only through Scholar tools; confirm valid nearby OKF citations and textbook-depth coverage of the source's central terminology, mechanisms, equations or algorithms, examples, empirical results, assumptions, tradeoffs, and supported limitations.
+6. Run `lint` once full-scope and once targeted. Confirm full scope reads every non-retired page (active or drifted) and issue, targeted scope stays bounded to its description and directly related pages, and each pass submits only guarded organizer or repair changes.
+7. Find a known phrase and concept through exact, lexical, or qmd search without treating qmd or projections as canonical state.
+8. Confirm every eligible page has one page-level FSRS record, stable page IDs across rename, and an acyclic prerequisite graph that blocks due pages until prerequisites reach FSRS `Review`.
+9. Observe the daily flow `candidate -> evidence -> publish`: the host returns every compact due, prerequisite-unblocked, non-drifted candidate; the model chooses a varied related subset; `scholar_get_daily_evidence` retrieves authoritative evidence for the selected pages; and one `scholar_publish_daily` call publishes the proposal or an explicit skip when no candidate exists. Target 15–45 minutes of combined reading and questions with a mental median near 30 minutes, without imposing a fixed question or page count or hard timer cap.
+10. Confirm daily questions use only `free-response` or `multiple-choice`, may include multiple questions for one page and connections among related pages, and bind every question to returned evidence. The host mints opaque question UUIDs and revalidates eligibility, prerequisites, drift, due state, evidence, and publication.
+11. Inspect the quiz Markdown and confirm visible headings are numeric, the only comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`, and no page/source/evidence/rubric/answer-key/FSRS metadata appears before grading.
+12. Submit answers to seal a revision, then run `quiz-grader` independently. Confirm it settles that sealed revision, preserves question feedback separately, and writes one bundled result, rating, review, and FSRS transition per covered page regardless of how many questions mention it. Browser sealing queues grading but does not launch a Pi process.
+13. Restart Pi Scholar and confirm durable page learning, prerequisites, quiz identity, results, source packets, wiki, and Git history remain available.
+14. Rerun the same workflow and confirm it does not duplicate canonical artifacts, republish a completed extraction, or settle the same sealed submission twice.
+15. Inspect Git history and confirm each completed durable operation produced a coherent local commit; run `pi-scholar sync` separately and verify it only pushes existing local commits to the configured remote.
 
-Validate meaning and source coverage rather than exact model prose or a fixed word count. Every accepted claim and quiz answer must trace to the source, and a source-grounded page fails validation when it omits central technical content or reduces the source to an abstract-style summary.
+## Independent scheduling and recovery
+
+Schedule `extract`, `ingest`, `lint`, `daily`, and `quiz-grader` independently under the operator's cron or other scheduler. Verify that no skill launches another, Pi Scholar never launches Pi or edits the scheduler, daily and grading remain separate, and `sync` is separately invoked or scheduled. Jobs may overlap; conflicts must be reported rather than merged or force-written.
+
+Verify `.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and Docling scratch, never Git content or authority. Successful operations clean scratch; failures use rollback data; crash remnants cannot override SQLite or durable packets, wiki, or quizzes. Recovery must go through ScholarApplication, `doctor`, and a safe retry rather than reading work files as state.
 
 ## Failure and safety validation
 
 Confirm each boundary fails safely:
 
-- Duplicate ingestion creates no duplicate canonical artifact.
-- Source removal rejects a stale confirmation ID.
+- Duplicate extraction creates no duplicate canonical artifact.
+- Source removal starts from an explicit operator request, requires a fresh preview and confirmation, rejects a stale confirmation, and preserves Git history.
 - Invalid page prerequisite updates reject self-edges, dangling pages, and cycles without partial writes.
 - Overlapping writers report a conflict without partial writes.
 - Interrupting a workflow leaves `doctor` able to explain recovery and permits a safe rerun.
 - Missing qmd disables semantic search without disabling exact or lexical search.
+- Symlinks at the shared I/O boundary are unsupported and cannot enter canonical state.
 - Stale or unauthorized direct page evidence rejects quiz generation or grading without changing page learning.
-- Invalid quiz and grading payloads, including incomplete page coverage or multiple page ratings, leave no partial state.
+- Invalid quiz and grading payloads, including incomplete page coverage or conflicting page ratings, leave no partial state.
 - Repeated sealed-submission settlement is idempotent and never applies a second page transition.
 - Instructions embedded in source text remain data and cannot directly invoke tools or writes.
 - Provider credentials never appear in vault files, Git commits, command arguments, or logs.
+- Tailscale, private tunnels, reverse proxies, authentication, DNS, and network policy remain operator-owned external context rather than product integration, identity, trust boundary, dependency, or feature.
 
-A release is valid when grounding, recovery, persistence, and safety pass with the disposable vault.
+A release is valid when grounding, streamed source handling, URL trust, strict OKF v0.2, daily candidate/evidence/publication behavior, independent scheduling, work-directory recovery, persistence, and safety pass with the disposable vault.

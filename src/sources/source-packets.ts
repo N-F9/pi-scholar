@@ -54,7 +54,7 @@ function parseManifestValue(raw: unknown): SourceManifest {
     typeof normalizer !== "object" ||
     Array.isArray(normalizer) ||
     (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
-    (normalizer as Record<string, unknown>).version !== "1"
+    (normalizer as Record<string, unknown>).version !== "2"
   )
     throw new Error("invalid source manifest normalizer");
   for (const key of ["originalBytes", "originalByteLength", "extractionBytes", "extractedByteLength"]) {

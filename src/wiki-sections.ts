@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { WikiPageSection } from "./contracts.js";
 
-function headingAnchor(heading: string, used: Map<string, number>): string {
+function headingAnchor(heading: string, used: Set<string>): string {
   const slug = heading
     .normalize("NFKD")
     .toLocaleLowerCase()
@@ -9,14 +9,15 @@ function headingAnchor(heading: string, used: Map<string, number>): string {
     .trim()
     .replace(/[\s-]+/gu, "-");
   if (!slug) return "";
-  const suffix = used.get(slug) ?? 0;
-  used.set(slug, suffix + 1);
-  return `#${slug}${suffix ? `-${suffix}` : ""}`;
+  let candidate = slug;
+  for (let suffix = 1; used.has(candidate); suffix += 1) candidate = `${slug}-${suffix}`;
+  used.add(candidate);
+  return `#${candidate}`;
 }
 
 export function parseWikiSections(markdown: string, pageId: string): WikiPageSection[] {
   const output: WikiPageSection[] = [];
-  const used = new Map<string, number>();
+  const used = new Set<string>();
   let fence: { readonly marker: string; readonly length: number } | undefined;
   let offset = 0;
   while (offset <= markdown.length) {

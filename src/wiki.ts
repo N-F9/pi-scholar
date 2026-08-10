@@ -3,7 +3,7 @@ import { promises as fs, readFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
 import type { WikiIssueRecord } from "./contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
-import { qmdCollectionName } from "./external/qmd.js";
+import { type QmdIndexOptions, qmdCollectionName } from "./external/qmd.js";
 import {
   type OkfProjectionPage,
   okfCitationText,
@@ -43,9 +43,9 @@ export type DriftResolution = "record-issue" | "restore";
 export interface QmdAdapter {
   search(
     query: string,
-    options?: { collection: string; scope: "wiki/**/*.md"; limit?: number },
+    options?: { collection: string; scope: "wiki/**/*.md"; limit?: number; ignoredPaths?: readonly string[] },
   ): Promise<unknown> | unknown;
-  index?: () => Promise<void> | void;
+  index?: (options?: QmdIndexOptions) => Promise<void> | void;
 }
 export interface WikiAdapters {
   qmd?: QmdAdapter;
@@ -128,6 +128,9 @@ export function isExecutableHtml(value: string): boolean {
 }
 function assertInertMarkdown(body: string): void {
   if (isExecutableHtml(body)) throw new Error("raw executable HTML is not allowed in wiki Markdown");
+}
+function assertPageTitle(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) throw new Error("wiki page title is required");
 }
 function serializePage(frontmatter: Record<string, unknown>, body: string): string {
   assertInertMarkdown(body);
@@ -240,9 +243,19 @@ export class WikiService {
   private root(): string {
     return vaultRoot(this.paths);
   }
+  private qmdIgnoredPaths(): readonly string[] {
+    return dbAll<{ readonly relative_path: string }>(
+      this.db,
+      "SELECT relative_path FROM pages WHERE status = 'drifted' ORDER BY relative_path",
+    ).map(({ relative_path }) => relative_path);
+  }
+  async refreshQmdIndex(): Promise<void> {
+    const index = this.adapters.qmd?.index;
+    if (typeof index === "function") await index({ ignoredPaths: this.qmdIgnoredPaths() });
+  }
   private async refreshQmd(): Promise<void> {
     try {
-      if (typeof this.adapters.qmd?.index === "function") await this.adapters.qmd.index();
+      await this.refreshQmdIndex();
     } catch {
       /* application maintenance checks enforce qmd */
     }
@@ -298,31 +311,29 @@ export class WikiService {
     ]);
     if (!snapshot) return undefined;
     const path = this.snapshotPath(rowToPage(row));
+    const bytes = readFileNoFollow(path);
+    const recordedDigest = String(snapshot.digest);
+    if (recordedDigest !== row.digest || digest(bytes) !== recordedDigest) return undefined;
     return {
-      digest: String(snapshot.digest),
+      digest: recordedDigest,
       revision: Number(snapshot.revision),
-      content: readFileNoFollow(path).toString("utf8"),
+      content: bytes.toString("utf8"),
     };
   }
   private async authoredPage(page: WikiPage): Promise<(WikiPage & { content: string }) | undefined> {
     if (page.status !== "active") return undefined;
     try {
-      const current = await this.get(page.pageId);
+      const currentBytes = await this.readExact(page.relativePath);
       const snapshot = this.authored(page.pageId);
-      const currentDigest = digest(current.content);
-      if (
-        !snapshot ||
-        currentDigest !== snapshot.digest ||
-        currentDigest !== page.digest ||
-        current.status !== "active"
-      )
-        return undefined;
-      return current;
+      const currentDigest = digest(currentBytes);
+      if (!snapshot || currentDigest !== snapshot.digest || currentDigest !== page.digest) return undefined;
+      return { ...page, content: currentBytes.toString("utf8") };
     } catch {
       return undefined;
     }
   }
   private async writeCatalog(page: WikiPage, content: string, previousPath?: string): Promise<void> {
+    assertPageTitle(page.title);
     const snapshot = this.snapshotPath(page);
     await this.atomicWrite(snapshot, content);
     transaction(this.db, () => {
@@ -428,6 +439,11 @@ export class WikiService {
           isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar" && typeof source.id === "string",
       )
       .map((source) => String(source.id));
+    const references = new Set(labels.references);
+    for (const label of labels.definitions) {
+      if (!references.has(label) && (byId.has(label) || UUID_CHUNK_REFERENCE.test(label)))
+        throw new Error(`orphan managed footnote definition: ${label}`);
+    }
     const retainedSources = existingSources.filter(
       (source) => !(isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar"),
     );
@@ -469,6 +485,7 @@ export class WikiService {
     const pageId = randomUUID();
     const createdAt = now();
     const title = input.title ?? titleFromPath(location.relativePath);
+    assertPageTitle(title);
     const quizWorthiness = input.quizWorthiness ?? "unknown";
     const frontmatter: Record<string, unknown> = {
       ...(input.frontmatter ?? {}),
@@ -554,16 +571,21 @@ export class WikiService {
     const page = rowToPage(row);
     const location = normalizePagePath(this.paths, input.path ?? page.relativePath);
     if (location.relativePath !== page.relativePath) throw new Error("page path changes must use rename");
-    const current = await fs.readFile(location.absolutePath, "utf8");
-    const parsed = parseOkfConcept(current);
-    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
+    const currentBytes = await this.readExact(location.relativePath);
     const expected = input.expectedDigest ?? page.digest;
-    if (expected !== digest(current)) throw new Error("page changed since it was read");
+    const currentDigest = digest(currentBytes);
+    if (expected !== currentDigest) throw new Error("page changed since it was read");
+    const authored = currentDigest !== page.digest ? this.authored(pageId) : undefined;
+    if (currentDigest !== page.digest && (!authored || authored.digest !== page.digest))
+      throw new Error("product-authored snapshot is unavailable");
+    const parsed = authored ? parseOkfConcept(authored.content) : parseOkfConcept(currentBytes.toString("utf8"));
+    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
     const body = input.body ?? parsed.body;
     const title =
       input.title ??
       (typeof parsed.frontmatter.title === "string" ? parsed.frontmatter.title : undefined) ??
       page.title;
+    assertPageTitle(title);
     const quizWorthiness = input.quizWorthiness ?? page.quizWorthiness;
     const frontmatter: Record<string, unknown> = {
       ...parsed.frontmatter,
@@ -577,7 +599,7 @@ export class WikiService {
     validateMarkdownLinks(this.root(), page.relativePath, body);
     const updated: WikiPage = {
       ...page,
-      title: input.title ?? page.title,
+      title,
       digest: digest(content),
       revision: page.revision + 1,
       status: "active",
@@ -598,6 +620,9 @@ export class WikiService {
     prepared?: WikiPreparedUpdate,
   ): Promise<WikiCreateResult> {
     const next = prepared ?? (await this.prepareUpdate(pageId, input));
+    assertPageTitle(next.page.title);
+    const nextFrontmatter = parseOkfConcept(next.content).frontmatter;
+    assertPageTitle(nextFrontmatter.title);
     const priorPageRow = this.catalog(pageId);
     if (!priorPageRow) throw new Error("page not found");
     const page = rowToPage(priorPageRow);
@@ -608,9 +633,8 @@ export class WikiService {
       next.page.revision !== page.revision + 1
     )
       throw new Error("prepared wiki update is stale");
-    const priorPageBytes = await fs.readFile(location.absolutePath);
-    const current = priorPageBytes.toString("utf8");
-    if (digest(current) !== next.expectedDigest) throw new Error("page changed since it was prepared");
+    const priorPageBytes = await this.readExact(location.relativePath);
+    if (digest(priorPageBytes) !== next.expectedDigest) throw new Error("page changed since it was prepared");
     const snapshotPath = this.snapshotPath(page);
     const priorSnapshotRow = dbGet<SnapshotRow>(this.db, "SELECT * FROM authored_snapshots WHERE relative_path = ?", [
       page.relativePath,
@@ -799,6 +823,12 @@ export class WikiService {
     if (!priorPageRow) throw new Error("page not found");
     const page = rowToPage(priorPageRow);
     if (page.status !== "active") throw new Error("page is not active");
+    const unresolvedIssue = dbGet<{ issue_id: string }>(
+      this.db,
+      "SELECT issue_id FROM wiki_issues WHERE page_id = ? AND status IN ('open', 'reopened') LIMIT 1",
+      [pageId],
+    );
+    if (unresolvedIssue) throw new Error("page has an open or reopened linked issue");
     const location = normalizePagePath(this.paths, page.relativePath);
     if (!this.authored(pageId)) throw new Error("product-authored snapshot is unavailable");
     const priorPageBytes = readFileNoFollow(location.absolutePath);
@@ -877,7 +907,7 @@ export class WikiService {
   }
   async readExact(requestedPath: string): Promise<Buffer> {
     const location = normalizePagePath(this.paths, requestedPath);
-    return fs.readFile(location.absolutePath);
+    return readFileNoFollow(location.absolutePath);
   }
   async semanticSearch(query: string, limit?: number): Promise<unknown[]> {
     return this.search(query, { mode: "semantic", limit });
@@ -974,10 +1004,13 @@ export class WikiService {
       if (!this.adapters.qmd) throw new Error("semantic search unavailable: qmd adapter not configured");
       const vaultId = this.paths.vaultId;
       if (!vaultId) throw new Error("qmd search requires vault identity");
+      const ignoredPaths = this.qmdIgnoredPaths();
+      const searchLimit = limit === undefined ? undefined : Math.min(100, limit + ignoredPaths.length);
       const result = await this.adapters.qmd.search(query, {
         collection: qmdCollectionName(vaultId),
         scope: "wiki/**/*.md",
-        limit,
+        limit: searchLimit,
+        ignoredPaths,
       });
       if (!Array.isArray(result)) throw new Error("qmd returned malformed search results");
       const filtered: unknown[] = [];
@@ -1052,11 +1085,15 @@ export class WikiService {
     return issue;
   }
   async inspectDrift(pageId: string): Promise<DriftReport> {
-    const page = await this.get(pageId);
+    const row = this.catalog(pageId);
+    if (!row) throw new Error("page not found");
+    const page = rowToPage(row);
+    const currentBytes = await this.readExact(page.relativePath);
+    const currentContent = currentBytes.toString("utf8");
     const snapshot = this.authored(pageId);
     if (!snapshot) throw new Error("product-authored snapshot is unavailable");
     const authoredDigest = snapshot.digest;
-    const currentDigest = digest(page.content);
+    const currentDigest = digest(currentBytes);
     const contentDrifted = authoredDigest !== currentDigest;
     const drifted = page.status === "drifted" || contentDrifted;
     const currentPage = {
@@ -1068,7 +1105,7 @@ export class WikiService {
       drifted,
       authoredDigest,
       currentDigest,
-      diff: contentDrifted ? simpleDiff(snapshot.content, page.content) : "",
+      diff: contentDrifted ? simpleDiff(snapshot.content, currentContent) : "",
       choices: ["record-issue", "restore"],
     };
   }
@@ -1267,9 +1304,11 @@ export class WikiService {
     const backlinks: Record<string, string[]> = {};
     const projectionPages: OkfProjectionPage[] = [];
     for (const page of pages) {
+      assertPageTitle(page.title);
       const content = (await this.readExact(page.relativePath)).toString("utf8");
       const parsed = parseOkfConcept(content);
       validateOkfConcept(content);
+      assertPageTitle(parsed.frontmatter.title);
       projectionPages.push({
         title: page.title,
         path: page.relativePath,

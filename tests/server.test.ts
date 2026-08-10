@@ -246,6 +246,51 @@ describe("server browser boundary", () => {
       rmSync(workRoot, { recursive: true, force: true });
     }
   });
+  it("decodes quoted multipart filenames as UTF-8", async () => {
+    const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));
+    let observedName = "";
+    let observedOriginalName = "";
+    const application = {
+      paths: { workRoot },
+      stageSource: async (request: {
+        readonly filePath: string;
+        readonly name: string;
+        readonly originalName: string;
+      }) => {
+        observedName = request.name;
+        observedOriginalName = request.originalName;
+        assert.equal(readFileSync(request.filePath, "utf8"), "résumé");
+        return { source: {} };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    const boundary = "pi-scholar-utf8";
+    const body = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="kind"\r\n\r\nupload\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="résumé.pdf"\r\n` +
+        "Content-Type: application/pdf\r\n\r\nrésumé\r\n" +
+        `--${boundary}--\r\n`,
+      "utf8",
+    );
+    try {
+      await withServer(application, async (base) => {
+        const response = await fetch(`${base}/api/v1/sources`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Sec-Fetch-Site": "same-origin",
+            "X-Pi-Scholar-Request": "1",
+          }),
+          body,
+        });
+        assert.equal(response.status, 200);
+      });
+      assert.equal(observedName, "résumé.pdf");
+      assert.equal(observedOriginalName, "résumé.pdf");
+    } finally {
+      rmSync(workRoot, { recursive: true, force: true });
+    }
+  });
 
   it("accepts a streamed multipart file beyond the former default cap", async () => {
     let observedSize = 0;
