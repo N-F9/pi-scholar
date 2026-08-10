@@ -82,7 +82,7 @@ flowchart TD
 | `src/application/projections.ts` | Public source, wiki, quiz, workflow, and result projections |
 | `src/application/grader-binding.ts` | Sealed quiz-grader workflow binding, lease, and replay identities |
 | `src/contracts.ts` | Shared DTOs, enums, skill/API contracts, and result shapes |
-| `src/database.ts` | SQLite schema v4, transactions, savepoints, WAL, and exact schema validation |
+| `src/database.ts` | SQLite schema v5, transactions, savepoints, WAL, and exact schema validation |
 | `src/vault.ts` | Vault discovery/initialization, containment, no-follow I/O, atomic writes, and sibling writer lock |
 | `src/sources/source-service.ts` | Stage, discover, claim, prepare, publish, verify, and remove source packets |
 | `src/sources/source-files.ts` | Streaming file/tree copies, URL/path provenance, digests, repository snapshots, and work-root containment |
@@ -128,6 +128,7 @@ built output, not a second source of authority.
 |---|---|
 | `sources/<source-id>/original/` | Canonical immutable accepted input bytes |
 | `sources/<source-id>/manifest.json` | Canonical packet provenance, normalizer, file, attachment, and digest metadata |
+| SQLite `sources` catalog | Retained exact packet manifest digest for byte-identity verification and doctor checks |
 | `sources/<source-id>/extracted.md` and `chunks/` | Canonical verified normalized representation and contiguous source evidence |
 | `wiki/<page>.md` plus SQLite `pages` | Canonical authored knowledge, identity, revision, and status |
 | `.pi-scholar/snapshots/wiki/` plus `authored_snapshots` | Durable product-authored versions used for drift detection and recovery |
@@ -184,9 +185,9 @@ post-open type/identity checks. Relative paths are normalized, slash-based,
 contained, and reject controls, absolute prefixes, traversal, and symlink
 components. A symlink is rejected, never followed or copied as authority.
 
-## 4. SQLite schema v4
+## 4. SQLite schema v5
 
-`state.sqlite` is an exact schema-v4 database. Foreign keys are enabled, WAL is
+`state.sqlite` is an exact schema-v5 database. Foreign keys are enabled, WAL is
 used with full synchronous durability, outer mutations use immediate
 transactions, nested work uses savepoints, and durable finalization
 checkpoints the WAL. Opening rejects an unsupported user/schema version,
@@ -528,7 +529,7 @@ pi-scholar serve [--vault <path>] [--port <1..65535>]
 pi-scholar sync [--vault <path>]
 ```
 
-`init` creates/validates the vault, v4 database, OKF projections, Git
+`init` creates/validates the vault, v5 database, OKF projections, Git
 repository, and private roots. `doctor` is read-only. `serve` binds the
 loopback HTTP server and drains the application on shutdown. `sync` performs
 only the explicit safe push described above. Unknown options, extra
@@ -575,7 +576,7 @@ home/cache. External output is untrusted and is checked before it affects
 state.
 
 `doctor` is read-only and checks vault roots and no-follow paths, exact schema
-v4/integrity/foreign keys, source packet manifests/digests/chunk coverage,
+v5/integrity/foreign keys, source packet manifests/digests/chunk coverage,
 workflow bindings and timestamps, OKF pages/snapshots/index/log, prerequisite
 coverage, quiz projections/evidence/settlement consistency, Git state, qmd
 scope, and Docling identity. qmd is derived and can be rebuilt; a qmd failure
@@ -595,7 +596,7 @@ removed. Crash remnants are diagnosable residue, not a state source.
 |---|---|
 | Node | `>= 22.19` |
 | Vault format | `1` |
-| SQLite schema | `4` |
+| SQLite schema | `5` |
 | Bind host / default port | `127.0.0.1` / `4816` |
 | URL schemes | HTTP and HTTPS |
 | URL redirects and fetch time | Bounded by the source transport policy |

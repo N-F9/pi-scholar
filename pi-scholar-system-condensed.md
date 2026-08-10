@@ -78,7 +78,7 @@ Symlinks are unsupported at the shared I/O boundary. Validated no-follow reads a
 <vault>/
 ├── .pi-scholar/
 │   ├── vault.json
-│   ├── state.sqlite          # schema v4
+│   ├── state.sqlite          # schema v5
 │   ├── qmd/                  # ignored, derived wiki index
 │   └── work/                 # ignored, private transient and rollback data
 ├── inbox/                    # pending staging, ignored
@@ -92,13 +92,13 @@ Symlinks are unsupported at the shared I/O boundary. Validated no-follow reads a
 
 Authorities are deliberately split:
 
-- `sources/<source-id>/` owns accepted originals, derived extraction, chunks, attachments, manifests, and provenance;
+- `sources/<source-id>/` owns accepted originals, derived extraction, chunks, attachments, manifests, and provenance; the SQLite source catalog retains each packet's exact manifest digest for byte-identity verification and doctor checks;
 - `wiki/` plus the SQLite page catalog owns authored knowledge and stable page identity;
 - `.pi-scholar/state.sqlite` owns revisions, workflows, issues, prerequisites, page learning and reviews, private quiz data, submissions, results, and initialization state;
 - quiz Markdown, indexes, logs, and qmd are projections;
 - Git owns local history; the explicit `sync` operation is the only push boundary.
 
-Schema v4 is strict: foreign keys, WAL, full synchronous durability, transactions/savepoints, and exact object validation are required. Unknown or unsupported schema objects fail validation rather than silently migrating or becoming a second authority.
+Schema v5 is the current exact database schema: foreign keys, WAL, full synchronous durability, transactions/savepoints, and exact object validation are required. Unknown or unsupported schema objects fail validation rather than silently migrating or becoming a second authority.
 
 The source and domain modules stay behind the application entry point:
 
@@ -216,7 +216,7 @@ pi-scholar sync [--vault <path>]
 ## 10. Operator defaults
 
 - Node.js 22.19 or newer.
-- Vault format 1 and SQLite schema v4.
+- Vault format 1 and SQLite schema v5.
 - One active physical vault per operation; no concurrent uncoordinated writers.
 - Git commits are local checkpoints; `pi-scholar sync` explicitly pushes existing commits only.
 - `doctor` is read-only and checks containment, schema/integrity, packet reconstruction, OKF projections, wiki identity/drift, prerequisites and FSRS state, quiz revisions/results, workflows, and external adapter scope.

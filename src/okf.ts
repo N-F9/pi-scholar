@@ -89,6 +89,26 @@ function blankMarkdown(value: string): string {
   return value.replace(/[^\r\n]/gu, " ");
 }
 
+function parseMarkdown(body: string): MarkdownNode {
+  return fromMarkdown(body, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as MarkdownNode;
+}
+
+export function okfRenderedText(body: string): string {
+  const text: string[] = [];
+  const visit = (node: MarkdownNode): void => {
+    if (node.type === "text" || node.type === "inlineCode" || node.type === "code") {
+      if (node.value) text.push(node.value);
+      return;
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(parseMarkdown(body));
+  return text.join("\n");
+}
+
 export function okfMarkdownEscapedAt(value: string, index: number): boolean {
   let backslashes = 0;
   for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor--) backslashes++;
@@ -142,12 +162,7 @@ export function okfCitationText(body: string): string {
     }
     for (const child of node.children ?? []) visit(child);
   };
-  visit(
-    fromMarkdown(body, {
-      extensions: [gfm()],
-      mdastExtensions: [gfmFromMarkdown()],
-    }) as MarkdownNode,
-  );
+  visit(parseMarkdown(body));
   let visible = body;
   for (const [start, end] of ranges.sort((left, right) => right[0] - left[0]))
     visible = `${visible.slice(0, start)}${blankMarkdown(visible.slice(start, end))}${visible.slice(end)}`;

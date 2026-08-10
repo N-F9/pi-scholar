@@ -1319,6 +1319,8 @@ describe("application capability boundaries", () => {
         `# Evidence\n\n[^${chunkId}]`,
         `<!-- hidden -->[^${chunkId}]`,
         `[](https://example.test)[^${chunkId}]`,
+        `---\n\n[^${chunkId}]`,
+        `- [^${chunkId}]`,
       ].entries()) {
         await assert.rejects(
           app.applyIngestChange({

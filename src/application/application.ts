@@ -63,7 +63,13 @@ import {
   safePush,
 } from "../external/git.js";
 import { qmdRefresh, qmdScopeCheck, qmdSearch } from "../external/qmd.js";
-import { okfCitationText, okfFootnoteLabels, okfMarkdownEscapedAt, removeOkfFootnoteDefinitions } from "../okf.js";
+import {
+  okfCitationText,
+  okfFootnoteLabels,
+  okfMarkdownEscapedAt,
+  okfRenderedText,
+  removeOkfFootnoteDefinitions,
+} from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
 import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
 import {
@@ -489,7 +495,7 @@ export class ScholarApplication {
       const text = sectionText(markdown, section);
       const newline = text.indexOf("\n");
       const content = section.anchor === "" ? text : newline < 0 ? "" : text.slice(newline + 1);
-      return okfCitationText(withoutEvidence(content)).trim().length > 0;
+      return okfRenderedText(withoutEvidence(content)).trim().length > 0;
     };
     const requireSectionCitation = (markdown: string, section: IngestSection): void => {
       const references = okfFootnoteLabels(sectionText(markdown, section)).references;
