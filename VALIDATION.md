@@ -37,7 +37,7 @@ Use real Git, qmd, Docling, and a configured Pi provider with a source whose cor
 
 ## Independent scheduling and recovery
 
-Schedule `extract`, `ingest`, `lint`, `daily`, and `quiz-grader` independently under the operator's cron or other scheduler. Verify that no skill launches another, Pi Scholar never launches Pi or edits the scheduler, daily and grading remain separate, and `sync` is separately invoked or scheduled. Jobs may overlap; conflicts must be reported rather than merged or force-written.
+Schedule `extract`, `ingest`, `lint`, `daily`, and `quiz-grader` independently under the operator's cron or other scheduler, while serializing Pi skill sessions for each vault. Verify that no skill launches another, Pi Scholar never launches Pi or edits the scheduler, daily and grading remain separate, and `sync` is separately invoked or scheduled. The loopback server and explicit CLI operations may contend with a Pi session; conflicts must be reported rather than merged or force-written.
 
 Verify `.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and Docling scratch, never Git content or authority. Successful operations clean scratch; failures use rollback data; crash remnants cannot override SQLite or durable packets, wiki, or quizzes. Recovery must go through ScholarApplication, `doctor`, and a safe retry rather than reading work files as state.
 
@@ -49,7 +49,7 @@ Confirm each boundary fails safely:
 - Source removal starts from an explicit operator request, requires a fresh preview and confirmation, rejects a stale confirmation, and preserves Git history.
 - Invalid page prerequisite updates reject self-edges, dangling pages, and cycles without partial writes.
 - Overlapping writers report a conflict without partial writes.
-- Interrupting a workflow leaves `doctor` able to explain recovery and permits a safe rerun.
+- After interrupting or crashing a Pi session, start the next serialized Pi session and confirm it marks pre-existing running workflows failed as interrupted before accepting tool work, leaves queued and terminal rows unchanged, stops the Workflows UI from polling abandoned rows, and permits a safe operation-specific retry.
 - Missing qmd disables semantic search without disabling exact or lexical search.
 - Symlinks at the shared I/O boundary are unsupported and cannot enter canonical state.
 - Stale or unauthorized direct page evidence rejects quiz generation or grading without changing page learning.

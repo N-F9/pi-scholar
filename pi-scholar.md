@@ -624,7 +624,7 @@ The entries are independent:
 | `quiz-grader` | Settle sealed pending browser submissions with one identity-bearing transaction per submission |
 | `pi-scholar sync` | Push accumulated local commits and perform no semantic work |
 
-If an entry is not scheduled, that workflow does not run. New inbox entries arriving after an extract snapshot wait for a later extract invocation. Overlapping user entries are allowed to contend on the sibling writer lock; each operation revalidates identities and revisions, and host idempotency makes retries safe. Pi Scholar does not add a global run guard or reorder user schedules. A user may schedule `pi-scholar doctor` separately, and should inspect its read-only result before enabling or troubleshooting a workflow. The loopback `pi-scholar serve` process is a separate prerequisite for browser use; it does not run semantic skills.
+If an entry is not scheduled, that workflow does not run. New inbox entries arriving after an extract snapshot wait for a later extract invocation. User schedules must serialize Pi skill sessions per vault; Pi Scholar does not add a process launcher or global run guard. The loopback server and explicit CLI operations may still contend with a Pi session on the sibling writer lock, and each operation revalidates identities and revisions. A user may schedule `pi-scholar doctor` separately and should inspect its read-only result before enabling or troubleshooting a workflow. The loopback `pi-scholar serve` process is a separate prerequisite for browser use; it does not run semantic skills.
 
 ### Initialization mode
 
@@ -654,7 +654,7 @@ A push failure never rolls back committed knowledge or a settled grade. Git itse
 - A non-fast-forward or diverged upstream is reported and never reset, force-pushed, or automatically merged.
 - An interrupted push is reconciled by fetching and comparing local/upstream object IDs.
 
-Recovery stays operation-specific and idempotent: source publication reuses its claimed digest, grading reuses its sealed submission identity, and deterministic Markdown projections may be retried from SQLite. There is no generic workflow replay engine. Recovery uses canonical files, SQLite transactions, immutable source packets, quiz sheets, and Git history; it never replays opaque model messages or fabricates missed quizzes.
+Recovery stays operation-specific and idempotent: source publication reuses its claimed digest, grading reuses its sealed submission identity, and deterministic Markdown projections may be retried from SQLite. Only one Pi session may use a vault at a time. At Pi session startup, any pre-existing running workflow rows fail as interrupted before tool work begins; queued and terminal rows remain unchanged. There is no generic workflow lease or replay engine; the quiz-grader claim lease remains operation-specific. Recovery uses canonical files, SQLite transactions, immutable source packets, quiz sheets, and Git history; it never replays opaque model messages or fabricates missed quizzes.
 
 ## Security and integrity invariants
 

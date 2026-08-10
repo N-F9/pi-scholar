@@ -97,6 +97,7 @@ type ScholarApplication = {
     status: "succeeded" | "failed",
     options?: WorkflowFinishOptions,
   ) => Promise<unknown>;
+  readonly recoverAbandonedWorkflows: () => Promise<unknown>;
   readonly getExtractContext: () => Promise<ExtractContext>;
   readonly publishExtraction: (input: ExtractPublicationInput) => Promise<ExtractPublicationResult>;
   readonly getIngestContext: () => Promise<IngestContext>;
@@ -295,7 +296,7 @@ const gradeInput = Type.Object({
   pages: Type.Array(gradePageInput),
 });
 
-const appCache = new Map<string, ScholarApplication>();
+const appCache = new Map<string, Promise<ScholarApplication>>();
 const gradingClaimOwner = randomUUID();
 
 async function loadRuntimeModule(): Promise<RuntimeModule> {
@@ -326,9 +327,25 @@ async function applicationFor(ctx: ExtensionContext): Promise<ScholarApplication
   const paths = module.resolveVault(ctx.cwd);
   const cached = appCache.get(paths.vaultRoot);
   if (cached) return cached;
-  const app = module.createApplication({ paths });
-  appCache.set(paths.vaultRoot, app);
-  return app;
+  const pending = (async () => {
+    const app = module.createApplication({ paths });
+    try {
+      await app.recoverAbandonedWorkflows();
+      return app;
+    } catch (error) {
+      try {
+        await app.close?.();
+      } catch {}
+      throw error;
+    }
+  })();
+  appCache.set(paths.vaultRoot, pending);
+  try {
+    return await pending;
+  } catch (error) {
+    if (appCache.get(paths.vaultRoot) === pending) appCache.delete(paths.vaultRoot);
+    throw error;
+  }
 }
 
 function progress(onUpdate: AgentToolUpdateCallback<unknown> | undefined, message: string): void {
@@ -1052,8 +1069,10 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    await Promise.all([...appCache.values()].map((app) => app.close?.()));
+    const pending = [...appCache.values()];
     appCache.clear();
     workflowStates.clear();
+    const apps = await Promise.allSettled(pending);
+    await Promise.all(apps.flatMap((result) => (result.status === "fulfilled" ? [result.value.close?.()] : [])));
   });
 }

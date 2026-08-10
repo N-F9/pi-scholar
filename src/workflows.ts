@@ -207,6 +207,30 @@ export class WorkflowCoordinator {
     });
   }
 
+  failRunningWorkflows(options: WorkflowFinishOptions): WorkflowRecord[] {
+    const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
+    const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
+    const errorMessage = boundedText(options.errorMessage, WORKFLOW_ERROR_MESSAGE_BYTES, "workflow error message");
+    return transaction(this.db, () => {
+      const requestIds = this.db
+        .all<Record<string, unknown>>(
+          "SELECT request_id FROM workflows WHERE status = 'running' ORDER BY rowid, request_id",
+        )
+        .map((row) => String(row.request_id));
+      if (requestIds.length === 0) return [];
+      const result = this.db.run(
+        "UPDATE workflows SET status = 'failed', finished_at = ?, message = COALESCE(?, message), error_code = ?, error_message = ? WHERE status = 'running'",
+        [new Date().toISOString(), message ?? null, errorCode ?? null, errorMessage ?? null],
+      );
+      if (Number(result.changes) !== requestIds.length) throw new Error("running workflows changed during recovery");
+      return requestIds.map((requestId) => {
+        const workflow = this.get(requestId);
+        if (!workflow) throw new Error("recovered workflow disappeared");
+        return workflow;
+      });
+    });
+  }
+
   updateWorkflow(requestId: string, input: WorkflowUpdateInput = {}): WorkflowRecord {
     workflowRequestId(requestId);
     const progress = workflowProgress(input.progress);
