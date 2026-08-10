@@ -148,6 +148,21 @@ describe("source admission mechanics", () => {
     expect(staged.kind).toBe("directory");
     db.close();
   });
+  it("preserves code blank runs after marker-looking text inside a multiline body", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "marker-body");
+    await fs.mkdir(directory);
+    const code = ["const value = `first", "--- END FILE: notes.md ---", "", "", "last`;", ""].join("\n");
+    await fs.writeFile(join(directory, "example.js"), code);
+    await fs.writeFile(join(directory, "notes.md"), "notes\n");
+    await sources.stage({ path: directory });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("marker-body directory was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
+    expect(extracted).toContain(`--- FILE: example.js ---\n${code}`);
+    db.close();
+  });
   it("normalizes blank runs outside fences while preserving original bytes and fenced content", async () => {
     const { paths, db, sources } = await fixture();
     const original = "before\n\n\n```\ninside\n\n\n```\n\n\nafter\n";

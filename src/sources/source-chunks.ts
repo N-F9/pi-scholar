@@ -31,6 +31,11 @@ export interface FileDoclingResult {
   converter?: { name: string; version?: string };
   attachments: Array<{ path: string; absolutePath: string; byteLength: number; digest: string }>;
 }
+export interface ExtractionFileBoundary {
+  startByte: number;
+  endByte: number;
+  preserveBlankRuns: boolean;
+}
 
 function atomRowsFromBuffer(extracted: Buffer): AtomMetadata[] {
   if (extracted.length === 0) return [];
@@ -247,7 +252,7 @@ export async function normalizeMarkdownFile(
   source: string,
   target: string,
   collapseBlankRuns = true,
-  codeFilePaths?: ReadonlySet<string>,
+  fileBoundaries?: readonly ExtractionFileBoundary[],
 ): Promise<void> {
   const inputStat = await lstatNoFollow(source);
   if (!inputStat.isFile()) throw new Error(`Markdown source must be a regular file: ${source}`);
@@ -269,38 +274,27 @@ export async function normalizeMarkdownFile(
   let pendingStart: number | undefined;
   let pendingEnd = 0;
   let lineBlank = true;
-  let currentCodeFile = false;
-  let markerPrefixIndex = 0;
-  let markerCandidate = true;
-  let markerKind: "file" | "end" = "file";
-  let markerPathBytes: number[] | undefined;
+  let boundaryIndex = 0;
   let leadingSpaces = 0;
   let fenceChar: string | undefined;
   let fenceLength = 0;
   let fenceTailOnly = true;
   let fencePhase: "leading" | "run" | "tail" | "invalid" = "leading";
-  const fileMarkerPrefix = Buffer.from("--- FILE: ");
-  const endFileMarkerPrefix = Buffer.from("--- END FILE: ");
   const flushPending = async (): Promise<void> => {
     if (pendingStart === undefined) return;
     await copySpoolRange(spoolReader!, output, pendingStart, pendingEnd);
     pendingStart = undefined;
     pendingEnd = 0;
   };
-  const scanMarkerByte = (byte: number): void => {
-    if (!markerCandidate) return;
-    if (markerPrefixIndex === 4 && byte === endFileMarkerPrefix[4]) markerKind = "end";
-    const prefix = markerKind === "end" ? endFileMarkerPrefix : fileMarkerPrefix;
-    if (markerPrefixIndex < prefix.length) {
-      if (byte === prefix[markerPrefixIndex]) markerPrefixIndex++;
-      else markerCandidate = false;
-      return;
+  const preserveBlankRuns = (lineStartByte: number): boolean => {
+    let boundary = fileBoundaries?.[boundaryIndex];
+    while (boundary && boundary.endByte <= lineStartByte) {
+      boundaryIndex++;
+      boundary = fileBoundaries?.[boundaryIndex];
     }
-    if (!markerPathBytes) markerPathBytes = [];
-    markerPathBytes.push(byte);
+    return boundary?.preserveBlankRuns === true && boundary.startByte <= lineStartByte;
   };
   const scanLineByte = (byte: number): void => {
-    scanMarkerByte(byte);
     if (byte !== 32 && byte !== 9 && byte !== 13) lineBlank = false;
     if (fencePhase === "invalid") return;
     if (fencePhase === "leading") {
@@ -331,7 +325,7 @@ export async function normalizeMarkdownFile(
     const marker =
       fenceChar && fenceLength >= 3 ? { char: fenceChar, length: fenceLength, tailOnly: fenceTailOnly } : undefined;
     const blank = lineBlank;
-    const preserveBlank = currentCodeFile && codeFilePaths !== undefined;
+    const preserveBlank = preserveBlankRuns(lineStart);
     if (preserveBlank || inFence || !blank || !previousBlank) {
       if (pendingStart === undefined) pendingStart = lineStart;
       pendingEnd = end;
@@ -346,23 +340,10 @@ export async function normalizeMarkdownFile(
       previousBlank = false;
       if (marker) inFence = { char: marker.char, length: marker.length };
     }
-    const markerPrefixLength = markerKind === "end" ? endFileMarkerPrefix.length : fileMarkerPrefix.length;
-    if (markerPrefixIndex === markerPrefixLength && markerPathBytes) {
-      const markerText = Buffer.from(markerPathBytes).toString("utf8");
-      if (markerText.endsWith(" ---")) {
-        const filePath = markerText.slice(0, -4);
-        currentCodeFile = markerKind === "file" && codeFilePaths?.has(filePath) === true;
-        inFence = undefined;
-      }
-    }
     lineStart = end;
     lineBlank = true;
-    markerPrefixIndex = 0;
-    markerCandidate = true;
-    markerKind = "file";
-    markerPathBytes = undefined;
-    leadingSpaces = 0;
     fenceChar = undefined;
+    leadingSpaces = 0;
     fenceLength = 0;
     fenceTailOnly = true;
     fencePhase = "leading";
@@ -537,16 +518,23 @@ export async function normalizeDoclingResult(
   };
 }
 
-export async function writeNativeExtraction(snapshot: TreeSnapshot, target: string): Promise<void> {
+export async function writeNativeExtraction(
+  snapshot: TreeSnapshot,
+  target: string,
+  preserveBlankRuns?: ReadonlySet<string>,
+): Promise<ExtractionFileBoundary[] | undefined> {
   if (snapshot.files.length === 1 && snapshot.kind !== "directory" && snapshot.kind !== "repository") {
     const first = snapshot.files[0];
     if (!first) throw new Error("source snapshot has no file");
     await copyFileNoFollow(first.absolutePath, target);
-    return;
+    return undefined;
   }
   const output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  const boundaries: ExtractionFileBoundary[] = [];
+  let outputPosition = 0;
   const write = async (bytes: Uint8Array): Promise<void> => {
-    await writeFully(output, Buffer.from(bytes));
+    await writeFully(output, bytes);
+    outputPosition += bytes.byteLength;
   };
   const append = async (source: string): Promise<void> => {
     const input = await openFile(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -556,6 +544,7 @@ export async function writeNativeExtraction(snapshot: TreeSnapshot, target: stri
         const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
         if (!bytesRead) break;
         await writeFully(output, buffer, 0, bytesRead);
+        outputPosition += bytesRead;
       }
     } finally {
       await input.close();
@@ -564,6 +553,7 @@ export async function writeNativeExtraction(snapshot: TreeSnapshot, target: stri
   try {
     for (const file of snapshot.files) {
       await write(Buffer.from(`--- FILE: ${file.path} ---\n`));
+      const startByte = outputPosition;
       await append(file.absolutePath);
       if (file.size > 0) {
         const tail = await openFile(file.absolutePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -575,11 +565,17 @@ export async function writeNativeExtraction(snapshot: TreeSnapshot, target: stri
         }
         if (last[0] !== 10) await write(Buffer.from("\n"));
       }
+      boundaries.push({
+        startByte,
+        endByte: outputPosition,
+        preserveBlankRuns: preserveBlankRuns?.has(file.path) === true,
+      });
       await write(Buffer.from(`--- END FILE: ${file.path} ---\n`));
     }
   } finally {
     await output.close();
   }
+  return boundaries;
 }
 
 export function chunkExtraction(

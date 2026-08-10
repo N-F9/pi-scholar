@@ -327,6 +327,7 @@ export class ScholarApplication {
     operation: () => T | PromiseLike<T>,
     subject: string,
     rollback?: DurableRollback<R>,
+    doctorAcceptance?: (report: DoctorReport) => boolean | PromiseLike<boolean>,
   ): Promise<T> {
     return withWriterLock(this.paths, async () => {
       let snapshot: R | undefined;
@@ -347,12 +348,13 @@ export class ScholarApplication {
         let report: DoctorReport;
         try {
           report = this.doctorFn(this.paths.vaultRoot);
+          const accepted = doctorAcceptance ? await doctorAcceptance(report) : report.ok;
+          if (!accepted) {
+            const error = new Error("doctor checks failed");
+            if (!rollback) throw mutationFinalizationError("doctor", error);
+            throw error;
+          }
         } catch (error) {
-          if (!rollback) throw mutationFinalizationError("doctor", error);
-          throw error;
-        }
-        if (!report.ok) {
-          const error = new Error("doctor checks failed");
           if (!rollback) throw mutationFinalizationError("doctor", error);
           throw error;
         }
@@ -1412,8 +1414,22 @@ export class ScholarApplication {
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
     await qmd.index();
     const doctor = this.doctorFn(this.paths.vaultRoot);
-    if (!doctor.ok) throw new ValidationError("doctor checks failed");
+    if (!this.doctorAllowsWikiDrift(doctor, allowedDrift, pages)) throw new ValidationError("doctor checks failed");
     return { lint, doctor };
+  }
+  private doctorAllowsWikiDrift(
+    report: DoctorReport,
+    allowedDrift: ReadonlySet<string>,
+    pages: readonly { readonly pageId: string; readonly relativePath: string }[],
+  ): boolean {
+    const failures = report.checks.filter((check) => check.status === "fail");
+    if (!failures.length) return report.ok;
+    const allowedMessages = new Set(
+      pages
+        .filter((page) => allowedDrift.has(page.pageId))
+        .map((page) => `Page digest drifted without a drift record: ${page.relativePath}`),
+    );
+    return failures.every((check) => check.name === "page-drift" && allowedMessages.has(check.message));
   }
   private async applyWikiChangeDecoded(
     proposal: WikiChangeInput,
@@ -1424,10 +1440,11 @@ export class ScholarApplication {
       restore: (snapshot: WikiChangeRollbackSnapshot) => this.restoreWikiChangeRollback(snapshot),
       dispose: (snapshot: WikiChangeRollbackSnapshot) => fs.rm(snapshot.workRoot, { recursive: true, force: true }),
     };
+    let preexistingDrift: ReadonlySet<string> = new Set();
     return this.durableDirect(
       async () => {
         const allowDrift = proposal.kind === "update-page" || proposal.kind === "resolve-issue";
-        const preexistingDrift = allowDrift ? await this.liveDriftPageIds() : new Set<string>();
+        preexistingDrift = allowDrift ? await this.liveDriftPageIds() : new Set<string>();
         await this.wikiChangePreflight(preexistingDrift);
         switch (proposal.kind) {
           case "create-page": {
@@ -1556,6 +1573,7 @@ export class ScholarApplication {
       },
       "wiki:change",
       rollback,
+      async (report) => this.doctorAllowsWikiDrift(report, preexistingDrift, await this.wiki.list()),
     );
   }
   async applyWikiChange(input: WikiChangeInput): Promise<WikiChangeResult> {

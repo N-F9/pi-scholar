@@ -36,7 +36,7 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture(options: { readonly maintenance?: boolean } = {}) {
+function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
@@ -45,10 +45,12 @@ function fixture(options: { readonly maintenance?: boolean } = {}) {
     paths,
     db,
     adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
-    doctor: () => {
-      calls.push("doctor");
-      return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
-    },
+    doctor: options.realDoctor
+      ? doctor
+      : () => {
+          calls.push("doctor");
+          return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
+        },
     commit: (_paths, subject) => {
       calls.push(`commit:${subject}`);
       return { committed: true, subject };
@@ -1278,7 +1280,6 @@ describe("application capability boundaries", () => {
       db.close();
     }
   });
-
   it("repairs multiple live-drift pages sequentially without over-blocking unrelated drift", async () => {
     const { app, db, paths } = fixture({ maintenance: true });
     try {
@@ -1296,6 +1297,7 @@ describe("application capability boundaries", () => {
       await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
       const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
       const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      (app as unknown as { doctorFn: typeof doctor }).doctorFn = doctor;
 
       await app.applyWikiChange({
         kind: "update-page",
@@ -1318,7 +1320,7 @@ describe("application capability boundaries", () => {
       await app.close();
       db.close();
     }
-  });
+  }, 15_000);
 
   it("refuses retirement with open or reopened linked issues without changing page bytes", async () => {
     const { app, db, paths } = fixture({ maintenance: true });

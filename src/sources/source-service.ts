@@ -25,6 +25,7 @@ import {
   atomizeExtraction,
   chunkEndpointNumber,
   chunkExtraction,
+  type ExtractionFileBoundary,
   normalizeDoclingResult,
   normalizeMarkdownFile,
   planFileAtoms,
@@ -925,6 +926,11 @@ export class SourceService {
       const mediaType = claim.snapshot.metadata?.mediaType;
       const useDocling =
         claim.snapshot.kind === "document" || (claim.snapshot.kind === "url" && !textualUrl(claim, mediaType));
+      const codeFilePaths =
+        claim.snapshot.kind === "directory" || claim.snapshot.kind === "repository"
+          ? new Set(claim.snapshot.files.filter((file) => inferKind(file.path) === "code").map((file) => file.path))
+          : undefined;
+      let fileBoundaries: ExtractionFileBoundary[] | undefined;
       let converter: { name: string; version: string } | undefined;
       if (useDocling) {
         if (!this.adapters.docling) throw new Error("Docling adapter is required for document extraction");
@@ -964,15 +970,11 @@ export class SourceService {
             absolutePath: ensureWithin(originalRoot, join(originalRoot, validRelativePath(file.path))),
           })),
         };
-        await writeNativeExtraction(copiedSnapshot, rawExtracted);
+        fileBoundaries = await writeNativeExtraction(copiedSnapshot, rawExtracted, codeFilePaths);
       }
       const rawStat = await lstatNoFollow(rawExtracted);
       if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");
-      const codeFilePaths =
-        claim.snapshot.kind === "directory" || claim.snapshot.kind === "repository"
-          ? new Set(claim.snapshot.files.filter((file) => inferKind(file.path) === "code").map((file) => file.path))
-          : undefined;
-      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code", codeFilePaths);
+      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code", fileBoundaries);
       await fs.rm(rawExtracted, { force: true });
       const extractedHash = await hashFile(extractedAbsolute);
       if (extractedHash.size === 0) throw new Error("empty extraction");
