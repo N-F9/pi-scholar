@@ -1948,7 +1948,8 @@ export class SourceService {
     this.refreshDependencies();
     const preview = this.removalPreview(sourceId);
     const token = typeof confirmation === "string" ? confirmation : confirmation.confirmationId;
-    if (token !== preview.confirmationId) throw new Error("stale removal confirmation");
+    if (token !== preview.confirmationId)
+      throw Object.assign(new Error("stale removal confirmation"), { code: "revision-conflict" });
     const affectedSubmittedQuizIds = this.affectedSubmittedQuizIds(sourceId);
     if (affectedSubmittedQuizIds.length)
       throw new Error(

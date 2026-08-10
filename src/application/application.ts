@@ -1858,20 +1858,18 @@ export class ScholarApplication {
     exact(input, ["date"], "quiz context");
     const date = input.date === undefined ? await this.currentLocalDate() : requiredString(input, "date");
     return this.durableDirect(async () => {
-      const settings = await this.getSettings();
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz context is limited to the current local date");
+      const expiredCount = this.quiz.expirePrior(date);
+      const settings = await this.getSettings();
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       const quiz = this.quiz.get(date);
-      const candidates = await this.quizCandidates(duePages);
-      const detail = quiz ? await this.quizDetail(quiz) : undefined;
-      const expiredCount = this.quiz.expirePrior(date);
       return {
         date,
         initializationEnabled: settings.settings.initializationEnabled,
         expiredCount,
-        candidates,
-        ...(detail ? { quiz: detail } : {}),
+        candidates: await this.quizCandidates(duePages),
+        ...(quiz ? { quiz: await this.quizDetail(quiz) } : {}),
         ...(settings.settings.initializationEnabled
           ? { message: "Initialization maintenance is active; quiz publication is blocked." }
           : {}),

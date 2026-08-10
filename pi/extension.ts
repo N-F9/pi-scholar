@@ -992,7 +992,8 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_get_daily_context",
     label: "scholar_get_daily_context",
     executionMode: "sequential",
-    description: "Read the current local-date daily quiz context and initialization guard.",
+    description:
+      "Read the current local-date daily quiz context and initialization guard. If initializationEnabled is true, call no other tool and answer exactly: Daily quiz guarded for <date>. Expired prior quizzes: <expiredCount>. No quiz was published. Substitute the returned values.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleContext(ctx, _signal, onUpdate, "Loading daily context", "daily", (app) =>
@@ -1016,7 +1017,8 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_publish_daily",
     label: "scholar_publish_daily",
     executionMode: "sequential",
-    description: "Publish one validated daily quiz proposal or explicit skip.",
+    description:
+      "Publish one validated daily quiz proposal or explicit skip after an unguarded daily context; never call when initialization is enabled.",
     parameters: quizInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily", (app) =>

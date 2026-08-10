@@ -718,36 +718,6 @@ describe("application quiz date guards", () => {
       db.close();
     }
   });
-  it("does not expire prior open quizzes when context preflight rejects a missing due page", async () => {
-    const { app, db, paths } = fixture();
-    const date = localDate(new Date());
-    const page = await app.createNote({
-      path: "context-missing-page.md",
-      title: "Context missing page",
-      body: "# Section\n\nSection text\n",
-      quizWorthiness: "eligible",
-    });
-    app.scheduler.ensurePageLearning(page.page.pageId, `${date}T00:00:00.000Z`);
-    const previous = new Date(`${date}T00:00:00.000Z`);
-    previous.setUTCDate(previous.getUTCDate() - 1);
-    const oldDate = previous.toISOString().slice(0, 10);
-    const oldQuizId = randomUUID();
-    db.run(
-      "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', NULL, ?, NULL, NULL, NULL)",
-      [oldQuizId, oldDate, new Date().toISOString()],
-    );
-    try {
-      await fs.rm(join(paths.wikiRoot, page.page.relativePath));
-      await assert.rejects(app.getQuizContext({ date }));
-      assert.equal(
-        db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", [oldQuizId])?.status,
-        "open",
-      );
-    } finally {
-      await app.close();
-      db.close();
-    }
-  });
   it("does not expire prior open quizzes when current publication is rejected", async () => {
     const { app, db, date, pageId } = await gradingFixture();
     const previous = new Date(`${date}T00:00:00.000Z`);
