@@ -301,10 +301,13 @@ export class WikiService {
     ]);
     if (!snapshot) return undefined;
     const path = this.snapshotPath(rowToPage(row));
+    const content = readFileNoFollow(path).toString("utf8");
+    const recordedDigest = String(snapshot.digest);
+    if (recordedDigest !== row.digest || digest(content) !== recordedDigest) return undefined;
     return {
-      digest: String(snapshot.digest),
+      digest: recordedDigest,
       revision: Number(snapshot.revision),
-      content: readFileNoFollow(path).toString("utf8"),
+      content,
     };
   }
   private async authoredPage(page: WikiPage): Promise<(WikiPage & { content: string }) | undefined> {

@@ -1247,9 +1247,18 @@ export class ScholarApplication {
     },
   ): string {
     const current = parseWikiMarkdown(currentContent);
-    const authored = parseWikiMarkdown(
-      readFileNoFollow(join(this.paths.metadataRoot, "snapshots", "wiki", `${pageId}.md`)).toString("utf8"),
+    const authoredBytes = readFileNoFollow(join(this.paths.metadataRoot, "snapshots", "wiki", `${pageId}.md`));
+    const recorded = this.db.get<{ readonly page_digest: string; readonly snapshot_digest: string }>(
+      "SELECT pages.digest AS page_digest, authored_snapshots.digest AS snapshot_digest FROM pages JOIN authored_snapshots ON authored_snapshots.relative_path = pages.relative_path WHERE pages.page_id = ?",
+      [pageId],
     );
+    if (
+      !recorded ||
+      recorded.page_digest !== recorded.snapshot_digest ||
+      sha256(authoredBytes) !== recorded.snapshot_digest
+    )
+      throw new ValidationError("product-authored snapshot failed verification");
+    const authored = parseWikiMarkdown(authoredBytes.toString("utf8"));
     const missing = [
       current.body !== authored.body && proposed.body === undefined ? "body" : undefined,
       current.frontmatter.title !== authored.frontmatter.title && proposed.title === undefined ? "title" : undefined,

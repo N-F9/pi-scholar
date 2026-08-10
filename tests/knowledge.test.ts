@@ -1250,6 +1250,47 @@ describe("wiki mechanics", () => {
       db.close();
     }
   });
+  it("rejects drift repair when the authored snapshot bytes are tampered", async () => {
+    const { paths, db } = await fixture();
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      doctor,
+      commit: (_paths, subject) => ({ committed: false, subject }),
+    });
+    try {
+      const created = await app.wiki.create({
+        path: "tampered-snapshot.md",
+        title: "Stable",
+        body: "Authored baseline.",
+      });
+      const pagePath = join(paths.wikiRoot, created.page.relativePath);
+      const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
+      const externalPage = created.content.replace("Authored baseline.", "External page.");
+      const tamperedSnapshot = created.content.replace("Authored baseline.", "Tampered snapshot.");
+      await fs.writeFile(pagePath, externalPage);
+      await fs.writeFile(snapshotPath, tamperedSnapshot);
+      const repair = {
+        body: "Explicit repair.",
+        title: "Repaired",
+        expectedDigest: sha256(externalPage),
+      };
+
+      await expect(app.wiki.prepareUpdate(created.page.pageId, repair)).rejects.toThrow(/product-authored snapshot/u);
+      await expect(
+        app.applyWikiChange({ kind: "update-page", pageId: created.page.pageId, ...repair }),
+      ).rejects.toThrow(/product-authored snapshot/u);
+      expect(await fs.readFile(pagePath, "utf8")).toBe(externalPage);
+      expect(await fs.readFile(snapshotPath, "utf8")).toBe(tamperedSnapshot);
+      expect(
+        db.get<{ status: string }>("SELECT status FROM pages WHERE page_id = ?", [created.page.pageId])?.status,
+      ).toBe("active");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 
   it("rejects orphan managed footnote definitions before persistence", async () => {
     const { paths, db, wiki } = await fixture();
