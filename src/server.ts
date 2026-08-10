@@ -162,7 +162,6 @@ function errorStatus(error: unknown): number {
   )
     return 409;
   if (/not found|unknown page|no quiz for/iu.test(errorText(error))) return 404;
-  if (error instanceof ValidationError) return 400;
   return 400;
 }
 function jsonSafe(value: unknown): JsonValue {
@@ -599,11 +598,6 @@ async function apiRoute(
       sendJson(res, 200, publicSourceResponse(await app.listSources()), requestId);
       return;
     }
-    if (method !== "POST")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     const type = contentType(req);
     if (type === "multipart/form-data") {
       const upload = await receiveMultipartUpload(req, app.paths.workRoot, options.maxMultipartBytes);
@@ -640,11 +634,6 @@ async function apiRoute(
   if (sourceMatch) {
     const sourceId = pathSegment(sourceMatch[1]!, "source");
     if (!UUID.test(sourceId)) throw new ValidationError("source ID is malformed");
-    if (method !== "POST")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     const raw = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
     if (
       !keysExactly(raw, sourceMatch[2] === "removal-preview" ? ["sourceId"] : ["sourceId", "confirmationId"]) ||
@@ -661,21 +650,11 @@ async function apiRoute(
     return;
   }
   if (path === "/api/v1/wiki") {
-    if (method !== "GET")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     queryOnly(url, []);
     sendJson(res, 200, await app.listWiki(), requestId);
     return;
   }
   if (path === "/api/v1/wiki/page") {
-    if (method !== "GET")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     queryOnly(url, ["pageId", "path"]);
     const pageId = queryOne(url, "pageId", false);
     const pagePath = queryOne(url, "path", false);
@@ -686,11 +665,6 @@ async function apiRoute(
     return;
   }
   if (path === "/api/v1/wiki/search") {
-    if (method !== "GET")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     queryOnly(url, ["q", "mode", "limit"]);
     const q = queryOne(url, "q")!;
     const mode = queryOne(url, "mode", false) as "semantic" | "lexical" | "exact" | undefined;
@@ -714,32 +688,21 @@ async function apiRoute(
       sendJson(res, 200, await app.listIssues(), requestId);
       return;
     }
-    if (method === "POST") {
-      const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-      if (!keysExactly(value, ["pageId", "heading", "pageDigest", "kind", "description"]))
-        throw new ValidationError("issue request has unsupported fields");
-      const input: WikiIssueCreateRequest = {
-        ...(value.pageId === undefined ? {} : { pageId: stringField(value, "pageId") }),
-        ...(value.heading === undefined ? {} : { heading: stringField(value, "heading") }),
-        ...(value.pageDigest === undefined ? {} : { pageDigest: stringField(value, "pageDigest") }),
-        kind: issueKindField(value),
-        description: stringField(value, "description", true)!,
-      };
-      sendJson(res, 200, await app.reportIssue(input, { origin: "browser" }), requestId);
-      return;
-    }
-    throw Object.assign(new Error("method is not supported for this route"), {
-      code: "METHOD_NOT_ALLOWED",
-      status: 405,
-    });
+    const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
+    if (!keysExactly(value, ["pageId", "heading", "pageDigest", "kind", "description"]))
+      throw new ValidationError("issue request has unsupported fields");
+    const input: WikiIssueCreateRequest = {
+      ...(value.pageId === undefined ? {} : { pageId: stringField(value, "pageId") }),
+      ...(value.heading === undefined ? {} : { heading: stringField(value, "heading") }),
+      ...(value.pageDigest === undefined ? {} : { pageDigest: stringField(value, "pageDigest") }),
+      kind: issueKindField(value),
+      description: stringField(value, "description", true)!,
+    };
+    sendJson(res, 200, await app.reportIssue(input, { origin: "browser" }), requestId);
+    return;
   }
   const issueMatch = /^\/api\/v1\/wiki\/issues\/([^/]+)$/u.exec(path);
   if (issueMatch) {
-    if (method !== "PATCH")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     const issueId = pathSegment(issueMatch[1]!, "issue");
     if (!UUID.test(issueId)) throw new ValidationError("issue ID is malformed");
     const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
@@ -753,11 +716,6 @@ async function apiRoute(
   }
   const driftMatch = /^\/api\/v1\/wiki\/pages\/([^/]+)\/drift-resolution$/u.exec(path);
   if (driftMatch) {
-    if (method !== "POST")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     const pageId = pathSegment(driftMatch[1]!, "page");
     if (!UUID.test(pageId)) throw new ValidationError("page ID is malformed");
     const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
@@ -772,11 +730,6 @@ async function apiRoute(
     return;
   }
   if (path === "/api/v1/quizzes") {
-    if (method !== "GET")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     queryOnly(url, []);
     sendJson(res, 200, await app.listQuizzes(), requestId);
     return;
@@ -785,53 +738,37 @@ async function apiRoute(
   if (quizMatch) {
     const date = quizDate(pathSegment(quizMatch[1]!, "quiz date"));
     const action = quizMatch[2];
-    if (!action && method === "GET") {
+    if (!action) {
       queryOnly(url, []);
       sendJson(res, 200, await app.getQuiz(date), requestId);
       return;
     }
-    if (action === "answers" && method === "PUT") {
+    if (action === "answers") {
       const value = answersRequest(decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes)));
       sendJson(res, 200, await app.saveAnswers(date, value, { origin: "browser" }), requestId);
       return;
     }
-    if (action === "submission" && method === "POST") {
-      const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-      if (!keysExactly(value, ["expectedRevision"])) throw new ValidationError("quiz submission request is malformed");
-      sendJson(
-        res,
-        200,
-        await app.sealSubmission(
-          date,
-          { expectedRevision: integerField(value, "expectedRevision") },
-          { origin: "browser" },
-        ),
-        requestId,
-      );
-      return;
-    }
-    throw Object.assign(new Error("method is not supported for this route"), {
-      code: "METHOD_NOT_ALLOWED",
-      status: 405,
-    });
+    const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
+    if (!keysExactly(value, ["expectedRevision"])) throw new ValidationError("quiz submission request is malformed");
+    sendJson(
+      res,
+      200,
+      await app.sealSubmission(
+        date,
+        { expectedRevision: integerField(value, "expectedRevision") },
+        { origin: "browser" },
+      ),
+      requestId,
+    );
+    return;
   }
   if (path === "/api/v1/workflows") {
-    if (method !== "GET")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     queryOnly(url, []);
     sendJson(res, 200, await app.listWorkflows(), requestId);
     return;
   }
   const workflowMatch = /^\/api\/v1\/workflows\/([^/]+)$/u.exec(path);
   if (workflowMatch) {
-    if (method !== "GET")
-      throw Object.assign(new Error("method is not supported for this route"), {
-        code: "METHOD_NOT_ALLOWED",
-        status: 405,
-      });
     const requestIdValue = pathSegment(workflowMatch[1]!, "workflow");
     if (!UUID.test(requestIdValue)) throw new ValidationError("workflow ID is malformed");
     sendJson(res, 200, { workflow: await app.getWorkflow(requestIdValue) }, requestId);
@@ -843,25 +780,19 @@ async function apiRoute(
       sendJson(res, 200, await app.getSettings(), requestId);
       return;
     }
-    if (method === "PUT") {
-      const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-      if (!keysExactly(value, ["initializationEnabled", "timezone", "port", "host"]))
-        throw new ValidationError("settings request has unsupported fields");
-      const input: SettingsUpdateRequest = {
-        ...(value.initializationEnabled === undefined
-          ? {}
-          : { initializationEnabled: booleanField(value, "initializationEnabled") }),
-        ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
-        ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
-        ...(value.host === undefined ? {} : { host: stringField(value, "host") }),
-      };
-      sendJson(res, 200, await app.updateSettings(input, { origin: "browser" }), requestId);
-      return;
-    }
-    throw Object.assign(new Error("method is not supported for this route"), {
-      code: "METHOD_NOT_ALLOWED",
-      status: 405,
-    });
+    const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
+    if (!keysExactly(value, ["initializationEnabled", "timezone", "port", "host"]))
+      throw new ValidationError("settings request has unsupported fields");
+    const input: SettingsUpdateRequest = {
+      ...(value.initializationEnabled === undefined
+        ? {}
+        : { initializationEnabled: booleanField(value, "initializationEnabled") }),
+      ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
+      ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
+      ...(value.host === undefined ? {} : { host: stringField(value, "host") }),
+    };
+    sendJson(res, 200, await app.updateSettings(input, { origin: "browser" }), requestId);
+    return;
   }
   throw Object.assign(new Error("route not found"), { code: "ROUTE_NOT_FOUND", status: 404 });
 }
