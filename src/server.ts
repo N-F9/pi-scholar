@@ -18,7 +18,7 @@ import type {
 } from "./contracts.js";
 import { QuizConflictError } from "./quiz.js";
 import { localDate, RevisionConflictError, ValidationError } from "./scheduler.js";
-import { resolveVault, type VaultPaths } from "./vault.js";
+import { LockBusyError, resolveVault, type VaultPaths } from "./vault.js";
 
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
 const MULTIPART_FIELD_BYTES = 64 * 1024;
@@ -155,6 +155,7 @@ function errorCode(error: unknown): string {
 }
 function errorStatus(error: unknown): number {
   if (
+    error instanceof LockBusyError ||
     error instanceof RevisionConflictError ||
     error instanceof QuizConflictError ||
     /stale|conflict|already submitted|only the current/iu.test(errorText(error))
@@ -194,7 +195,7 @@ function sendError(res: ServerResponse, status: number, error: unknown, requestI
     ok: false,
     error: {
       code: errorCode(error),
-      message: errorText(error),
+      message: error instanceof LockBusyError ? "Pi Scholar is busy; try again later." : errorText(error),
       ...(error instanceof Error && "details" in error && isRecord(error.details)
         ? { details: jsonSafe(error.details) }
         : {}),

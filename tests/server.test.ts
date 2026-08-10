@@ -20,6 +20,7 @@ import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import type { QuizRecord } from "../src/contracts.js";
 import { type ServerOptions, startServer } from "../src/server.js";
+import { LockBusyError } from "../src/vault.js";
 
 async function withServer(
   application: ScholarApplication,
@@ -581,6 +582,32 @@ describe("server browser boundary", () => {
         assert.equal(response.status, 400);
       }
       assert.equal(calls, 0);
+    });
+  });
+
+  it("sanitizes lock diagnostics at the HTTP boundary", async () => {
+    const application = {
+      stageSource: async () => {
+        throw new LockBusyError("/private/vault/.pi-scholar/writer.lock");
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/sources`, {
+        method: "POST",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ kind: "text", text: "valid source text" }),
+      });
+      const payload = await response.text();
+      const body = JSON.parse(payload) as {
+        readonly error: { readonly code: string; readonly message: string };
+      };
+      assert.equal(response.status, 409);
+      assert.equal(body.error.code, "LOCK_BUSY");
+      assert.equal(body.error.message, "Pi Scholar is busy; try again later.");
+      assert.equal(payload.includes("/private"), false);
+      assert.equal(payload.includes("writer.lock"), false);
     });
   });
   it("accepts deterministic RFC v5 source IDs for removal preview", async () => {

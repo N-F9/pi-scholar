@@ -147,7 +147,7 @@ export function AddPage() {
     },
     onError: (error) => {
       const sourceId = preview?.source.sourceId;
-      if (error instanceof ApiRequestError && error.status === 409 && sourceId) {
+      if (error instanceof ApiRequestError && error.status === 409 && error.code === "revision-conflict" && sourceId) {
         setPreview(undefined);
         previewRemoval.mutate(sourceId);
       }
@@ -321,7 +321,9 @@ export function AddPage() {
                   {remove.isError ? (
                     <p className="mt-3 text-sm text-danger" role="alert">
                       {errorMessage(remove.error)}
-                      {remove.error instanceof ApiRequestError && remove.error.status === 409
+                      {remove.error instanceof ApiRequestError &&
+                      remove.error.status === 409 &&
+                      remove.error.code === "revision-conflict"
                         ? " The impact changed; review the refreshed preview before confirming."
                         : ""}
                     </p>

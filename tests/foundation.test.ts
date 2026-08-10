@@ -711,7 +711,12 @@ describe("vault foundation", () => {
       assert.notEqual(editedPreview.confirmationId, initialPreview.confirmationId);
       await assert.rejects(
         sources.removeConfirmed(result.sourceId, initialPreview.confirmationId),
-        /stale removal confirmation/iu,
+        (error: unknown) => {
+          if (!(error instanceof Error) || !("code" in error)) return false;
+          assert.equal(error.code, "revision-conflict");
+          assert.match(error.message, /stale removal confirmation/iu);
+          return true;
+        },
       );
       writeFileSync(pagePath, page.content);
       assert.equal(sources.removalPreview(result.sourceId).confirmationId, initialPreview.confirmationId);
