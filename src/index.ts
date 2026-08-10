@@ -10,9 +10,9 @@ export type {
   WikiSearchResult,
 } from "./application/application.js";
 export { createApplication, ScholarApplication } from "./application/application.js";
-export * from "./contracts.js";
 export * from "./database.js";
 export * from "./doctor.js";
+export * from "./okf.js";
 export { FORBIDDEN_SHEET_TEXT, QuizConflictError, QuizService } from "./quiz.js";
 export { localDate, RevisionConflictError, SchedulerService, ValidationError } from "./scheduler.js";
 export type { ScholarServer, ServerOptions } from "./server.js";

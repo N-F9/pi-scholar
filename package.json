@@ -56,12 +56,14 @@
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
     "busboy": "1.6.0",
+    "mdast-util-from-markdown": "2.0.3",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
     "react-router-dom": "7.18.2",
     "remark-gfm": "4.0.1",
-    "ts-fsrs": "5.4.1"
+    "ts-fsrs": "5.4.1",
+    "yaml": "2.9.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

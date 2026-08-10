@@ -4,7 +4,19 @@ import { dirname, join, normalize, relative } from "node:path";
 import type { WikiIssueRecord } from "./contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
 import { qmdCollectionName } from "./external/qmd.js";
-import { safeRelativePath, type VaultPaths } from "./vault.js";
+import {
+  type OkfProjectionPage,
+  okfCitationText,
+  okfFootnoteLabels,
+  okfMarkdownEscapedAt,
+  parseOkfConcept,
+  removeOkfFootnoteDefinitions,
+  renderOkfIndex,
+  renderOkfLog,
+  serializeOkfConcept,
+  validateOkfConcept,
+} from "./okf.js";
+import { readFileNoFollow, safeRelativePath, type VaultPaths } from "./vault.js";
 
 export type WikiIssueKind = "incorrect" | "unclear" | "missing" | "bad-boundary";
 export type WikiIssueStatus = "open" | "resolved" | "reopened";
@@ -25,6 +37,7 @@ export interface WikiPageInput {
   body: string;
   pageId?: string;
   quizWorthiness?: "eligible" | "skip" | "unknown";
+  frontmatter?: Record<string, unknown>;
 }
 export type DriftResolution = "record-issue" | "restore";
 export interface QmdAdapter {
@@ -108,9 +121,6 @@ function normalizePagePath(
     throw new Error("reserved wiki path");
   return { relativePath, absolutePath: absolute };
 }
-function yamlValue(value: string): string {
-  return JSON.stringify(value);
-}
 export function isExecutableHtml(value: string): boolean {
   return (
     BLOCKED_TAG.test(value) || EVENT_ATTRIBUTE.test(value) || DANGEROUS_URI.test(value) || DANGEROUS_DATA.test(value)
@@ -119,42 +129,26 @@ export function isExecutableHtml(value: string): boolean {
 function assertInertMarkdown(body: string): void {
   if (isExecutableHtml(body)) throw new Error("raw executable HTML is not allowed in wiki Markdown");
 }
-function parseFrontmatter(content: string): { fields: Record<string, string>; body: string } {
-  if (!content.startsWith("---\n")) throw new Error("wiki page requires frontmatter");
-  const end = content.indexOf("\n---\n", 4);
-  if (end < 0) throw new Error("unterminated wiki frontmatter");
-  const fields: Record<string, string> = {};
-  for (const line of content.slice(4, end).split("\n")) {
-    if (!line) continue;
-    const match = /^([A-Za-z][A-Za-z0-9_-]*):(?:\s*)(.*)$/u.exec(line);
-    if (!match) throw new Error("invalid wiki frontmatter");
-    const key = match[1];
-    if (key === undefined || key in fields) throw new Error("invalid wiki frontmatter");
-    let value = match[2] ?? "";
-    if (value.startsWith('"')) {
-      try {
-        value = JSON.parse(value) as string;
-      } catch {
-        throw new Error("invalid wiki frontmatter value");
-      }
-    } else if (value.startsWith("'")) {
-      if (!value.endsWith("'")) throw new Error("invalid wiki frontmatter value");
-      value = value.slice(1, -1).replaceAll("''", "'");
-    }
-    fields[key] = value;
-  }
-  return { fields, body: content.slice(end + 5) };
-}
-function serializePage(
-  pageId: string,
-  title: string,
-  body: string,
-  quizWorthiness: string,
-  createdAt: string,
-  updatedAt: string,
-): string {
+function serializePage(frontmatter: Record<string, unknown>, body: string): string {
   assertInertMarkdown(body);
-  return `---\nid: ${yamlValue(pageId)}\ntitle: ${yamlValue(title)}\ntype: note\ncreated: ${yamlValue(createdAt)}\nupdated: ${yamlValue(updatedAt)}\nquiz-worthiness: ${yamlValue(quizWorthiness)}\n---\n${body.endsWith("\n") ? body : `${body}\n`}`;
+  return serializeOkfConcept(frontmatter, body);
+}
+type SourceChunkCitationRow = {
+  chunk_id: string;
+  source_id: string;
+  ordinal: number;
+  chunk_digest: string;
+  source_digest: string | null;
+  display_name: string;
+  status: string;
+};
+const UUID_CHUNK_REFERENCE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/iu;
+const UUID_CHUNK_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+/giu;
+function sourceCitationId(row: SourceChunkCitationRow): string {
+  return `${row.source_id}:${row.ordinal}`;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function rowToPage(row: PageRow, body?: string): WikiPage {
   const page: WikiPage = {
@@ -194,29 +188,28 @@ function linksFromMarkdown(body: string): string[] {
   }
   return links;
 }
-function validateMarkdownLinks(root: string, pagePath: string, body: string): void {
-  for (const raw of linksFromMarkdown(body)) {
-    const target = raw.split("#", 1)[0] ?? raw;
-    if (!target || /^https?:\/\//iu.test(target)) continue;
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(target);
-    } catch {
-      throw new Error("invalid Markdown link encoding");
-    }
-    if (
-      !decoded ||
-      decoded.startsWith("/") ||
-      decoded.startsWith("//") ||
-      decoded.includes("\\") ||
-      /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(decoded) ||
-      /^[A-Za-z]:/u.test(decoded)
-    ) {
-      throw new Error(`unsafe Markdown link: ${target}`);
-    }
-    const candidate = normalize(join(dirname(pagePath), decoded)).replaceAll("\\", "/");
-    safeRelativePath(root, candidate);
+function resolveWikiLink(root: string, pagePath: string, target: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(target);
+  } catch {
+    throw new Error("invalid Markdown link encoding");
   }
+  if (
+    !decoded ||
+    decoded.startsWith("//") ||
+    decoded.includes("\\") ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(decoded) ||
+    /^[A-Za-z]:/u.test(decoded)
+  )
+    throw new Error(`unsafe Markdown link: ${target}`);
+  const candidate = decoded.startsWith("/")
+    ? decoded.slice(1)
+    : normalize(join(dirname(pagePath), decoded)).replaceAll("\\", "/");
+  return relative(root, safeRelativePath(root, candidate)).replaceAll("\\", "/");
+}
+function validateMarkdownLinks(root: string, pagePath: string, body: string): void {
+  for (const target of linksFromMarkdown(body)) resolveWikiLink(root, pagePath, target);
 }
 function titleFromPath(path: string): string {
   const name = path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? path;
@@ -308,7 +301,7 @@ export class WikiService {
     return {
       digest: String(snapshot.digest),
       revision: Number(snapshot.revision),
-      content: readFileSync(path, "utf8"),
+      content: readFileNoFollow(path).toString("utf8"),
     };
   }
   private async authoredPage(page: WikiPage): Promise<(WikiPage & { content: string }) | undefined> {
@@ -375,6 +368,99 @@ export class WikiService {
       );
     });
   }
+  private sourceRows(): SourceChunkCitationRow[] {
+    return dbAll<SourceChunkCitationRow>(
+      this.db,
+      "SELECT c.chunk_id, c.source_id, c.ordinal, c.digest AS chunk_digest, s.digest AS source_digest, s.display_name, s.status FROM source_chunks c JOIN sources s ON s.source_id = c.source_id WHERE s.status != 'removed' ORDER BY c.source_id, c.ordinal",
+    ).map((row) => ({
+      ...row,
+      chunk_id: String(row.chunk_id),
+      source_id: String(row.source_id),
+      ordinal: Number(row.ordinal),
+      chunk_digest: String(row.chunk_digest),
+      source_digest: row.source_digest === null ? null : String(row.source_digest),
+      display_name: String(row.display_name),
+      status: String(row.status),
+    }));
+  }
+  private sourceAwareContent(
+    frontmatter: Record<string, unknown>,
+    body: string,
+  ): {
+    frontmatter: Record<string, unknown>;
+    body: string;
+  } {
+    const rows = this.sourceRows();
+    const byId = new Map<string, SourceChunkCitationRow>();
+    for (const row of rows) {
+      const expectedId = sourceCitationId(row);
+      if (row.chunk_id !== expectedId) throw new Error(`source chunk identity is invalid: ${row.chunk_id}`);
+      byId.set(expectedId, row);
+    }
+    const cited = new Map<string, SourceChunkCitationRow>();
+    const labels = okfFootnoteLabels(body);
+    const citationText = okfCitationText(body);
+    for (const label of labels.references) {
+      const row = byId.get(label);
+      if (row) cited.set(label, row);
+      else if (UUID_CHUNK_REFERENCE.test(label)) throw new Error(`unknown source chunk citation: ${label}`);
+    }
+    for (const match of citationText.matchAll(UUID_CHUNK_TEXT)) {
+      const label = match[0];
+      const offset = match.index;
+      if (!label || offset === undefined) continue;
+      const opening = offset - 2;
+      if (opening >= 0 && citationText.slice(opening, offset) === "[^" && okfMarkdownEscapedAt(citationText, opening))
+        continue;
+      if (!byId.has(label)) throw new Error(`unknown source chunk citation: ${label}`);
+      if (citationText.slice(Math.max(0, offset - 2), offset) !== "[^" || citationText[offset + label.length] !== "]")
+        throw new Error(`raw source chunk ID is not a keyed footnote reference: ${label}`);
+    }
+    const next = { ...frontmatter };
+    if (next.sources !== undefined && !Array.isArray(next.sources))
+      throw new Error("OKF sources must be a YAML sequence");
+    const existingSources = Array.isArray(next.sources) ? next.sources : [];
+    if (existingSources.some((source) => !isRecord(source)))
+      throw new Error("OKF source entries must be YAML mappings");
+    const priorManagedIds = existingSources
+      .filter(
+        (source) =>
+          isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar" && typeof source.id === "string",
+      )
+      .map((source) => String(source.id));
+    const retainedSources = existingSources.filter(
+      (source) => !(isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar"),
+    );
+    const managedSources = [...cited.values()].map((row) => ({
+      id: sourceCitationId(row),
+      resource: `pi-scholar://source/${row.source_id}/chunk/${row.ordinal}`,
+      title: row.display_name,
+      pi_scholar: {
+        managed_by: "pi-scholar",
+        source_id: row.source_id,
+        chunk_id: row.chunk_id,
+        ordinal: row.ordinal,
+        ...(row.source_digest ? { source_digest: row.source_digest } : {}),
+        chunk_digest: row.chunk_digest,
+      },
+    }));
+    if (retainedSources.length || managedSources.length || Array.isArray(next.sources))
+      next.sources = [...retainedSources, ...managedSources];
+    const definitions = managedSources.map((source) => `[^${source.id}]: Pi Scholar source evidence`);
+    let nextBody = removeOkfFootnoteDefinitions(
+      body,
+      new Set([...priorManagedIds, ...managedSources.map((source) => source.id)]),
+    );
+    if (definitions.length) {
+      if (!nextBody.endsWith("\n")) nextBody += "\n";
+      nextBody += `\n${definitions.join("\n")}\n`;
+    }
+    return { frontmatter: next, body: nextBody };
+  }
+  private serializeContent(frontmatter: Record<string, unknown>, body: string): string {
+    const prepared = this.sourceAwareContent(frontmatter, body);
+    return serializePage(prepared.frontmatter, prepared.body);
+  }
   async create(input: WikiPageInput): Promise<WikiCreateResult> {
     const location = normalizePagePath(this.paths, input.path);
     if (this.catalogByPath(location.relativePath)) throw new Error("wiki path already exists");
@@ -383,7 +469,17 @@ export class WikiService {
     const pageId = randomUUID();
     const createdAt = now();
     const title = input.title ?? titleFromPath(location.relativePath);
-    const content = serializePage(pageId, title, input.body, input.quizWorthiness ?? "unknown", createdAt, createdAt);
+    const quizWorthiness = input.quizWorthiness ?? "unknown";
+    const frontmatter: Record<string, unknown> = {
+      ...(input.frontmatter ?? {}),
+      id: pageId,
+      title,
+      type: input.frontmatter?.type ?? "note",
+      created: createdAt,
+      updated: createdAt,
+      "quiz-worthiness": quizWorthiness,
+    };
+    const content = this.serializeContent(frontmatter, input.body);
     validateMarkdownLinks(this.root(), location.relativePath, input.body);
     const page: WikiPage = {
       pageId,
@@ -459,19 +555,25 @@ export class WikiService {
     const location = normalizePagePath(this.paths, input.path ?? page.relativePath);
     if (location.relativePath !== page.relativePath) throw new Error("page path changes must use rename");
     const current = await fs.readFile(location.absolutePath, "utf8");
-    const parsed = parseFrontmatter(current);
-    if (parsed.fields.id !== pageId) throw new Error("page ID mismatch");
+    const parsed = parseOkfConcept(current);
+    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
     const expected = input.expectedDigest ?? page.digest;
     if (expected !== digest(current)) throw new Error("page changed since it was read");
     const body = input.body ?? parsed.body;
-    const content = serializePage(
-      pageId,
-      input.title ?? parsed.fields.title ?? page.title,
-      body,
-      input.quizWorthiness ?? page.quizWorthiness,
-      parsed.fields.created ?? updatedAt,
-      updatedAt,
-    );
+    const title =
+      input.title ??
+      (typeof parsed.frontmatter.title === "string" ? parsed.frontmatter.title : undefined) ??
+      page.title;
+    const quizWorthiness = input.quizWorthiness ?? page.quizWorthiness;
+    const frontmatter: Record<string, unknown> = {
+      ...parsed.frontmatter,
+      id: pageId,
+      title,
+      created: typeof parsed.frontmatter.created === "string" ? parsed.frontmatter.created : updatedAt,
+      updated: updatedAt,
+      "quiz-worthiness": quizWorthiness,
+    };
+    const content = this.serializeContent(frontmatter, body);
     validateMarkdownLinks(this.root(), page.relativePath, body);
     const updated: WikiPage = {
       ...page,
@@ -595,8 +697,18 @@ export class WikiService {
     await this.assertDestinationAbsent(to.absolutePath);
     const priorPageBytes = await fs.readFile(from.absolutePath);
     const content = priorPageBytes.toString("utf8");
-    const parsed = parseFrontmatter(content);
-    if (parsed.fields.id !== pageId) throw new Error("page ID mismatch");
+    const parsed = parseOkfConcept(content);
+    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
+    const currentDigest = digest(content);
+    const authored = this.authored(pageId);
+    if (
+      currentDigest !== page.digest ||
+      !authored ||
+      authored.digest !== page.digest ||
+      authored.revision !== page.revision ||
+      digest(authored.content) !== page.digest
+    )
+      throw new Error("wiki page changed outside Pi Scholar; inspect drift before renaming");
     const snapshotPath = this.snapshotPath(page);
     const priorSnapshotRow = dbGet<SnapshotRow>(this.db, "SELECT * FROM authored_snapshots WHERE relative_path = ?", [
       page.relativePath,
@@ -892,7 +1004,7 @@ export class WikiService {
     if (!snapshot) throw new Error("product-authored snapshot is unavailable");
     const priorPageRow = this.catalog(pageId);
     if (!priorPageRow) throw new Error("page not found");
-    const parsed = parseFrontmatter(snapshot.content);
+    const parsed = parseOkfConcept(snapshot.content);
     const location = normalizePagePath(this.paths, report.page.relativePath);
     const snapshotPath = this.snapshotPath(report.page);
     const priorSnapshotRow = dbGet<SnapshotRow>(this.db, "SELECT * FROM authored_snapshots WHERE relative_path = ?", [
@@ -991,7 +1103,7 @@ export class WikiService {
       digest: snapshot.digest,
       revision: report.page.revision + 1,
       updatedAt: now(),
-      title: parsed.fields.title ?? report.page.title,
+      title: typeof parsed.frontmatter.title === "string" ? parsed.frontmatter.title : report.page.title,
     };
     try {
       await this.atomicWrite(location.absolutePath, snapshot.content);
@@ -1072,31 +1184,29 @@ export class WikiService {
   ): Promise<{ indexPath: string; logPath: string; backlinks: Record<string, string[]>; lint: string[] }> {
     const pages = (await this.list()).filter((page) => page.status === "active");
     const backlinks: Record<string, string[]> = {};
+    const projectionPages: OkfProjectionPage[] = [];
     for (const page of pages) {
       const content = (await this.readExact(page.relativePath)).toString("utf8");
-      validateMarkdownLinks(this.root(), page.relativePath, content);
-      for (const target of linksFromMarkdown(content)) {
-        const pageDirectory = dirname(page.relativePath);
-        const candidate = normalize(join(pageDirectory, target)).replaceAll("\\", "/");
-        const resolved = relative(this.root(), safeRelativePath(this.root(), candidate)).replaceAll("\\", "/");
+      const parsed = parseOkfConcept(content);
+      validateOkfConcept(content);
+      projectionPages.push({
+        title: page.title,
+        path: page.relativePath,
+        description: typeof parsed.frontmatter.description === "string" ? parsed.frontmatter.description : undefined,
+        updatedAt: page.updatedAt,
+        digest: page.digest,
+      });
+      validateMarkdownLinks(this.root(), page.relativePath, parsed.body);
+      for (const target of linksFromMarkdown(parsed.body)) {
+        const resolved = resolveWikiLink(this.root(), page.relativePath, target);
         const backlinksForTarget = backlinks[resolved] ?? [];
         backlinks[resolved] = backlinksForTarget;
         backlinksForTarget.push(page.relativePath);
       }
     }
     for (const list of Object.values(backlinks)) list.sort();
-    const indexBody = [
-      "# Wiki index",
-      "",
-      ...pages.map((page) => `- [${page.title}](${page.relativePath}) — ${page.pageId}`),
-      "",
-    ].join("\n");
-    const logBody = [
-      "# Wiki log",
-      "",
-      ...pages.map((page) => `- ${page.updatedAt} ${page.relativePath} ${page.digest}`),
-      "",
-    ].join("\n");
+    const indexBody = renderOkfIndex(projectionPages);
+    const logBody = renderOkfLog(projectionPages);
     const indexPath = join(this.root(), "index.md");
     const logPath = join(this.root(), "log.md");
     if (write) {
@@ -1115,11 +1225,15 @@ export class WikiService {
       try {
         const content = readFileSync(join(this.root(), page.relativePath), "utf8");
         assertInertMarkdown(content);
-        const parsed = parseFrontmatter(content);
-        if (parsed.fields.id !== page.pageId || !ID.test(parsed.fields.id))
+        const parsed = parseOkfConcept(content);
+        validateOkfConcept(content);
+        const parsedId = parsed.frontmatter.id;
+        if (parsedId !== page.pageId || typeof parsedId !== "string" || !ID.test(parsedId))
           errors.push(`${page.relativePath}: stable page ID mismatch`);
-        for (const field of ["title", "type", "created", "updated"])
-          if (!parsed.fields[field]) errors.push(`${page.relativePath}: missing ${field}`);
+        for (const field of ["title", "type", "created", "updated"]) {
+          const value = parsed.frontmatter[field];
+          if (typeof value !== "string" || !value.trim()) errors.push(`${page.relativePath}: missing ${field}`);
+        }
         if (digest(content) !== page.digest) errors.push(`${page.relativePath}: catalog digest mismatch`);
       } catch (error) {
         errors.push(`${page.relativePath}: ${error instanceof Error ? error.message : String(error)}`);
@@ -1131,21 +1245,14 @@ export class WikiService {
     return errors;
   }
 }
+export function parseWikiMarkdown(content: string): { frontmatter: Record<string, unknown>; body: string } {
+  return parseOkfConcept(content);
+}
+export function serializeWikiMarkdown(frontmatter: Record<string, unknown>, body: string): string {
+  assertInertMarkdown(body);
+  return serializeOkfConcept(frontmatter, body);
+}
 
-export function parseWikiMarkdown(content: string): { fields: Record<string, string>; body: string } {
-  return parseFrontmatter(content);
-}
-export function serializeWikiMarkdown(
-  pageId: string,
-  title: string,
-  body: string,
-  quizWorthiness = "unknown",
-  createdAt = now(),
-  updatedAt = createdAt,
-): string {
-  if (!ID.test(pageId)) throw new Error("page ID must be host-minted UUID");
-  return serializePage(pageId, title, body, quizWorthiness, createdAt, updatedAt);
-}
 export function sanitizeImportedMarkdown(value: string): string {
   return value
     .replace(/<\s*(script|style|iframe|object|embed|form|base|meta|link)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/giu, "")

@@ -17,6 +17,17 @@ import { openDatabase, SCHEMA_VERSION, type ScholarDatabase, validateSchema } fr
 import { doclingDependencyIdentity } from "./external/docling.js";
 import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
+import {
+  okfCitationText,
+  okfDate,
+  okfFootnoteLabels,
+  okfMarkdownEscapedAt,
+  parseOkfConcept,
+  renderOkfIndex,
+  renderOkfLog,
+  validateOkfIndex,
+  validateOkfLog,
+} from "./okf.js";
 import { QuizService } from "./quiz.js";
 import { localDate, SchedulerService } from "./scheduler.js";
 import { validateFileEndpointsSync } from "./sources/source-chunks.js";
@@ -715,48 +726,267 @@ function checkWorkflows(paths: VaultPaths): DoctorCheck {
 }
 
 const PAGE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const DIGEST_PATTERN = /^[0-9a-f]{64}$/iu;
+const CHUNK_CITATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/iu;
+const CHUNK_CITATION_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+/giu;
 
-function pageIdFromMarkdown(markdown: string): string | undefined {
-  const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/u.exec(markdown)?.[1];
-  return /^(?:page[-_]id|id):\s*["']?([^\s"']+)["']?\s*$/mu.exec(frontmatter ?? "")?.[1];
+type WikiConcept = {
+  readonly relativePath: string;
+  readonly markdown: string;
+  readonly body: string;
+  readonly frontmatter: Record<string, unknown>;
+};
+
+type IndexEntry = { readonly path: string; readonly title: string };
+type LogEntry = { readonly path: string; readonly date: string };
+
+function asRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    throw new Error(`${label} must be a mapping`);
+  return value as Record<string, unknown>;
 }
 
-function checkPages(paths: VaultPaths): DoctorCheck {
+function canonicalWikiLink(value: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    throw new Error(`invalid OKF link encoding: ${value}`);
+  }
+  if (!decoded || decoded.startsWith("//") || decoded.includes("\\") || /[\u0000-\u001f\u007f]/u.test(decoded))
+    throw new Error(`invalid OKF link path: ${value}`);
+  return decoded.replace(/^\.\/+/u, "").replace(/^\/+/u, "");
+}
+
+function validateIndex(markdown: string, root: boolean): IndexEntry[] {
+  validateOkfIndex(markdown, root);
+  if (!root) return [];
+  const match = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/u.exec(markdown);
+  if (!match) throw new Error('root index must declare okf_version "0.2"');
+  const body = markdown.slice(match[0].length);
+  const entries: IndexEntry[] = [];
+  for (const line of body.replaceAll("\r\n", "\n").split("\n")) {
+    if (!line.trim() || /^#{1,6}\s+\S/u.test(line)) continue;
+    const entry = /^\* \[([^\]\r\n]+)\]\(([^)\r\n]+)\)(?: - \S(?:.*\S)?)?$/u.exec(line);
+    if (!entry) throw new Error("invalid OKF index entry");
+    entries.push({ title: entry[1]!, path: canonicalWikiLink(entry[2]!) });
+  }
+  return entries;
+}
+function validateLog(markdown: string, collectEntries: boolean): LogEntry[] {
+  validateOkfLog(markdown);
+  if (!collectEntries) return [];
+  const lines = markdown.replaceAll("\r\n", "\n").split("\n");
+  const entries: LogEntry[] = [];
+  let date: string | undefined;
+  for (const line of lines) {
+    if (!line.trim() || /^#\s+\S.*$/u.test(line)) continue;
+    const dateHeading = /^##\s+(\d{4}-\d{2}-\d{2})$/u.exec(line);
+    if (dateHeading) {
+      date = dateHeading[1]!;
+      continue;
+    }
+    if (/^#{1,6}\s/u.test(line)) throw new Error("invalid OKF log heading");
+    if (!date) throw new Error("OKF log entry has no date");
+    const target = /\[[^\]\r\n]+\]\(([^)\r\n]+)\)/u.exec(line)?.[1];
+    if (target) entries.push({ date, path: canonicalWikiLink(target) });
+  }
+  return entries;
+}
+
+function footnoteSets(body: string): { readonly references: Set<string>; readonly definitions: Set<string> } {
+  const labels = okfFootnoteLabels(body);
+  return { references: new Set(labels.references), definitions: new Set(labels.definitions) };
+}
+function sourceIdentity(
+  item: Record<string, unknown>,
+): { readonly sourceId: string; readonly chunkId: string; readonly ordinal: number } | undefined {
+  const pi = item.pi_scholar;
+  if (pi === undefined || pi === null || typeof pi !== "object" || Array.isArray(pi)) return undefined;
+  const metadata = pi as Record<string, unknown>;
+  const managedBy = metadata.managed_by;
+  if (managedBy !== "pi-scholar") return undefined;
+  const sourceId = metadata.source_id;
+  const chunkId = metadata.chunk_id;
+  const ordinal = metadata.ordinal;
+  if (
+    typeof sourceId !== "string" ||
+    typeof chunkId !== "string" ||
+    typeof ordinal !== "number" ||
+    !Number.isSafeInteger(ordinal) ||
+    ordinal < 0
+  )
+    throw new Error("invalid Pi Scholar source identity");
+  return { sourceId, chunkId, ordinal };
+}
+
+function validateConceptSources(
+  concept: WikiConcept,
+  pageStatus: string,
+  sourceRows: ReadonlyMap<string, { readonly digest: string | null; readonly status: string }>,
+  chunkRows: ReadonlyMap<string, { readonly source_id: string; readonly ordinal: number; readonly digest: string }>,
+): void {
+  const sources = concept.frontmatter.sources;
+  const sourceItems = (Array.isArray(sources) ? sources : []).map((item) => asRecord(item, "source entry"));
+  const references = footnoteSets(concept.body);
+  const sourceIds = new Set<string>();
+  const managedIds = new Set<string>();
+  for (const item of sourceItems) {
+    if (typeof item.resource !== "string" || !item.resource.trim()) throw new Error("source resource is required");
+    if (item.id !== undefined) {
+      if (typeof item.id !== "string" || !item.id.trim()) throw new Error("source id must be a nonempty string");
+      if (sourceIds.has(item.id)) throw new Error(`duplicate source id ${item.id}`);
+      sourceIds.add(item.id);
+    }
+    const identity = sourceIdentity(item);
+    if (!identity) continue;
+    managedIds.add(identity.chunkId);
+    const sourceId = item.id;
+    const resource = `pi-scholar://source/${identity.sourceId}/chunk/${identity.ordinal}`;
+    const metadata = asRecord(item.pi_scholar, "pi_scholar");
+    const sourceDigest = metadata.source_digest;
+    const chunkDigest = metadata.chunk_digest;
+    if (
+      sourceId !== identity.chunkId ||
+      item.resource !== resource ||
+      typeof item.title !== "string" ||
+      !item.title.trim() ||
+      identity.chunkId !== `${identity.sourceId}:${identity.ordinal}` ||
+      typeof sourceDigest !== "string" ||
+      !DIGEST_PATTERN.test(sourceDigest) ||
+      typeof chunkDigest !== "string" ||
+      !DIGEST_PATTERN.test(chunkDigest)
+    )
+      throw new Error(`invalid Pi Scholar source metadata: ${String(sourceId ?? identity.chunkId)}`);
+    const source = sourceRows.get(identity.sourceId);
+    const chunk = chunkRows.get(identity.chunkId);
+    if (
+      !source ||
+      source.digest !== sourceDigest ||
+      !chunk ||
+      chunk.source_id !== identity.sourceId ||
+      chunk.ordinal !== identity.ordinal ||
+      chunk.digest !== chunkDigest
+    )
+      throw new Error(`Pi Scholar source/chunk identity or digest mismatch: ${identity.chunkId}`);
+    if (pageStatus === "active" && source.status !== "published")
+      throw new Error(`active page cites unavailable Pi Scholar source: ${identity.sourceId}`);
+  }
+  for (const label of [...references.references, ...references.definitions]) {
+    if (chunkRows.has(label) && !managedIds.has(label))
+      throw new Error(`known source chunk is not Pi Scholar managed: ${label}`);
+  }
+  for (const item of sourceItems) {
+    const identity = sourceIdentity(item);
+    if (identity && (!references.references.has(identity.chunkId) || !references.definitions.has(identity.chunkId)))
+      throw new Error(`Pi Scholar source must have a claim reference and definition: ${identity.chunkId}`);
+  }
+  const citationText = okfCitationText(concept.body);
+  for (const match of citationText.matchAll(CHUNK_CITATION_TEXT)) {
+    const chunkId = match[0];
+    const offset = match.index;
+    if (
+      offset !== undefined &&
+      offset >= 2 &&
+      citationText.slice(offset - 2, offset) === "[^" &&
+      okfMarkdownEscapedAt(citationText, offset - 2)
+    )
+      continue;
+    if (!chunkRows.has(chunkId)) continue;
+    if (
+      offset === undefined ||
+      offset < 2 ||
+      citationText.slice(offset - 2, offset) !== "[^" ||
+      citationText[offset + chunkId.length] !== "]"
+    )
+      throw new Error(`raw source chunk ID outside keyed footnote: ${chunkId}`);
+  }
+  for (const label of references.references) {
+    if (CHUNK_CITATION_PATTERN.test(label) && !chunkRows.has(label))
+      throw new Error(`unknown Pi Scholar chunk reference: ${label}`);
+  }
+}
+
+function checkPages(paths: VaultPaths): DoctorCheck[] {
   let files: string[];
   try {
     files = collectFiles(paths.wikiRoot, ".md");
   } catch (error) {
-    return check("page-ids", "fail", `Cannot traverse wiki pages: ${errorMessage(error)}`);
+    return [check("page-ids", "fail", `Cannot traverse wiki pages: ${errorMessage(error)}`)];
   }
   files = files.filter(
     (relativePath) =>
       relativePath.startsWith("SYMLINK:") || (!relativePath.startsWith(".snapshots/") && relativePath !== ".snapshots"),
   );
   const ids = new Map<string, string>();
+  const concepts: WikiConcept[] = [];
+  let rootIndex: IndexEntry[] = [];
+  let rootLog: LogEntry[] = [];
+  let rootIndexMarkdown = "";
+  let rootLogMarkdown = "";
+  let hasRootIndex = false;
+  let hasRootLog = false;
   for (const relativePath of files) {
     if (relativePath.startsWith("SYMLINK:"))
-      return check("page-ids", "fail", `Wiki contains symlink: ${relativePath.slice(8)}`);
-    const baseName = relativePath.split("/").at(-1)?.toLowerCase();
-    if (baseName === "index.md" || baseName === "log.md") continue;
+      return [check("page-ids", "fail", `Wiki contains symlink: ${relativePath.slice(8)}`)];
     const absolutePath = join(paths.wikiRoot, relativePath);
     let markdown: string;
     try {
       markdown = readFileNoFollow(absolutePath).toString("utf8");
     } catch (error) {
-      return check("page-ids", "fail", `Cannot read wiki page ${relativePath}: ${errorMessage(error)}`);
+      return [check("page-ids", "fail", `Cannot read wiki page ${relativePath}: ${errorMessage(error)}`)];
     }
-    const pageId = pageIdFromMarkdown(markdown);
-    if (!pageId || !PAGE_ID_PATTERN.test(pageId))
-      return check("page-ids", "fail", `Wiki page has invalid stable page ID: ${relativePath}`);
-    const previous = ids.get(pageId);
-    if (previous) return check("page-ids", "fail", `Duplicate page_id ${pageId}: ${previous} and ${relativePath}`);
-    ids.set(pageId, relativePath);
+    const baseName = relativePath.split("/").at(-1);
+    try {
+      if (baseName === "index.md") {
+        const root = relativePath === "index.md";
+        const entries = validateIndex(markdown, root);
+        if (root) {
+          rootIndex = entries;
+          rootIndexMarkdown = markdown;
+          hasRootIndex = true;
+        }
+        continue;
+      }
+      if (baseName === "log.md") {
+        const root = relativePath === "log.md";
+        const entries = validateLog(markdown, root);
+        if (root) {
+          rootLog = entries;
+          rootLogMarkdown = markdown;
+          hasRootLog = true;
+        }
+        continue;
+      }
+      const parsed = parseOkfConcept(markdown);
+      const pageId = parsed.frontmatter.id;
+      if (typeof pageId !== "string" || !PAGE_ID_PATTERN.test(pageId))
+        throw new Error(`Wiki page has invalid stable page ID: ${relativePath}`);
+      const previous = ids.get(pageId);
+      if (previous) throw new Error(`Duplicate page_id ${pageId}: ${previous} and ${relativePath}`);
+      ids.set(pageId, relativePath);
+      concepts.push({ relativePath, markdown, body: parsed.body, frontmatter: parsed.frontmatter });
+    } catch (error) {
+      return [check("okf", "fail", `${relativePath}: ${errorMessage(error)}`)];
+    }
   }
+  if (!hasRootIndex || !hasRootLog)
+    return [check("okf", "fail", "Wiki bundle requires root index.md and log.md projections")];
   let db: ScholarDatabase | undefined;
+  let okfValidated = false;
+  const okfMessage = `${concepts.length} concept(s), ${rootIndex.length} index entr${rootIndex.length === 1 ? "y" : "ies"}, and ${rootLog.length} log entr${rootLog.length === 1 ? "y" : "ies"} conform to OKF v0.2`;
   try {
     db = openDatabase(paths, { readOnly: true, initializeSchema: false });
-    const rows = db.all<{ page_id: string; relative_path: string; digest: string; revision: number; status: string }>(
-      "SELECT page_id, relative_path, digest, revision, status FROM pages",
+    const rows = db.all<{
+      page_id: string;
+      relative_path: string;
+      title: string;
+      digest: string;
+      revision: number;
+      status: string;
+      updated_at: string;
+    }>(
+      "SELECT page_id, relative_path, title, digest, revision, status, updated_at FROM pages ORDER BY relative_path, page_id",
     );
     const byPath = new Map(rows.map((row) => [row.relative_path, row]));
     const snapshots = db.all<{ relative_path: string; digest: string; revision: number }>(
@@ -764,65 +994,177 @@ function checkPages(paths: VaultPaths): DoctorCheck {
     );
     const snapshotsByPath = new Map(snapshots.map((row) => [row.relative_path, row]));
     const byPageId = new Map(rows.map((row) => [row.page_id, row]));
+    const sourceRows = new Map(
+      db
+        .all<{ source_id: string; digest: string | null; status: string }>(
+          "SELECT source_id, digest, status FROM sources",
+        )
+        .map((row) => [row.source_id, row]),
+    );
+    const chunkRows = new Map(
+      db
+        .all<{ chunk_id: string; source_id: string; ordinal: number; digest: string }>(
+          "SELECT chunk_id, source_id, ordinal, digest FROM source_chunks",
+        )
+        .map((row) => [row.chunk_id, row]),
+    );
+    for (const concept of concepts) {
+      const page = byPath.get(concept.relativePath);
+      if (!page) throw new Error(`Page catalog has no matching wiki artifact: ${concept.relativePath}`);
+      validateConceptSources(concept, page.status, sourceRows, chunkRows);
+    }
+    const active = rows.filter((row) => row.status === "active");
+    const conceptByPath = new Map(concepts.map((concept) => [concept.relativePath, concept]));
+    const projectionPages = active.map((row) => {
+      const concept = conceptByPath.get(row.relative_path);
+      if (!concept) throw new Error(`Page catalog has no matching wiki artifact: ${row.relative_path}`);
+      return {
+        title: row.title,
+        path: row.relative_path,
+        description: typeof concept.frontmatter.description === "string" ? concept.frontmatter.description : undefined,
+        updatedAt: row.updated_at,
+        digest: row.digest,
+      };
+    });
+    if (rootIndexMarkdown !== renderOkfIndex(projectionPages))
+      throw new Error("Root index does not match the generated active page projection");
+    if (rootLogMarkdown !== renderOkfLog(projectionPages))
+      throw new Error("Root log does not match the generated active page projection");
+    const activeByPath = new Map(active.map((row) => [row.relative_path, row]));
+    const indexPaths = new Set<string>();
+    for (const entry of rootIndex) {
+      if (indexPaths.has(entry.path) || !activeByPath.has(entry.path))
+        throw new Error(`Root index does not match active page catalog: ${entry.path}`);
+      indexPaths.add(entry.path);
+    }
+    if (indexPaths.size !== active.length) throw new Error("Root index does not list every active page");
+    const logPaths = new Set<string>();
+    for (const entry of rootLog) {
+      const row = activeByPath.get(entry.path);
+      if (!row || logPaths.has(entry.path) || okfDate(row.updated_at) !== entry.date)
+        throw new Error(`Root log does not match active page catalog: ${entry.path}`);
+      logPaths.add(entry.path);
+    }
+    if (logPaths.size !== active.length) throw new Error("Root log does not list every active page");
+    okfValidated = true;
     for (const relativePath of snapshotsByPath.keys()) {
       if (!byPath.has(relativePath))
-        return check("page-drift", "fail", `Authored snapshot catalog has no matching page: ${relativePath}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot catalog has no matching page: ${relativePath}`),
+        ];
     }
     let snapshotFiles: string[];
     try {
       snapshotFiles = collectFiles(join(paths.metadataRoot, "snapshots", "wiki"), ".md");
     } catch (error) {
-      return check("page-drift", "fail", `Cannot traverse authored wiki snapshots: ${errorMessage(error)}`);
+      return [
+        check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+        check("page-drift", "fail", `Cannot traverse authored wiki snapshots: ${errorMessage(error)}`),
+      ];
     }
     const snapshotIds = new Map<string, string>();
     for (const relativePath of snapshotFiles) {
       if (relativePath.startsWith("SYMLINK:"))
-        return check("page-drift", "fail", `Authored snapshot tree contains symlink: ${relativePath.slice(8)}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot tree contains symlink: ${relativePath.slice(8)}`),
+        ];
       if (relativePath.includes("/"))
-        return check("page-drift", "fail", `Authored snapshot has invalid path: ${relativePath}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot has invalid path: ${relativePath}`),
+        ];
       const pageId = relativePath.slice(0, -3);
       if (!PAGE_ID_PATTERN.test(pageId))
-        return check("page-drift", "fail", `Authored snapshot has a non-UUID filename: ${relativePath}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot has a non-UUID filename: ${relativePath}`),
+        ];
       if (snapshotIds.has(pageId))
-        return check("page-drift", "fail", `Duplicate authored snapshot filename: ${relativePath}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Duplicate authored snapshot filename: ${relativePath}`),
+        ];
       snapshotIds.set(pageId, relativePath);
       const row = byPageId.get(pageId);
-      if (!row) return check("page-drift", "fail", `Authored snapshot has no matching page: ${relativePath}`);
+      if (!row)
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot has no matching page: ${relativePath}`),
+        ];
       if (!snapshotsByPath.has(row.relative_path))
-        return check("page-drift", "fail", `Authored snapshot has no catalog row: ${relativePath}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot has no catalog row: ${relativePath}`),
+        ];
     }
     for (const [pageId, relativePath] of ids) {
       const row = byPath.get(relativePath);
-      if (!row || row.page_id !== pageId) return check("page-drift", "fail", `Page catalog mismatch: ${relativePath}`);
+      if (!row || row.page_id !== pageId)
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Page catalog mismatch: ${relativePath}`),
+        ];
       const digest = createHash("sha256")
         .update(readFileNoFollow(join(paths.wikiRoot, relativePath)))
         .digest("hex");
       if (row.digest !== digest && row.status !== "drifted")
-        return check("page-drift", "fail", `Page digest drifted without a drift record: ${relativePath}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Page digest drifted without a drift record: ${relativePath}`),
+        ];
     }
     for (const row of rows) {
       if (row.status === "retired") continue;
       if (ids.get(row.page_id) !== row.relative_path)
-        return check("page-drift", "fail", `Page catalog has no matching wiki artifact: ${row.relative_path}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Page catalog has no matching wiki artifact: ${row.relative_path}`),
+        ];
       if (!PAGE_ID_PATTERN.test(row.page_id))
-        return check("page-drift", "fail", `Page catalog has an invalid stable ID: ${row.relative_path}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Page catalog has an invalid stable ID: ${row.relative_path}`),
+        ];
       const snapshot = snapshotsByPath.get(row.relative_path);
-      if (!snapshot || snapshot.digest !== row.digest || Number(snapshot.revision) !== Number(row.revision))
-        return check("page-drift", "fail", `Authored snapshot catalog mismatch: ${row.relative_path}`);
+      const snapshotRevision = Number(snapshot?.revision);
+      const pageRevision = Number(row.revision);
+      const revisionMatches =
+        Number.isSafeInteger(snapshotRevision) &&
+        Number.isSafeInteger(pageRevision) &&
+        snapshotRevision > 0 &&
+        (row.status === "drifted" ? snapshotRevision <= pageRevision : snapshotRevision === pageRevision);
+      if (!snapshot || snapshot.digest !== row.digest || !revisionMatches)
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot catalog mismatch: ${row.relative_path}`),
+        ];
       const snapshotPath = safeRelativePath(join(paths.metadataRoot, "snapshots", "wiki"), `${row.page_id}.md`);
       const snapshotStat = lstatSync(snapshotPath);
       if (snapshotStat.isSymbolicLink() || !snapshotStat.isFile())
-        return check("page-drift", "fail", `Authored snapshot is not a regular file: ${row.relative_path}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot is not a regular file: ${row.relative_path}`),
+        ];
       const snapshotDigest = createHash("sha256").update(readFileNoFollow(snapshotPath)).digest("hex");
       if (snapshotDigest !== row.digest || snapshotDigest !== snapshot.digest)
-        return check("page-drift", "fail", `Authored snapshot digest mismatch: ${row.relative_path}`);
+        return [
+          check("okf", "pass", `${concepts.length} concept(s) conform to OKF`),
+          check("page-drift", "fail", `Authored snapshot digest mismatch: ${row.relative_path}`),
+        ];
     }
   } catch (error) {
-    return check("page-drift", "fail", `Cannot inspect page catalog: ${errorMessage(error)}`);
+    return okfValidated
+      ? [check("okf", "pass", okfMessage), check("page-drift", "fail", errorMessage(error))]
+      : [check("okf", "fail", errorMessage(error))];
   } finally {
     db?.close();
   }
-  return check("page-ids", "pass", `${ids.size} wiki page(s) have unique stable IDs and bidirectional catalog entries`);
+  return [
+    check("okf", "pass", okfMessage),
+    check("page-ids", "pass", `${ids.size} wiki page(s) have unique stable IDs and bidirectional catalog entries`),
+  ];
 }
 
 function checkScheduler(paths: VaultPaths): DoctorCheck {
@@ -1023,7 +1365,7 @@ function checkDependencies(paths: VaultPaths): DoctorCheck[] {
   return checks;
 }
 
-function checkExternalState(paths: VaultPaths, qmdDependency: DoctorCheck | undefined): DoctorCheck[] {
+function checkExternalState(paths: VaultPaths, qmdDependency?: DoctorCheck): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
   if (qmdDependency?.status !== "pass") {
     checks.push(
@@ -1074,7 +1416,7 @@ export function doctor(explicitPath?: string): DoctorReport {
     ...checkDatabase(paths),
     checkPackets(paths),
     checkWorkflows(paths),
-    checkPages(paths),
+    ...checkPages(paths),
     checkScheduler(paths),
     checkQuizzes(paths),
     ...dependencyChecks,

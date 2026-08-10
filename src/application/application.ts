@@ -204,10 +204,14 @@ function boundedUtf8(value: string, maxBytes: number): string {
   }
   return value.slice(0, end);
 }
-function mutationFinalizationError(stage: "checkpoint" | "doctor" | "commit" | "rollback", cause: unknown): Error {
+function mutationFinalizationError(
+  stage: "checkpoint" | "doctor" | "commit" | "projection" | "rollback",
+  cause: unknown,
+  retryable = false,
+): Error {
   return Object.assign(new Error(`mutation applied but ${stage} failed: ${errorMessage(cause)}`), {
     code: "MUTATION_APPLIED_FINALIZATION_FAILED",
-    details: { applied: true, retryable: false, stage },
+    details: { applied: true, retryable, stage },
   });
 }
 function isAppliedFinalizationFailure(error: unknown): boolean {
@@ -585,6 +589,11 @@ export class ScholarApplication {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
         const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
+        try {
+          await this.wiki.refreshProjections();
+        } catch (error) {
+          throw mutationFinalizationError("projection", error, true);
+        }
         return { sourceId, status: "removed", dependentPageIds: removed.dependentPageIds };
       }, "source:remove"),
     );

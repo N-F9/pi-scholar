@@ -19,6 +19,7 @@ import {
 import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep, win32 } from "node:path";
 import { openDatabase, transaction } from "./database.js";
 import { initializeRepository } from "./external/git.js";
+import { renderOkfIndex, renderOkfLog } from "./okf.js";
 export const VAULT_FORMAT_VERSION = 1 as const;
 export const DEFAULT_VAULT_HOST = "127.0.0.1" as const;
 export const DEFAULT_VAULT_PORT = 4816 as const;
@@ -385,6 +386,13 @@ function seedDefaultSettings(paths: VaultPaths): void {
     db.close();
   }
 }
+function seedWikiProjections(paths: VaultPaths): void {
+  for (const [path, content] of [
+    [join(paths.wikiRoot, "index.md"), renderOkfIndex([])],
+    [join(paths.wikiRoot, "log.md"), renderOkfLog([])],
+  ] as const)
+    if (!existsSync(path)) atomicWriteFile(path, content);
+}
 
 /** Create the product roots, durable schema, derived directories, and Git repository. */
 export function initVault(requestedRoot = process.cwd()): VaultPaths {
@@ -404,6 +412,7 @@ export function initVault(requestedRoot = process.cwd()): VaultPaths {
     ensureDirectory(join(metadataRoot, "snapshots", "wiki"), "wiki snapshots");
     const paths = resolveVault(vaultRoot);
     seedDefaultSettings(paths);
+    seedWikiProjections(paths);
     initializeRepository(paths);
     return paths;
   }
@@ -424,12 +433,12 @@ export function initVault(requestedRoot = process.cwd()): VaultPaths {
   ] as const)
     ensureDirectory(path, name);
   ensureGitignore(join(vaultRoot, ".gitignore"));
+  seedWikiProjections(paths);
   validateVaultLayout(paths);
   seedDefaultSettings(paths);
   initializeRepository(paths);
   return paths;
 }
-
 function recoverStaleLock(path: string): boolean {
   let observed: Buffer;
   try {
