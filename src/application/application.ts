@@ -327,7 +327,10 @@ export class ScholarApplication {
     string,
     { readonly claim: SourceClaim; readonly prepared: PreparedAdmission }
   >();
-  private readonly completedExtractions = new Map<string, ExtractPublicationResult>();
+  private readonly completedExtractions = new Map<
+    string,
+    { readonly result: ExtractPublicationResult; readonly pendingFinalization: boolean }
+  >();
   constructor(input: ApplicationOptions) {
     this.paths = typeof input.paths === "string" ? resolveVault(input.paths) : input.paths;
     this.db = input.db ?? openDatabase(this.paths);
@@ -630,19 +633,24 @@ export class ScholarApplication {
   async publishExtraction(input: ExtractPublicationInput): Promise<ExtractPublicationResult> {
     const decoded = decodeExtractPublicationInput(input);
     const resultKey = extractionResultKey(decoded);
-    const completed = this.completedExtractions.get(resultKey);
-    if (completed) return completed;
-    const pending = this.extractionClaims.get(decoded.claimId);
-    if (!pending || pending.prepared.preparedId !== decoded.preparedId || pending.prepared.digest !== decoded.digest)
-      throw new ValidationError("extract claim is unknown, stale, or expired");
-    let appliedResult: ExtractPublicationResult | undefined;
-    const cacheResult = (result: ExtractPublicationResult): void => {
-      this.completedExtractions.set(resultKey, result);
+    const cacheResult = (result: ExtractPublicationResult, pendingFinalization = false): void => {
+      this.completedExtractions.set(resultKey, { result, pendingFinalization });
       if (this.completedExtractions.size > 256) {
         const oldest = this.completedExtractions.keys().next().value;
         if (typeof oldest === "string") this.completedExtractions.delete(oldest);
       }
     };
+    const completed = this.completedExtractions.get(resultKey);
+    if (completed) {
+      if (!completed.pendingFinalization) return completed.result;
+      const result = await this.durableDirect(() => completed.result, "source:extract");
+      cacheResult(result);
+      return result;
+    }
+    const pending = this.extractionClaims.get(decoded.claimId);
+    if (!pending || pending.prepared.preparedId !== decoded.preparedId || pending.prepared.digest !== decoded.digest)
+      throw new ValidationError("extract claim is unknown, stale, or expired");
+    let appliedResult: ExtractPublicationResult | undefined;
     try {
       const result = await this.durableDirect(async () => {
         const published = await this.sources.publishPreparedClaim({
@@ -665,7 +673,7 @@ export class ScholarApplication {
       return result;
     } catch (error) {
       if (appliedResult && isAppliedFinalizationFailure(error)) {
-        cacheResult(appliedResult);
+        cacheResult(appliedResult, true);
         this.extractionClaims.delete(decoded.claimId);
         throw error;
       }
@@ -1850,18 +1858,20 @@ export class ScholarApplication {
     exact(input, ["date"], "quiz context");
     const date = input.date === undefined ? await this.currentLocalDate() : requiredString(input, "date");
     return this.durableDirect(async () => {
+      const settings = await this.getSettings();
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz context is limited to the current local date");
-      const expiredCount = this.quiz.expirePrior(date);
-      const settings = await this.getSettings();
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       const quiz = this.quiz.get(date);
+      const candidates = await this.quizCandidates(duePages);
+      const detail = quiz ? await this.quizDetail(quiz) : undefined;
+      const expiredCount = this.quiz.expirePrior(date);
       return {
         date,
         initializationEnabled: settings.settings.initializationEnabled,
         expiredCount,
-        candidates: await this.quizCandidates(duePages),
-        ...(quiz ? { quiz: await this.quizDetail(quiz) } : {}),
+        candidates,
+        ...(detail ? { quiz: detail } : {}),
         ...(settings.settings.initializationEnabled
           ? { message: "Initialization maintenance is active; quiz publication is blocked." }
           : {}),

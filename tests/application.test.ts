@@ -185,29 +185,31 @@ describe("durable application writes", () => {
       const claim = context.claims[0];
       if (!claim) throw new Error("admission claim is missing");
       const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest, endpoints: [1] };
-      (db as unknown as { checkpoint: () => void }).checkpoint = () => {
-        throw new Error("checkpoint failed after publication");
-      };
-      await assert.rejects(app.publishExtraction(input), (error: unknown) => {
+      const appliedCheckpointFailure = (error: unknown): boolean => {
         if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
         assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
         assert.deepEqual(error.details, { applied: true, retryable: false, stage: "checkpoint" });
         return true;
-      });
+      };
+      (db as unknown as { checkpoint: () => void }).checkpoint = () => {
+        throw new Error("checkpoint failed after publication");
+      };
+      await assert.rejects(app.publishExtraction(input), appliedCheckpointFailure);
       const row = db.get<{ source_id: string; status: string; error_code: string | null }>(
         "SELECT source_id, status, error_code FROM sources",
       );
       assert.equal(row?.status, "published");
       assert.equal(row?.error_code, null);
+      await assert.rejects(app.publishExtraction(input), appliedCheckpointFailure);
+      (db as unknown as { checkpoint: () => void }).checkpoint = originalCheckpoint;
       const retry = await app.publishExtraction(input);
       assert.equal(retry.sourceId, row?.source_id);
-      assert.equal(
-        db.get<{ status: string; error_code: string | null }>(
-          "SELECT status, error_code FROM sources WHERE source_id = ?",
-          [retry.sourceId],
-        )?.status,
-        "published",
+      const published = db.get<{ status: string; error_code: string | null }>(
+        "SELECT status, error_code FROM sources WHERE source_id = ?",
+        [retry.sourceId],
       );
+      assert.equal(published?.status, "published");
+      assert.equal(published?.error_code, null);
     } finally {
       (db as unknown as { checkpoint: () => void }).checkpoint = originalCheckpoint;
       await app.close();
@@ -710,6 +712,36 @@ describe("application quiz date guards", () => {
       await assert.rejects(
         app.sealSubmission(stale.toISOString().slice(0, 10), { expectedRevision: 1 }),
         /current local date/u,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("does not expire prior open quizzes when context preflight rejects a missing due page", async () => {
+    const { app, db, paths } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "context-missing-page.md",
+      title: "Context missing page",
+      body: "# Section\n\nSection text\n",
+      quizWorthiness: "eligible",
+    });
+    app.scheduler.ensurePageLearning(page.page.pageId, `${date}T00:00:00.000Z`);
+    const previous = new Date(`${date}T00:00:00.000Z`);
+    previous.setUTCDate(previous.getUTCDate() - 1);
+    const oldDate = previous.toISOString().slice(0, 10);
+    const oldQuizId = randomUUID();
+    db.run(
+      "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', NULL, ?, NULL, NULL, NULL)",
+      [oldQuizId, oldDate, new Date().toISOString()],
+    );
+    try {
+      await fs.rm(join(paths.wikiRoot, page.page.relativePath));
+      await assert.rejects(app.getQuizContext({ date }));
+      assert.equal(
+        db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", [oldQuizId])?.status,
+        "open",
       );
     } finally {
       await app.close();
