@@ -1,32 +1,62 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
-import { constants, promises as fs, lstatSync, readFileSync, type Stats } from "node:fs";
-import { open as openFile } from "node:fs/promises";
+import { promises as fs, readFileSync, type Stats } from "node:fs";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP, type LookupFunction } from "node:net";
-import {
-  basename,
-  dirname,
-  extname,
-  isAbsolute,
-  join,
-  normalize,
-  parse as parsePath,
-  relative,
-  resolve,
-  sep,
-} from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   PreparedAdmission as ContractPreparedAdmission,
   SourceKind as ContractSourceKind,
   SourceManifest as ContractSourceManifest,
-} from "./contracts.js";
-import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
-import type { DoclingResult as ExternalDoclingResult } from "./external/docling.js";
-import { runChild } from "./external/process.js";
-import { QuizService } from "./quiz.js";
-import { safeRelativePath, type VaultPaths } from "./vault.js";
+} from "../contracts.js";
+import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "../database.js";
+import type { DoclingResult as ExternalDoclingResult } from "../external/docling.js";
+import { QuizService } from "../quiz.js";
+import { safeRelativePath, type VaultPaths } from "../vault.js";
+import {
+  atomizeExtraction,
+  chunkExtraction,
+  nativeExtraction,
+  normalizeDoclingResult,
+  reconstructChunks,
+  validateChunkEndpoints,
+} from "./source-chunks.js";
+import {
+  canonical,
+  copyPathNoFollow,
+  copyRepositoryNoSecrets,
+  deterministicUuid,
+  digestBytes,
+  ENVELOPE_NAME,
+  ensureWithin,
+  inferKind,
+  lstatNoFollow,
+  MAX_SOURCE_BYTES,
+  measurePath,
+  pathFor,
+  provenanceUrl,
+  publicSourceUri,
+  readNoFollow,
+  repositoryFiles,
+  repositoryRevision,
+  resolveWorkArtifact,
+  SOURCE_KINDS,
+  safeChildPath,
+  sameIdentity,
+  sanitizedSourceUri,
+  snapshotPath,
+  stagedMetadata,
+  statIdentity,
+  textualUrl,
+  treeDigest,
+  validRelativePath,
+  walkFiles,
+  wikiPathFor,
+  workArtifactRelative,
+  writeTree,
+} from "./source-files.js";
+import { parseManifest, parsePreparedMetadata, verifyRetainedPacket } from "./source-packets.js";
 export interface VaultPathsLike extends Partial<VaultPaths> {
   root?: string;
   inbox?: string;
@@ -165,7 +195,7 @@ interface PreparedAttachment {
   byteLength: number;
   digest: string;
 }
-interface PersistedPreparedAdmission extends PreparedAdmission {
+export interface PersistedPreparedAdmission extends PreparedAdmission {
   entryRelativePath: string;
   entryIdentity: PhysicalIdentity;
   snapshotIdentity: PhysicalIdentity;
@@ -207,10 +237,6 @@ export interface ChunkPlanEndpoint {
   index?: number;
 }
 
-const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
-const ENVELOPE_NAME = ".pi-scholar-source.json";
-const SOURCE_KINDS: readonly SourceKind[] = ["document", "url", "text", "note", "code", "directory", "repository"];
-const INPUT_KINDS: readonly InputKind[] = [...SOURCE_KINDS, "upload", "pasted"];
 const MAX_SOURCE_REDIRECTS = 5;
 const METADATA_HOSTNAMES: Record<string, true> = {
   metadata: true,
@@ -316,27 +342,6 @@ async function safeAddressFor(url: URL): Promise<SafeAddress> {
   const first = addresses[0];
   if (!first || (first.family !== 4 && first.family !== 6)) throw new Error("source URL address family is unsupported");
   return first;
-}
-function provenanceUrl(url: URL): string {
-  const safe = new URL(url.toString());
-  safe.username = "";
-  safe.password = "";
-  safe.search = "";
-  safe.hash = "";
-  return safe.toString();
-}
-function sanitizedSourceUri(value: string): string {
-  const parsed = new URL(value);
-  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("source URL protocol is not allowed");
-  return provenanceUrl(parsed);
-}
-function publicSourceUri(value: unknown): unknown {
-  if (typeof value !== "string") return value;
-  try {
-    return sanitizedSourceUri(value);
-  } catch {
-    return undefined;
-  }
 }
 interface SourceHttpResponse {
   status: number;
@@ -448,99 +453,6 @@ function dbGet<T = Row>(db: ScholarDatabase, sql: string, params: unknown[] = []
 function dbAll<T = Row>(db: ScholarDatabase, sql: string, params: unknown[] = []): T[] {
   return db.all<T>(sql, params);
 }
-function digestBytes(bytes: Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-function canonical(value: unknown): string {
-  const normalizeValue = (input: unknown): unknown => {
-    if (input === undefined || typeof input === "function" || typeof input === "symbol" || typeof input === "bigint")
-      throw new Error("value cannot be serialized canonically");
-    if (input === null || typeof input === "string" || typeof input === "number" || typeof input === "boolean")
-      return input;
-    if (input instanceof Uint8Array) return Buffer.from(input).toString("base64");
-    if (Array.isArray(input)) return input.map((item) => normalizeValue(item));
-    if (typeof input === "object") {
-      const record = input as Record<string, unknown>;
-      const normalized: Record<string, unknown> = {};
-      for (const key of Object.keys(record).sort((a, b) => a.localeCompare(b))) {
-        const nested = record[key];
-        if (nested !== undefined) normalized[key] = normalizeValue(nested);
-      }
-      return normalized;
-    }
-    throw new Error("value cannot be serialized canonically");
-  };
-  const output = JSON.stringify(normalizeValue(value));
-  if (output === undefined) throw new Error("value cannot be serialized canonically");
-  return output;
-}
-function validRelativePath(value: string): string {
-  if (!value || /[\u0000-\u001f\u007f]/u.test(value) || value.includes("\\") || isAbsolute(value))
-    throw new Error("invalid relative path");
-  const normalized = normalize(value).replaceAll("\\", "/");
-  if (
-    normalized !== value ||
-    normalized === "." ||
-    normalized === ".." ||
-    normalized.startsWith("../") ||
-    normalized.includes("/../")
-  )
-    throw new Error("path traversal");
-  return normalized;
-}
-function vaultRootFor(paths: VaultPathsLike): string {
-  const root = paths.root ?? paths.vaultRoot;
-  if (typeof root !== "string") throw new Error("vault root is required");
-  return root;
-}
-function workArtifactRelative(paths: VaultPathsLike, target: string): string {
-  const absolute = resolve(target);
-  const work = resolve(pathFor(paths, "work"));
-  const workRelative = relative(work, absolute).replaceAll("\\", "/");
-  if (!workRelative || workRelative === ".." || workRelative.startsWith("../") || isAbsolute(workRelative))
-    throw new Error("prepared path escapes work");
-  const vaultRelative = relative(resolve(vaultRootFor(paths)), absolute).replaceAll("\\", "/");
-  return validRelativePath(vaultRelative);
-}
-function resolveWorkArtifact(paths: VaultPathsLike, requested: string): string {
-  const absolute = safeRelativePath(vaultRootFor(paths), validRelativePath(requested));
-  return ensureWithin(pathFor(paths, "work"), absolute);
-}
-function deterministicUuid(seed: string): string {
-  const bytes = createHash("sha256").update(seed).digest().subarray(0, 16);
-  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
-  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-function statIdentity(stat: Stats): PhysicalIdentity {
-  const mtimeNs =
-    "mtimeNs" in stat && typeof stat.mtimeNs === "bigint"
-      ? stat.mtimeNs.toString()
-      : String(Math.round(stat.mtimeMs * 1_000_000));
-  return { device: String(stat.dev), inode: String(stat.ino), mode: stat.mode, size: stat.size, mtimeNs };
-}
-function pathFor(paths: VaultPathsLike, name: "inbox" | "sources" | "work" | "quizzes"): string {
-  const explicit =
-    name === "inbox"
-      ? (paths.inbox ?? paths.inboxRoot)
-      : name === "sources"
-        ? (paths.sources ?? paths.sourcesRoot)
-        : name === "work"
-          ? (paths.work ?? paths.workRoot)
-          : paths.quizzesRoot;
-  if (typeof explicit === "string") return explicit;
-  const root = paths.root ?? paths.vaultRoot;
-  if (typeof root !== "string") throw new Error("vault root is required");
-  return join(root, name === "work" ? ".pi-scholar/work" : name);
-}
-function wikiPathFor(paths: VaultPathsLike): string {
-  const explicit = paths.wikiRoot;
-  if (typeof explicit === "string") return explicit;
-  const root = paths.root ?? paths.vaultRoot;
-  if (typeof root !== "string") throw new Error("vault root is required");
-  return join(root, "wiki");
-}
 function sourceRecord(row: Row): Record<string, unknown> {
   const { source_uri: _sourceUri, ...rest } = row;
   return {
@@ -557,803 +469,6 @@ function sourceRecord(row: Row): Record<string, unknown> {
     updatedAt: row.updated_at,
   };
 }
-async function lstatNoFollow(path: string): Promise<Stats> {
-  const stat = await fs.lstat(path);
-  if (stat.isSymbolicLink()) throw new Error(`symlink rejected: ${path}`);
-  return stat;
-}
-async function rejectSymlinkAncestors(path: string): Promise<void> {
-  const absolute = resolve(path);
-  const root = parsePath(absolute).root;
-  let current = root;
-  for (const segment of relative(root, absolute).split(sep).filter(Boolean)) {
-    current = join(current, segment);
-    const stat = await fs.lstat(current);
-    if (stat.isSymbolicLink()) throw new Error(`symlink ancestor rejected: ${current}`);
-  }
-}
-async function readNoFollow(path: string): Promise<Buffer> {
-  const handle = await openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error(`not a regular file: ${path}`);
-    const bytes = Buffer.from(await handle.readFile());
-    if (bytes.byteLength > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-    return bytes;
-  } finally {
-    await handle.close();
-  }
-}
-async function measurePath(path: string): Promise<number> {
-  const stat = await lstatNoFollow(path);
-  if (stat.isFile()) return stat.size;
-  if (!stat.isDirectory()) throw new Error(`unsupported filesystem entry: ${path}`);
-  let total = 0;
-  for (const name of (await fs.readdir(path)).sort((a, b) => a.localeCompare(b))) {
-    if (name === ".git") continue;
-    total += await measurePath(join(path, name));
-    if (total > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-  }
-  return total;
-}
-async function walkFiles(root: string, current = "", skipGit = true): Promise<FileSnapshot[]> {
-  const absolute = join(root, current);
-  await rejectSymlinkAncestors(absolute);
-  const stat = await lstatNoFollow(absolute);
-  if (stat.isFile()) {
-    const bytes = await readNoFollow(absolute);
-    return [{ path: current.replaceAll("\\", "/"), size: bytes.byteLength, digest: digestBytes(bytes), bytes }];
-  }
-  if (!stat.isDirectory()) throw new Error(`unsupported filesystem entry: ${absolute}`);
-  const files: FileSnapshot[] = [];
-  for (const name of (await fs.readdir(absolute)).sort((a, b) => a.localeCompare(b))) {
-    if (skipGit && name === ".git") continue;
-    validRelativePath(join(current, name));
-    files.push(...(await walkFiles(root, join(current, name), skipGit)));
-    if (files.reduce((sum, file) => sum + file.size, 0) > MAX_SOURCE_BYTES)
-      throw new Error("source exceeds 100 MiB limit");
-  }
-  return files;
-}
-const SAFE_REPOSITORY_GIT_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"] as const;
-const SAFE_REPOSITORY_GIT_ENV = {
-  GIT_CONFIG_NOSYSTEM: "1",
-  GIT_CONFIG_SYSTEM: "/dev/null",
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_OPTIONAL_LOCKS: "0",
-} as const;
-async function repositoryGit(
-  root: string,
-  command: "ls-files" | "rev-parse",
-  maxOutputBytes: number,
-): Promise<Awaited<ReturnType<typeof runChild>>> {
-  const args =
-    command === "ls-files"
-      ? [...SAFE_REPOSITORY_GIT_ARGS, "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
-      : [...SAFE_REPOSITORY_GIT_ARGS, "rev-parse", "HEAD"];
-  return runChild("git", ["-C", root, ...args], {
-    cwd: root,
-    timeoutMs: 120_000,
-    maxOutputBytes,
-    env: SAFE_REPOSITORY_GIT_ENV,
-  });
-}
-async function repositoryRevision(root: string): Promise<string> {
-  const result = await repositoryGit(root, "rev-parse", 1024);
-  if (result.timedOut || result.code !== 0)
-    throw new Error(`git revision lookup failed (${result.code ?? result.signal ?? "unknown"})`);
-  const revision = result.stdout.trim();
-  if (!/^[0-9a-f]{40,64}$/iu.test(revision)) throw new Error("git revision is invalid");
-  return revision;
-}
-async function repositoryFiles(root: string): Promise<FileSnapshot[]> {
-  const result = await repositoryGit(root, "ls-files", MAX_SOURCE_BYTES + 1);
-  if (result.timedOut || result.code !== 0)
-    throw new Error(`git file listing failed (${result.code ?? result.signal ?? "unknown"})`);
-  if (Buffer.byteLength(result.stdout, "utf8") >= MAX_SOURCE_BYTES)
-    throw new Error("repository file listing exceeds 100 MiB limit");
-  const files: FileSnapshot[] = [];
-  const seen = new Set<string>();
-  let total = 0;
-  for (const rawPath of result.stdout.split("\0")) {
-    if (!rawPath) continue;
-    const normalized = rawPath;
-    if (normalized.split("/").includes(".git")) continue;
-    if (/[\u0000-\u001f\u007f]/u.test(normalized)) throw new Error("repository file path contains control characters");
-    const path = validRelativePath(normalized);
-    if (seen.has(path)) continue;
-    seen.add(path);
-    const absolute = ensureWithin(root, join(root, path));
-    await rejectSymlinkAncestors(absolute);
-    const stat = await lstatNoFollow(absolute);
-    if (!stat.isFile()) throw new Error(`repository entry is not a regular file: ${path}`);
-    const bytes = await readNoFollow(absolute);
-    total += bytes.byteLength;
-    if (total > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-    files.push({ path, size: bytes.byteLength, digest: digestBytes(bytes), bytes });
-  }
-  return files.sort((left, right) => left.path.localeCompare(right.path));
-}
-function sameIdentity(a: PhysicalIdentity, b: PhysicalIdentity): boolean {
-  return (
-    a.device === b.device && a.inode === b.inode && a.mode === b.mode && a.size === b.size && a.mtimeNs === b.mtimeNs
-  );
-}
-function ensureWithin(root: string, target: string): string {
-  const rootAbs = resolve(root);
-  const targetAbs = resolve(target);
-  const rel = relative(rootAbs, targetAbs);
-  if (rel === "" || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("path escapes vault");
-  return targetAbs;
-}
-function safeChildPath(root: string, target: string): string {
-  const rel = relative(resolve(root), resolve(target)).replaceAll("\\", "/");
-  if (!rel || rel.startsWith("../") || isAbsolute(rel)) throw new Error("path escapes vault");
-  return safeRelativePath(root, rel);
-}
-function inferKind(path: string, stat?: Stats): SourceKind {
-  if (stat?.isDirectory()) return "directory";
-  const ext = extname(path).toLowerCase();
-  if (
-    [".pdf", ".epub", ".docx", ".pptx", ".xlsx", ".html", ".htm", ".png", ".jpg", ".jpeg", ".tif", ".tiff"].includes(
-      ext,
-    )
-  )
-    return "document";
-  if (
-    [
-      ".ts",
-      ".tsx",
-      ".js",
-      ".jsx",
-      ".mjs",
-      ".cjs",
-      ".py",
-      ".go",
-      ".rs",
-      ".java",
-      ".c",
-      ".h",
-      ".cpp",
-      ".cc",
-      ".sh",
-      ".sql",
-    ].includes(ext)
-  )
-    return "code";
-  return "text";
-}
-function textualUrl(claim: SourceClaim, mediaType?: string): boolean {
-  const media = mediaType?.toLowerCase().split(";", 1)[0];
-  if (
-    media &&
-    [
-      "text/plain",
-      "text/markdown",
-      "text/csv",
-      "application/json",
-      "application/xml",
-      "text/xml",
-      "application/yaml",
-      "text/yaml",
-    ].includes(media)
-  )
-    return true;
-  return [".md", ".markdown", ".txt", ".text", ".json", ".xml", ".csv", ".yaml", ".yml"].includes(
-    extname(claim.entry.metadata?.originalName ?? claim.entry.relativePath).toLowerCase(),
-  );
-}
-function treeDigest(files: FileSnapshot[], identity: PhysicalIdentity, revision?: string): string {
-  return digestBytes(
-    Buffer.from(
-      canonical({ identity, revision, files: files.map(({ path, size, digest }) => ({ path, size, digest })) }),
-    ),
-  );
-}
-function requiredString(record: Record<string, unknown>, key: string): string {
-  const value = record[key];
-  if (typeof value !== "string" || !value) throw new Error(`invalid source manifest ${key}`);
-  return value;
-}
-function parseMetadata(raw: string): StageMetadata {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw) as unknown;
-  } catch {
-    throw new Error("invalid staged source metadata");
-  }
-  if (value === null || typeof value !== "object" || Array.isArray(value))
-    throw new Error("invalid staged source metadata");
-  const record = value as Record<string, unknown>;
-  if (
-    record.version !== 1 ||
-    typeof record.requestedKind !== "string" ||
-    !INPUT_KINDS.includes(record.requestedKind as InputKind) ||
-    typeof record.kind !== "string" ||
-    !SOURCE_KINDS.includes(record.kind as SourceKind) ||
-    typeof record.displayName !== "string" ||
-    !record.displayName ||
-    /[\u0000-\u001f\u007f]/u.test(record.displayName) ||
-    record.payload !== "payload"
-  )
-    throw new Error("invalid staged source metadata");
-  const requestedKind = record.requestedKind as InputKind;
-  const kind = record.kind as SourceKind;
-  const originalName = typeof record.originalName === "string" ? record.originalName : undefined;
-  if (originalName !== undefined) validRelativePath(originalName);
-  if (
-    (requestedKind === "url" && kind !== "url") ||
-    ((requestedKind === "text" || requestedKind === "pasted") && kind !== "text") ||
-    (requestedKind === "upload" && kind !== inferKind(originalName ?? record.displayName)) ||
-    (requestedKind === "repository" && kind !== "repository") ||
-    (requestedKind !== "url" &&
-      requestedKind !== "text" &&
-      requestedKind !== "pasted" &&
-      requestedKind !== "upload" &&
-      requestedKind !== "repository")
-  )
-    throw new Error("staged source metadata kind is inconsistent");
-  if (requestedKind === "url" && typeof record.sourceUri !== "string")
-    throw new Error("staged URL source metadata is missing sourceUri");
-  if (requestedKind === "upload" && originalName === undefined)
-    throw new Error("staged upload metadata is missing originalName");
-  if (
-    kind === "repository" &&
-    (typeof record.repositoryRevision !== "string" ||
-      !record.repositoryRevision ||
-      /[\u0000-\u001f\u007f]/u.test(record.repositoryRevision))
-  )
-    throw new Error("invalid staged repository revision");
-  const metadata: StageMetadata = {
-    version: 1,
-    requestedKind,
-    kind,
-    displayName: record.displayName,
-    payload: "payload",
-  };
-  for (const key of ["originalName", "sourceUri", "mediaType", "repositoryRevision"] as const) {
-    const item = record[key];
-    if (item !== undefined) {
-      if (typeof item !== "string" || item.includes("\0") || /[\u0000-\u001f\u007f]/u.test(item))
-        throw new Error("invalid staged source metadata");
-      metadata[key] = key === "sourceUri" ? sanitizedSourceUri(item) : item;
-    }
-  }
-  validRelativePath(metadata.payload);
-  return metadata;
-}
-async function stagedMetadata(path: string): Promise<StageMetadata | undefined> {
-  const stat = await lstatNoFollow(path);
-  if (!stat.isDirectory()) return undefined;
-  const envelope = join(path, ENVELOPE_NAME);
-  try {
-    const envelopeStat = await lstatNoFollow(envelope);
-    if (!envelopeStat.isFile()) throw new Error("staged source metadata must be a file");
-    const metadata = parseMetadata((await readNoFollow(envelope)).toString("utf8"));
-    const payload = join(path, metadata.payload);
-    const payloadStat = await lstatNoFollow(payload);
-    if (metadata.kind === "repository" ? !payloadStat.isDirectory() : !payloadStat.isFile())
-      throw new Error(
-        `staged source payload must be a regular ${metadata.kind === "repository" ? "directory" : "file"}`,
-      );
-    return metadata;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
-      return undefined;
-    throw error;
-  }
-}
-async function snapshotPath(
-  path: string,
-  relativePath: string,
-  kind?: SourceKind,
-  revision?: string,
-  metadata?: StageMetadata,
-): Promise<TreeSnapshot> {
-  const stat = await lstatNoFollow(path);
-  const identity = statIdentity(stat);
-  const files = stat.isDirectory()
-    ? kind === "repository" && !metadata
-      ? await repositoryFiles(path)
-      : await walkFiles(path)
-    : [{ path: basename(path), size: 0, digest: "", bytes: Buffer.alloc(0) }];
-  if (!stat.isDirectory()) {
-    const first = files[0];
-    if (!first) throw new Error("source file snapshot is empty");
-    const bytes = await readNoFollow(path);
-    first.bytes = bytes;
-    first.size = bytes.byteLength;
-    first.digest = digestBytes(bytes);
-  }
-  const bytes = files.reduce((sum, file) => sum + file.size, 0);
-  if (bytes > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-  const finalKind = kind ?? (stat.isDirectory() ? "directory" : inferKind(path, stat));
-  return {
-    root: path,
-    relativePath: validRelativePath(relativePath),
-    kind: finalKind,
-    identity,
-    digest: treeDigest(files, identity, revision),
-    bytes,
-    files,
-    revision,
-    metadata,
-  };
-}
-async function writeTree(root: string, files: FileSnapshot[]): Promise<void> {
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
-  for (const file of files) {
-    const target = ensureWithin(root, join(root, validRelativePath(file.path)));
-    await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    const handle = await openFile(target, "wx", 0o600);
-    try {
-      await handle.writeFile(file.bytes);
-    } finally {
-      await handle.close();
-    }
-  }
-}
-function atomRows(extracted: Buffer): Array<{ start: number; end: number; bytes: Buffer }> {
-  const rows: Array<{ start: number; end: number; bytes: Buffer }> = [];
-  let start = 0;
-  for (let index = 0; index < extracted.length; index++)
-    if (extracted[index] === 10) {
-      rows.push({ start, end: index + 1, bytes: extracted.subarray(start, index + 1) });
-      start = index + 1;
-    }
-  if (start < extracted.length || rows.length === 0)
-    rows.push({ start, end: extracted.length, bytes: extracted.subarray(start) });
-  return rows;
-}
-export function atomizeExtraction(
-  extracted: string | Uint8Array,
-): Array<{ index: number; startByte: number; endByte: number; body: Buffer }> {
-  return atomRows(Buffer.from(extracted)).map((row, index) => ({
-    index,
-    startByte: row.start,
-    endByte: row.end,
-    body: Buffer.from(row.bytes),
-  }));
-}
-export function validateChunkEndpoints(
-  extracted: string | Uint8Array,
-  proposed?: Array<number | ChunkPlanEndpoint>,
-): SourceChunk[] {
-  const bytes = Buffer.from(extracted);
-  const atoms = atomizeExtraction(bytes);
-  const raw = proposed?.map((endpoint) =>
-    typeof endpoint === "number" ? endpoint : (endpoint.endAtom ?? endpoint.end ?? endpoint.index),
-  );
-  const endpoints = raw?.length ? raw : [atoms.length];
-  for (const endpoint of endpoints)
-    if (endpoint === undefined || !Number.isInteger(endpoint) || endpoint <= 0 || endpoint > atoms.length)
-      throw new Error("chunk endpoints must be increasing atom endpoints");
-  const finalEndpoint = endpoints.at(-1);
-  if (finalEndpoint !== atoms.length) throw new Error("chunk endpoints must cover the extraction");
-  for (let index = 1; index < endpoints.length; index++) {
-    const current = endpoints[index];
-    const previous = endpoints[index - 1];
-    if (current === undefined || previous === undefined || current <= previous)
-      throw new Error("chunk endpoints must be strictly increasing");
-  }
-  const chunks: SourceChunk[] = [];
-  let startAtom = 0;
-  for (let index = 0; index < endpoints.length; index++) {
-    const endAtom = endpoints[index];
-    if (endAtom === undefined) throw new Error("chunk endpoint is missing");
-    const start = atoms[startAtom];
-    const end = atoms[endAtom - 1];
-    if (!start || !end) throw new Error("chunk endpoint is outside extraction");
-    const body = Buffer.from(bytes.subarray(start.startByte, end.endByte));
-    chunks.push({
-      index,
-      startAtom,
-      endAtom,
-      startByte: start.startByte,
-      endByte: end.endByte,
-      digest: digestBytes(body),
-      body,
-    });
-    startAtom = endAtom;
-  }
-  return chunks;
-}
-export function reconstructChunks(chunks: Array<Pick<SourceChunk, "body">>): Buffer {
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.body)));
-}
-
-function isLocalDoclingResult(result: DoclingResult | ExternalDoclingResult): result is DoclingResult {
-  if (typeof result !== "object" || result === null || Array.isArray(result)) return false;
-  const record = result as unknown as Record<string, unknown>;
-  return "extracted" in record && !("outputDirectory" in record) && !("command" in record);
-}
-async function normalizeDoclingResult(result: DoclingResult | ExternalDoclingResult): Promise<DoclingResult> {
-  if (isLocalDoclingResult(result)) return result;
-  if (typeof result !== "object" || result === null || Array.isArray(result)) throw new Error("invalid Docling result");
-  const record = result as unknown as Record<string, unknown>;
-  if (
-    typeof record.outputDirectory !== "string" ||
-    record.command === null ||
-    typeof record.command !== "object" ||
-    Array.isArray(record.command)
-  )
-    throw new Error("invalid Docling result");
-  const command = record.command as Record<string, unknown>;
-  if (typeof command.code === "number" && command.code !== 0)
-    throw new Error(`Docling conversion failed with exit code ${command.code}`);
-  const files = await walkFiles(record.outputDirectory);
-  const extracted = files.find((file) => [".md", ".markdown", ".txt"].includes(extname(file.path).toLowerCase()));
-  if (!extracted) throw new Error("Docling produced no Markdown or text output");
-  return {
-    extracted: extracted.bytes,
-    converter: { name: "docling", version: "unknown" },
-    attachments: files
-      .filter((file) => file.path !== extracted.path)
-      .map((file) => ({ path: file.path, bytes: file.bytes })),
-  };
-}
-function parseManifestValue(raw: unknown): SourceManifest {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid source manifest");
-  const record = raw as Record<string, unknown>;
-  requiredString(record, "sourceId");
-  requiredString(record, "originalDigest");
-  if (!Array.isArray(record.files) || !Array.isArray(record.chunks)) throw new Error("invalid source manifest files");
-  if (record.attachments === undefined) record.attachments = [];
-  if (!Array.isArray(record.attachments)) throw new Error("invalid source manifest attachments");
-  for (const key of ["sourceUri", "originalUrl"] as const) {
-    if (typeof record[key] !== "string") continue;
-    const sanitized = sanitizedSourceUri(record[key]);
-    if (sanitized !== record[key]) throw new Error("source manifest URL is not canonical");
-    record[key] = sanitized;
-  }
-  if (record.stagedMetadata !== undefined) {
-    if (
-      record.stagedMetadata === null ||
-      typeof record.stagedMetadata !== "object" ||
-      Array.isArray(record.stagedMetadata)
-    )
-      throw new Error("invalid source manifest metadata");
-    const metadata = record.stagedMetadata as Record<string, unknown>;
-    if (typeof metadata.sourceUri === "string") {
-      const sanitized = sanitizedSourceUri(metadata.sourceUri);
-      if (sanitized !== metadata.sourceUri) throw new Error("source manifest metadata URL is not canonical");
-      metadata.sourceUri = sanitized;
-    }
-  }
-  return raw as SourceManifest;
-}
-function parseManifest(packet: string): SourceManifest {
-  const manifestPath = join(packet, "manifest.json");
-  const stat = lstatSync(manifestPath);
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("source manifest must be a regular file");
-  return parseManifestValue(JSON.parse(readFileSync(manifestPath, "utf8")) as unknown);
-}
-function manifestInteger(value: unknown, key: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
-    throw new Error(`invalid source manifest ${key}`);
-  return value;
-}
-function manifestDigest(value: unknown, key: string): string {
-  if (typeof value !== "string" || !/^[0-9a-f]{64}$/iu.test(value)) throw new Error(`invalid source manifest ${key}`);
-  return value;
-}
-function manifestAttachments(value: unknown): Array<{ path: string; byteLength: number; digest: string }> {
-  if (!Array.isArray(value)) throw new Error("invalid source manifest attachments");
-  return value
-    .map((item, index) => {
-      if (item === null || typeof item !== "object" || Array.isArray(item))
-        throw new Error(`invalid source manifest attachment ${index}`);
-      const record = item as Record<string, unknown>;
-      const path = record.path;
-      const relativePath = record.relativePath;
-      if (typeof path !== "string" || relativePath !== path)
-        throw new Error(`invalid source manifest attachment ${index}`);
-      const normalizedPath = validRelativePath(path);
-      const byteLength = manifestInteger(record.byteLength, `attachments[${index}].byteLength`);
-      if (manifestInteger(record.bytes, `attachments[${index}].bytes`) !== byteLength)
-        throw new Error(`source manifest attachment length mismatch: ${path}`);
-      return {
-        path: normalizedPath,
-        byteLength,
-        digest: manifestDigest(record.digest, `attachments[${index}].digest`),
-      };
-    })
-    .sort((left, right) => left.path.localeCompare(right.path));
-}
-async function verifyRetainedPacket(
-  packet: string,
-  expected: { sourceId: string; originalDigest: string },
-): Promise<SourceManifest> {
-  await rejectSymlinkAncestors(packet);
-  const packetStat = await lstatNoFollow(packet);
-  if (!packetStat.isDirectory()) throw new Error("source packet must be a directory");
-  const names = (await fs.readdir(packet)).sort((left, right) => left.localeCompare(right));
-  const allowed = ["attachments", "chunks", "extracted.md", "manifest.json", "original"];
-  if (names.length !== allowed.length || names.some((name, index) => name !== allowed[index]))
-    throw new Error("source packet contains unexpected artifacts");
-  const requiredDirectory = async (name: string): Promise<string> => {
-    const target = join(packet, name);
-    const stat = await lstatNoFollow(target);
-    if (!stat.isDirectory()) throw new Error(`source packet ${name} must be a directory`);
-    return target;
-  };
-  const originalRoot = await requiredDirectory("original");
-  const chunksRoot = await requiredDirectory("chunks");
-  const attachmentsRoot = await requiredDirectory("attachments");
-  const manifestPath = join(packet, "manifest.json");
-  const manifestStat = await lstatNoFollow(manifestPath);
-  if (!manifestStat.isFile()) throw new Error("source manifest must be a regular file");
-  const manifest = parseManifestValue(JSON.parse((await readNoFollow(manifestPath)).toString("utf8")) as unknown);
-  const attachmentFiles = await walkFiles(attachmentsRoot, "", false);
-  const expectedAttachments = manifestAttachments(manifest.attachments);
-  const actualAttachments = attachmentFiles.map((file) => ({
-    path: file.path,
-    byteLength: file.size,
-    digest: file.digest,
-  }));
-  if (canonical(expectedAttachments) !== canonical(actualAttachments))
-    throw new Error("retained source attachments mismatch");
-  if (
-    manifest.id !== manifest.sourceId ||
-    manifest.sourceId !== expected.sourceId ||
-    manifest.originalDigest !== expected.originalDigest
-  )
-    throw new Error("retained source packet identity mismatch");
-  manifestDigest(manifest.originalDigest, "originalDigest");
-  const originalFiles = await walkFiles(originalRoot, "", false);
-  const expectedFiles = manifest.files.map((file, index) => {
-    const record = file as unknown as Record<string, unknown>;
-    const relativePath = record.relativePath;
-    if (typeof relativePath !== "string" || typeof record.path !== "string" || record.path !== relativePath)
-      throw new Error(`invalid source manifest file ${index}`);
-    const normalizedPath = validRelativePath(relativePath);
-    const byteLength = manifestInteger(record.byteLength, `files[${index}].byteLength`);
-    if (manifestInteger(record.bytes, `files[${index}].bytes`) !== byteLength)
-      throw new Error(`source manifest file length mismatch: ${relativePath}`);
-    return {
-      relativePath: normalizedPath,
-      byteLength,
-      digest: manifestDigest(record.digest, `files[${index}].digest`),
-    };
-  });
-  const actualFiles = originalFiles.map((file) => ({
-    relativePath: file.path,
-    byteLength: file.size,
-    digest: file.digest,
-  }));
-  if (canonical(expectedFiles) !== canonical(actualFiles)) throw new Error("retained source original files mismatch");
-  const originalBytes = actualFiles.reduce((sum, file) => sum + file.byteLength, 0);
-  if (
-    manifestInteger(manifest.originalBytes, "originalBytes") !== originalBytes ||
-    manifestInteger(manifest.originalByteLength, "originalByteLength") !== originalBytes
-  )
-    throw new Error("retained source original length mismatch");
-  const extractedPath = join(packet, "extracted.md");
-  const extractedStat = await lstatNoFollow(extractedPath);
-  if (!extractedStat.isFile()) throw new Error("source extraction must be a regular file");
-  const extracted = await readNoFollow(extractedPath);
-  const extractedLength = manifestInteger(manifest.extractedByteLength, "extractedByteLength");
-  if (
-    manifestInteger(manifest.extractionBytes, "extractionBytes") !== extractedLength ||
-    extractedLength !== extracted.byteLength
-  )
-    throw new Error("retained source extraction length mismatch");
-  const extractedDigest = manifestDigest(manifest.extractedDigest, "extractedDigest");
-  if (
-    manifestDigest(manifest.extractionDigest, "extractionDigest") !== extractedDigest ||
-    digestBytes(extracted) !== extractedDigest
-  )
-    throw new Error("retained source extraction digest mismatch");
-  const atoms = atomizeExtraction(extracted);
-  const chunkNames = (await fs.readdir(chunksRoot)).sort((left, right) => left.localeCompare(right));
-  if (!manifest.chunks.length || chunkNames.length !== manifest.chunks.length)
-    throw new Error("retained source chunks are incomplete");
-  const chunkBodies: Buffer[] = [];
-  let nextAtom = 0;
-  let nextByte = 0;
-  for (const [index, chunk] of manifest.chunks.entries()) {
-    const record = chunk as unknown as Record<string, unknown>;
-    const expectedName = `${String(index + 1).padStart(4, "0")}.md`;
-    if (chunkNames[index] !== expectedName) throw new Error("retained source chunk order is invalid");
-    const chunkPath = join(chunksRoot, expectedName);
-    const chunkStat = await lstatNoFollow(chunkPath);
-    if (!chunkStat.isFile()) throw new Error("source chunk must be a regular file");
-    const body = await readNoFollow(chunkPath);
-    if (
-      manifestInteger(record.index, `chunks[${index}].index`) !== index ||
-      manifestInteger(record.ordinal, `chunks[${index}].ordinal`) !== index ||
-      record.sourceId !== expected.sourceId ||
-      record.chunkId !== `${expected.sourceId}:${index}` ||
-      record.relativePath !== "extracted.md"
-    )
-      throw new Error("retained source chunk metadata mismatch");
-    const startAtom = manifestInteger(record.startAtom, `chunks[${index}].startAtom`);
-    const atomStart = manifestInteger(record.atomStart, `chunks[${index}].atomStart`);
-    const endAtom = manifestInteger(record.endAtom, `chunks[${index}].endAtom`);
-    const atomEnd = manifestInteger(record.atomEnd, `chunks[${index}].atomEnd`);
-    const startByte = manifestInteger(record.startByte, `chunks[${index}].startByte`);
-    const endByte = manifestInteger(record.endByte, `chunks[${index}].endByte`);
-    if (
-      startAtom !== atomStart ||
-      endAtom !== atomEnd ||
-      startAtom !== nextAtom ||
-      endAtom <= startAtom ||
-      endAtom > atoms.length ||
-      startByte !== nextByte ||
-      endByte < startByte ||
-      endByte - startByte !== body.byteLength ||
-      endByte - startByte !== manifestInteger(record.byteLength, `chunks[${index}].byteLength`)
-    )
-      throw new Error("retained source chunk coverage is invalid");
-    const firstAtom = atoms[startAtom];
-    const lastAtom = atoms[endAtom - 1];
-    if (
-      !firstAtom ||
-      !lastAtom ||
-      firstAtom.startByte !== startByte ||
-      lastAtom.endByte !== endByte ||
-      !body.equals(extracted.subarray(startByte, endByte)) ||
-      digestBytes(body) !== manifestDigest(record.digest, `chunks[${index}].digest`)
-    )
-      throw new Error("retained source chunk digest mismatch");
-    chunkBodies.push(body);
-    nextAtom = endAtom;
-    nextByte = endByte;
-  }
-  if (nextAtom !== atoms.length || nextByte !== extracted.byteLength || !Buffer.concat(chunkBodies).equals(extracted))
-    throw new Error("retained source chunk reconstruction is incomplete");
-  return manifest;
-}
-
-function objectRecord(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value))
-    throw new Error(`invalid prepared metadata ${label}`);
-  return value as Record<string, unknown>;
-}
-function integerField(record: Record<string, unknown>, key: string, minimum = 0): number {
-  const value = record[key];
-  if (typeof value !== "number" || !Number.isInteger(value) || value < minimum)
-    throw new Error(`invalid prepared metadata ${key}`);
-  return value;
-}
-function identityField(value: unknown, label: string): PhysicalIdentity {
-  const record = objectRecord(value, label);
-  const mode = record.mode;
-  if (
-    typeof record.device !== "string" ||
-    typeof record.inode !== "string" ||
-    typeof mode !== "number" ||
-    !Number.isInteger(mode) ||
-    typeof record.size !== "number" ||
-    !Number.isInteger(record.size) ||
-    record.size < 0 ||
-    typeof record.mtimeNs !== "string"
-  )
-    throw new Error(`invalid prepared metadata ${label}`);
-  return { device: record.device, inode: record.inode, mode, size: record.size, mtimeNs: record.mtimeNs };
-}
-function parsePreparedMetadata(raw: unknown): PersistedPreparedAdmission {
-  const record = objectRecord(raw, "root");
-  const preparedId = requiredString(record, "preparedId");
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(preparedId))
-    throw new Error("invalid prepared metadata preparedId");
-  const claimId = requiredString(record, "claimId");
-  const kind = requiredString(record, "kind") as SourceKind;
-  if (!SOURCE_KINDS.includes(kind)) throw new Error("invalid prepared metadata kind");
-  const displayName = requiredString(record, "displayName");
-  const digest = requiredString(record, "digest");
-  const snapshotPath = validRelativePath(requiredString(record, "snapshotPath"));
-  const extractedPath = validRelativePath(requiredString(record, "extractedPath"));
-  const filesValue = record.files;
-  if (!Array.isArray(filesValue)) throw new Error("invalid prepared metadata files");
-  const files = filesValue.map((value) => {
-    const item = objectRecord(value, "file");
-    const relativePath = validRelativePath(requiredString(item, "relativePath"));
-    const byteLength = integerField(item, "byteLength");
-    const fileDigest = requiredString(item, "digest");
-    return { relativePath, byteLength, digest: fileDigest };
-  });
-  if (new Set(files.map((file) => file.relativePath)).size !== files.length)
-    throw new Error("invalid prepared metadata duplicate file");
-  const atomsValue = record.atoms;
-  if (!Array.isArray(atomsValue)) throw new Error("invalid prepared metadata atoms");
-  const atoms = atomsValue.map((value) => {
-    const item = objectRecord(value, "atom");
-    const index = integerField(item, "index");
-    const startByte = integerField(item, "startByte");
-    const endByte = integerField(item, "endByte");
-    const byteLength = integerField(item, "byteLength");
-    if (endByte < startByte || endByte - startByte !== byteLength)
-      throw new Error("invalid prepared metadata atom bounds");
-    return { index, startByte, endByte, byteLength };
-  });
-  const entryRelativePath = validRelativePath(requiredString(record, "entryRelativePath"));
-  const entryIdentity = identityField(record.entryIdentity, "entryIdentity");
-  const snapshotIdentity = identityField(record.snapshotIdentity, "snapshotIdentity");
-  const snapshotBytes = integerField(record, "snapshotBytes");
-  const revision = record.revision === undefined ? undefined : requiredString(record, "revision");
-  let metadata: StageMetadata | undefined;
-  if (record.metadata !== undefined) {
-    const metadataJson = JSON.stringify(record.metadata);
-    if (metadataJson === undefined) throw new Error("invalid prepared metadata metadata");
-    metadata = parseMetadata(metadataJson);
-  }
-  const converterValue = record.converter;
-  let converter: { name: string; version: string } | undefined;
-  if (converterValue !== undefined) {
-    const item = objectRecord(converterValue, "converter");
-    converter = { name: requiredString(item, "name"), version: requiredString(item, "version") };
-  }
-  const attachmentsValue = record.attachments;
-  if (!Array.isArray(attachmentsValue)) throw new Error("invalid prepared metadata attachments");
-  const attachments = attachmentsValue.map((value) => {
-    const item = objectRecord(value, "attachment");
-    return {
-      path: validRelativePath(requiredString(item, "path")),
-      byteLength: integerField(item, "byteLength"),
-      digest: requiredString(item, "digest"),
-    };
-  });
-  if (new Set(attachments.map((attachment) => attachment.path)).size !== attachments.length)
-    throw new Error("invalid prepared metadata duplicate attachment");
-  const extractedDigest = requiredString(record, "extractedDigest");
-  const extractedByteLength = integerField(record, "extractedByteLength");
-  return {
-    preparedId,
-    claimId,
-    kind,
-    displayName,
-    digest,
-    snapshotPath,
-    extractedPath,
-    files,
-    atoms,
-    entryRelativePath,
-    entryIdentity,
-    snapshotIdentity,
-    snapshotBytes,
-    revision,
-    metadata,
-    converter,
-    attachments,
-    extractedDigest,
-    extractedByteLength,
-  };
-}
-
-async function copyPathNoFollow(source: string, target: string): Promise<void> {
-  const stat = await lstatNoFollow(source);
-  try {
-    const existing = await fs.lstat(target);
-    if (existing.isSymbolicLink()) throw new Error(`symlink rejected: ${target}`);
-    throw new Error(`staging target already exists: ${target}`);
-  } catch (error) {
-    if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
-  }
-  if (stat.isDirectory()) {
-    await fs.mkdir(target, { recursive: false, mode: 0o700 });
-    for (const name of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
-      if (name === ".git") continue;
-      validRelativePath(name);
-      await copyPathNoFollow(join(source, name), join(target, name));
-    }
-    return;
-  }
-  const bytes = await readNoFollow(source);
-  await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
-  const handle = await openFile(target, "wx", 0o600);
-  try {
-    await handle.writeFile(bytes);
-  } finally {
-    await handle.close();
-  }
-}
-async function copyRepositoryNoSecrets(target: string, files: FileSnapshot[], metadata: StageMetadata): Promise<void> {
-  await fs.mkdir(target, { recursive: false, mode: 0o700 });
-  await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-  await writeTree(join(target, metadata.payload), files);
-}
-
 export class SourceService {
   readonly db: ScholarDatabase;
   readonly paths: VaultPathsLike;
@@ -1564,7 +679,6 @@ export class SourceService {
     const source = resolve(input);
     const name = validRelativePath(request.name ?? basename(source));
     if (name.includes("/")) throw new Error("staging name must be a single filename");
-    await rejectSymlinkAncestors(source);
     const stat = await lstatNoFollow(source);
     const repository = stat.isDirectory() && (await this.isRepository(source));
     const kind: SourceKind = repository ? "repository" : inferKind(source, stat);
@@ -2807,28 +1921,5 @@ export class SourceService {
   }
 }
 
-export function nativeExtraction(snapshot: TreeSnapshot): Buffer {
-  if (snapshot.files.length === 1 && snapshot.kind !== "directory" && snapshot.kind !== "repository") {
-    const first = snapshot.files[0];
-    if (!first) throw new Error("source snapshot has no file");
-    return Buffer.from(first.bytes);
-  }
-  const pieces: Buffer[] = [];
-  for (const file of snapshot.files) {
-    const last = file.bytes.at(-1);
-    pieces.push(
-      Buffer.from(`--- FILE: ${file.path} ---\n`),
-      file.bytes,
-      Buffer.from(last === 10 ? "" : "\n"),
-      Buffer.from(`--- END FILE: ${file.path} ---\n`),
-    );
-  }
-  return Buffer.concat(pieces);
-}
+export { atomizeExtraction, chunkExtraction, nativeExtraction, reconstructChunks, validateChunkEndpoints };
 export const sha256 = digestBytes;
-export function chunkExtraction(
-  extracted: string | Uint8Array,
-  endpoints?: Array<number | ChunkPlanEndpoint>,
-): SourceChunk[] {
-  return validateChunkEndpoints(extracted, endpoints);
-}

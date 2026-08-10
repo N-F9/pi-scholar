@@ -4,7 +4,7 @@ import { promises as fs, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
-import { ScholarApplication } from "../src/application.js";
+import { ScholarApplication } from "../src/application/application.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { localDate } from "../src/scheduler.js";

@@ -266,7 +266,10 @@ const appCache = new Map<string, ScholarApplication>();
 const gradingClaimOwner = randomUUID();
 
 async function loadRuntimeModule(): Promise<RuntimeModule> {
-  const application = (await import("../dist/application.js")) as unknown as Pick<RuntimeModule, "createApplication">;
+  const application = (await import("../dist/application/application.js")) as unknown as Pick<
+    RuntimeModule,
+    "createApplication"
+  >;
   const vault = (await import("../dist/vault.js")) as unknown as Pick<RuntimeModule, "resolveVault">;
   return { ...application, ...vault };
 }

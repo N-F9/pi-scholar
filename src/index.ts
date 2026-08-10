@@ -8,8 +8,8 @@ export type {
   WikiNoteInput,
   WikiNoteUpdateInput,
   WikiSearchResult,
-} from "./application.js";
-export { createApplication, ScholarApplication } from "./application.js";
+} from "./application/application.js";
+export { createApplication, ScholarApplication } from "./application/application.js";
 export * from "./contracts.js";
 export * from "./database.js";
 export * from "./doctor.js";
@@ -25,7 +25,7 @@ export {
   SourceService,
   sha256,
   validateChunkEndpoints,
-} from "./sources.js";
+} from "./sources/source-service.js";
 export * from "./vault.js";
 export {
   isExecutableHtml,

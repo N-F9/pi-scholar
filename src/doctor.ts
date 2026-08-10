@@ -8,7 +8,7 @@ import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import { QuizService } from "./quiz.js";
 import { localDate, SchedulerService } from "./scheduler.js";
-import { atomizeExtraction } from "./sources.js";
+import { atomizeExtraction } from "./sources/source-service.js";
 import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
 
 function check(name: string, status: DoctorCheck["status"], message: string, details?: JsonValue): DoctorCheck {
