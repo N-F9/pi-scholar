@@ -1,7 +1,8 @@
 {
   "name": "pi-scholar",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Local-first sourced Markdown wiki and daily review for Pi",
+  "license": "MIT",
   "keywords": [
     "pi-package"
   ],
