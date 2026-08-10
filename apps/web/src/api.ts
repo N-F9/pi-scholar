@@ -56,7 +56,7 @@ const ISSUE_KINDS = ["incorrect", "unclear", "missing", "bad-boundary"] as const
 const ISSUE_STATUSES = ["open", "resolved", "reopened"] as const;
 const FSRS_STATES = ["New", "Learning", "Review", "Relearning"] as const;
 const REVIEW_RATINGS = ["Again", "Hard", "Good", "Easy"] as const;
-const WORKFLOW_KINDS = ["source-admission", "wiki-maintenance", "daily-quiz", "quiz-grader", "sync"] as const;
+const WORKFLOW_KINDS = ["extract", "ingest", "lint", "daily", "quiz-grader", "sync"] as const;
 const WORKFLOW_STATUSES = ["queued", "running", "succeeded", "failed", "cancelled"] as const;
 function isEnum(value: unknown, values: readonly string[]): boolean {
   return typeof value === "string" && values.includes(value);

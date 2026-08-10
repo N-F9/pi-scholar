@@ -1,12 +1,12 @@
 import type {
-  AdmissionPublicationInput,
+  ExtractPublicationInput,
   GradeSettlementInput,
-  MaintenanceInput,
-  MaintenanceIssuePageInput,
   QuizAnswerInput,
   QuizPublicationInput,
   QuizQuestionProposal,
   ReviewRating,
+  WikiChangeInput,
+  WikiChangeIssuePageInput,
 } from "../contracts.js";
 import { ValidationError } from "../scheduler.js";
 
@@ -57,7 +57,7 @@ export function requiredInteger(value: Record<string, unknown>, key: string, lab
   return result as number;
 }
 
-function decodeMaintenancePage(value: unknown): MaintenanceIssuePageInput {
+function decodeWikiChangePage(value: unknown): WikiChangeIssuePageInput {
   if (!isRecord(value)) throw new ValidationError("resolve-issue page must be an object");
   exact(value, ["pageId", "expectedDigest", "title", "body", "quizWorthiness"], "resolve-issue page");
   const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
@@ -98,28 +98,27 @@ function objectArray(value: unknown, label: string): Record<string, unknown>[] {
   return value as Record<string, unknown>[];
 }
 
-export function decodeAdmissionInput(value: unknown): AdmissionPublicationInput {
-  if (!isRecord(value)) throw new ValidationError("admission publication must be an object");
-  exact(value, ["claimId", "preparedId", "digest", "endpoints"], "admission publication");
-  const endpoints =
-    value.endpoints === undefined
-      ? undefined
-      : Array.isArray(value.endpoints) && value.endpoints.every((item) => Number.isInteger(item) && Number(item) >= 1)
-        ? value.endpoints.map((item) => Number(item))
-        : (() => {
-            throw new ValidationError("endpoints must be an array of positive line endpoints");
-          })();
+export function decodeExtractPublicationInput(value: unknown): ExtractPublicationInput {
+  if (!isRecord(value)) throw new ValidationError("extract publication must be an object");
+  exact(value, ["claimId", "preparedId", "digest", "endpoints"], "extract publication");
+  const endpoints = value.endpoints;
+  if (
+    !Array.isArray(endpoints) ||
+    endpoints.length === 0 ||
+    endpoints.some((item) => !Number.isInteger(item) || Number(item) < 1)
+  )
+    throw new ValidationError("endpoints must be a non-empty array of positive line endpoints");
   return {
     claimId: requiredString(value, "claimId"),
     preparedId: requiredString(value, "preparedId"),
     digest: requiredString(value, "digest"),
-    ...(endpoints ? { endpoints } : {}),
+    endpoints: endpoints.map((item) => Number(item)),
   };
 }
 
-export function decodeMaintenanceInput(value: unknown): MaintenanceInput {
-  if (!isRecord(value)) throw new ValidationError("maintenance proposal must be an object");
-  const kind = requiredString(value, "kind") as MaintenanceInput["kind"];
+export function decodeWikiChangeInput(value: unknown): WikiChangeInput {
+  if (!isRecord(value)) throw new ValidationError("wiki change must be an object");
+  const kind = requiredString(value, "kind") as WikiChangeInput["kind"];
   switch (kind) {
     case "create-page": {
       exact(value, ["kind", "path", "title", "body", "quizWorthiness"], "create-page");
@@ -170,6 +169,13 @@ export function decodeMaintenanceInput(value: unknown): MaintenanceInput {
         expectedDigest: requiredString(value, "expectedDigest"),
         path: requiredString(value, "path"),
       };
+    case "retire-page":
+      exact(value, ["kind", "pageId", "expectedDigest"], "retire-page");
+      return {
+        kind,
+        pageId: requiredString(value, "pageId"),
+        expectedDigest: requiredString(value, "expectedDigest"),
+      };
     case "prerequisites": {
       exact(value, ["kind", "pageId", "expectedRevision", "prerequisitePageIds"], "prerequisites");
       const expectedRevision = optionalInteger(value, "expectedRevision");
@@ -185,11 +191,11 @@ export function decodeMaintenanceInput(value: unknown): MaintenanceInput {
       return {
         kind,
         issueId: requiredString(value, "issueId"),
-        page: decodeMaintenancePage(value.page),
+        page: decodeWikiChangePage(value.page),
         resolution: requiredString(value, "resolution"),
       };
     default:
-      throw new ValidationError(`unsupported maintenance kind: ${kind}`);
+      throw new ValidationError(`unsupported wiki change kind: ${kind}`);
   }
 }
 

@@ -8,6 +8,7 @@ import type {
   PreparedAdmission as ContractPreparedAdmission,
   SourceKind as ContractSourceKind,
   SourceManifest as ContractSourceManifest,
+  SourceRecord,
 } from "../contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "../database.js";
 import type { DoclingResult as ExternalDoclingResult } from "../external/docling.js";
@@ -397,6 +398,45 @@ function sameFileContents(left: FileSnapshot[], right: FileSnapshot[]): boolean 
       right.map(({ path, size, digest }) => ({ path, size, digest })).sort((a, b) => a.path.localeCompare(b.path)),
     )
   );
+}
+function manifestProvenance(manifest: SourceManifest): Record<string, unknown> {
+  return {
+    kind: manifest.kind,
+    displayName: manifest.displayName,
+    originalName: manifest.originalName,
+    sourceUri: manifest.sourceUri,
+    mediaType: manifest.mediaType,
+    revision: manifest.revision,
+    repositoryRevision: manifest.repositoryRevision,
+    inputKind: manifest.inputKind,
+    converter: manifest.converter ?? null,
+    capturedAt: manifest.capturedAt,
+    stagedMetadata: manifest.stagedMetadata ?? null,
+  };
+}
+function claimProvenance(claim: SourceClaim, publication: SourceManifest): Record<string, unknown> {
+  const metadata = claim.snapshot.metadata;
+  return {
+    kind: claim.snapshot.kind,
+    displayName: metadata?.displayName ?? claim.entry.relativePath,
+    originalName: metadata?.originalName ?? claim.entry.relativePath,
+    sourceUri: metadata?.sourceUri,
+    mediaType: metadata?.mediaType,
+    revision: claim.snapshot.revision,
+    repositoryRevision: claim.snapshot.revision,
+    inputKind: metadata?.requestedKind,
+    converter: publication.converter ?? null,
+    capturedAt: publication.capturedAt,
+    stagedMetadata: metadata ?? null,
+  };
+}
+function assertManifestClaimProvenance(
+  manifest: SourceManifest,
+  claim: SourceClaim,
+  publication: SourceManifest = manifest,
+): void {
+  if (canonical(manifestProvenance(manifest)) !== canonical(claimProvenance(claim, publication)))
+    throw new Error("source packet provenance mismatch");
 }
 export class SourceService {
   readonly db: ScholarDatabase;
@@ -1013,6 +1053,7 @@ export class SourceService {
         sourceId: manifest.sourceId,
         originalDigest: claim.snapshot.digest,
       });
+      assertManifestClaimProvenance(publishedManifest, claim, manifest);
       this.recordSource(publishedManifest, packet);
     } catch (error) {
       if (createdPacket && createdPacketIdentity) {
@@ -1269,6 +1310,7 @@ export class SourceService {
       throw error;
     }
     const manifest = await verifyRetainedPacket(packet, { sourceId, originalDigest: claim.snapshot.digest });
+    assertManifestClaimProvenance(manifest, claim);
     this.recordSource(manifest, packet);
     return { sourceId, manifest, packetPath: packet, removedInbox: await this.removeInboxAfterAdmission(claim), claim };
   }
@@ -1485,6 +1527,43 @@ export class SourceService {
   }
   list(): Array<Record<string, unknown>> {
     return dbAll<Row>(this.db, "SELECT * FROM sources ORDER BY captured_at, source_id").map((row) => sourceRecord(row));
+  }
+  async publishedPackets(): Promise<
+    Array<{ readonly source: SourceRecord; readonly manifest: SourceManifest; readonly packetPath: string }>
+  > {
+    const published = dbAll<Row>(
+      this.db,
+      "SELECT * FROM sources WHERE status = 'published' ORDER BY captured_at, source_id",
+    );
+    const packets: Array<{
+      readonly source: SourceRecord;
+      readonly manifest: SourceManifest;
+      readonly packetPath: string;
+    }> = [];
+    for (const row of published) {
+      try {
+        const sourceId = String(row.source_id);
+        const digest = String(row.digest ?? "");
+        const packetPath = safeChildPath(this.sources(), String(row.manifest_path ?? join(this.sources(), sourceId)));
+        const manifest = await verifyRetainedPacket(packetPath, { sourceId, originalDigest: digest });
+        if (
+          row.source_id !== manifest.sourceId ||
+          row.kind !== manifest.kind ||
+          row.display_name !== manifest.displayName ||
+          (row.original_name ?? undefined) !== (manifest.originalName ?? undefined) ||
+          (row.source_uri ?? undefined) !== (manifest.sourceUri ?? undefined) ||
+          (row.media_type ?? undefined) !== (manifest.mediaType ?? undefined) ||
+          (row.repository_revision ?? undefined) !== (manifest.repositoryRevision ?? undefined) ||
+          row.captured_at !== manifest.capturedAt ||
+          row.digest !== manifest.originalDigest
+        )
+          throw new Error("published source provenance mismatch");
+        packets.push({ source: sourceRecord(row) as unknown as SourceRecord, manifest, packetPath });
+      } catch (error) {
+        throw new Error("published source packet is unavailable or unverified", { cause: error });
+      }
+    }
+    return packets;
   }
   private discoverCurrentCitationDependencies(): CurrentCitationDependency[] {
     const sources = dbAll<{ source_id: string; digest: string | null; status: string }>(

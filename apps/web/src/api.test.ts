@@ -8,6 +8,7 @@ import {
   isSourceListResult,
   isSourceRemovalPreviewResult,
   isWikiPageResult,
+  isWorkflowListResult,
 } from "./api";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -252,6 +253,20 @@ describe("api response boundary", () => {
         ],
       }),
       false,
+    );
+  });
+  it("accepts the six workflow kinds", () => {
+    const kinds = ["extract", "ingest", "lint", "daily", "quiz-grader", "sync"] as const;
+    assert.equal(
+      isWorkflowListResult({
+        workflows: kinds.map((kind, index) => ({
+          requestId: `workflow-${index}`,
+          kind,
+          status: "queued",
+          progress: 0,
+        })),
+      }),
+      true,
     );
   });
 });

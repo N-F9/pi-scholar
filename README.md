@@ -47,17 +47,20 @@ Create an operator-owned environment file such as `/absolute/path/to/pi-scholar.
 For a package checkout, run `npm install && npm run build && npm run build:web` before pointing cron at it. Published npm installs run the same build during packaging.
 
 ```cron
-# source-admission: choose its own minute/hour/day fields
-0 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/source-admission/SKILL.md --no-context-files --no-session -p 'Process the current stable source queue sequentially with the source-admission skill and Scholar tools; report concise status.' >> /absolute/path/to/pi-scholar/logs/source-admission.log 2>&1
+# extract: choose its own minute/hour/day fields
+0 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/extract/SKILL.md --no-context-files --no-session -p "Process the current stable extract context sequentially, publish each immutable source packet through Scholar tools, and report concise status." >> /absolute/path/to/pi-scholar/logs/extract.log 2>&1
 
-# wiki-maintenance: choose its own minute/hour/day fields
-15 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/wiki-maintenance/SKILL.md --no-context-files --no-session -p 'Review the current maintenance context with the wiki-maintenance skill, publish only guarded proposals, and report concise status.' >> /absolute/path/to/pi-scholar/logs/wiki-maintenance.log 2>&1
+# ingest: choose its own minute/hour/day fields
+15 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/ingest/SKILL.md --no-context-files --no-session -p "Review the current ingest context and submit guarded source-grounded wiki changes through Scholar tools; report concise status." >> /absolute/path/to/pi-scholar/logs/ingest.log 2>&1
 
-# daily-quiz: choose its own minute/hour/day fields
-0 7 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily-quiz/SKILL.md --no-context-files --no-session -p 'Use the current local-date quiz context with the daily-quiz skill, publish today's quiz or an explicit skip, and report concise status.' >> /absolute/path/to/pi-scholar/logs/daily-quiz.log 2>&1
+# lint: choose its own minute/hour/day fields
+30 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/lint/SKILL.md --no-context-files --no-session -p "Inspect the final wiki with lint and submit guarded organizer or repair changes through Scholar tools; report concise status." >> /absolute/path/to/pi-scholar/logs/lint.log 2>&1
+
+# daily: choose its own minute/hour/day fields
+0 7 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Use today's local-date daily context to publish today's bounded quiz or explicit skip unless initialization blocks generation; report concise status." >> /absolute/path/to/pi-scholar/logs/daily.log 2>&1
 
 # quiz-grader: choose its own minute/hour/day fields (usually event-driven or frequent)
-*/15 * * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/quiz-grader/SKILL.md --no-context-files --no-session -p 'Settle the current sealed quiz submission with the quiz-grader skill and Scholar tools; report concise status.' >> /absolute/path/to/pi-scholar/logs/quiz-grader.log 2>&1
+*/15 * * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/quiz-grader/SKILL.md --no-context-files --no-session -p "Settle the current sealed quiz submission with quiz-grader and Scholar tools; report concise status." >> /absolute/path/to/pi-scholar/logs/quiz-grader.log 2>&1
 
 # Optional, separately controlled Git push; choose its own minute/hour/day fields
 30 7 * * * /absolute/path/to/bin/pi-scholar sync --vault /absolute/path/to/vault >> /absolute/path/to/pi-scholar/logs/sync.log 2>&1
@@ -69,7 +72,7 @@ Each schedule is independently user-owned; jobs may overlap without an ordering 
 
 ## Recovery and boundaries
 
-Run `pi-scholar doctor /absolute/path/to/vault` after an interrupted command or dependency change. Source admission is idempotent by claimed physical identity and digest, quiz grading by sealed submission identity, and Git synchronization by the repository's own object state.
+Run `pi-scholar doctor /absolute/path/to/vault` after an interrupted command or dependency change. Source extraction is idempotent by claimed physical identity and digest, quiz grading by sealed submission identity, and Git synchronization by the repository's own object state.
 
 Source removal deletes current dependent artifacts only after a fresh preview and explicit confirmation. It does not erase Git history; recover a prior version from Git when necessary. Browser drafts and inbox staging are intentionally not commits until the corresponding durable operation succeeds.
 

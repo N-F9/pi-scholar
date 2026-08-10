@@ -280,7 +280,7 @@ export async function runActor({ cwd, prompt }) {
           "--extension",
           repoRoot,
           "--skills",
-          "source-admission,wiki-maintenance,daily-quiz,quiz-grader",
+          "extract,ingest,lint,daily,quiz-grader",
           "--no-rules",
           "--config",
           config,

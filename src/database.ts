@@ -213,6 +213,7 @@ const REQUIRED_SCHEMA_FRAGMENTS: Readonly<Record<string, readonly string[]>> = {
   question_pages: ["criterion_json text not null", "weight real not null"],
   page_results: ["unique (quiz_id, page_id)", "unique (review_id)"],
   quiz_evidence: ["primary key (quiz_id, reference)"],
+  workflows: ["check (kind in ('extract','ingest','lint','daily','quiz-grader','sync'))"],
 };
 
 export const SCHEMA_SQL = `
@@ -425,7 +426,7 @@ CREATE TABLE IF NOT EXISTS quiz_evidence (
 
 CREATE TABLE IF NOT EXISTS workflows (
   request_id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('source-admission','wiki-maintenance','daily-quiz','quiz-grader','sync')),
+  kind TEXT NOT NULL CHECK (kind IN ('extract','ingest','lint','daily','quiz-grader','sync')),
   status TEXT NOT NULL CHECK (status IN ('queued','running','succeeded','failed','cancelled')),
   started_at TEXT,
   finished_at TEXT,

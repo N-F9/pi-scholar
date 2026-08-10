@@ -37,6 +37,10 @@ export interface SourceChunk {
   readonly atomEnd: number;
 }
 
+export interface IngestSourceChunk extends SourceChunk {
+  readonly path: string;
+}
+
 export interface SourceManifest {
   readonly sourceId: string;
   readonly kind: SourceKind;
@@ -102,7 +106,7 @@ export interface PreparedAdmission {
   readonly atoms: readonly PreparedAdmissionAtom[];
 }
 
-export interface AdmissionClaimRecord extends PreparedAdmission {
+export interface ExtractClaimRecord extends PreparedAdmission {
   readonly relativePath: string;
   readonly originalName?: string;
   readonly sourceUri?: string;
@@ -117,22 +121,22 @@ export interface AdmissionClaimRecord extends PreparedAdmission {
     readonly mtimeNs: string;
   };
 }
-export interface AdmissionFailureRecord {
+export interface ExtractFailureRecord {
   readonly relativePath: string;
   readonly errorCode: string;
   readonly errorMessage: string;
 }
-export interface AdmissionContext {
+export interface ExtractContext {
   readonly claims: readonly PreparedAdmission[];
-  readonly failures?: readonly AdmissionFailureRecord[];
+  readonly failures?: readonly ExtractFailureRecord[];
 }
-export interface AdmissionPublicationInput {
+export interface ExtractPublicationInput {
   readonly claimId: string;
   readonly preparedId: string;
   readonly digest: string;
-  readonly endpoints?: readonly number[];
+  readonly endpoints: readonly number[];
 }
-export interface AdmissionPublicationResult {
+export interface ExtractPublicationResult {
   readonly sourceId: string;
   readonly manifest: SourceManifest;
   readonly removedInbox: boolean;
@@ -226,7 +230,7 @@ export interface PageReviewRecord {
   readonly settlementId: string;
 }
 
-export interface MaintenanceIssuePageInput {
+export interface WikiChangeIssuePageInput {
   readonly pageId: string;
   readonly expectedDigest: string;
   readonly title?: string;
@@ -234,7 +238,7 @@ export interface MaintenanceIssuePageInput {
   readonly quizWorthiness?: PageRecord["quizWorthiness"];
 }
 
-export type MaintenanceInput =
+export type WikiChangeInput =
   | {
       readonly kind: "create-page";
       readonly path: string;
@@ -251,6 +255,7 @@ export type MaintenanceInput =
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     }
   | { readonly kind: "rename-page"; readonly pageId: string; readonly expectedDigest: string; readonly path: string }
+  | { readonly kind: "retire-page"; readonly pageId: string; readonly expectedDigest: string }
   | {
       readonly kind: "prerequisites";
       readonly pageId: string;
@@ -260,18 +265,31 @@ export type MaintenanceInput =
   | {
       readonly kind: "resolve-issue";
       readonly issueId: string;
-      readonly page: MaintenanceIssuePageInput;
+      readonly page: WikiChangeIssuePageInput;
       readonly resolution: string;
     };
 
-export interface MaintenanceContext {
-  readonly pages: readonly WikiPageResult[];
-  readonly issues: readonly WikiIssueRecord[];
-  readonly sources: readonly SourceRecord[];
+export interface IngestSourceContext {
+  readonly source: SourceRecord;
+  readonly manifest: SourceManifest;
+  readonly packetPath: string;
+  readonly chunks: readonly IngestSourceChunk[];
 }
 
-export interface MaintenanceResult {
-  readonly kind: MaintenanceInput["kind"];
+export interface IngestContext {
+  readonly pages: readonly WikiPageResult[];
+  readonly issues: readonly WikiIssueRecord[];
+  readonly sources: readonly IngestSourceContext[];
+}
+
+export interface LintContext {
+  readonly scope: { readonly kind: "full" } | { readonly kind: "targeted"; readonly description: string };
+  readonly pages: readonly WikiPageResult[];
+  readonly issues: readonly WikiIssueRecord[];
+}
+
+export interface WikiChangeResult {
+  readonly kind: WikiChangeInput["kind"];
   readonly page?: PageRecord;
   readonly pageLearning?: PageLearningRecord;
   readonly prerequisites?: readonly PagePrerequisiteRecord[];
@@ -483,7 +501,7 @@ export interface GradingResult {
 
 export interface WorkflowRecord {
   readonly requestId: string;
-  readonly kind: "source-admission" | "wiki-maintenance" | "daily-quiz" | "quiz-grader" | "sync";
+  readonly kind: "extract" | "ingest" | "lint" | "daily" | "quiz-grader" | "sync";
   readonly status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   readonly startedAt?: IsoDateTime;
   readonly finishedAt?: IsoDateTime;
@@ -507,8 +525,8 @@ export interface SettingsFacts {
   readonly localDate: LocalDate;
   readonly pendingInboxCount: number;
   readonly openIssueCount: number;
-  readonly lastMaintenanceAt?: IsoDateTime;
-  readonly lastMaintenanceResult?: string;
+  readonly lastLintAt?: IsoDateTime;
+  readonly lastLintResult?: string;
   readonly recentChanges: readonly string[];
   readonly git: GitStateFacts;
 }

@@ -1,16 +1,28 @@
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { promises as fs, mkdtempSync } from "node:fs";
+import { promises as fs, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
+import { decodeExtractPublicationInput } from "../src/application/decoders.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
 import { WikiService } from "../src/wiki.js";
+
+it("requires non-empty extraction line endpoints", () => {
+  const base = { claimId: "claim", preparedId: "prepared", digest: "digest" };
+  for (const endpoints of [undefined, [], [0], ["1"]]) {
+    assert.throws(
+      () => decodeExtractPublicationInput({ ...base, ...(endpoints === undefined ? {} : { endpoints }) }),
+      /endpoints must be a non-empty array/u,
+    );
+  }
+  assert.deepEqual(decodeExtractPublicationInput({ ...base, endpoints: [2, 4] }).endpoints, [2, 4]);
+});
 
 type DurableApplication = ScholarApplication & {
   durableDirect<T>(operation: () => T | PromiseLike<T>, subject: string): Promise<T>;
@@ -66,6 +78,17 @@ describe("durable application writes", () => {
         "done",
       );
       assert.deepEqual(calls, ["operation", "checkpoint", "doctor", "commit:test:write"]);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("finalizes source staging through the durable pipeline", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      const result = await app.stageSource({ kind: "text", text: "staged\n", name: "staged.txt" });
+      assert.equal(result.source.status, "pending");
+      assert.deepEqual(calls, ["checkpoint", "doctor", "commit:source:stage"]);
     } finally {
       await app.close();
       db.close();
@@ -140,14 +163,14 @@ describe("durable application writes", () => {
     const originalCheckpoint = db.checkpoint.bind(db);
     try {
       await app.stageSource({ kind: "text", text: "durable source\n", name: "durable.txt" });
-      const context = await app.getAdmissionContext();
+      const context = await app.getExtractContext();
       const claim = context.claims[0];
       if (!claim) throw new Error("admission claim is missing");
-      const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest };
+      const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest, endpoints: [1] };
       (db as unknown as { checkpoint: () => void }).checkpoint = () => {
         throw new Error("checkpoint failed after publication");
       };
-      await assert.rejects(app.admitSource(input), (error: unknown) => {
+      await assert.rejects(app.publishExtraction(input), (error: unknown) => {
         if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
         assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
         assert.deepEqual(error.details, { applied: true, retryable: false, stage: "checkpoint" });
@@ -158,7 +181,7 @@ describe("durable application writes", () => {
       );
       assert.equal(row?.status, "published");
       assert.equal(row?.error_code, null);
-      const retry = await app.admitSource(input);
+      const retry = await app.publishExtraction(input);
       assert.equal(retry.sourceId, row?.source_id);
       assert.equal(
         db.get<{ status: string; error_code: string | null }>(
@@ -177,12 +200,13 @@ describe("durable application writes", () => {
     const { app, db, paths } = fixture();
     try {
       await app.stageSource({ kind: "text", text: "evidence\n", name: "evidence.txt" });
-      const claim = (await app.getAdmissionContext()).claims[0];
+      const claim = (await app.getExtractContext()).claims[0];
       if (!claim) throw new Error("admission claim is missing");
-      const admitted = await app.admitSource({
+      const admitted = await app.publishExtraction({
         claimId: claim.claimId,
         preparedId: claim.preparedId,
         digest: claim.digest,
+        endpoints: [1],
       });
       const page = await app.createNote({
         path: "grounded.md",
@@ -265,7 +289,7 @@ describe("durable application writes", () => {
       const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
       const beforeTables = Object.fromEntries(tableNames.map((name) => [name, rows(name)]));
       await assert.rejects(
-        app.applyMaintenance({
+        app.applyWikiChange({
           kind: "resolve-issue",
           issueId: issue.issueId,
           page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body: correctedBody },
@@ -321,7 +345,7 @@ describe("durable application writes", () => {
       const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
       const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
       await assert.rejects(
-        app.applyMaintenance({
+        app.applyWikiChange({
           kind: "update-page",
           pageId: page.page.pageId,
           expectedDigest: page.page.digest,
@@ -342,6 +366,312 @@ describe("durable application writes", () => {
       await app.close();
       db.close();
       await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+  it("rejects rollback restoration through a symlink", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-symlink-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const outside = join(root, "outside.txt");
+    await fs.writeFile(outside, "outside\n");
+    let destination = "";
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: () => {
+        rmSync(destination);
+        symlinkSync(outside, destination);
+        throw new Error("injected commit failure");
+      },
+    });
+    try {
+      const page = await app.wiki.create({ path: "rollback-symlink.md", body: "before\n", quizWorthiness: "skip" });
+      destination = join(paths.wikiRoot, page.page.relativePath);
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: page.page.pageId,
+          expectedDigest: page.page.digest,
+          body: "after\n",
+        }),
+        (error: unknown) => {
+          if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
+          assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+          assert.deepEqual(error.details, {
+            applied: true,
+            retryable: false,
+            stage: "rollback",
+          });
+          return true;
+        },
+      );
+      assert.equal(await fs.readFile(outside, "utf8"), "outside\n");
+      assert.equal(await fs.readlink(destination), outside);
+    } finally {
+      await app.close();
+      db.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+  it("rejects rollback deletion through a symlinked parent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-parent-symlink-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const outside = join(root, "outside");
+    await fs.mkdir(outside);
+    await fs.writeFile(join(outside, "marker.txt"), "outside\n");
+    const parent = join(paths.wikiRoot, "nested");
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: () => {
+        rmSync(parent, { recursive: true, force: true });
+        symlinkSync(outside, parent);
+        throw new Error("injected commit failure");
+      },
+    });
+    try {
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "create-page",
+          path: "nested/new.md",
+          body: "before\n",
+          quizWorthiness: "skip",
+        }),
+        (error: unknown) => {
+          if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
+          assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+          assert.deepEqual(error.details, {
+            applied: true,
+            retryable: false,
+            stage: "rollback",
+          });
+          return true;
+        },
+      );
+      assert.equal(await fs.readFile(join(outside, "marker.txt"), "utf8"), "outside\n");
+      assert.equal(await fs.readlink(parent), outside);
+    } finally {
+      await app.close();
+      db.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+describe("knowledge capability contexts", () => {
+  it("exposes only verified published source packets to ingest", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      await app.stageSource({ kind: "text", text: "published\n", name: "published.txt" });
+      const claim = (await app.getExtractContext()).claims[0];
+      if (!claim) throw new Error("extract claim is missing");
+      const published = await app.publishExtraction({
+        claimId: claim.claimId,
+        preparedId: claim.preparedId,
+        digest: claim.digest,
+        endpoints: [1],
+      });
+      await app.stageSource({ kind: "text", text: "pending\n", name: "pending.txt" });
+      const context = await app.getIngestContext();
+      assert.equal(context.sources.length, 1);
+      const packet = context.sources[0];
+      if (!packet) throw new Error("published packet is missing");
+      assert.equal(packet.source.sourceId, published.sourceId);
+      assert.equal(packet.source.status, "published");
+      assert.equal(packet.source.manifestPath, packet.packetPath);
+      assert.equal(packet.manifest.sourceId, published.sourceId);
+      assert.equal(packet.packetPath, join(paths.sourcesRoot, published.sourceId));
+      assert.equal(packet.chunks.length, packet.manifest.chunks.length);
+      for (const [index, chunk] of packet.chunks.entries()) {
+        const expectedPath = join(packet.packetPath, "chunks", `${String(index + 1).padStart(4, "0")}.md`);
+        assert.equal(chunk.path, expectedPath);
+        assert.equal((await fs.stat(chunk.path)).isFile(), true);
+        const { path: _path, ...manifestChunk } = chunk;
+        assert.deepEqual(manifestChunk, packet.manifest.chunks[index]);
+      }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("fails closed when a published source packet cannot be verified", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      await app.stageSource({ kind: "text", text: "tamper me\n", name: "tamper.txt" });
+      const claim = (await app.getExtractContext()).claims[0];
+      if (!claim) throw new Error("extract claim is missing");
+      const published = await app.publishExtraction({
+        claimId: claim.claimId,
+        preparedId: claim.preparedId,
+        digest: claim.digest,
+        endpoints: [1],
+      });
+      await fs.appendFile(join(paths.sourcesRoot, published.sourceId, "extracted.md"), "tampered\n");
+      await assert.rejects(app.getIngestContext(), /unavailable or unverified/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("builds full and targeted lint scopes without source paths", async () => {
+    const { app, db } = fixture();
+    try {
+      const full = await app.getLintContext();
+      assert.deepEqual(full.scope, { kind: "full" });
+      assert.equal(Object.hasOwn(full, "sources"), false);
+      const targeted = await app.getLintContext({ description: "repair backlinks" });
+      assert.deepEqual(targeted.scope, { kind: "targeted", description: "repair backlinks" });
+      assert.equal(Object.hasOwn(targeted, "sources"), false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("keeps drifted pages in ingest and lint repair contexts", async () => {
+    const { app, db } = fixture();
+    try {
+      const drifted = await app.createNote({ path: "drifted.md", body: "# Drifted\n", quizWorthiness: "skip" });
+      const retired = await app.createNote({ path: "retired.md", body: "# Retired\n", quizWorthiness: "skip" });
+      db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
+      db.run("UPDATE pages SET status = 'retired' WHERE page_id = ?", [retired.page.pageId]);
+
+      const ingest = await app.getIngestContext();
+      const lint = await app.getLintContext();
+      for (const pages of [ingest.pages, lint.pages]) {
+        assert.equal(
+          pages.some(({ page }) => page.pageId === drifted.page.pageId && page.status === "drifted"),
+          true,
+        );
+        assert.equal(
+          pages.some(({ page }) => page.pageId === retired.page.pageId),
+          false,
+        );
+      }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("keeps wiki, ingest, and lint reads from healing missing learning state", async () => {
+    const { app, db } = fixture();
+    try {
+      const page = await app.createNote({
+        path: "missing-learning.md",
+        body: "# Missing learning\n",
+        quizWorthiness: "eligible",
+      });
+      db.run("DELETE FROM page_learning WHERE page_id = ?", [page.page.pageId]);
+      await assert.rejects(app.getWiki(page.page.pageId), /learning state is missing/u);
+      await assert.rejects(app.getIngestContext(), /learning state is missing/u);
+      await assert.rejects(app.getLintContext(), /learning state is missing/u);
+      assert.equal(db.get("SELECT page_id FROM page_learning WHERE page_id = ?", [page.page.pageId]), undefined);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects stale retire changes before mutating the page", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const page = await app.createNote({ path: "stale-retire.md", body: "# Stale retire\n", quizWorthiness: "skip" });
+      await assert.rejects(
+        app.applyWikiChange({ kind: "retire-page", pageId: page.page.pageId, expectedDigest: "stale-digest" }),
+        /stale/u,
+      );
+      const current = await app.wiki.get(page.page.pageId);
+      assert.equal(current.status, "active");
+      assert.equal(current.digest, page.page.digest);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("guards prerequisite changes while a quiz is unresolved", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const page = await app.createNote({
+        path: "quiz-guarded.md",
+        body: "# Quiz guarded\n",
+        quizWorthiness: "eligible",
+      });
+      const prerequisite = await app.createNote({
+        path: "quiz-prerequisite.md",
+        body: "# Quiz prerequisite\n",
+        quizWorthiness: "eligible",
+      });
+      const quizId = randomUUID();
+      const questionId = randomUUID();
+      db.run("INSERT INTO quizzes (quiz_id, date, revision, status, generated_at) VALUES (?, ?, 1, 'open', ?)", [
+        quizId,
+        "2099-01-01",
+        new Date().toISOString(),
+      ]);
+      db.run(
+        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, ?)",
+        [questionId, quizId, "Explain", "[]"],
+      );
+      db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, 1)", [
+        questionId,
+        page.page.pageId,
+        "{}",
+      ]);
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "prerequisites",
+          pageId: page.page.pageId,
+          prerequisitePageIds: [prerequisite.page.pageId],
+        }),
+        /unresolved quiz/u,
+      );
+      assert.equal(
+        db.get("SELECT 1 FROM page_prerequisites WHERE page_id = ? AND prerequisite_page_id = ?", [
+          page.page.pageId,
+          prerequisite.page.pageId,
+        ]),
+        undefined,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects retiring pages until prerequisite edges are repaired", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const dependent = await app.createNote({
+        path: "dependent.md",
+        body: "# Dependent\n",
+        quizWorthiness: "eligible",
+      });
+      const prerequisite = await app.createNote({
+        path: "prerequisite.md",
+        body: "# Prerequisite\n",
+        quizWorthiness: "eligible",
+      });
+      await app.applyWikiChange({
+        kind: "prerequisites",
+        pageId: dependent.page.pageId,
+        prerequisitePageIds: [prerequisite.page.pageId],
+      });
+      for (const page of [dependent.page, prerequisite.page]) {
+        await assert.rejects(
+          app.applyWikiChange({ kind: "retire-page", pageId: page.pageId, expectedDigest: page.digest }),
+          /quiz-eligible/u,
+        );
+        assert.equal((await app.wiki.get(page.pageId)).status, "active");
+      }
+    } finally {
+      await app.close();
+      db.close();
     }
   });
 });
@@ -736,7 +1066,7 @@ describe("application prerequisite mutation guards", () => {
         "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
       );
       await assert.rejects(
-        app.applyMaintenance({
+        app.applyWikiChange({
           kind: "update-page",
           pageId: prerequisite.pageId,
           expectedDigest: before.digest,
@@ -774,7 +1104,7 @@ describe("application prerequisite mutation guards", () => {
         "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
       );
       await assert.rejects(
-        app.applyMaintenance({
+        app.applyWikiChange({
           kind: "resolve-issue",
           issueId: issue.issueId,
           page: {

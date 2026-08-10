@@ -794,6 +794,87 @@ export class WikiService {
     }
     return updated;
   }
+  async retire(pageId: string): Promise<WikiPage> {
+    const priorPageRow = this.catalog(pageId);
+    if (!priorPageRow) throw new Error("page not found");
+    const page = rowToPage(priorPageRow);
+    if (page.status !== "active") throw new Error("page is not active");
+    const location = normalizePagePath(this.paths, page.relativePath);
+    if (!this.authored(pageId)) throw new Error("product-authored snapshot is unavailable");
+    const priorPageBytes = readFileNoFollow(location.absolutePath);
+    const parsed = parseOkfConcept(priorPageBytes.toString("utf8"));
+    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
+    const indexPath = join(this.root(), "index.md");
+    const logPath = join(this.root(), "log.md");
+    const priorIndex = await this.optionalBytes(indexPath);
+    const priorLog = await this.optionalBytes(logPath);
+    const retired: WikiPage = {
+      ...page,
+      revision: page.revision + 1,
+      status: "retired",
+      quizWorthiness: "skip",
+      updatedAt: now(),
+    };
+    const rollback = async (): Promise<void> => {
+      const errors: unknown[] = [];
+      const attempt = async (action: () => Promise<void> | void): Promise<void> => {
+        try {
+          await action();
+        } catch (error) {
+          errors.push(error);
+        }
+      };
+      await attempt(() => this.atomicWrite(location.absolutePath, priorPageBytes));
+      await attempt(() => {
+        transaction(this.db, () => {
+          dbRun(
+            this.db,
+            "UPDATE pages SET relative_path = ?, title = ?, digest = ?, revision = ?, status = ?, quiz_worthiness = ?, updated_at = ? WHERE page_id = ?",
+            [
+              priorPageRow.relative_path,
+              priorPageRow.title,
+              priorPageRow.digest,
+              priorPageRow.revision,
+              priorPageRow.status,
+              priorPageRow.quiz_worthiness,
+              priorPageRow.updated_at,
+              pageId,
+            ],
+          );
+        });
+      });
+      await attempt(() => this.restoreOptional(indexPath, priorIndex));
+      await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (errors.length) {
+        const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
+        throw new Error(`wiki retirement rollback failed: ${detail}`, { cause: errors[0] });
+      }
+    };
+    try {
+      await fs.rm(location.absolutePath);
+      transaction(this.db, () => {
+        const result = dbRun(
+          this.db,
+          "UPDATE pages SET revision = ?, status = ?, quiz_worthiness = ?, updated_at = ? WHERE page_id = ? AND status = 'active'",
+          [retired.revision, retired.status, retired.quizWorthiness, retired.updatedAt, pageId],
+        );
+        if (Number(result.changes) !== 1) throw new Error("page is not active");
+      });
+      await this.refreshProjections();
+      await this.refreshQmd();
+    } catch (error) {
+      try {
+        await rollback();
+      } catch (rollbackError) {
+        throw new Error(
+          `wiki retirement failed and rollback failed: ${error instanceof Error ? error.message : String(error)}; ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+          { cause: rollbackError },
+        );
+      }
+      throw error;
+    }
+    return retired;
+  }
   async readExact(requestedPath: string): Promise<Buffer> {
     const location = normalizePagePath(this.paths, requestedPath);
     return fs.readFile(location.absolutePath);
