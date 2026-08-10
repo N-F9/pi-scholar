@@ -24,12 +24,10 @@ import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js
 import {
   atomizeExtraction,
   chunkEndpointNumber,
-  chunkExtraction,
   type ExtractionFileBoundary,
   normalizeDoclingResult,
   normalizeMarkdownFile,
   planFileAtoms,
-  reconstructChunks,
   validateChunkEndpoints,
   validateFileEndpoints,
   writeFileChunks,
@@ -2040,5 +2038,5 @@ export class SourceService {
   }
 }
 
-export { atomizeExtraction, chunkExtraction, reconstructChunks, validateChunkEndpoints };
+export { atomizeExtraction, validateChunkEndpoints };
 export const sha256 = digestBytes;
