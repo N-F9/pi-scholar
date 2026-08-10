@@ -2,8 +2,6 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, promises as fs, fstatSync, lstatSync, openSync, readSync, type Stats } from "node:fs";
 import { type FileHandle, open as openFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { runChild } from "../external/process.js";
 import { assertNoSymlinkPath, safeRelativePath } from "../vault.js";
 import type {
@@ -231,20 +229,6 @@ function hashFileSync(path: string): { size: number; digest: string } {
   return { size, digest: hash.digest("hex") };
 }
 
-async function copyReadableToFile(
-  readable: NodeJS.ReadableStream | ReadableStream<Uint8Array>,
-  target: string,
-): Promise<void> {
-  assertNoSymlinkPath(target);
-  await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
-  const handle = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-  try {
-    const stream = readable instanceof Readable ? readable : Readable.fromWeb(readable as ReadableStream<Uint8Array>);
-    await pipeline(stream, handle.createWriteStream());
-  } finally {
-    await handle.close();
-  }
-}
 async function copyFileNoFollow(source: string, target: string): Promise<void> {
   assertNoSymlinkPath(source);
   assertNoSymlinkPath(target);
@@ -672,7 +656,6 @@ export {
   copyFileNoFollow,
   copyFileRangeNoFollow,
   copyPathNoFollow,
-  copyReadableToFile,
   copyRepositoryNoSecrets,
   deterministicUuid,
   digestBytes,
@@ -701,7 +684,6 @@ export {
   textualUrl,
   treeDigest,
   validRelativePath,
-  vaultRootFor,
   walkFiles,
   wikiPathFor,
   workArtifactRelative,

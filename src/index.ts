@@ -20,8 +20,6 @@ export type { ScholarServer, ServerOptions } from "./server.js";
 export { createServer, serve, startServer } from "./server.js";
 export {
   atomizeExtraction,
-  chunkExtraction,
-  reconstructChunks,
   SourceService,
   sha256,
   validateChunkEndpoints,

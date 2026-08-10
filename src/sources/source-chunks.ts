@@ -480,10 +480,6 @@ export async function writeFileChunks(
   return output;
 }
 
-export function reconstructChunks(chunks: Array<Pick<SourceChunk, "body">>): Buffer {
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.body)));
-}
-
 function isLocalDoclingResult(result: DoclingResult | ExternalDoclingResult): result is DoclingResult {
   if (typeof result !== "object" || result === null || Array.isArray(result)) return false;
   const record = result as unknown as Record<string, unknown>;
@@ -581,11 +577,4 @@ export async function writeNativeExtraction(
     await output.close();
   }
   return boundaries;
-}
-
-export function chunkExtraction(
-  extracted: string | Uint8Array,
-  endpoints?: Array<number | ChunkPlanEndpoint>,
-): SourceChunk[] {
-  return validateChunkEndpoints(extracted, endpoints);
 }

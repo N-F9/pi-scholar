@@ -71,20 +71,6 @@ export async function convertWithDocling(paths: VaultPaths, request: DoclingRequ
   };
 }
 
-export function convertWithDoclingSync(paths: VaultPaths, request: DoclingRequest): DoclingResult {
-  const command = doclingArgs(paths, request);
-  const result = runChildSync("docling", command.args, {
-    cwd: paths.workRoot,
-    timeoutMs: request.timeoutMs ?? DOCLING_TIMEOUT_MS,
-    env: doclingEnvironment(paths),
-  });
-  assertSuccessful(result);
-  return {
-    command: result,
-    outputDirectory: command.outputDirectory,
-  };
-}
-
 export function doclingDependencyIdentity(
   paths: VaultPaths,
   runner: DoclingSyncRunner = (target, args, timeoutMs = 10_000) =>
