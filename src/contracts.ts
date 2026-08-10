@@ -166,8 +166,6 @@ export interface PageRecord {
   readonly updatedAt: IsoDateTime;
 }
 
-export type WikiPageRecord = PageRecord;
-
 export interface WikiPageSection {
   readonly pageId: string;
   readonly heading?: string;
@@ -316,8 +314,6 @@ export interface QuizQuestionRecord {
   readonly pages: readonly QuizQuestionPageRecord[];
   readonly sourceRefs: readonly string[];
 }
-
-export type QuizQuestion = QuizQuestionRecord;
 
 export interface QuizAnswerInput {
   readonly questionId: string;
@@ -587,8 +583,6 @@ export interface HealthResult {
 export interface SourceListResult {
   readonly sources: readonly PublicSourceRecord[];
 }
-
-export type SourceCreateRequest = SourceRequest;
 
 export interface SourceCreateResult {
   readonly source: PublicSourceRecord;

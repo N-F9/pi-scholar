@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
@@ -566,18 +567,27 @@ describe("knowledge capability contexts", () => {
       const retired = await app.createNote({ path: "retired.md", body: "# Retired\n", quizWorthiness: "skip" });
       db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
       db.run("UPDATE pages SET status = 'retired' WHERE page_id = ?", [retired.page.pageId]);
+      const open = await app.wiki.report({ description: "open issue" });
+      const reopened = await app.wiki.report({ description: "reopened issue" });
+      await app.wiki.patchIssue(reopened.issueId, { status: "reopened" });
+      const resolved = await app.wiki.report({ description: "resolved issue" });
+      await app.wiki.resolveIssueAfterCorrection(resolved.issueId, "corrected");
 
       const ingest = await app.getIngestContext();
       const lint = await app.getLintContext();
-      for (const pages of [ingest.pages, lint.pages]) {
+      for (const context of [ingest, lint]) {
         assert.equal(
-          pages.some(({ page }) => page.pageId === drifted.page.pageId && page.status === "drifted"),
+          context.pages.some(({ page }) => page.pageId === drifted.page.pageId && page.status === "drifted"),
           true,
         );
         assert.equal(
-          pages.some(({ page }) => page.pageId === retired.page.pageId),
+          context.pages.some(({ page }) => page.pageId === retired.page.pageId),
           false,
         );
+        const issueIds = new Set(context.issues.map((issue) => issue.issueId));
+        assert.equal(issueIds.has(open.issueId), true);
+        assert.equal(issueIds.has(reopened.issueId), true);
+        assert.equal(issueIds.has(resolved.issueId), false);
       }
     } finally {
       await app.close();
@@ -822,6 +832,45 @@ describe("application quiz publication guards", () => {
       db.close();
     }
   });
+  it("excludes live-drift pages from quiz candidates, evidence, and publication", async () => {
+    const { app, db, paths } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "live-drift.md",
+      body: "# Live drift\n\nCataloged text\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    await fs.appendFile(join(paths.wikiRoot, page.page.relativePath), "\nPhysical edit\n");
+    try {
+      const context = await app.getQuizContext({ date });
+      assert.equal(
+        context.candidates.some((candidate) => candidate.pageId === pageId),
+        false,
+      );
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: [pageId] }), /Quiz page is not currently eligible/u);
+      await assert.rejects(
+        app.publishQuiz({
+          status: "published",
+          date,
+          questions: [
+            {
+              kind: "free-response",
+              prompt: "Explain the page",
+              pages: [{ pageId, criterion: "Explain", weight: 1 }],
+              sourceRefs: ["not-authorized"],
+            },
+          ],
+        }),
+        /Quiz question references an ineligible page/u,
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 
   it("rejects empty and duplicate evidence requests", async () => {
     const { app, db } = fixture();
@@ -905,6 +954,57 @@ describe("browser quiz drafts", () => {
     }
   });
 });
+describe("application browser mutation boundary", () => {
+  it("drains browser mutations in FIFO order before closing its database", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-browser-close-"));
+    const paths = initVault(join(root, "vault"));
+    const app = new ScholarApplication({
+      paths,
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const originalReport = app.wiki.report.bind(app.wiki);
+    app.wiki.report = async (input) => {
+      order.push(input.description);
+      if (order.length === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return originalReport(input);
+    };
+    const mutations: Promise<unknown>[] = [];
+    let closing: Promise<void> | undefined;
+    let closeResolved = false;
+    try {
+      const first = app.reportIssue({ kind: "incorrect", description: "first" }, { origin: "browser" });
+      const second = app.reportIssue({ kind: "incorrect", description: "second" }, { origin: "browser" });
+      mutations.push(first, second);
+      await started.promise;
+      closing = app.close().then(() => {
+        closeResolved = true;
+      });
+      await waitForImmediate();
+      assert.equal(closeResolved, false);
+      assert.deepEqual(order, ["first"]);
+      release.resolve();
+      await Promise.all([first, second, closing]);
+      assert.deepEqual(order, ["first", "second"]);
+      await assert.rejects(
+        app.reportIssue({ kind: "incorrect", description: "after close" }, { origin: "browser" }),
+        /browser mutation worker is closed/u,
+      );
+    } finally {
+      release.resolve();
+      await Promise.allSettled([...mutations, ...(closing ? [closing] : [])]);
+      if (!closing) await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 async function gradingFixture() {
   const fixtureValue = fixture();
   const { app } = fixtureValue;

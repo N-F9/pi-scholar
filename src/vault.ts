@@ -24,8 +24,6 @@ export const VAULT_FORMAT_VERSION = 1 as const;
 export const DEFAULT_VAULT_HOST = "127.0.0.1" as const;
 export const DEFAULT_VAULT_PORT = 4816 as const;
 
-const PRODUCT_DIRECTORIES = [".pi-scholar", "inbox", "sources", "wiki", "quizzes"] as const;
-const METADATA_DIRECTORIES = ["qmd", "work"] as const;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 export const VAULT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -531,12 +529,4 @@ export async function withWriterLock<T>(paths: VaultPaths, operation: () => T | 
   } finally {
     lock.release();
   }
-}
-
-export function productRoots(paths: VaultPaths): readonly string[] {
-  return PRODUCT_DIRECTORIES.map((name) => join(paths.vaultRoot, name));
-}
-
-export function metadataDirectories(paths: VaultPaths): readonly string[] {
-  return METADATA_DIRECTORIES.map((name) => join(paths.metadataRoot, name));
 }

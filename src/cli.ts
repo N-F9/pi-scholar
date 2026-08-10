@@ -7,6 +7,7 @@ import { doctor } from "./doctor.js";
 import { localCheckpointCommit } from "./external/git.js";
 import type { ChildResult } from "./external/process.js";
 import { ensureQmdCollection } from "./external/qmd.js";
+import type { ScholarServer } from "./server.js";
 import { initVault, NoVaultError, resolveVault } from "./vault.js";
 
 export interface CliArgs {
@@ -89,25 +90,7 @@ function qmdInitializationFailure(result: ChildResult): string | undefined {
   return `collection setup failed (${result.code ?? "unknown"}): ${(result.stderr.trim() || result.stdout.trim()).slice(0, 500)}`;
 }
 
-async function delegate(modulePath: string, names: readonly string[], ...args: unknown[]): Promise<unknown> {
-  const module = (await import(modulePath)) as Record<string, unknown>;
-  for (const name of names) {
-    const candidate = module[name];
-    if (typeof candidate === "function") return (candidate as (...values: unknown[]) => unknown)(...args);
-  }
-  throw new Error(`No supported ${names.join(" or ")} delegation hook is installed`);
-}
-
-interface GracefulServer {
-  readonly closeGracefully: () => Promise<void>;
-}
-
-function isGracefulServer(value: unknown): value is GracefulServer {
-  if (typeof value !== "object" || value === null || !("closeGracefully" in value)) return false;
-  return typeof value.closeGracefully === "function";
-}
-
-function waitForServerShutdown(server: GracefulServer): Promise<void> {
+function waitForServerShutdown(server: ScholarServer): Promise<void> {
   const { promise, resolve, reject } = Promise.withResolvers<void>();
   let closePromise: Promise<void> | undefined;
   let settled = false;
@@ -178,8 +161,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (parsed.command === "doctor") return reportDoctor(parsed.positional[0]);
   const paths = resolveVault(parsed.vaultPath);
   if (parsed.command === "serve") {
-    const server = await delegate("./server.js", ["startServer", "serve"], { paths, port: parsed.port });
-    if (!isGracefulServer(server)) throw new Error("server delegation did not return a graceful server");
+    // Keep non-server CLI commands from loading the HTTP and browser runtime.
+    const { startServer } = await import("./server.js");
+    const server = await startServer({ paths, ...(parsed.port === undefined ? {} : { port: parsed.port }) });
     await waitForServerShutdown(server);
     return 0;
   }

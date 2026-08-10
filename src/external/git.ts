@@ -88,17 +88,6 @@ function commandFailure(result: ChildResult, command: string): Error {
   );
 }
 
-export async function gitRevision(root: string): Promise<string> {
-  const args = ["rev-parse", "HEAD"] as const;
-  validateGitCommand(args);
-  const result = await runChild("git", ["-C", root, ...SAFE_GIT_CONFIG, ...args], {
-    ...gitOptions(root, GIT_REVISION_TIMEOUT_MS),
-    maxOutputBytes: GIT_REVISION_OUTPUT_BYTES,
-  });
-  if (result.code !== 0) throw commandFailure(result, "git rev-parse");
-  return result.stdout.trim();
-}
-
 export function initializeRepository(paths: VaultPaths): void {
   assertGitDirectory(paths, true);
   const result = runChildSync("git", [...SAFE_GIT_CONFIG, "init", "--quiet"], gitOptions(paths.vaultRoot));

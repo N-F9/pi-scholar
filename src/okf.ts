@@ -214,10 +214,6 @@ export function serializeOkfConcept(frontmatter: Record<string, unknown>, body: 
   return `---\n${yamlBlock}---\n${body.endsWith("\n") ? body : `${body}\n`}`;
 }
 
-export function validateOkfConcept(markdown: string): void {
-  parseOkfConcept(markdown);
-}
-
 function normalizePiScholar(value: unknown): OkfPiScholarIdentity | undefined {
   if (!isRecord(value) || value.managed_by !== "pi-scholar") return undefined;
   if (

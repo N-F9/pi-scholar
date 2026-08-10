@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type {
-  ApiEnvelope,
   DoctorReport,
   ExtractContext,
   ExtractFailureRecord,
@@ -53,7 +52,7 @@ import type {
   WorkflowRecord,
 } from "../contracts.js";
 import { openDatabase, type ScholarDatabase, transaction } from "../database.js";
-import { doctor as runDoctor } from "../doctor.js";
+import { doctor } from "../doctor.js";
 import { convertWithDocling } from "../external/docling.js";
 import {
   type GitCheckpointResult,
@@ -81,6 +80,8 @@ import {
 import {
   assertNoSymlinkPath,
   atomicWriteFile,
+  DEFAULT_VAULT_HOST,
+  DEFAULT_VAULT_PORT,
   readFileNoFollow,
   resolveVault,
   safeRelativePath,
@@ -146,7 +147,6 @@ export interface ApplicationOptions {
   readonly schedulerService?: SchedulerService;
   readonly quizService?: QuizService;
   readonly adapters?: ApplicationAdapters;
-  readonly worker?: BrowserMutationWorker;
   readonly doctor?: (explicitPath?: string) => DoctorReport;
   readonly commit?: (paths: VaultPaths, subject: string, excludedPaths?: readonly string[]) => GitCheckpointResult;
   readonly push?: (paths: VaultPaths) => GitPushResult;
@@ -312,8 +312,8 @@ export class ScholarApplication {
   readonly wiki: WikiService;
   readonly scheduler: SchedulerService;
   readonly quiz: QuizService;
-  readonly workflows: WorkflowCoordinator;
-  readonly worker: BrowserMutationWorker;
+  private readonly workflows: WorkflowCoordinator;
+  private readonly worker: BrowserMutationWorker;
   readonly version: string;
   private readonly ownsDatabase: boolean;
   private readonly doctorFn: (explicitPath?: string) => DoctorReport;
@@ -342,12 +342,12 @@ export class ScholarApplication {
       input.wikiService ?? new WikiService(this.db, this.paths, defaultWikiAdapters(this.paths, input.adapters?.wiki));
     this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths);
     this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
-    this.worker = input.worker ?? new BrowserMutationWorker();
+    this.worker = new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
-    this.doctorFn = input.doctor ?? runDoctor;
+    this.doctorFn = input.doctor ?? doctor;
     this.commitFn = input.commit ?? localCheckpointCommit;
     this.pushFn = input.push ?? ((paths) => safePush(paths));
-    this.workflows = new WorkflowCoordinator(this.db, { worker: this.worker });
+    this.workflows = new WorkflowCoordinator(this.db);
   }
   private async durableDirect<T, R = never>(
     operation: () => T | PromiseLike<T>,
@@ -1161,8 +1161,8 @@ export class ScholarApplication {
   async getSettings(): Promise<{ readonly settings: SettingsRecord }> {
     const initializationEnabled = await this.readSetting("initializationEnabled", true);
     const timezone = await this.readSetting("timezone", "local");
-    const port = await this.readSetting("port", 4816);
-    const host = await this.readSetting("host", "127.0.0.1");
+    const port = await this.readSetting("port", DEFAULT_VAULT_PORT);
+    const host = await this.readSetting("host", DEFAULT_VAULT_HOST);
     const pendingInboxCount = (await this.sources.discover()).length;
     const openIssueCount = Number(
       this.db.get<Record<string, unknown>>(
@@ -1266,7 +1266,8 @@ export class ScholarApplication {
             throw new ValidationError("port is invalid");
           updates.push(["port", input.port]);
         }
-        if (input.host !== undefined && input.host !== "127.0.0.1") throw new ValidationError("host must be 127.0.0.1");
+        if (input.host !== undefined && input.host !== DEFAULT_VAULT_HOST)
+          throw new ValidationError(`host must be ${DEFAULT_VAULT_HOST}`);
         if (input.host !== undefined) updates.push(["host", input.host]);
         transaction(this.db, () => {
           for (const [key, value] of updates)
@@ -1303,7 +1304,7 @@ export class ScholarApplication {
   async close(): Promise<void> {
     let closeError: unknown;
     try {
-      await this.workflows.close({ drain: true });
+      await this.worker.close();
     } catch (error) {
       closeError = error;
     }
@@ -1316,11 +1317,15 @@ export class ScholarApplication {
     if (this.ownsDatabase) this.db.close();
     if (closeError) throw closeError;
   }
-  async getIngestContext(): Promise<IngestContext> {
+  private async wikiMaintenanceContext(): Promise<Pick<LintContext, "pages" | "issues">> {
     const pages = await Promise.all(
       (await this.wiki.list()).filter((page) => page.status !== "retired").map((page) => this.wikiResult(page.pageId)),
     );
     const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
+    return { pages, issues };
+  }
+  async getIngestContext(): Promise<IngestContext> {
+    const { pages, issues } = await this.wikiMaintenanceContext();
     const sources = await this.sources.publishedPackets();
     return {
       pages,
@@ -1341,10 +1346,7 @@ export class ScholarApplication {
     };
   }
   async getLintContext(input?: { readonly description?: string }): Promise<LintContext> {
-    const pages = await Promise.all(
-      (await this.wiki.list()).filter((page) => page.status !== "retired").map((page) => this.wikiResult(page.pageId)),
-    );
-    const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
+    const { pages, issues } = await this.wikiMaintenanceContext();
     const scope =
       input?.description === undefined
         ? ({ kind: "full" } as const)
@@ -1356,9 +1358,6 @@ export class ScholarApplication {
     return new Map(
       reports.filter((report) => report.drifted).map((report) => [report.page.pageId, report.currentDigest]),
     );
-  }
-  private async liveDriftPageIds(): Promise<Set<string>> {
-    return new Set((await this.liveDriftDigests()).keys());
   }
   private catalogDriftExclusions(): readonly string[] {
     return this.db
@@ -1409,7 +1408,7 @@ export class ScholarApplication {
     return authored.body;
   }
   private async filterLiveDriftPages(pages: readonly PageLearningRecord[]): Promise<PageLearningRecord[]> {
-    const drifted = await this.liveDriftPageIds();
+    const drifted = new Set((await this.liveDriftDigests()).keys());
     return pages.filter((page) => !drifted.has(page.pageId));
   }
   private assertWikiChangeCoverage(
@@ -2179,7 +2178,4 @@ export function createApplication(input: ApplicationOptions | VaultPaths | strin
   if (typeof input === "string") return new ScholarApplication({ paths: input });
   if ("vaultRoot" in input && "databasePath" in input) return new ScholarApplication({ paths: input });
   return new ScholarApplication(input);
-}
-export function isApiEnvelope(value: unknown): value is ApiEnvelope<unknown> {
-  return isRecord(value) && typeof value.ok === "boolean";
 }
