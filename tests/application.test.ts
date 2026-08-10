@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
@@ -905,6 +906,57 @@ describe("browser quiz drafts", () => {
     }
   });
 });
+describe("application browser mutation boundary", () => {
+  it("drains browser mutations in FIFO order before closing its database", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-browser-close-"));
+    const paths = initVault(join(root, "vault"));
+    const app = new ScholarApplication({
+      paths,
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const originalReport = app.wiki.report.bind(app.wiki);
+    app.wiki.report = async (input) => {
+      order.push(input.description);
+      if (order.length === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return originalReport(input);
+    };
+    const mutations: Promise<unknown>[] = [];
+    let closing: Promise<void> | undefined;
+    let closeResolved = false;
+    try {
+      const first = app.reportIssue({ kind: "incorrect", description: "first" }, { origin: "browser" });
+      const second = app.reportIssue({ kind: "incorrect", description: "second" }, { origin: "browser" });
+      mutations.push(first, second);
+      await started.promise;
+      closing = app.close().then(() => {
+        closeResolved = true;
+      });
+      await waitForImmediate();
+      assert.equal(closeResolved, false);
+      assert.deepEqual(order, ["first"]);
+      release.resolve();
+      await Promise.all([first, second, closing]);
+      assert.deepEqual(order, ["first", "second"]);
+      await assert.rejects(
+        app.reportIssue({ kind: "incorrect", description: "after close" }, { origin: "browser" }),
+        /browser mutation worker is closed/u,
+      );
+    } finally {
+      release.resolve();
+      await Promise.allSettled([...mutations, ...(closing ? [closing] : [])]);
+      if (!closing) await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 async function gradingFixture() {
   const fixtureValue = fixture();
   const { app } = fixtureValue;

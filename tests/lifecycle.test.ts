@@ -804,7 +804,7 @@ describe("Pi package lifecycle", () => {
       assert.throws(() => workflows.updateWorkflow(started.requestId, { progress: 0.75 }), /not running/u);
 
       const failed = workflows.beginWorkflow("lint");
-      const failure = workflows.failWorkflow(failed.requestId, {
+      const failure = workflows.finishWorkflow(failed.requestId, "failed", {
         errorCode: "E".repeat(120),
         errorMessage: "é".repeat(400),
       });
