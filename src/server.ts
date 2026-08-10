@@ -18,7 +18,7 @@ import type {
 } from "./contracts.js";
 import { QuizConflictError } from "./quiz.js";
 import { localDate, RevisionConflictError, ValidationError } from "./scheduler.js";
-import { LockBusyError, resolveVault, type VaultPaths } from "./vault.js";
+import { DEFAULT_VAULT_HOST, DEFAULT_VAULT_PORT, LockBusyError, resolveVault, type VaultPaths } from "./vault.js";
 
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
 const MULTIPART_FIELD_BYTES = 64 * 1024;
@@ -48,10 +48,8 @@ const CONTENT_TYPES: Record<string, string> = {
 
 export interface ServerOptions {
   readonly application?: ScholarApplication;
-  readonly app?: ScholarApplication;
   readonly paths?: VaultPaths | string;
   readonly staticRoot?: string;
-  readonly host?: "127.0.0.1";
   readonly port?: number;
   readonly version?: string;
   readonly maxJsonBytes?: number;
@@ -59,8 +57,6 @@ export interface ServerOptions {
 }
 
 export interface ScholarServer extends Server {
-  readonly application: ScholarApplication;
-  readonly staticRoot: string;
   readonly closeGracefully: () => Promise<void>;
 }
 
@@ -882,12 +878,11 @@ async function serveStatic(
 export function createServer(options: ServerOptions = {}): ScholarServer {
   const application =
     options.application ??
-    options.app ??
     createApplication({
       paths: options.paths ?? resolveVault(),
       ...(options.version ? { version: options.version } : {}),
     });
-  const host = "127.0.0.1";
+  const host = DEFAULT_VAULT_HOST;
   const staticRoot = resolve(options.staticRoot ?? join(dirname(fileURLToPath(import.meta.url)), "../apps/web/dist"));
   const requestOptions: RequestOptions = {
     host,
@@ -897,8 +892,6 @@ export function createServer(options: ServerOptions = {}): ScholarServer {
   const server = nodeCreateServer((req, res) => {
     void handleRequest(req, res, application, staticRoot, requestOptions);
   }) as ScholarServer;
-  Object.defineProperty(server, "application", { value: application });
-  Object.defineProperty(server, "staticRoot", { value: staticRoot });
   Object.defineProperty(server, "closeGracefully", {
     value: async () => {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
@@ -909,8 +902,8 @@ export function createServer(options: ServerOptions = {}): ScholarServer {
 }
 export async function startServer(options: ServerOptions = {}): Promise<ScholarServer> {
   const server = createServer(options);
-  const port = options.port ?? 4816;
-  const host = "127.0.0.1";
+  const port = options.port ?? DEFAULT_VAULT_PORT;
+  const host = DEFAULT_VAULT_HOST;
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => {
@@ -920,4 +913,3 @@ export async function startServer(options: ServerOptions = {}): Promise<ScholarS
   });
   return server;
 }
-export const serve = startServer;
