@@ -79,6 +79,64 @@ function publicQuizFixture(): QuizRecord {
 }
 
 describe("server browser boundary", () => {
+  it("rejects route-disallowed methods before application dispatch", async () => {
+    const unexpectedDispatch = () => assert.fail("route method policy allowed application dispatch");
+    const application = {
+      listSources: unexpectedDispatch,
+      stageSource: unexpectedDispatch,
+      removalPreview: unexpectedDispatch,
+      removeSource: unexpectedDispatch,
+      listWiki: unexpectedDispatch,
+      getWiki: unexpectedDispatch,
+      searchWiki: unexpectedDispatch,
+      listIssues: unexpectedDispatch,
+      reportIssue: unexpectedDispatch,
+      patchIssue: unexpectedDispatch,
+      resolveDrift: unexpectedDispatch,
+      listQuizzes: unexpectedDispatch,
+      getQuiz: unexpectedDispatch,
+      saveAnswers: unexpectedDispatch,
+      sealSubmission: unexpectedDispatch,
+      listWorkflows: unexpectedDispatch,
+      getWorkflow: unexpectedDispatch,
+      getSettings: unexpectedDispatch,
+      updateSettings: unexpectedDispatch,
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    const id = "11111111-1111-4111-8111-111111111111";
+    const date = "2026-08-09";
+    const cases = [
+      ["PUT", "/api/v1/sources"],
+      ["GET", `/api/v1/sources/${id}/removal-preview`],
+      ["GET", `/api/v1/sources/${id}/removal`],
+      ["POST", "/api/v1/wiki"],
+      ["POST", "/api/v1/wiki/page"],
+      ["POST", "/api/v1/wiki/search"],
+      ["PUT", "/api/v1/wiki/issues"],
+      ["GET", `/api/v1/wiki/issues/${id}`],
+      ["GET", `/api/v1/wiki/pages/${id}/drift-resolution`],
+      ["POST", "/api/v1/quizzes"],
+      ["POST", `/api/v1/quizzes/${date}`],
+      ["GET", `/api/v1/quizzes/${date}/answers`],
+      ["GET", `/api/v1/quizzes/${date}/submission`],
+      ["POST", "/api/v1/workflows"],
+      ["POST", `/api/v1/workflows/${id}`],
+      ["POST", "/api/v1/settings"],
+    ] as const;
+
+    await withServer(application, async (base) => {
+      for (const [method, path] of cases) {
+        const response = await fetch(`${base}${path}`, {
+          method,
+          ...(method === "GET" ? {} : { headers: sameOriginHeaders(base, { "X-Pi-Scholar-Request": "1" }) }),
+        });
+        assert.equal(response.status, 405, `${method} ${path}`);
+        const payload = (await response.json()) as { error: { code: string } };
+        assert.equal(payload.error.code, "METHOD_NOT_ALLOWED", `${method} ${path}`);
+      }
+    });
+  });
+
   it("rejects cross-site unsafe requests before invoking application mutations", async () => {
     let calls = 0;
     const application = {
