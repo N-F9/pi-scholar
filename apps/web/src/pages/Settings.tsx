@@ -103,17 +103,17 @@ export function SettingsPage() {
                 <dd className="mt-2 font-serif text-3xl font-semibold">{query.data.settings.facts.openIssueCount}</dd>
               </div>
               <div className="bg-paper p-5">
-                <dt className="text-sm text-muted">Last maintenance</dt>
+                <dt className="text-sm text-muted">Last lint</dt>
                 <dd className="mt-2 font-bold">
-                  {query.data.settings.facts.lastMaintenanceAt
-                    ? formatDate(query.data.settings.facts.lastMaintenanceAt, {
+                  {query.data.settings.facts.lastLintAt
+                    ? formatDate(query.data.settings.facts.lastLintAt, {
                         dateStyle: "medium",
                         timeStyle: "short",
                       })
                     : "No run recorded"}
                 </dd>
-                {query.data.settings.facts.lastMaintenanceResult ? (
-                  <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastMaintenanceResult}</dd>
+                {query.data.settings.facts.lastLintResult ? (
+                  <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastLintResult}</dd>
                 ) : null}
               </div>
               <div className="bg-paper p-5">

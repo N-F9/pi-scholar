@@ -4,9 +4,10 @@ import { api, errorMessage, formatDate, isWorkflowListResult } from "../api";
 import { Badge, Button, Card, Spinner, StateView } from "../components/ui";
 
 const workflowNames: Record<WorkflowRecord["kind"], string> = {
-  "source-admission": "Source admission",
-  "wiki-maintenance": "Wiki maintenance",
-  "daily-quiz": "Quiz publishing",
+  extract: "Extract",
+  ingest: "Ingest",
+  lint: "Lint",
+  daily: "Daily",
   "quiz-grader": "Quiz grading",
   sync: "Git sync",
 };

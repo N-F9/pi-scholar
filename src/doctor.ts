@@ -552,8 +552,21 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
     db?.close();
   }
 }
-const WORKFLOW_KINDS = new Set(["source-admission", "wiki-maintenance", "daily-quiz", "quiz-grader", "sync"]);
-const WORKFLOW_STATUSES = new Set(["queued", "running", "succeeded", "failed", "cancelled"]);
+const WORKFLOW_KINDS: Record<string, true> = {
+  extract: true,
+  ingest: true,
+  lint: true,
+  daily: true,
+  "quiz-grader": true,
+  sync: true,
+};
+const WORKFLOW_STATUSES: Record<string, true> = {
+  queued: true,
+  running: true,
+  succeeded: true,
+  failed: true,
+  cancelled: true,
+};
 const WORKFLOW_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const QUIZ_GRADER_BINDING_PREFIX = "quiz-grader:v1:";
 
@@ -569,9 +582,9 @@ function checkWorkflows(paths: VaultPaths): DoctorCheck {
       const requestId = row.request_id;
       if (typeof requestId !== "string" || !WORKFLOW_ID.test(requestId))
         throw new Error(`Workflow request_id is malformed: ${String(requestId)}`);
-      if (typeof row.kind !== "string" || !WORKFLOW_KINDS.has(row.kind))
+      if (typeof row.kind !== "string" || !WORKFLOW_KINDS[row.kind])
         throw new Error(`Workflow kind is malformed: ${requestId}`);
-      if (typeof row.status !== "string" || !WORKFLOW_STATUSES.has(row.status))
+      if (typeof row.status !== "string" || !WORKFLOW_STATUSES[row.status])
         throw new Error(`Workflow status is malformed: ${requestId}`);
       if (typeof row.progress !== "number" || !Number.isFinite(row.progress) || row.progress < 0 || row.progress > 1)
         throw new Error(`Workflow progress is malformed: ${requestId}`);

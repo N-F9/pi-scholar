@@ -110,7 +110,7 @@ function doctor(vault) {
   return report;
 }
 
-test("pasted source is staged pending admission", async () => {
+test("pasted source is staged pending extraction", async () => {
   const trialRoot = mkdtempSync(join(tmpdir(), "pi-scholar-pasted-eval-"));
   const vault = join(trialRoot, "vault");
   try {
@@ -120,7 +120,7 @@ test("pasted source is staged pending admission", async () => {
     const prompt = [
       "Call exactly one Scholar tool: scholar_add. Do not call any other tool.",
       "Use exactly the following JSON argument object; preserve the text value exactly after JSON decoding.",
-      "After the call, answer concisely that the source is staged and pending admission.",
+      "After the call, answer concisely that the source is staged and pending extraction.",
       JSON.stringify({
         kind: "pasted",
         text: fixtureText,
@@ -155,7 +155,7 @@ test("pasted source is staged pending admission", async () => {
 
     const report = doctor(vault);
     const rubric =
-      "Pass only if the actor answer is concise, accurately says the pasted source was staged or is pending admission, and does not claim admission, publication, or addition to the trusted wiki.";
+      "Pass only if the actor answer is concise, accurately says the pasted source was staged or is pending extraction, and does not claim extraction, publication, or addition to the trusted wiki.";
     const verdict = await runJudge({
       rubric,
       evidence: {
@@ -179,11 +179,11 @@ test("daily quiz is guarded in a fresh vault", async () => {
     const initial = domainSnapshot(vault, ["inbox", "sources", "wiki", "quizzes"]);
     const dateBefore = localDate();
 
-    const actor = await runActor({ cwd: vault, prompt: "/skill:daily-quiz" });
+    const actor = await runActor({ cwd: vault, prompt: "/skill:daily" });
     const dateAfter = localDate();
     assert.deepEqual(
       actor.toolCalls.map((call) => call.name),
-      ["scholar_get_quiz_context"],
+      ["scholar_get_daily_context"],
     );
     const context = actor.toolCalls[0].result?.details;
     assert.equal([dateBefore, dateAfter].includes(context?.date), true);

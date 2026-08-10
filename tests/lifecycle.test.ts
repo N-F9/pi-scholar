@@ -4,13 +4,102 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { describe, it } from "vitest";
+import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import { describe, it, vi } from "vitest";
 import piScholarExtension from "../pi/extension.ts";
 import { parseCliArgs } from "../src/cli.js";
 import { openDatabase } from "../src/database.js";
 import { WorkflowCoordinator } from "../src/workflows.js";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+type ToolExecutor = (
+  toolCallId: string,
+  params: unknown,
+  signal: AbortSignal | undefined,
+  onUpdate: unknown,
+  ctx: { readonly cwd: string },
+) => Promise<unknown>;
+type FakeLifecycleApp = {
+  readonly paths: { readonly vaultRoot: string };
+  readonly finishes: { readonly status: string; readonly options: unknown }[];
+  readonly updates: readonly unknown[];
+  beginWorkflow: (kind: string) => Promise<{ readonly workflow: { readonly requestId: string } }>;
+  getExtractContext: () => Promise<unknown>;
+  getIngestContext: () => Promise<unknown>;
+  getLintContext: () => Promise<unknown>;
+  publishExtraction: (input: unknown) => Promise<unknown>;
+  applyWikiChange: (input: unknown) => Promise<unknown>;
+  finishWorkflow: (requestId: string, status: string, options?: unknown) => Promise<unknown>;
+  updateWorkflow: (requestId: string, options: unknown) => Promise<unknown>;
+};
+
+const runtimeApps = vi.hoisted(() => new Map<string, FakeLifecycleApp>());
+vi.mock("../dist/application/application.js", () => ({
+  createApplication: ({ paths }: { readonly paths: { readonly vaultRoot: string } }) => {
+    const app = runtimeApps.get(paths.vaultRoot);
+    if (!app) throw new Error(`missing fake app for ${paths.vaultRoot}`);
+    return app;
+  },
+}));
+vi.mock("../dist/vault.js", () => ({
+  resolveVault: (cwd?: string) => ({ vaultRoot: cwd ?? "test-vault" }),
+}));
+
+let lifecycleTestNumber = 0;
+
+function registerLifecycleTools(): Map<string, ToolExecutor> {
+  const tools = new Map<string, ToolExecutor>();
+  const pi = {
+    registerTool: (tool: { readonly name: string; readonly execute: ToolExecutor }) => {
+      tools.set(tool.name, tool.execute);
+    },
+    registerCommand: () => undefined,
+    on: () => undefined,
+  } as unknown as ExtensionAPI;
+  piScholarExtension(pi);
+  return tools;
+}
+
+function fakeLifecycleApp(
+  context: unknown,
+  publishExtraction: (input: unknown) => Promise<unknown>,
+): { readonly app: FakeLifecycleApp; readonly root: string; readonly tools: Map<string, ToolExecutor> } {
+  const root = `lifecycle-test-${++lifecycleTestNumber}`;
+  const finishes: { status: string; options: unknown }[] = [];
+  const updates: unknown[] = [];
+  const app: FakeLifecycleApp = {
+    paths: { vaultRoot: root },
+    finishes,
+    updates,
+    beginWorkflow: async (kind) => ({ workflow: { requestId: `${kind}-${root}` } }),
+    getExtractContext: async () => context,
+    getIngestContext: async () => ({}),
+    getLintContext: async () => ({}),
+    publishExtraction,
+    applyWikiChange: async () => ({}),
+    finishWorkflow: async (_requestId, status, options) => {
+      finishes.push({ status, options });
+      return {};
+    },
+    updateWorkflow: async (_requestId, options) => {
+      updates.push(options);
+      return {};
+    },
+  };
+  runtimeApps.set(root, app);
+  return { app, root, tools: registerLifecycleTools() };
+}
+
+async function invoke(tools: Map<string, ToolExecutor>, name: string, params: unknown, root: string): Promise<unknown> {
+  const execute = tools.get(name);
+  if (!execute) throw new Error(`missing tool ${name}`);
+  return execute(name, params, undefined, undefined, { cwd: root });
+}
+
+function claim(claimId: string, preparedId: string): Record<string, string> {
+  return { claimId, preparedId, digest: `${preparedId}-digest` };
+}
 
 function packageManifest(): {
   readonly pi: { readonly extensions: readonly string[]; readonly skills: readonly string[] };
@@ -21,15 +110,16 @@ function packageManifest(): {
 }
 
 describe("Pi package lifecycle", () => {
-  it("ships one extension and exactly four declared skills", () => {
+  it("ships one extension and exactly five declared skills", () => {
     const manifest = packageManifest();
     assert.deepEqual(manifest.pi.extensions, ["./pi/extension.ts"]);
-    assert.equal(manifest.pi.skills.length, 4);
+    assert.equal(manifest.pi.skills.length, 5);
     assert.deepEqual([...manifest.pi.skills].sort(), [
-      "./skills/daily-quiz",
+      "./skills/daily",
+      "./skills/extract",
+      "./skills/ingest",
+      "./skills/lint",
       "./skills/quiz-grader",
-      "./skills/source-admission",
-      "./skills/wiki-maintenance",
     ]);
     for (const skill of manifest.pi.skills) {
       assert.equal(readFileSync(join(repositoryRoot, skill, "SKILL.md"), "utf8").includes("name:"), true);
@@ -39,7 +129,7 @@ describe("Pi package lifecycle", () => {
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name)
         .sort(),
-      ["daily-quiz", "quiz-grader", "source-admission", "wiki-maintenance"],
+      ["daily", "extract", "ingest", "lint", "quiz-grader"],
     );
   });
 
@@ -60,15 +150,18 @@ describe("Pi package lifecycle", () => {
 
     assert.deepEqual([...tools].sort(), [
       "scholar_add",
-      "scholar_admit_source",
-      "scholar_apply_maintenance",
-      "scholar_finish_maintenance",
-      "scholar_get_admission_context",
+      "scholar_apply_ingest",
+      "scholar_apply_lint",
+      "scholar_finish_ingest",
+      "scholar_finish_lint",
+      "scholar_get_daily_context",
+      "scholar_get_extract_context",
       "scholar_get_grading_context",
-      "scholar_get_maintenance_context",
-      "scholar_get_quiz_context",
+      "scholar_get_ingest_context",
+      "scholar_get_lint_context",
       "scholar_note",
-      "scholar_publish_quiz",
+      "scholar_publish_daily",
+      "scholar_publish_extraction",
       "scholar_remove_source",
       "scholar_search",
       "scholar_settle_grade",
@@ -81,23 +174,70 @@ describe("Pi package lifecycle", () => {
         .sort(),
       [
         "scholar_add",
-        "scholar_admit_source",
-        "scholar_apply_maintenance",
-        "scholar_finish_maintenance",
-        "scholar_get_admission_context",
+        "scholar_apply_ingest",
+        "scholar_apply_lint",
+        "scholar_finish_ingest",
+        "scholar_finish_lint",
+        "scholar_get_daily_context",
+        "scholar_get_extract_context",
         "scholar_get_grading_context",
-        "scholar_get_maintenance_context",
-        "scholar_get_quiz_context",
+        "scholar_get_ingest_context",
+        "scholar_get_lint_context",
         "scholar_note",
-        "scholar_publish_quiz",
+        "scholar_publish_daily",
+        "scholar_publish_extraction",
         "scholar_remove_source",
         "scholar_settle_grade",
       ],
     );
     assert.equal(toolModes.get("scholar_search"), undefined);
     assert.equal(toolModes.get("scholar_status"), undefined);
-    assert.deepEqual([...commands].sort(), ["add", "issue", "scholar-status"]);
+    assert.deepEqual([...commands].sort(), ["scholar-add", "scholar-issue", "scholar-lint", "scholar-status"]);
     assert.deepEqual(events, ["session_shutdown"]);
+  });
+
+  it("expands the current-session lint skill before sending the command", async () => {
+    type CommandHandler = (args: string, ctx: object) => Promise<void> | void;
+    const handlers = new Map<string, CommandHandler>();
+    const messages: string[] = [];
+    const order: string[] = [];
+    const skillPath = join(repositoryRoot, "skills", "lint", "SKILL.md");
+    const baseDir = dirname(skillPath);
+    const pi = {
+      registerTool: () => undefined,
+      registerCommand: (name: string, command: { readonly handler: CommandHandler }) => {
+        handlers.set(name, command.handler);
+      },
+      getCommands: () => [
+        {
+          name: "skill:lint",
+          source: "skill",
+          sourceInfo: { path: skillPath, baseDir },
+        },
+      ],
+      waitForIdle: async () => {
+        order.push("idle");
+      },
+      sendUserMessage: (message: string) => {
+        order.push("send");
+        messages.push(message);
+      },
+      on: () => undefined,
+    } as unknown as ExtensionAPI;
+    piScholarExtension(pi);
+    const handler = handlers.get("scholar-lint");
+    if (!handler) throw new Error("scholar-lint command was not registered");
+    const context = { waitForIdle: async () => order.push("idle") };
+    await handler("  repair broken references  ", context);
+    await handler("   ", context);
+    const body = stripFrontmatter(readFileSync(skillPath, "utf8")).trim();
+    const skillBlock = `<skill name="lint" location="${skillPath}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
+    assert.deepEqual(messages, [`${skillBlock}\n\nrepair broken references`, skillBlock]);
+    assert.deepEqual(order, ["idle", "send", "idle", "send"]);
+    assert.equal(
+      messages.some((message) => message.includes("/skill:lint")),
+      false,
+    );
   });
 
   it("has no runner, weekday planner, or child-process orchestration", () => {
@@ -111,6 +251,219 @@ describe("Pi package lifecycle", () => {
     assert.doesNotMatch(extension, /\.\.\/src\/(application|vault)\.js/u);
     assert.doesNotMatch(extension, /kind:\s*"document"\s*\}/u);
     assert.doesNotMatch(extension, /WEEKDAY|weekday|Monday|Sunday|scheduled/u);
+  });
+
+  it("does not let duplicate extraction publication attempts consume claims", async () => {
+    const first = claim("claim-first", "prepared-first");
+    const second = claim("claim-second", "prepared-second");
+    const third = claim("claim-third", "prepared-third");
+    const fixture = fakeLifecycleApp({ claims: [first, second, third] }, async (input) => {
+      const claimId = (input as { readonly claimId: string }).claimId;
+      if (claimId === second.claimId) throw new Error("publication failed");
+      return { sourceId: claimId, manifest: {}, removedInbox: true };
+    });
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    const publish = (value: Record<string, string>) =>
+      invoke(fixture.tools, "scholar_publish_extraction", { ...value, endpoints: [1] }, fixture.root);
+    await publish(first);
+    await publish(first);
+    await assert.rejects(publish(second), /publication failed/u);
+    await assert.rejects(publish(second), /publication failed/u);
+    await publish(third);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["failed"],
+    );
+  });
+
+  it("finishes extraction failed when every preparation fails", async () => {
+    const fixture = fakeLifecycleApp(
+      {
+        claims: [],
+        failures: [{ relativePath: "broken.txt", errorCode: "EXTRACT_FAILED", errorMessage: "cannot prepare" }],
+      },
+      async () => ({ sourceId: "unused", manifest: {}, removedInbox: false }),
+    );
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["failed"],
+    );
+  });
+
+  it("retains a publication failure through later successful claims", async () => {
+    const first = claim("claim-failing", "prepared-failing");
+    const second = claim("claim-success", "prepared-success");
+    const fixture = fakeLifecycleApp({ claims: [first, second] }, async (input) => {
+      const claimId = (input as { readonly claimId: string }).claimId;
+      if (claimId === first.claimId) throw new Error("publication failed");
+      return { sourceId: claimId, manifest: {}, removedInbox: true };
+    });
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...first, endpoints: [1] }, fixture.root),
+      /publication failed/u,
+    );
+    assert.deepEqual(fixture.app.finishes, []);
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...second, endpoints: [1] }, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["failed"],
+    );
+  });
+
+  it("does not poison extraction success with a malformed duplicate", async () => {
+    const first = claim("claim-duplicate", "prepared-duplicate");
+    const second = claim("claim-after-duplicate", "prepared-after-duplicate");
+    let firstAttempts = 0;
+    const fixture = fakeLifecycleApp({ claims: [first, second] }, async (input) => {
+      const claimId = (input as { readonly claimId: string }).claimId;
+      if (claimId === first.claimId && ++firstAttempts === 2) throw new Error("malformed duplicate");
+      return { sourceId: claimId, manifest: {}, removedInbox: true };
+    });
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...first, endpoints: [1] }, fixture.root);
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...first, endpoints: [1] }, fixture.root),
+      /malformed duplicate/u,
+    );
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...second, endpoints: [1] }, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+  });
+
+  it("retries an extraction progress update without recording a publication failure", async () => {
+    const first = claim("claim-update", "prepared-update");
+    const second = claim("claim-after-update", "prepared-after-update");
+    const fixture = fakeLifecycleApp({ claims: [first, second] }, async (input) => ({
+      sourceId: (input as { readonly claimId: string }).claimId,
+      manifest: {},
+      removedInbox: true,
+    }));
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    const update = fixture.app.updateWorkflow.bind(fixture.app);
+    let failUpdate = true;
+    fixture.app.updateWorkflow = async (requestId, options) => {
+      if (failUpdate) {
+        failUpdate = false;
+        throw new Error("injected update failure");
+      }
+      return update(requestId, options);
+    };
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...first, endpoints: [1] }, fixture.root),
+      /injected update failure/u,
+    );
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...first, endpoints: [1] }, fixture.root);
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...second, endpoints: [1] }, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+  });
+
+  it("retries an unapplied extraction finish without issuing a failed finish", async () => {
+    const only = claim("claim-finish", "prepared-finish");
+    const fixture = fakeLifecycleApp({ claims: [only] }, async (input) => ({
+      sourceId: (input as { readonly claimId: string }).claimId,
+      manifest: {},
+      removedInbox: true,
+    }));
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    const finish = fixture.app.finishWorkflow.bind(fixture.app);
+    let failFinish = true;
+    fixture.app.finishWorkflow = async (requestId, status, options) => {
+      if (failFinish) {
+        failFinish = false;
+        throw Object.assign(new Error("injected finish failure"), { details: { applied: false } });
+      }
+      return finish(requestId, status, options);
+    };
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...only, endpoints: [1] }, fixture.root),
+      /injected finish failure/u,
+    );
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...only, endpoints: [1] }, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+  });
+
+  it("deletes extract state after an applied finish error instead of double-finishing", async () => {
+    const only = claim("claim-applied-finish", "prepared-applied-finish");
+    const fixture = fakeLifecycleApp({ claims: [only] }, async (input) => ({
+      sourceId: (input as { readonly claimId: string }).claimId,
+      manifest: {},
+      removedInbox: true,
+    }));
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    const finish = fixture.app.finishWorkflow.bind(fixture.app);
+    let failFinish = true;
+    fixture.app.finishWorkflow = async (requestId, status, options) => {
+      if (failFinish) {
+        failFinish = false;
+        throw Object.assign(new Error("applied finish failure"), { details: { applied: true } });
+      }
+      return finish(requestId, status, options);
+    };
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...only, endpoints: [1] }, fixture.root),
+      /applied finish failure/u,
+    );
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...only, endpoints: [1] }, fixture.root),
+      /extract context is required/u,
+    );
+    assert.deepEqual(fixture.app.finishes, []);
+  });
+
+  it("does not fail an empty extract after an applied automatic finish error", async () => {
+    const fixture = fakeLifecycleApp({ claims: [] }, async () => ({
+      sourceId: "unused",
+      manifest: {},
+      removedInbox: false,
+    }));
+    const finish = fixture.app.finishWorkflow.bind(fixture.app);
+    let failFinish = true;
+    fixture.app.finishWorkflow = async (requestId, status, options) => {
+      if (failFinish) {
+        failFinish = false;
+        throw Object.assign(new Error("applied empty finish failure"), { details: { applied: true } });
+      }
+      return finish(requestId, status, options);
+    };
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root),
+      /applied empty finish failure/u,
+    );
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+  });
+
+  it("does not issue a failed finish after an applied lint finish error", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({}));
+    await invoke(fixture.tools, "scholar_get_lint_context", {}, fixture.root);
+    const finish = fixture.app.finishWorkflow.bind(fixture.app);
+    let failFinish = true;
+    fixture.app.finishWorkflow = async (requestId, status, options) => {
+      if (failFinish) {
+        failFinish = false;
+        throw Object.assign(new Error("applied lint finish failure"), { details: { applied: true } });
+      }
+      return finish(requestId, status, options);
+    };
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_finish_lint", {}, fixture.root),
+      /applied lint finish failure/u,
+    );
+    await assert.rejects(invoke(fixture.tools, "scholar_finish_lint", {}, fixture.root), /lint context is required/u);
+    assert.deepEqual(fixture.app.finishes, []);
   });
   it("tracks bounded workflow lifecycle state transactionally", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-lifecycle-"));
@@ -138,7 +491,7 @@ describe("Pi package lifecycle", () => {
       assert.ok(succeeded.finishedAt);
       assert.throws(() => workflows.updateWorkflow(started.requestId, { progress: 0.75 }), /not running/u);
 
-      const failed = workflows.beginWorkflow("wiki-maintenance");
+      const failed = workflows.beginWorkflow("lint");
       const failure = workflows.failWorkflow(failed.requestId, {
         errorCode: "E".repeat(120),
         errorMessage: "é".repeat(400),

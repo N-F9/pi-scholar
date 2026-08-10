@@ -5,12 +5,14 @@ import {
   canonical,
   compareFileRange,
   hashFile,
+  INPUT_KINDS,
   lstatNoFollow,
   parseMetadata,
   readNoFollow,
   requiredString,
   SOURCE_KINDS,
   sanitizedSourceUri,
+  treeDigest,
   validRelativePath,
   walkFiles,
 } from "./source-files.js";
@@ -22,11 +24,30 @@ import type {
   StageMetadata,
 } from "./source-service.js";
 
+function manifestOptionalString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f]/u.test(value))
+    throw new Error(`invalid source manifest ${key}`);
+  return value;
+}
+
+function manifestRequiredString(record: Record<string, unknown>, key: string): string {
+  const value = requiredString(record, key);
+  if (/[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`invalid source manifest ${key}`);
+  return value;
+}
+
 function parseManifestValue(raw: unknown): SourceManifest {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid source manifest");
   const record = raw as Record<string, unknown>;
-  requiredString(record, "sourceId");
-  requiredString(record, "originalDigest");
+  manifestRequiredString(record, "id");
+  manifestRequiredString(record, "sourceId");
+  const kind = manifestRequiredString(record, "kind") as SourceKind;
+  if (!SOURCE_KINDS.includes(kind)) throw new Error("invalid source manifest kind");
+  manifestRequiredString(record, "displayName");
+  const capturedAt = manifestRequiredString(record, "capturedAt");
+  if (!Number.isFinite(Date.parse(capturedAt))) throw new Error("invalid source manifest capturedAt");
   const normalizer = record.normalizer;
   if (
     normalizer === null ||
@@ -36,28 +57,60 @@ function parseManifestValue(raw: unknown): SourceManifest {
     (normalizer as Record<string, unknown>).version !== "1"
   )
     throw new Error("invalid source manifest normalizer");
+  for (const key of ["originalBytes", "originalByteLength", "extractionBytes", "extractedByteLength"]) {
+    manifestInteger(record[key], key);
+  }
+  for (const key of ["originalDigest", "extractionDigest", "extractedDigest"]) {
+    manifestDigest(record[key], key);
+  }
   if (!Array.isArray(record.files) || !Array.isArray(record.chunks)) throw new Error("invalid source manifest files");
-  if (record.attachments === undefined) record.attachments = [];
   if (!Array.isArray(record.attachments)) throw new Error("invalid source manifest attachments");
+  for (const [label, entries] of [
+    ["files", record.files],
+    ["attachments", record.attachments],
+  ] as const) {
+    for (const [index, item] of entries.entries()) {
+      if (item === null || typeof item !== "object" || Array.isArray(item))
+        throw new Error(`invalid source manifest ${label} ${index}`);
+      manifestOptionalString(item as Record<string, unknown>, "mediaType");
+    }
+  }
+  const originalName = manifestOptionalString(record, "originalName");
+  if (originalName !== undefined) validRelativePath(originalName);
   for (const key of ["sourceUri", "originalUrl"] as const) {
-    if (typeof record[key] !== "string") continue;
-    const sanitized = sanitizedSourceUri(record[key]);
-    if (sanitized !== record[key]) throw new Error("source manifest URL is not canonical");
+    const value = manifestOptionalString(record, key);
+    if (value === undefined) continue;
+    const sanitized = sanitizedSourceUri(value);
+    if (sanitized !== value) throw new Error("source manifest URL is not canonical");
     record[key] = sanitized;
   }
+  if (
+    (record.sourceUri === undefined) !== (record.originalUrl === undefined) ||
+    record.sourceUri !== record.originalUrl
+  )
+    throw new Error("source manifest URL fields disagree");
+  manifestOptionalString(record, "mediaType");
+  const revision = record.revision === undefined ? undefined : manifestRequiredString(record, "revision");
+  const repositoryRevision =
+    record.repositoryRevision === undefined ? undefined : manifestRequiredString(record, "repositoryRevision");
+  if (revision !== repositoryRevision) throw new Error("source manifest revision fields disagree");
+  if (record.inputKind !== undefined) {
+    const inputKind = manifestOptionalString(record, "inputKind");
+    if (!inputKind || !(INPUT_KINDS as readonly string[]).includes(inputKind))
+      throw new Error("invalid source manifest input kind");
+  }
+  if (record.converter !== undefined) {
+    const converter = record.converter;
+    if (converter === null || typeof converter !== "object" || Array.isArray(converter))
+      throw new Error("invalid source manifest converter");
+    const converterRecord = converter as Record<string, unknown>;
+    manifestRequiredString(converterRecord, "name");
+    manifestRequiredString(converterRecord, "version");
+  }
   if (record.stagedMetadata !== undefined) {
-    if (
-      record.stagedMetadata === null ||
-      typeof record.stagedMetadata !== "object" ||
-      Array.isArray(record.stagedMetadata)
-    )
-      throw new Error("invalid source manifest metadata");
-    const metadata = record.stagedMetadata as Record<string, unknown>;
-    if (typeof metadata.sourceUri === "string") {
-      const sanitized = sanitizedSourceUri(metadata.sourceUri);
-      if (sanitized !== metadata.sourceUri) throw new Error("source manifest metadata URL is not canonical");
-      metadata.sourceUri = sanitized;
-    }
+    const metadataJson = JSON.stringify(record.stagedMetadata);
+    if (metadataJson === undefined) throw new Error("invalid source manifest metadata");
+    record.stagedMetadata = parseMetadata(metadataJson);
   }
   return raw as SourceManifest;
 }
@@ -122,6 +175,15 @@ export async function verifyRetainedPacket(
   const manifestStat = await lstatNoFollow(manifestPath);
   if (!manifestStat.isFile()) throw new Error("source manifest must be a regular file");
   const manifest = parseManifestValue(JSON.parse((await readNoFollow(manifestPath)).toString("utf8")) as unknown);
+  for (const [label, entries] of [
+    ["files", manifest.files],
+    ["attachments", manifest.attachments],
+  ] as const) {
+    for (const [index, entry] of entries.entries()) {
+      const mediaType = (entry as unknown as Record<string, unknown>).mediaType;
+      if (mediaType !== manifest.mediaType) throw new Error(`retained source ${label} media type mismatch at ${index}`);
+    }
+  }
   const attachmentFiles = await walkFiles(attachmentsRoot, "", false);
   const expectedAttachments = manifestAttachments(manifest.attachments);
   const actualAttachments = attachmentFiles.map((file) => ({
@@ -166,6 +228,8 @@ export async function verifyRetainedPacket(
     manifestInteger(manifest.originalByteLength, "originalByteLength") !== originalBytes
   )
     throw new Error("retained source original length mismatch");
+  if (treeDigest(originalFiles, manifest.repositoryRevision) !== manifest.originalDigest)
+    throw new Error("retained source original tree digest mismatch");
   const extractedPath = join(packet, "extracted.md");
   const extractedStat = await lstatNoFollow(extractedPath);
   if (!extractedStat.isFile()) throw new Error("source extraction must be a regular file");

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
@@ -6,21 +8,23 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type {
-  AdmissionContext,
-  AdmissionPublicationInput,
-  AdmissionPublicationResult,
+  ExtractContext,
+  ExtractPublicationInput,
+  ExtractPublicationResult,
   GradeSettlementInput,
   GradingContext,
   GradingResult,
-  MaintenanceContext,
-  MaintenanceInput,
-  MaintenanceResult,
+  IngestContext,
+  LintContext,
   QuizContext,
   QuizDetailRecord,
   QuizPublicationInput,
   SourceRequest,
+  WikiChangeInput,
+  WikiChangeResult,
 } from "../src/contracts.js";
 
 type WikiNoteInput = {
@@ -38,12 +42,22 @@ type WikiNoteUpdateInput = {
   readonly expectedDigest?: string;
 };
 
-type LifecycleKind = "source-admission" | "wiki-maintenance" | "daily-quiz";
+type LifecycleKind = "extract" | "ingest" | "lint" | "daily" | "quiz-grader" | "sync";
 
-type WorkflowState = {
+type ExtractWorkflowState = {
   readonly requestId: string;
-  readonly remaining: number;
+  readonly expectedClaimKeys: ReadonlySet<string>;
+  readonly attemptedClaimKeys: ReadonlySet<string>;
+  readonly completedClaimKeys: ReadonlySet<string>;
+  readonly failed: boolean;
 };
+
+type WorkflowState =
+  | {
+      readonly requestId: string;
+      readonly remaining: number;
+    }
+  | ExtractWorkflowState;
 
 type WorkflowFinishOptions = {
   readonly progress?: number;
@@ -77,10 +91,11 @@ type ScholarApplication = {
     status: "succeeded" | "failed",
     options?: WorkflowFinishOptions,
   ) => Promise<unknown>;
-  readonly getAdmissionContext: () => Promise<AdmissionContext>;
-  readonly admitSource: (input: AdmissionPublicationInput) => Promise<AdmissionPublicationResult>;
-  readonly getMaintenanceContext: () => Promise<MaintenanceContext>;
-  readonly applyMaintenance: (input: MaintenanceInput) => Promise<MaintenanceResult>;
+  readonly getExtractContext: () => Promise<ExtractContext>;
+  readonly publishExtraction: (input: ExtractPublicationInput) => Promise<ExtractPublicationResult>;
+  readonly getIngestContext: () => Promise<IngestContext>;
+  readonly getLintContext: (input?: { readonly description?: string }) => Promise<LintContext>;
+  readonly applyWikiChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
   readonly getQuizContext: (input?: { readonly date?: string }) => Promise<QuizContext>;
   readonly publishQuiz: (input: QuizPublicationInput) => Promise<QuizDetailRecord>;
   readonly getGradingContext: (input?: { readonly date?: string }, ownerToken?: string) => Promise<GradingContext>;
@@ -147,14 +162,14 @@ const searchInput = Type.Object({
 const statusInput = Type.Object({});
 const emptyInput = Type.Object({});
 
-const admissionInput = Type.Object({
+const extractionInput = Type.Object({
   claimId: Type.String({ minLength: 1 }),
   preparedId: Type.String({ minLength: 1 }),
   digest: Type.String({ minLength: 1 }),
-  endpoints: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }))),
+  endpoints: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 }),
 });
 
-const maintenanceIssuePageInput = Type.Object({
+const wikiChangeIssuePageInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
   expectedDigest: Type.String({ minLength: 1 }),
   title: Type.Optional(Type.String()),
@@ -162,7 +177,7 @@ const maintenanceIssuePageInput = Type.Object({
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
 });
 
-const maintenanceInput = Type.Union([
+const wikiChangeInput = Type.Union([
   Type.Object({
     kind: Type.Literal("create-page"),
     path: Type.String({ minLength: 1 }),
@@ -205,8 +220,13 @@ const maintenanceInput = Type.Union([
   Type.Object({
     kind: Type.Literal("resolve-issue"),
     issueId: Type.String({ minLength: 1 }),
-    page: maintenanceIssuePageInput,
+    page: wikiChangeIssuePageInput,
     resolution: Type.String({ minLength: 1 }),
+  }),
+  Type.Object({
+    kind: Type.Literal("retire-page"),
+    pageId: Type.String({ minLength: 1 }),
+    expectedDigest: Type.String({ minLength: 1 }),
   }),
 ]);
 
@@ -237,6 +257,7 @@ const quizInput = Type.Union([
   }),
 ]);
 const contextDateInput = Type.Object({ date: Type.Optional(Type.String({ minLength: 1 })) });
+const lintContextInput = Type.Object({ description: Type.Optional(Type.String()) });
 const gradeReadingInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
   anchor: Type.String({ minLength: 1 }),
@@ -330,11 +351,73 @@ function workflowError(error: unknown): WorkflowFinishOptions {
   };
 }
 
-function contextRemaining(kind: LifecycleKind, result: unknown): number {
-  if (kind === "daily-quiz" && (result as QuizContext).initializationEnabled) return 0;
-  if (kind !== "source-admission") return 1;
-  const claims = (result as AdmissionContext).claims;
-  return Array.isArray(claims) ? claims.length : 0;
+function extractClaimKey(input: Pick<ExtractPublicationInput, "claimId" | "preparedId">): string {
+  return `${input.claimId}\u0000${input.preparedId}`;
+}
+
+function extractWorkflowFailure(): WorkflowFinishOptions {
+  return {
+    progress: 1,
+    message: "Workflow completed with extraction failures",
+    errorCode: "PI_WORKFLOW_FAILED",
+    errorMessage: "One or more extraction entries failed",
+  };
+}
+
+function recordExtractAttempt(
+  state: ExtractWorkflowState,
+  claimKey: string | undefined,
+  succeeded: boolean,
+): { readonly state: ExtractWorkflowState; readonly accepted: boolean; readonly finished: boolean } {
+  if (!claimKey || !state.expectedClaimKeys.has(claimKey)) return { state, accepted: false, finished: false };
+  if (state.attemptedClaimKeys.has(claimKey))
+    return {
+      state,
+      accepted: true,
+      finished: state.attemptedClaimKeys.size === state.expectedClaimKeys.size,
+    };
+  const attemptedClaimKeys = new Set(state.attemptedClaimKeys);
+  attemptedClaimKeys.add(claimKey);
+  const completedClaimKeys = new Set(state.completedClaimKeys);
+  if (succeeded) completedClaimKeys.add(claimKey);
+  const next = {
+    ...state,
+    attemptedClaimKeys,
+    completedClaimKeys,
+    failed: state.failed || !succeeded,
+  };
+  return {
+    state: next,
+    accepted: true,
+    finished: attemptedClaimKeys.size === state.expectedClaimKeys.size,
+  };
+}
+
+function workflowFinalizationApplied(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("details" in error)) return false;
+  const details = error.details;
+  return details !== null && typeof details === "object" && "applied" in details && details.applied === true;
+}
+
+async function persistExtractAttempt(
+  app: ScholarApplication,
+  key: string,
+  attempt: { readonly state: ExtractWorkflowState; readonly finished: boolean },
+): Promise<void> {
+  if (attempt.finished) {
+    await app.finishWorkflow(
+      attempt.state.requestId,
+      attempt.state.failed ? "failed" : "succeeded",
+      attempt.state.failed ? extractWorkflowFailure() : { progress: 1, message: "Workflow completed" },
+    );
+    workflowStates.delete(key);
+  } else {
+    const remaining = attempt.state.expectedClaimKeys.size - attempt.state.attemptedClaimKeys.size;
+    await app.updateWorkflow(attempt.state.requestId, {
+      progress: 0.5,
+      message: `${remaining} extraction(s) remaining`,
+    });
+  }
 }
 
 async function lifecycleContext<T>(
@@ -351,31 +434,85 @@ async function lifecycleContext<T>(
   const key = workflowKey(app, kind);
   if (workflowStates.has(key)) throw new Error(`${kind} workflow is already running`);
   let state: WorkflowState | undefined;
+  let result: T;
   try {
     const started = await app.beginWorkflow(kind);
-    state = { requestId: started.workflow.requestId, remaining: 1 };
-    const result = await operation(app);
-    const remaining = contextRemaining(kind, result);
-    if (remaining === 0) {
-      await app.finishWorkflow(state.requestId, "succeeded", { progress: 1, message: "Workflow completed" });
-      workflowStates.delete(key);
-    } else {
-      await app.updateWorkflow(state.requestId, { progress: 0.25, message: "Context loaded" });
-      workflowStates.set(key, { requestId: state.requestId, remaining });
-    }
-    progress(onUpdate, "Pi Scholar completed");
-    return jsonResult(result);
+    const requestId = started.workflow.requestId;
+    state =
+      kind === "extract"
+        ? {
+            requestId,
+            expectedClaimKeys: new Set<string>(),
+            attemptedClaimKeys: new Set<string>(),
+            completedClaimKeys: new Set<string>(),
+            failed: false,
+          }
+        : { requestId, remaining: 1 };
+    result = await operation(app);
   } catch (error) {
     if (state) {
-      workflowStates.delete(key);
+      workflowStates.set(key, state);
       try {
         await app.finishWorkflow(state.requestId, "failed", workflowError(error));
-      } catch {
-        // Preserve the tool error if lifecycle persistence is unavailable.
+        workflowStates.delete(key);
+      } catch (persistenceError) {
+        if (workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+        else workflowStates.set(key, state);
       }
     }
     throw error;
   }
+
+  if (!state) throw new Error("workflow state unavailable");
+  const requestId = state.requestId;
+  if (kind === "extract") {
+    const context = result as ExtractContext;
+    const expectedClaimKeys = new Set(
+      (Array.isArray(context.claims) ? context.claims : []).map((claim) => extractClaimKey(claim)),
+    );
+    const extractState: ExtractWorkflowState = {
+      requestId,
+      expectedClaimKeys,
+      attemptedClaimKeys: new Set(),
+      completedClaimKeys: new Set(),
+      failed: Array.isArray(context.failures) && context.failures.length > 0,
+    };
+    workflowStates.set(key, extractState);
+    try {
+      if (expectedClaimKeys.size === 0) {
+        await app.finishWorkflow(
+          requestId,
+          extractState.failed ? "failed" : "succeeded",
+          extractState.failed ? extractWorkflowFailure() : { progress: 1, message: "Workflow completed" },
+        );
+        workflowStates.delete(key);
+      } else {
+        await app.updateWorkflow(requestId, { progress: 0.25, message: "Context loaded" });
+      }
+    } catch (persistenceError) {
+      if (expectedClaimKeys.size === 0 && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+      else workflowStates.set(key, extractState);
+      throw persistenceError;
+    }
+  } else {
+    const remaining = kind === "daily" && (result as QuizContext).initializationEnabled ? 0 : 1;
+    const nextState = { requestId, remaining };
+    workflowStates.set(key, nextState);
+    try {
+      if (remaining === 0) {
+        await app.finishWorkflow(requestId, "succeeded", { progress: 1, message: "Workflow completed" });
+        workflowStates.delete(key);
+      } else {
+        await app.updateWorkflow(requestId, { progress: 0.25, message: "Context loaded" });
+      }
+    } catch (persistenceError) {
+      if (remaining === 0 && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+      else workflowStates.set(key, nextState);
+      throw persistenceError;
+    }
+  }
+  progress(onUpdate, "Pi Scholar completed");
+  return jsonResult(result);
 }
 
 async function lifecycleFinal<T>(
@@ -385,6 +522,7 @@ async function lifecycleFinal<T>(
   message: string,
   kind: LifecycleKind,
   operation: (app: ScholarApplication) => Promise<T>,
+  claimKey?: string,
 ): Promise<AgentToolResult<unknown>> {
   cancelled(signal);
   progress(onUpdate, message);
@@ -392,66 +530,84 @@ async function lifecycleFinal<T>(
   const key = workflowKey(app, kind);
   const state = workflowStates.get(key);
   if (!state) throw new Error(`${kind} context is required before the final tool`);
+
+  let result: T;
   try {
     cancelled(signal);
-    const result = await operation(app);
-    if (kind === "wiki-maintenance") {
-      await app.updateWorkflow(state.requestId, {
-        progress: 0.5,
-        message: "Maintenance proposal applied; submit another or finish",
-      });
-      workflowStates.set(key, state);
-    } else {
-      const remaining = state.remaining - 1;
-      if (remaining <= 0) {
-        await app.finishWorkflow(state.requestId, "succeeded", { progress: 1, message: "Workflow completed" });
-        workflowStates.delete(key);
-      } else {
-        await app.updateWorkflow(state.requestId, { progress: 0.5, message: `${remaining} admission(s) remaining` });
-        workflowStates.set(key, { requestId: state.requestId, remaining });
-      }
-    }
-    progress(onUpdate, "Pi Scholar completed");
-    return jsonResult(result);
+    result = await operation(app);
   } catch (error) {
-    if (kind === "wiki-maintenance") {
+    if (kind === "ingest" || kind === "lint") {
       try {
         await app.updateWorkflow(state.requestId, {
           progress: 0.5,
-          message: "Maintenance proposal rejected; submit another or finish",
+          message: "Wiki change rejected; submit another or finish",
         });
       } catch {
         // Preserve the tool error if progress persistence is unavailable.
       }
       workflowStates.set(key, state);
-    } else if (kind === "source-admission") {
-      const remaining = state.remaining - 1;
-      if (remaining > 0) {
+    } else if (kind === "extract") {
+      const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, false);
+      if (attempt.accepted) {
+        workflowStates.set(key, attempt.state);
         try {
-          await app.updateWorkflow(state.requestId, { progress: 0.5, message: `${remaining} admission(s) remaining` });
-        } catch {
-          /* Preserve the source failure if progress persistence is unavailable. */
-        }
-        workflowStates.set(key, { requestId: state.requestId, remaining });
-      } else {
-        workflowStates.delete(key);
-        try {
-          await app.finishWorkflow(state.requestId, "failed", workflowError(error));
-        } catch {
-          /* Preserve the tool error if lifecycle persistence is unavailable. */
+          await persistExtractAttempt(app, key, attempt);
+        } catch (persistenceError) {
+          if (attempt.finished && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+          else workflowStates.set(key, attempt.state);
         }
       }
     } else {
-      workflowStates.delete(key);
+      workflowStates.set(key, state);
       try {
         await app.finishWorkflow(state.requestId, "failed", workflowError(error));
-      } catch {
-        // Preserve the tool error if lifecycle persistence is unavailable.
+        workflowStates.delete(key);
+      } catch (persistenceError) {
+        if (workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+        else workflowStates.set(key, state);
       }
     }
     throw error;
   }
+
+  if (kind === "ingest" || kind === "lint") {
+    await app.updateWorkflow(state.requestId, {
+      progress: 0.5,
+      message: "Wiki change applied; submit another or finish",
+    });
+    workflowStates.set(key, state);
+  } else if (kind === "extract") {
+    const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, true);
+    if (attempt.accepted) {
+      workflowStates.set(key, attempt.state);
+      try {
+        await persistExtractAttempt(app, key, attempt);
+      } catch (persistenceError) {
+        if (attempt.finished && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+        else workflowStates.set(key, attempt.state);
+        throw persistenceError;
+      }
+    }
+  } else {
+    const remaining = (state as { readonly requestId: string; readonly remaining: number }).remaining - 1;
+    if (remaining <= 0) {
+      try {
+        await app.finishWorkflow(state.requestId, "succeeded", { progress: 1, message: "Workflow completed" });
+        workflowStates.delete(key);
+      } catch (persistenceError) {
+        if (workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+        else workflowStates.set(key, state);
+        throw persistenceError;
+      }
+    } else {
+      await app.updateWorkflow(state.requestId, { progress: 0.5, message: `${remaining} extraction(s) remaining` });
+      workflowStates.set(key, { requestId: state.requestId, remaining });
+    }
+  }
+  progress(onUpdate, "Pi Scholar completed");
+  return jsonResult(result);
 }
+
 async function lifecycleFinish<T>(
   ctx: ExtensionContext,
   signal: AbortSignal | undefined,
@@ -466,22 +622,33 @@ async function lifecycleFinish<T>(
   const key = workflowKey(app, kind);
   const state = workflowStates.get(key);
   if (!state) throw new Error(`${kind} context is required before finishing`);
+
+  let result: T;
   try {
     cancelled(signal);
-    const result = await operation(app);
-    await app.finishWorkflow(state.requestId, "succeeded", { progress: 1, message: "Workflow completed" });
-    workflowStates.delete(key);
-    progress(onUpdate, "Pi Scholar completed");
-    return jsonResult(result);
+    result = await operation(app);
   } catch (error) {
-    workflowStates.delete(key);
+    workflowStates.set(key, state);
     try {
       await app.finishWorkflow(state.requestId, "failed", workflowError(error));
-    } catch {
-      // Preserve the tool error if lifecycle persistence is unavailable.
+      workflowStates.delete(key);
+    } catch (persistenceError) {
+      if (workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+      else workflowStates.set(key, state);
     }
     throw error;
   }
+
+  try {
+    await app.finishWorkflow(state.requestId, "succeeded", { progress: 1, message: "Workflow completed" });
+    workflowStates.delete(key);
+  } catch (persistenceError) {
+    if (workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+    else workflowStates.set(key, state);
+    throw persistenceError;
+  }
+  progress(onUpdate, "Pi Scholar completed");
+  return jsonResult(result);
 }
 
 async function stage(app: ScholarApplication, params: Record<string, unknown>): Promise<unknown> {
@@ -565,18 +732,34 @@ async function handleStatusCommand(_args: string, ctx: ExtensionCommandContext):
   ctx.ui.notify(text && text.type === "text" ? text.text : "Pi Scholar status loaded", "info");
 }
 
+async function handleLintCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
+  const command = pi.getCommands().find((entry) => entry.source === "skill" && entry.name === "skill:lint");
+  if (!command) throw new Error("lint skill is unavailable");
+  const location = command.sourceInfo.path;
+  const baseDir = command.sourceInfo.baseDir ?? dirname(location);
+  const body = stripFrontmatter(readFileSync(location, "utf8")).trim();
+  const skillBlock = `<skill name="lint" location="${location}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
+  const description = args.trim();
+  await ctx.waitForIdle();
+  pi.sendUserMessage(description ? `${skillBlock}\n\n${description}` : skillBlock);
+}
+
 export default function piScholarExtension(pi: ExtensionAPI): void {
-  pi.registerCommand("add", {
+  pi.registerCommand("scholar-add", {
     description: "Stage a URL, pasted source, file, directory, or repository",
     handler: handleAddCommand,
   });
-  pi.registerCommand("issue", {
+  pi.registerCommand("scholar-issue", {
     description: "Report an incorrect, unclear, missing, or badly bounded wiki item",
     handler: handleIssueCommand,
   });
   pi.registerCommand("scholar-status", {
     description: "Show Pi Scholar vault, workflow, learning, doctor, and Git facts",
     handler: handleStatusCommand,
+  });
+  pi.registerCommand("scholar-lint", {
+    description: "Inspect the final wiki and propose guarded repairs",
+    handler: async (args, ctx) => handleLintCommand(pi, args, ctx),
   });
 
   pi.registerTool({
@@ -649,87 +832,130 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "scholar_get_admission_context",
-    label: "scholar_get_admission_context",
+    name: "scholar_get_extract_context",
+    label: "scholar_get_extract_context",
     executionMode: "sequential",
-    description: "List and claim the current stable source-admission context.",
+    description: "List and claim the current stable extract context.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
-      return lifecycleContext(ctx, _signal, onUpdate, "Loading admission context", "source-admission", (app) =>
-        app.getAdmissionContext(),
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading extract context", "extract", (app) =>
+        app.getExtractContext(),
       );
     },
   });
   pi.registerTool({
-    name: "scholar_admit_source",
-    label: "scholar_admit_source",
+    name: "scholar_publish_extraction",
+    label: "scholar_publish_extraction",
     executionMode: "sequential",
-    description: "Publish one claimed source packet with validated 1-based line endpoints.",
-    parameters: admissionInput,
+    description: "Publish one claimed source extraction with validated 1-based line endpoints.",
+    parameters: extractionInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing source admission", "source-admission", (app) =>
-        app.admitSource(params as AdmissionPublicationInput),
+      const input = params as ExtractPublicationInput;
+      return lifecycleFinal(
+        ctx,
+        _signal,
+        onUpdate,
+        "Publishing extraction",
+        "extract",
+        (app) => app.publishExtraction(input),
+        extractClaimKey(input),
       );
     },
   });
   pi.registerTool({
-    name: "scholar_get_maintenance_context",
-    label: "scholar_get_maintenance_context",
+    name: "scholar_get_ingest_context",
+    label: "scholar_get_ingest_context",
     executionMode: "sequential",
-    description: "Read the current bounded wiki-maintenance context.",
+    description: "Read the current wiki and only published, verified source packets for ingest.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
-      return lifecycleContext(ctx, _signal, onUpdate, "Loading maintenance context", "wiki-maintenance", (app) =>
-        app.getMaintenanceContext(),
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading ingest context", "ingest", (app) =>
+        app.getIngestContext(),
       );
     },
   });
-
   pi.registerTool({
-    name: "scholar_apply_maintenance",
-    label: "scholar_apply_maintenance",
+    name: "scholar_apply_ingest",
+    label: "scholar_apply_ingest",
     executionMode: "sequential",
-    description:
-      "Apply one guarded wiki-page proposal; model-authored source pages must be self-contained textbook-style exposition.",
-    parameters: maintenanceInput,
+    description: "Apply one guarded source-grounded wiki change during ingest.",
+    parameters: wikiChangeInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded maintenance", "wiki-maintenance", (app) =>
-        app.applyMaintenance(params as MaintenanceInput),
+      return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded ingest change", "ingest", (app) =>
+        app.applyWikiChange(params as WikiChangeInput),
       );
     },
   });
   pi.registerTool({
-    name: "scholar_finish_maintenance",
-    label: "scholar_finish_maintenance",
+    name: "scholar_finish_ingest",
+    label: "scholar_finish_ingest",
     executionMode: "sequential",
-    description: "Finish a wiki-maintenance context after submitting all bounded proposals, including none.",
+    description: "Finish an ingest context after submitting all bounded changes, including none.",
     parameters: emptyInput,
     async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
-      return lifecycleFinish(ctx, _signal, onUpdate, "Finishing wiki maintenance", "wiki-maintenance", async () => ({
+      return lifecycleFinish(ctx, _signal, onUpdate, "Finishing ingest", "ingest", async () => ({
         status: "completed" as const,
       }));
     },
   });
   pi.registerTool({
-    name: "scholar_get_quiz_context",
-    label: "scholar_get_quiz_context",
+    name: "scholar_get_lint_context",
+    label: "scholar_get_lint_context",
     executionMode: "sequential",
-    description: "Read the current local-date quiz context and initialization guard.",
+    description: "Read the final wiki for a full or targeted lint scope.",
+    parameters: lintContextInput,
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+      const input = asRecord(params);
+      const description = typeof input.description === "string" ? input.description.trim() : "";
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading lint context", "lint", (app) =>
+        app.getLintContext(description ? { description } : undefined),
+      );
+    },
+  });
+  pi.registerTool({
+    name: "scholar_apply_lint",
+    label: "scholar_apply_lint",
+    executionMode: "sequential",
+    description: "Apply one guarded wiki change during lint; split and merge use composed operations.",
+    parameters: wikiChangeInput,
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+      return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded lint change", "lint", (app) =>
+        app.applyWikiChange(params as WikiChangeInput),
+      );
+    },
+  });
+  pi.registerTool({
+    name: "scholar_finish_lint",
+    label: "scholar_finish_lint",
+    executionMode: "sequential",
+    description: "Finish a lint context after submitting all bounded changes, including none.",
+    parameters: emptyInput,
+    async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
+      return lifecycleFinish(ctx, _signal, onUpdate, "Finishing lint", "lint", async () => ({
+        status: "completed" as const,
+      }));
+    },
+  });
+  pi.registerTool({
+    name: "scholar_get_daily_context",
+    label: "scholar_get_daily_context",
+    executionMode: "sequential",
+    description: "Read the current local-date daily quiz context and initialization guard.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleContext(ctx, _signal, onUpdate, "Loading quiz context", "daily-quiz", (app) =>
+      return lifecycleContext(ctx, _signal, onUpdate, "Loading daily context", "daily", (app) =>
         app.getQuizContext(params),
       );
     },
   });
   pi.registerTool({
-    name: "scholar_publish_quiz",
-    label: "scholar_publish_quiz",
-    description: "Publish one validated daily quiz proposal or explicit skip.",
+    name: "scholar_publish_daily",
+    label: "scholar_publish_daily",
     executionMode: "sequential",
+    description: "Publish one validated daily quiz proposal or explicit skip.",
     parameters: quizInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily-quiz", (app) =>
+      return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily", (app) =>
         app.publishQuiz(params as QuizPublicationInput),
       );
     },

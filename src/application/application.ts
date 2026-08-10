@@ -2,19 +2,19 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type {
-  AdmissionContext,
-  AdmissionFailureRecord,
-  AdmissionPublicationInput,
-  AdmissionPublicationResult,
   ApiEnvelope,
   DoctorReport,
+  ExtractContext,
+  ExtractFailureRecord,
+  ExtractPublicationInput,
+  ExtractPublicationResult,
   GradeSettlementInput,
   GradingContext,
   GradingResult,
   HealthResult,
-  MaintenanceContext,
-  MaintenanceInput,
-  MaintenanceResult,
+  IngestContext,
+  IngestSourceContext,
+  LintContext,
   PageLearningRecord,
   PageRecord,
   PreparedAdmission,
@@ -39,6 +39,8 @@ import type {
   SourceRecord,
   SourceRemovalResult,
   SourceRequest,
+  WikiChangeInput,
+  WikiChangeResult,
   WikiDriftResolutionRequest,
   WikiIssueCreateRequest,
   WikiIssueRecord,
@@ -66,7 +68,15 @@ import {
   type SourceClaim,
   SourceService,
 } from "../sources/source-service.js";
-import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths, withWriterLock } from "../vault.js";
+import {
+  assertNoSymlinkPath,
+  atomicWriteFile,
+  readFileNoFollow,
+  resolveVault,
+  safeRelativePath,
+  type VaultPaths,
+  withWriterLock,
+} from "../vault.js";
 import { parseWikiMarkdown, type WikiAdapters, WikiService } from "../wiki.js";
 import { parseWikiSections } from "../wiki-sections.js";
 import {
@@ -78,11 +88,11 @@ import {
 } from "../workflows.js";
 import {
   asAnswers,
-  decodeAdmissionInput,
+  decodeExtractPublicationInput,
   decodeGrade,
-  decodeMaintenanceInput,
   decodeQuizPublication,
   decodeReading,
+  decodeWikiChangeInput,
   exact,
   isRecord,
   jsonValue,
@@ -164,22 +174,22 @@ type DurableRollback<T> = {
   readonly restore: (snapshot: T) => void | PromiseLike<void>;
   readonly dispose?: (snapshot: T) => void | PromiseLike<void>;
 };
-const MAINTENANCE_ROLLBACK_TABLES = [
+const WIKI_CHANGE_ROLLBACK_TABLES = [
   { name: "pages", keys: ["page_id"] },
   { name: "page_learning", keys: ["page_id"] },
   { name: "page_prerequisites", keys: ["page_id", "prerequisite_page_id"] },
   { name: "authored_snapshots", keys: ["relative_path"] },
   { name: "wiki_issues", keys: ["issue_id"] },
 ] as const;
-interface MaintenanceRollbackFile {
+interface WikiChangeRollbackFile {
   readonly destination: string;
   readonly backup: string;
   readonly exists: boolean;
 }
-interface MaintenanceRollbackSnapshot {
+interface WikiChangeRollbackSnapshot {
   readonly workRoot: string;
   readonly tables: Readonly<Record<string, readonly Record<string, unknown>[]>>;
-  readonly files: readonly MaintenanceRollbackFile[];
+  readonly files: readonly WikiChangeRollbackFile[];
   readonly snapshotRoot: string;
   readonly snapshotEntries: readonly string[];
 }
@@ -190,7 +200,7 @@ function sha256(value: string | Uint8Array): string {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-function admissionResultKey(input: Pick<AdmissionPublicationInput, "claimId" | "preparedId" | "digest">): string {
+function extractionResultKey(input: Pick<ExtractPublicationInput, "claimId" | "preparedId" | "digest">): string {
   return `${input.claimId}\u0000${input.preparedId}\u0000${input.digest}`;
 }
 function boundedUtf8(value: string, maxBytes: number): string {
@@ -286,11 +296,11 @@ export class ScholarApplication {
   private readonly doctorFn: (explicitPath?: string) => DoctorReport;
   private readonly commitFn: (paths: VaultPaths, subject: string) => GitCheckpointResult;
   private readonly pushFn: (paths: VaultPaths) => GitPushResult;
-  private readonly admissionClaims = new Map<
+  private readonly extractionClaims = new Map<
     string,
     { readonly claim: SourceClaim; readonly prepared: PreparedAdmission }
   >();
-  private readonly completedAdmissions = new Map<string, AdmissionPublicationResult>();
+  private readonly completedExtractions = new Map<string, ExtractPublicationResult>();
   constructor(input: ApplicationOptions) {
     this.paths = typeof input.paths === "string" ? resolveVault(input.paths) : input.paths;
     this.db = input.db ?? openDatabase(this.paths);
@@ -448,64 +458,64 @@ export class ScholarApplication {
       ...(await this.sources.discover()).map((entry) => this.pendingSource(entry)),
     ];
   }
-  private async clearAdmissionClaims(): Promise<void> {
-    const tracked = [...this.admissionClaims.values()];
-    this.admissionClaims.clear();
+  private async clearExtractionClaims(): Promise<void> {
+    const tracked = [...this.extractionClaims.values()];
+    this.extractionClaims.clear();
     for (const { prepared } of tracked) await this.sources.cleanupPrepared(prepared.preparedId);
   }
-  async getAdmissionContext(): Promise<AdmissionContext> {
-    await this.clearAdmissionClaims();
+  async getExtractContext(): Promise<ExtractContext> {
+    await this.clearExtractionClaims();
     const claims: PreparedAdmission[] = [];
-    const failures: AdmissionFailureRecord[] = [];
+    const failures: ExtractFailureRecord[] = [];
     let recordingError: unknown;
     for (const entry of await this.sources.discover()) {
       let claim: SourceClaim | undefined;
       try {
         claim = await this.sources.claim(entry);
         const prepared = await this.sources.prepareClaim(claim);
-        this.admissionClaims.set(claim.claimId, { claim, prepared });
+        this.extractionClaims.set(claim.claimId, { claim, prepared });
         claims.push(prepared);
       } catch (error) {
         try {
           await this.durableDirect(
             () => this.sources.recordAdmissionFailure(entry, error, claim),
-            "source:admission-failed",
+            "source:extract-failed",
           );
         } catch (failureError) {
           recordingError ??= failureError;
         }
         if (claim) {
-          const tracked = this.admissionClaims.get(claim.claimId);
-          this.admissionClaims.delete(claim.claimId);
+          const tracked = this.extractionClaims.get(claim.claimId);
+          this.extractionClaims.delete(claim.claimId);
           if (tracked) await this.sources.cleanupPrepared(tracked.prepared.preparedId);
         }
         failures.push({
           relativePath: entry.relativePath,
-          errorCode: "ADMISSION_FAILED",
+          errorCode: "EXTRACT_FAILED",
           errorMessage: errorMessage(error).slice(0, 500),
         });
       }
     }
     if (recordingError) {
-      await this.clearAdmissionClaims();
+      await this.clearExtractionClaims();
       throw recordingError;
     }
     return { claims, ...(failures.length ? { failures } : {}) };
   }
-  async admitSource(input: AdmissionPublicationInput): Promise<AdmissionPublicationResult> {
-    const decoded = decodeAdmissionInput(input);
-    const resultKey = admissionResultKey(decoded);
-    const completed = this.completedAdmissions.get(resultKey);
+  async publishExtraction(input: ExtractPublicationInput): Promise<ExtractPublicationResult> {
+    const decoded = decodeExtractPublicationInput(input);
+    const resultKey = extractionResultKey(decoded);
+    const completed = this.completedExtractions.get(resultKey);
     if (completed) return completed;
-    const pending = this.admissionClaims.get(decoded.claimId);
+    const pending = this.extractionClaims.get(decoded.claimId);
     if (!pending || pending.prepared.preparedId !== decoded.preparedId || pending.prepared.digest !== decoded.digest)
-      throw new ValidationError("admission claim is unknown, stale, or expired");
-    let appliedResult: AdmissionPublicationResult | undefined;
-    const cacheResult = (result: AdmissionPublicationResult): void => {
-      this.completedAdmissions.set(resultKey, result);
-      if (this.completedAdmissions.size > 256) {
-        const oldest = this.completedAdmissions.keys().next().value;
-        if (typeof oldest === "string") this.completedAdmissions.delete(oldest);
+      throw new ValidationError("extract claim is unknown, stale, or expired");
+    let appliedResult: ExtractPublicationResult | undefined;
+    const cacheResult = (result: ExtractPublicationResult): void => {
+      this.completedExtractions.set(resultKey, result);
+      if (this.completedExtractions.size > 256) {
+        const oldest = this.completedExtractions.keys().next().value;
+        if (typeof oldest === "string") this.completedExtractions.delete(oldest);
       }
     };
     try {
@@ -515,35 +525,35 @@ export class ScholarApplication {
           preparedId: decoded.preparedId,
           claimId: decoded.claimId,
           digest: decoded.digest,
-          ...(decoded.endpoints ? { endpoints: [...decoded.endpoints] } : {}),
+          endpoints: [...decoded.endpoints],
         });
-        const publication: AdmissionPublicationResult = {
+        const publication: ExtractPublicationResult = {
           sourceId: published.sourceId,
           manifest: published.manifest as SourceManifest,
           removedInbox: published.removedInbox,
         };
         appliedResult = publication;
         return publication;
-      }, "source:admit");
+      }, "source:extract");
       cacheResult(result);
-      this.admissionClaims.delete(decoded.claimId);
+      this.extractionClaims.delete(decoded.claimId);
       return result;
     } catch (error) {
       if (appliedResult && isAppliedFinalizationFailure(error)) {
         cacheResult(appliedResult);
-        this.admissionClaims.delete(decoded.claimId);
+        this.extractionClaims.delete(decoded.claimId);
         throw error;
       }
       let recordingError: unknown;
       try {
         await this.durableDirect(
           () => this.sources.recordAdmissionFailure(pending.claim.entry, error, pending.claim),
-          "source:admission-failed",
+          "source:extract-failed",
         );
       } catch (failureError) {
         recordingError = failureError;
       }
-      this.admissionClaims.delete(decoded.claimId);
+      this.extractionClaims.delete(decoded.claimId);
       await this.sources.cleanupPrepared(pending.prepared.preparedId);
       if (recordingError) throw recordingError;
       throw error;
@@ -557,12 +567,16 @@ export class ScholarApplication {
     request: SourceRequest | MechanicsSourceStageRequest,
     context?: ApplicationMutationContext,
   ): Promise<SourceStageResult> {
-    return this.mutate(context, async () => {
-      const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
-      const entry = (await this.sources.discover()).find((candidate) => candidate.relativePath === staged.relativePath);
-      if (!entry) throw new Error("staged source disappeared");
-      return { source: publicSource(this.pendingSource(entry)) };
-    });
+    return this.mutate(context, () =>
+      this.durableDirect(async () => {
+        const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
+        const entry = (await this.sources.discover()).find(
+          (candidate) => candidate.relativePath === staged.relativePath,
+        );
+        if (!entry) throw new Error("staged source disappeared");
+        return { source: publicSource(this.pendingSource(entry)) };
+      }, "source:stage"),
+    );
   }
   async removalPreview(sourceId: string): Promise<{
     readonly source: PublicSourceRecord;
@@ -705,10 +719,11 @@ export class ScholarApplication {
     const page = pageRecord(inspected.page);
     const markdown = value.content;
     const pageSections = parseWikiSections(markdown, page.pageId);
-    let schedule: PageLearningRecord | undefined;
-    if (page.quizWorthiness === "eligible") schedule = this.scheduler.ensurePageLearning(page.pageId);
-    else if (this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", [page.pageId]))
-      schedule = this.scheduler.getPageLearning(page.pageId);
+    const schedule =
+      page.quizWorthiness === "eligible" ||
+      this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", [page.pageId])
+        ? this.scheduler.getPageLearning(page.pageId)
+        : undefined;
     const prerequisites = this.scheduler.listPrerequisites(page.pageId);
     const learning: WikiPageLearningProjection = { ...(schedule ? { schedule } : {}), prerequisites };
     const drift = inspected.drifted
@@ -1008,8 +1023,8 @@ export class ScholarApplication {
         "SELECT COUNT(*) AS count FROM wiki_issues WHERE status IN ('open','reopened')",
       )?.count ?? 0,
     );
-    const maintenance = this.db.get<Record<string, unknown>>(
-      "SELECT finished_at, message FROM workflows WHERE kind = 'wiki-maintenance' AND status = 'succeeded' ORDER BY finished_at DESC LIMIT 1",
+    const lint = this.db.get<Record<string, unknown>>(
+      "SELECT finished_at, message FROM workflows WHERE kind = 'lint' AND status = 'succeeded' ORDER BY finished_at DESC LIMIT 1",
     );
     let git: SettingsFacts["git"] = {
       clean: false,
@@ -1035,8 +1050,8 @@ export class ScholarApplication {
       localDate: await this.currentLocalDate(),
       pendingInboxCount,
       openIssueCount,
-      ...(maintenance?.finished_at ? { lastMaintenanceAt: String(maintenance.finished_at) } : {}),
-      ...(maintenance?.message ? { lastMaintenanceResult: String(maintenance.message) } : {}),
+      ...(lint?.finished_at ? { lastLintAt: String(lint.finished_at) } : {}),
+      ...(lint?.message ? { lastLintResult: String(lint.message) } : {}),
       recentChanges: [],
       git,
     };
@@ -1126,21 +1141,42 @@ export class ScholarApplication {
       closeError = error;
     }
     try {
-      await this.clearAdmissionClaims();
+      await this.clearExtractionClaims();
     } catch (error) {
       closeError ??= error;
     }
-    this.completedAdmissions.clear();
+    this.completedExtractions.clear();
     if (this.ownsDatabase) this.db.close();
     if (closeError) throw closeError;
   }
-  async getMaintenanceContext(): Promise<MaintenanceContext> {
-    const pages = await Promise.all((await this.wiki.list()).map((page) => this.wikiResult(page.pageId)));
+  async getIngestContext(): Promise<IngestContext> {
+    const pages = await Promise.all(
+      (await this.wiki.list()).filter((page) => page.status === "active").map((page) => this.wikiResult(page.pageId)),
+    );
+    const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
+    const sources = await this.sources.publishedPackets();
     return {
       pages,
-      issues: (await this.listIssues()).issues,
-      sources: this.sources.list().map(sourceRecord),
+      issues,
+      sources: sources.map(
+        ({ source, manifest, packetPath }): IngestSourceContext => ({
+          source: { ...sourceRecord(source as unknown as Record<string, unknown>), manifestPath: packetPath },
+          manifest,
+          packetPath,
+        }),
+      ),
     };
+  }
+  async getLintContext(input?: { readonly description?: string }): Promise<LintContext> {
+    const pages = await Promise.all(
+      (await this.wiki.list()).filter((page) => page.status === "active").map((page) => this.wikiResult(page.pageId)),
+    );
+    const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
+    const scope =
+      input?.description === undefined
+        ? ({ kind: "full" } as const)
+        : ({ kind: "targeted", description: input.description } as const);
+    return { scope, pages, issues };
   }
   private async liveDriftPageIds(): Promise<Set<string>> {
     const reports = await Promise.all((await this.wiki.list()).map((page) => this.wiki.inspectDrift(page.pageId)));
@@ -1154,7 +1190,7 @@ export class ScholarApplication {
     const drifted = await this.liveDriftPageIds();
     if (drifted.size) throw new ValidationError(`Wiki pages have unresolved live drift: ${[...drifted].join(", ")}`);
   }
-  private assertMaintenanceCoverage(
+  private assertWikiChangeCoverage(
     pages?: readonly {
       readonly pageId: string;
       readonly status?: "active" | "drifted" | "retired";
@@ -1165,7 +1201,7 @@ export class ScholarApplication {
     if (!coverage.ok)
       throw new ValidationError(`Eligible wiki pages lack learning rows: ${coverage.missingPageIds.join(", ")}`);
   }
-  private async maintenancePreflight(allowDrift = false): Promise<void> {
+  private async wikiChangePreflight(allowDrift = false): Promise<void> {
     if (!allowDrift) await this.assertNoLiveWikiDrift();
     const pages = await this.wiki.list();
     const projection = await this.wiki.refreshProjections(false);
@@ -1175,7 +1211,7 @@ export class ScholarApplication {
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
     await qmd.index();
   }
-  private async captureMaintenanceRollback(proposal: MaintenanceInput): Promise<MaintenanceRollbackSnapshot> {
+  private async captureWikiChangeRollback(proposal: WikiChangeInput): Promise<WikiChangeRollbackSnapshot> {
     const destinations = new Set<string>([join(this.paths.wikiRoot, "index.md"), join(this.paths.wikiRoot, "log.md")]);
     const pageIds = new Set<string>();
     switch (proposal.kind) {
@@ -1184,6 +1220,7 @@ export class ScholarApplication {
         break;
       case "update-page":
       case "rename-page":
+      case "retire-page":
         pageIds.add(proposal.pageId);
         if (proposal.kind === "rename-page") destinations.add(safeRelativePath(this.paths.wikiRoot, proposal.path));
         break;
@@ -1202,12 +1239,12 @@ export class ScholarApplication {
     const snapshotEntries = await fs.readdir(snapshotRoot);
     const workRoot = join(this.paths.workRoot, `maintenance-rollback-${randomUUID()}`);
     await fs.mkdir(workRoot, { recursive: false, mode: 0o700 });
-    const files: MaintenanceRollbackFile[] = [];
+    const files: WikiChangeRollbackFile[] = [];
     try {
       for (const [index, destination] of [...destinations].entries()) {
         let content: Buffer | undefined;
         try {
-          content = await fs.readFile(destination);
+          content = readFileNoFollow(destination);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
@@ -1217,7 +1254,7 @@ export class ScholarApplication {
         files.push({ destination, backup, exists });
       }
       const tables = Object.fromEntries(
-        MAINTENANCE_ROLLBACK_TABLES.map(({ name }) => [
+        WIKI_CHANGE_ROLLBACK_TABLES.map(({ name }) => [
           name,
           this.db.all<Record<string, unknown>>(`SELECT * FROM ${name}`),
         ]),
@@ -1228,11 +1265,11 @@ export class ScholarApplication {
       throw error;
     }
   }
-  private async restoreMaintenanceRollback(snapshot: MaintenanceRollbackSnapshot): Promise<void> {
+  private async restoreWikiChangeRollback(snapshot: WikiChangeRollbackSnapshot): Promise<void> {
     const deleteOrder = ["wiki_issues", "page_prerequisites", "page_learning", "authored_snapshots", "pages"];
     const writeOrder = ["pages", "authored_snapshots", "page_learning", "page_prerequisites", "wiki_issues"];
-    const specs = new Map<string, (typeof MAINTENANCE_ROLLBACK_TABLES)[number]>(
-      MAINTENANCE_ROLLBACK_TABLES.map((spec): [string, (typeof MAINTENANCE_ROLLBACK_TABLES)[number]] => [
+    const specs = new Map<string, (typeof WIKI_CHANGE_ROLLBACK_TABLES)[number]>(
+      WIKI_CHANGE_ROLLBACK_TABLES.map((spec): [string, (typeof WIKI_CHANGE_ROLLBACK_TABLES)[number]] => [
         spec.name,
         spec,
       ]),
@@ -1273,21 +1310,14 @@ export class ScholarApplication {
           );
       }
     };
-    const restoreFile = async (file: MaintenanceRollbackFile): Promise<void> => {
+    const restoreFile = async (file: WikiChangeRollbackFile): Promise<void> => {
       if (!file.exists) {
+        assertNoSymlinkPath(dirname(file.destination));
         await fs.rm(file.destination, { force: true });
         return;
       }
-      const content = await fs.readFile(file.backup);
-      await fs.mkdir(dirname(file.destination), { recursive: true, mode: 0o700 });
-      const temporary = join(dirname(file.destination), `.${randomUUID()}.rollback`);
-      try {
-        await fs.writeFile(temporary, content, { flag: "wx", mode: 0o600 });
-        await fs.rename(temporary, file.destination);
-      } catch (error) {
-        await fs.rm(temporary, { force: true }).catch(() => undefined);
-        throw error;
-      }
+      const content = readFileNoFollow(file.backup);
+      atomicWriteFile(file.destination, content);
     };
     try {
       transaction(this.db, () => {
@@ -1309,6 +1339,7 @@ export class ScholarApplication {
         for (const name of writeOrder) restoreTable(name);
       });
       for (const file of snapshot.files) await restoreFile(file);
+      assertNoSymlinkPath(snapshot.snapshotRoot);
       const expectedSnapshots = new Set(snapshot.snapshotEntries);
       for (const entry of await fs.readdir(snapshot.snapshotRoot)) {
         if (!expectedSnapshots.has(entry))
@@ -1324,7 +1355,7 @@ export class ScholarApplication {
       await fs.rm(snapshot.workRoot, { recursive: true, force: true });
     }
   }
-  private async maintenanceChecks(): Promise<{ readonly lint: readonly string[]; readonly doctor: DoctorReport }> {
+  private async wikiChangeChecks(): Promise<{ readonly lint: readonly string[]; readonly doctor: DoctorReport }> {
     await this.assertNoLiveWikiDrift();
     const pages = await this.wiki.list();
     const projection = await this.wiki.refreshProjections();
@@ -1334,7 +1365,7 @@ export class ScholarApplication {
       if (page.status === "active" && page.quizWorthiness === "eligible")
         this.scheduler.ensurePageLearning(page.pageId);
     }
-    this.assertMaintenanceCoverage(pages);
+    this.assertWikiChangeCoverage(pages);
     const qmd = this.wiki.adapters.qmd;
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
     await qmd.index();
@@ -1342,16 +1373,16 @@ export class ScholarApplication {
     if (!doctor.ok) throw new ValidationError("doctor checks failed");
     return { lint, doctor };
   }
-  async applyMaintenance(input: MaintenanceInput): Promise<MaintenanceResult> {
-    const proposal = decodeMaintenanceInput(input);
+  async applyWikiChange(input: WikiChangeInput): Promise<WikiChangeResult> {
+    const proposal = decodeWikiChangeInput(input);
     const rollback = {
-      capture: () => this.captureMaintenanceRollback(proposal),
-      restore: (snapshot: MaintenanceRollbackSnapshot) => this.restoreMaintenanceRollback(snapshot),
-      dispose: (snapshot: MaintenanceRollbackSnapshot) => fs.rm(snapshot.workRoot, { recursive: true, force: true }),
+      capture: () => this.captureWikiChangeRollback(proposal),
+      restore: (snapshot: WikiChangeRollbackSnapshot) => this.restoreWikiChangeRollback(snapshot),
+      dispose: (snapshot: WikiChangeRollbackSnapshot) => fs.rm(snapshot.workRoot, { recursive: true, force: true }),
     };
     return this.durableDirect(
       async () => {
-        await this.maintenancePreflight(proposal.kind === "update-page" || proposal.kind === "resolve-issue");
+        await this.wikiChangePreflight(proposal.kind === "update-page" || proposal.kind === "resolve-issue");
         switch (proposal.kind) {
           case "create-page": {
             const created = await this.wiki.create(proposal);
@@ -1359,7 +1390,7 @@ export class ScholarApplication {
               created.page.quizWorthiness === "eligible"
                 ? this.scheduler.ensurePageLearning(created.page.pageId)
                 : undefined;
-            const checks = await this.maintenanceChecks();
+            const checks = await this.wikiChangeChecks();
             return {
               kind: proposal.kind,
               page: pageRecord(created.page),
@@ -1377,7 +1408,7 @@ export class ScholarApplication {
               updated.page.quizWorthiness === "eligible"
                 ? this.scheduler.ensurePageLearning(updated.page.pageId)
                 : undefined;
-            const checks = await this.maintenanceChecks();
+            const checks = await this.wikiChangeChecks();
             return {
               kind: proposal.kind,
               page: pageRecord(updated.page),
@@ -1391,15 +1422,25 @@ export class ScholarApplication {
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
             const renamed = await this.wiki.rename(proposal.pageId, proposal.path);
-            const checks = await this.maintenanceChecks();
+            const checks = await this.wikiChangeChecks();
             return { kind: proposal.kind, page: pageRecord(renamed), checks };
           }
+          case "retire-page": {
+            this.assertPageMutationAllowed(proposal.pageId, "skip");
+            const current = await this.wiki.get(proposal.pageId);
+            if (current.digest !== proposal.expectedDigest)
+              throw new RevisionConflictError("The wiki page digest is stale");
+            const retired = await this.wiki.retire(proposal.pageId);
+            const checks = await this.wikiChangeChecks();
+            return { kind: proposal.kind, page: pageRecord(retired), checks };
+          }
           case "prerequisites": {
+            this.assertPageMutationAllowed(proposal.pageId);
             const page = await this.wiki.get(proposal.pageId);
             const pageLearning =
               page.quizWorthiness === "eligible" ? this.scheduler.ensurePageLearning(page.pageId) : undefined;
             this.scheduler.setPrerequisites(proposal.pageId, proposal.prerequisitePageIds, proposal.expectedRevision);
-            const checks = await this.maintenanceChecks();
+            const checks = await this.wikiChangeChecks();
             return {
               kind: proposal.kind,
               prerequisites: this.scheduler.listPrerequisites(page.pageId),
@@ -1448,7 +1489,7 @@ export class ScholarApplication {
               updatedPage.page.quizWorthiness === "eligible"
                 ? this.scheduler.ensurePageLearning(updatedPage.page.pageId)
                 : undefined;
-            const checks = await this.maintenanceChecks();
+            const checks = await this.wikiChangeChecks();
             const resolved = await this.wiki.resolveIssueAfterCorrection(proposal.issueId, proposal.resolution);
             return {
               kind: proposal.kind,
@@ -1460,7 +1501,7 @@ export class ScholarApplication {
           }
         }
       },
-      "wiki:maintenance",
+      "wiki:change",
       rollback,
     );
   }

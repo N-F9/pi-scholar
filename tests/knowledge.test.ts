@@ -8,7 +8,7 @@ import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
 import { parseOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
-import { SourceService, validateChunkEndpoints } from "../src/sources/source-service.js";
+import { SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
 import { isExecutableHtml, WikiService } from "../src/wiki.js";
 
@@ -502,6 +502,77 @@ describe("source admission mechanics", () => {
     ).toBe("published");
     db.close();
   });
+  it("rejects metadata-only tampering in retained packet provenance", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "metadata-tamper.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const manifestPath = join(result.packetPath, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    manifest.displayName = "forged display name";
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await expect(sources.publishedPackets()).rejects.toThrow(/unverified/iu);
+    db.close();
+  });
+  it("rejects forged provenance before recovery can rewrite the source row", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "recovery-tamper.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const claim = await sources.claim(entry);
+    const result = await sources.admitClaim(claim);
+    const manifestPath = join(result.packetPath, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    manifest.displayName = "recovery forgery";
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await expect(sources.admitClaim(claim)).rejects.toThrow(/provenance|unverified/iu);
+    expect(
+      db.get<{ display_name: string }>("SELECT display_name FROM sources WHERE source_id = ?", [result.sourceId])
+        ?.display_name,
+    ).toBe(result.manifest.displayName);
+    db.close();
+  });
+
+  it("rejects file and attachment media types that disagree with manifest provenance", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "media-tamper.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const manifestPath = join(result.packetPath, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    const files = manifest.files as Array<Record<string, unknown>>;
+    const file = files[0];
+    if (!file) throw new Error("source manifest file is missing");
+    file.mediaType = "application/forged";
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await expect(sources.publishedPackets()).rejects.toThrow(/unverified/iu);
+    db.close();
+  });
+
+  it("rejects original-byte tampering when the manifest file entry is forged too", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "original-tamper.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const manifestPath = join(result.packetPath, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    const files = manifest.files as Array<Record<string, unknown>>;
+    const file = files[0];
+    if (!file || typeof file.relativePath !== "string") throw new Error("source manifest file is missing");
+    const originalPath = join(result.packetPath, "original", file.relativePath);
+    const tampered = await fs.readFile(originalPath);
+    tampered[0] = (tampered[0] ?? 0) ^ 0xff;
+    file.digest = sha256(tampered);
+    file.bytes = tampered.byteLength;
+    file.byteLength = tampered.byteLength;
+    await fs.writeFile(originalPath, tampered);
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await expect(sources.publishedPackets()).rejects.toThrow(/unverified/iu);
+    db.close();
+  });
   it("reactivates a removed deterministic packet without replacing its history", async () => {
     const { paths, db, sources } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "reactivate.txt"), "evidence\n");
@@ -799,6 +870,70 @@ describe("wiki mechanics", () => {
     expect(index).not.toContain("notes/one.md");
     expect(log).toContain("notes/two.md");
     expect(log).not.toContain("notes/one.md");
+    db.close();
+  });
+  it("retires a page without losing its authored snapshot or path history", async () => {
+    const { paths, db, wiki } = await fixture();
+    const created = await wiki.create({
+      path: "notes/retire.md",
+      body: "# Retire\n\nKeep this history.",
+      quizWorthiness: "eligible",
+    });
+    const livePath = join(paths.wikiRoot, created.page.relativePath);
+    const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
+    const snapshotBytes = await fs.readFile(snapshotPath);
+    const snapshotRow = db.get<Record<string, unknown>>("SELECT * FROM authored_snapshots WHERE relative_path = ?", [
+      created.page.relativePath,
+    ]);
+    const retired = await wiki.retire(created.page.pageId);
+    expect(retired).toMatchObject({
+      pageId: created.page.pageId,
+      relativePath: created.page.relativePath,
+      digest: created.page.digest,
+      revision: created.page.revision + 1,
+      status: "retired",
+      quizWorthiness: "skip",
+    });
+    await expect(fs.lstat(livePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await wiki.list()).toEqual([]);
+    const index = await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8");
+    const log = await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8");
+    expect(index).not.toContain(created.page.relativePath);
+    expect(log).not.toContain(created.page.relativePath);
+    expect((await fs.readFile(snapshotPath)).equals(snapshotBytes)).toBe(true);
+    expect(
+      db.get<Record<string, unknown>>("SELECT * FROM authored_snapshots WHERE relative_path = ?", [
+        created.page.relativePath,
+      ]),
+    ).toEqual(snapshotRow);
+    expect(
+      db.get<Record<string, unknown>>("SELECT * FROM pages WHERE page_id = ?", [created.page.pageId]),
+    ).toMatchObject({
+      relative_path: created.page.relativePath,
+      digest: created.page.digest,
+      revision: created.page.revision + 1,
+      status: "retired",
+      quiz_worthiness: "skip",
+    });
+    await expect(wiki.create({ path: created.page.relativePath, body: "replacement" })).rejects.toThrow(
+      /already exists/u,
+    );
+    db.close();
+  });
+  it("guards retirement of unknown, retired, and symlinked pages", async () => {
+    const { root, paths, db, wiki } = await fixture();
+    await expect(wiki.retire("11111111-1111-4111-8111-111111111111")).rejects.toThrow("page not found");
+    const created = await wiki.create({ path: "notes/symlink-retire.md", body: "Keep the target safe." });
+    await wiki.retire(created.page.pageId);
+    await expect(wiki.retire(created.page.pageId)).rejects.toThrow("page is not active");
+    const symlinked = await wiki.create({ path: "notes/symlink-guard.md", body: "Do not follow this link." });
+    const livePath = join(paths.wikiRoot, symlinked.page.relativePath);
+    const outsidePath = join(root, "outside.md");
+    await fs.writeFile(outsidePath, "outside\n");
+    await fs.rm(livePath);
+    await fs.symlink(outsidePath, livePath);
+    await expect(wiki.retire(symlinked.page.pageId)).rejects.toThrow(/symlink|regular file/u);
+    expect(await fs.readFile(outsidePath, "utf8")).toBe("outside\n");
     db.close();
   });
   it("rejects rename after an unsupported direct edit", async () => {
@@ -1226,18 +1361,18 @@ describe("wiki mechanics", () => {
         page: { pageId: page.page.pageId, expectedDigest: page.page.digest, body },
         resolution: "Corrected the section.",
       });
-      await expect(app.applyMaintenance(proposal(originalBody))).rejects.toThrow(/actual page correction/u);
+      await expect(app.applyWikiChange(proposal(originalBody))).rejects.toThrow(/actual page correction/u);
       expect((await app.wiki.get(page.page.pageId)).content).toContain("original");
       expect((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status).toBe("open");
 
-      const applied = await app.applyMaintenance(proposal(correctedBody));
+      const applied = await app.applyWikiChange(proposal(correctedBody));
       expect(applied.issue?.status).toBe("resolved");
       expect((await app.wiki.get(page.page.pageId)).content).toContain("corrected");
       expect((await app.wiki.get(page.page.pageId)).revision).toBe(2);
       expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
 
       const beforeRename = await app.wiki.get(page.page.pageId);
-      const renamed = await app.applyMaintenance({
+      const renamed = await app.applyWikiChange({
         kind: "rename-page",
         pageId: page.page.pageId,
         expectedDigest: beforeRename.digest,
