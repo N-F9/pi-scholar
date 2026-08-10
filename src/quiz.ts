@@ -63,9 +63,6 @@ export interface QuestionGradeInput {
   readonly feedback?: string;
 }
 
-export type GradePageInput = PageGradeInput;
-export type GradeQuestionInput = QuestionGradeInput;
-
 export interface GradeSubmissionInput {
   readonly date: string | Date;
   readonly revision?: number;
@@ -1461,5 +1458,3 @@ export class QuizService {
     this.replaceSheet(sheetPath, rendered, () => undefined);
   }
 }
-
-export { FORBIDDEN_SHEET_TEXT };

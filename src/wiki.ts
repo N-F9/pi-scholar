@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs, readFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
-import type { WikiIssueRecord } from "./contracts.js";
+import type { WikiIssueKind, WikiIssueRecord, WikiIssueStatus } from "./contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
 import { type QmdIndexOptions, qmdCollectionName } from "./external/qmd.js";
 import {
@@ -14,12 +14,9 @@ import {
   renderOkfIndex,
   renderOkfLog,
   serializeOkfConcept,
-  validateOkfConcept,
 } from "./okf.js";
 import { readFileNoFollow, safeRelativePath, type VaultPaths } from "./vault.js";
 
-export type WikiIssueKind = "incorrect" | "unclear" | "missing" | "bad-boundary";
-export type WikiIssueStatus = "open" | "resolved" | "reopened";
 export interface WikiPage {
   pageId: string;
   relativePath: string;
@@ -49,9 +46,6 @@ export interface QmdAdapter {
 }
 export interface WikiAdapters {
   qmd?: QmdAdapter;
-  commit?: () => Promise<boolean> | boolean;
-  doctor?: () => Promise<boolean> | boolean;
-  lint?: () => Promise<boolean> | boolean;
 }
 export interface WikiCreateResult {
   page: WikiPage;
@@ -68,11 +62,10 @@ export interface DriftReport {
   diff: string;
   choices: ["record-issue", "restore"];
 }
-export interface WikiSearchOptions {
+interface WikiSearchOptions {
   mode?: "semantic" | "lexical" | "exact";
   limit?: number;
 }
-export type WikiIssue = WikiIssueRecord;
 
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const PROJECTION_NAMES = new Set(["index.md", "log.md"]);
@@ -167,7 +160,7 @@ function rowToPage(row: PageRow, body?: string): WikiPage {
   if (body !== undefined) page.body = body;
   return page;
 }
-function rowToIssue(row: IssueRow): WikiIssue {
+function rowToIssue(row: IssueRow): WikiIssueRecord {
   return {
     issueId: String(row.issue_id),
     pageId: typeof row.page_id === "string" ? row.page_id : undefined,
@@ -1058,14 +1051,14 @@ export class WikiService {
     pageDigest?: string;
     kind?: WikiIssueKind;
     description: string;
-  }): Promise<WikiIssue> {
+  }): Promise<WikiIssueRecord> {
     if (!input.description.trim()) throw new Error("issue description is required");
     const page = input.pageId ? this.catalog(input.pageId) : undefined;
     if (input.pageId && !page) throw new Error("page not found");
     if (input.heading !== undefined && !input.heading.trim())
       throw new Error("issue heading is required when provided");
     const createdAt = now();
-    const issue: WikiIssue = {
+    const issue: WikiIssueRecord = {
       issueId: randomUUID(),
       pageId: input.pageId,
       heading: input.heading,
@@ -1123,7 +1116,7 @@ export class WikiService {
   async resolveDrift(
     pageId: string,
     choice: DriftResolution,
-  ): Promise<{ page: WikiPage; issue?: WikiIssue; restored: true }> {
+  ): Promise<{ page: WikiPage; issue?: WikiIssueRecord; restored: true }> {
     if (choice !== "record-issue" && choice !== "restore") throw new Error("unsupported drift resolution");
     const report = await this.inspectDrift(pageId);
     if (!report.drifted) return { page: report.page, restored: true };
@@ -1271,7 +1264,10 @@ export class WikiService {
     }
     return { page: updated, ...(issue ? { issue } : {}), restored: true };
   }
-  async patchIssue(issueId: string, patch: { status?: WikiIssueStatus; resolution?: string }): Promise<WikiIssue> {
+  async patchIssue(
+    issueId: string,
+    patch: { status?: WikiIssueStatus; resolution?: string },
+  ): Promise<WikiIssueRecord> {
     const current = dbGet<IssueRow>(this.db, "SELECT * FROM wiki_issues WHERE issue_id = ?", [issueId]);
     if (!current) throw new Error("issue not found");
     if (patch.status === "resolved") throw new Error("issue resolution requires a composite maintenance proposal");
@@ -1290,7 +1286,7 @@ export class WikiService {
     if (!updated) throw new Error("issue disappeared after update");
     return rowToIssue(updated);
   }
-  async resolveIssueAfterCorrection(issueId: string, resolution: string): Promise<WikiIssue> {
+  async resolveIssueAfterCorrection(issueId: string, resolution: string): Promise<WikiIssueRecord> {
     if (!resolution.trim()) throw new Error("issue resolution is required");
     const current = dbGet<IssueRow>(this.db, "SELECT * FROM wiki_issues WHERE issue_id = ?", [issueId]);
     if (!current) throw new Error("issue not found");
@@ -1318,7 +1314,6 @@ export class WikiService {
       assertPageTitle(page.title);
       const content = (await this.readExact(page.relativePath)).toString("utf8");
       const parsed = parseOkfConcept(content);
-      validateOkfConcept(content);
       assertPageTitle(parsed.frontmatter.title);
       projectionPages.push({
         title: page.title,
@@ -1357,7 +1352,6 @@ export class WikiService {
         const content = readFileSync(join(this.root(), page.relativePath), "utf8");
         assertInertMarkdown(content);
         const parsed = parseOkfConcept(content);
-        validateOkfConcept(content);
         const parsedId = parsed.frontmatter.id;
         if (parsedId !== page.pageId || typeof parsedId !== "string" || !ID.test(parsedId))
           errors.push(`${page.relativePath}: stable page ID mismatch`);
@@ -1378,22 +1372,4 @@ export class WikiService {
 }
 export function parseWikiMarkdown(content: string): { frontmatter: Record<string, unknown>; body: string } {
   return parseOkfConcept(content);
-}
-export function serializeWikiMarkdown(frontmatter: Record<string, unknown>, body: string): string {
-  assertInertMarkdown(body);
-  return serializeOkfConcept(frontmatter, body);
-}
-
-export function sanitizeImportedMarkdown(value: string): string {
-  return value
-    .replace(/<\s*(script|style|iframe|object|embed|form|base|meta|link)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/giu, "")
-    .replace(/<\s*\/?\s*(script|style|iframe|object|embed|form|base|meta|link)\b[^>]*>/giu, (tag) =>
-      tag.replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
-    )
-    .replace(/\bon[a-z][a-z0-9:_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)/giu, "")
-    .replace(/\b(?:javascript|vbscript)\s*:/giu, "")
-    .replace(
-      /\bdata\s*:\s*(?:text\/html|text\/javascript|application\/(?:javascript|x-javascript)|image\/svg\+xml)\b/giu,
-      "",
-    );
 }

@@ -1485,5 +1485,3 @@ export function doctor(explicitPath?: string): DoctorReport {
   ];
   return { ok: checks.every((item) => item.status !== "fail"), checkedAt, checks };
 }
-
-export const runDoctor = doctor;
