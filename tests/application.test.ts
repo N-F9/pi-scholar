@@ -9,6 +9,7 @@ import { decodeExtractPublicationInput } from "../src/application/decoders.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
+import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
 import { WikiService } from "../src/wiki.js";
@@ -1297,6 +1298,15 @@ describe("application capability boundaries", () => {
       await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
       const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
       const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: first.page.pageId,
+          expectedDigest: firstDrift.currentDigest,
+          title: "First repaired",
+        }),
+        /body/u,
+      );
       (app as unknown as { doctorFn: typeof doctor }).doctorFn = doctor;
 
       await app.applyWikiChange({
@@ -1312,10 +1322,53 @@ describe("application capability boundaries", () => {
         kind: "update-page",
         pageId: second.page.pageId,
         expectedDigest: secondDrift.currentDigest,
+
         body: "# Second\n\nRepaired.\n",
       });
       assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
       assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  }, 15_000);
+  it("leaves unrelated drift bytes outside a targeted checkpoint", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const first = await app.createNote({
+        path: "checkpoint-first.md",
+        body: "# First\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const second = await app.createNote({
+        path: "checkpoint-second.md",
+        body: "# Second\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      localCheckpointCommit(paths, "test: baseline");
+      await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
+      await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
+      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
+      const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      (app as unknown as { commitFn: typeof localCheckpointCommit }).commitFn = localCheckpointCommit;
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: first.page.pageId,
+        expectedDigest: firstDrift.currentDigest,
+        body: "# First\n\nRepaired.\n",
+      });
+      const afterFirst = gitStatus(paths);
+      assert.equal(afterFirst.raw.includes(second.page.relativePath), true);
+      assert.equal(afterFirst.raw.includes(first.page.relativePath), false);
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: second.page.pageId,
+        expectedDigest: secondDrift.currentDigest,
+        body: "# Second\n\nRepaired.\n",
+      });
+      assert.equal(gitStatus(paths).clean, true);
     } finally {
       await app.close();
       db.close();
@@ -1390,7 +1443,7 @@ describe("application capability boundaries", () => {
     const { app, db } = fixture();
     try {
       const ingest = await app.beginWorkflow("ingest");
-      const ingestResult = await app.finishWorkflow(ingest.workflow.requestId, "succeeded", {
+      await app.finishWorkflow(ingest.workflow.requestId, "succeeded", {
         message: "ingest complete",
       });
       const lint = await app.beginWorkflow("lint");
@@ -1398,11 +1451,15 @@ describe("application capability boundaries", () => {
         message: "lint complete",
       });
       const failedIngest = await app.beginWorkflow("ingest");
-      await app.finishWorkflow(failedIngest.workflow.requestId, "failed", { message: "ingest failed" });
+      const failedIngestResult = await app.finishWorkflow(failedIngest.workflow.requestId, "failed", {
+        message: "ingest failed",
+        errorCode: "INGEST_FAILED",
+        errorMessage: "source packet unavailable",
+      });
 
       const facts = (await app.getSettings()).settings.facts;
-      assert.equal(facts.lastIngestAt, ingestResult.workflow.finishedAt);
-      assert.equal(facts.lastIngestResult, "ingest complete");
+      assert.equal(facts.lastIngestAt, failedIngestResult.workflow.finishedAt);
+      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): source packet unavailable");
       assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
       assert.equal(facts.lastLintResult, "lint complete");
     } finally {

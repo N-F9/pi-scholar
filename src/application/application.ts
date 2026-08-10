@@ -142,7 +142,7 @@ export interface ApplicationOptions {
   readonly adapters?: ApplicationAdapters;
   readonly worker?: BrowserMutationWorker;
   readonly doctor?: (explicitPath?: string) => DoctorReport;
-  readonly commit?: (paths: VaultPaths, subject: string) => GitCheckpointResult;
+  readonly commit?: (paths: VaultPaths, subject: string, excludedPaths?: readonly string[]) => GitCheckpointResult;
   readonly push?: (paths: VaultPaths) => GitPushResult;
   readonly version?: string;
 }
@@ -298,7 +298,11 @@ export class ScholarApplication {
   readonly version: string;
   private readonly ownsDatabase: boolean;
   private readonly doctorFn: (explicitPath?: string) => DoctorReport;
-  private readonly commitFn: (paths: VaultPaths, subject: string) => GitCheckpointResult;
+  private readonly commitFn: (
+    paths: VaultPaths,
+    subject: string,
+    excludedPaths?: readonly string[],
+  ) => GitCheckpointResult;
   private readonly pushFn: (paths: VaultPaths) => GitPushResult;
   private readonly extractionClaims = new Map<
     string,
@@ -327,7 +331,6 @@ export class ScholarApplication {
     operation: () => T | PromiseLike<T>,
     subject: string,
     rollback?: DurableRollback<R>,
-    doctorAcceptance?: (report: DoctorReport) => boolean | PromiseLike<boolean>,
   ): Promise<T> {
     return withWriterLock(this.paths, async () => {
       let snapshot: R | undefined;
@@ -348,8 +351,7 @@ export class ScholarApplication {
         let report: DoctorReport;
         try {
           report = this.doctorFn(this.paths.vaultRoot);
-          const accepted = doctorAcceptance ? await doctorAcceptance(report) : report.ok;
-          if (!accepted) {
+          if (!report.ok) {
             const error = new Error("doctor checks failed");
             if (!rollback) throw mutationFinalizationError("doctor", error);
             throw error;
@@ -359,7 +361,12 @@ export class ScholarApplication {
           throw error;
         }
         try {
-          const result = this.commitFn(this.paths, subject) as GitCheckpointResult & { readonly ok?: boolean };
+          const excludedPaths = this.catalogDriftExclusions();
+          const result = (
+            excludedPaths.length > 0
+              ? this.commitFn(this.paths, subject, excludedPaths)
+              : this.commitFn(this.paths, subject)
+          ) as GitCheckpointResult & { readonly ok?: boolean };
           if (result.ok === false) throw new Error("Git checkpoint failed");
         } catch (error) {
           if (!rollback) throw mutationFinalizationError("commit", error);
@@ -1040,11 +1047,27 @@ export class ScholarApplication {
       )?.count ?? 0,
     );
     const lint = this.db.get<Record<string, unknown>>(
-      "SELECT finished_at, message FROM workflows WHERE kind = 'lint' AND status = 'succeeded' ORDER BY finished_at DESC LIMIT 1",
+      "SELECT finished_at, status, message, error_code, error_message FROM workflows WHERE kind = 'lint' AND finished_at IS NOT NULL ORDER BY finished_at DESC, rowid DESC LIMIT 1",
     );
     const ingest = this.db.get<Record<string, unknown>>(
-      "SELECT finished_at, message FROM workflows WHERE kind = 'ingest' AND status = 'succeeded' ORDER BY finished_at DESC LIMIT 1",
+      "SELECT finished_at, status, message, error_code, error_message FROM workflows WHERE kind = 'ingest' AND finished_at IS NOT NULL ORDER BY finished_at DESC, rowid DESC LIMIT 1",
     );
+    const workflowResult = (workflow: Record<string, unknown> | undefined): string | undefined => {
+      if (!workflow) return undefined;
+      const status = String(workflow.status ?? "unknown");
+      if (status === "failed") {
+        const errorCode = workflow.error_code ? ` (${String(workflow.error_code)})` : "";
+        const detail = workflow.error_message
+          ? String(workflow.error_message)
+          : workflow.message
+            ? String(workflow.message)
+            : "Workflow failed";
+        return `failed${errorCode}: ${detail}`;
+      }
+      return workflow.message ? String(workflow.message) : status;
+    };
+    const ingestResult = workflowResult(ingest);
+    const lintResult = workflowResult(lint);
     let git: SettingsFacts["git"] = {
       clean: false,
       ahead: 0,
@@ -1070,9 +1093,9 @@ export class ScholarApplication {
       pendingInboxCount,
       openIssueCount,
       ...(ingest?.finished_at ? { lastIngestAt: String(ingest.finished_at) } : {}),
-      ...(ingest?.message ? { lastIngestResult: String(ingest.message) } : {}),
+      ...(ingestResult ? { lastIngestResult: ingestResult } : {}),
       ...(lint?.finished_at ? { lastLintAt: String(lint.finished_at) } : {}),
-      ...(lint?.message ? { lastLintResult: String(lint.message) } : {}),
+      ...(lintResult ? { lastLintResult: lintResult } : {}),
       recentChanges: [],
       git,
     };
@@ -1209,6 +1232,36 @@ export class ScholarApplication {
     const reports = await Promise.all((await this.wiki.list()).map((page) => this.wiki.inspectDrift(page.pageId)));
     return new Set(reports.filter((report) => report.drifted).map((report) => report.page.pageId));
   }
+  private catalogDriftExclusions(): readonly string[] {
+    return this.db
+      .all<{ readonly relative_path: string }>("SELECT relative_path FROM pages WHERE status = 'drifted'")
+      .map(({ relative_path }) => join(this.paths.wikiRoot, relative_path));
+  }
+  private assertDriftRepairFields(
+    pageId: string,
+    currentContent: string,
+    proposed: {
+      readonly body?: string;
+      readonly title?: string;
+      readonly quizWorthiness?: PageRecord["quizWorthiness"];
+    },
+  ): string {
+    const current = parseWikiMarkdown(currentContent);
+    const authored = parseWikiMarkdown(
+      readFileNoFollow(join(this.paths.metadataRoot, "snapshots", "wiki", `${pageId}.md`)).toString("utf8"),
+    );
+    const missing = [
+      current.body !== authored.body && proposed.body === undefined ? "body" : undefined,
+      current.frontmatter.title !== authored.frontmatter.title && proposed.title === undefined ? "title" : undefined,
+      current.frontmatter["quiz-worthiness"] !== authored.frontmatter["quiz-worthiness"] &&
+      proposed.quizWorthiness === undefined
+        ? "quizWorthiness"
+        : undefined,
+    ].filter((field): field is string => field !== undefined);
+    if (missing.length)
+      throw new ValidationError(`drifted page repair must explicitly provide changed fields: ${missing.join(", ")}`);
+    return authored.body;
+  }
   private async filterLiveDriftPages(pages: readonly PageLearningRecord[]): Promise<PageLearningRecord[]> {
     const drifted = await this.liveDriftPageIds();
     return pages.filter((page) => !drifted.has(page.pageId));
@@ -1230,14 +1283,9 @@ export class ScholarApplication {
   }
   private async wikiChangePreflight(allowedDrift: ReadonlySet<string> = new Set()): Promise<void> {
     if (!allowedDrift.size) await this.assertNoLiveWikiDrift();
-    const pages = await this.wiki.list();
-    const allowedDigestMismatches = new Set(
-      pages
-        .filter((page) => allowedDrift.has(page.pageId))
-        .map((page) => `${page.relativePath}: catalog digest mismatch`),
-    );
+    const pages = (await this.wiki.list()).filter((page) => page.status === "active");
     const projection = await this.wiki.refreshProjections(false);
-    const lint = this.wiki.lintSync(pages, projection.backlinks).filter((error) => !allowedDigestMismatches.has(error));
+    const lint = this.wiki.lintSync(pages, projection.backlinks);
     if (lint.length) throw new ValidationError(`wiki lint failed: ${lint.join("; ")}`);
     const qmd = this.wiki.adapters.qmd;
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
@@ -1396,14 +1444,9 @@ export class ScholarApplication {
     if (introduced.length) throw new ValidationError(`Wiki mutation introduced live drift: ${introduced.join(", ")}`);
     if (targetPageId && drifted.has(targetPageId))
       throw new ValidationError(`Wiki mutation did not repair target drift: ${targetPageId}`);
-    const pages = await this.wiki.list();
-    const allowedDigestMismatches = new Set(
-      pages
-        .filter((page) => allowedDrift.has(page.pageId))
-        .map((page) => `${page.relativePath}: catalog digest mismatch`),
-    );
+    const pages = (await this.wiki.list()).filter((page) => page.status === "active");
     const projection = await this.wiki.refreshProjections();
-    const lint = this.wiki.lintSync(pages, projection.backlinks).filter((error) => !allowedDigestMismatches.has(error));
+    const lint = this.wiki.lintSync(pages, projection.backlinks);
     if (lint.length) throw new ValidationError(`wiki lint failed: ${lint.join("; ")}`);
     for (const page of pages) {
       if (page.status === "active" && page.quizWorthiness === "eligible")
@@ -1414,22 +1457,8 @@ export class ScholarApplication {
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
     await qmd.index();
     const doctor = this.doctorFn(this.paths.vaultRoot);
-    if (!this.doctorAllowsWikiDrift(doctor, allowedDrift, pages)) throw new ValidationError("doctor checks failed");
+    if (!doctor.ok) throw new ValidationError("doctor checks failed");
     return { lint, doctor };
-  }
-  private doctorAllowsWikiDrift(
-    report: DoctorReport,
-    allowedDrift: ReadonlySet<string>,
-    pages: readonly { readonly pageId: string; readonly relativePath: string }[],
-  ): boolean {
-    const failures = report.checks.filter((check) => check.status === "fail");
-    if (!failures.length) return report.ok;
-    const allowedMessages = new Set(
-      pages
-        .filter((page) => allowedDrift.has(page.pageId))
-        .map((page) => `Page digest drifted without a drift record: ${page.relativePath}`),
-    );
-    return failures.every((check) => check.name === "page-drift" && allowedMessages.has(check.message));
   }
   private async applyWikiChangeDecoded(
     proposal: WikiChangeInput,
@@ -1445,6 +1474,11 @@ export class ScholarApplication {
       async () => {
         const allowDrift = proposal.kind === "update-page" || proposal.kind === "resolve-issue";
         preexistingDrift = allowDrift ? await this.liveDriftPageIds() : new Set<string>();
+        if (preexistingDrift.size)
+          transaction(this.db, () => {
+            for (const pageId of preexistingDrift)
+              this.db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [pageId]);
+          });
         await this.wikiChangePreflight(preexistingDrift);
         switch (proposal.kind) {
           case "create-page": {
@@ -1468,7 +1502,11 @@ export class ScholarApplication {
             if (sha256(current.content) !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
             const body = proposal.body;
-            const bodyChanged = body !== undefined && body !== parseWikiMarkdown(current.content).body;
+            const parsed = parseWikiMarkdown(current.content);
+            const authoredBody = preexistingDrift.has(proposal.pageId)
+              ? this.assertDriftRepairFields(proposal.pageId, current.content, proposal)
+              : parsed.body;
+            const bodyChanged = body !== undefined && body !== authoredBody;
             if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body);
             const updated = await this.wiki.update(proposal.pageId, proposal);
             const pageLearning =
@@ -1531,7 +1569,10 @@ export class ScholarApplication {
               throw new RevisionConflictError("The issue page digest is stale");
             const parsed = parseWikiMarkdown(current.content);
             const body = proposal.page.body;
-            const bodyChanged = body !== undefined && body !== parsed.body;
+            const authoredBody = preexistingDrift.has(issue.pageId)
+              ? this.assertDriftRepairFields(issue.pageId, current.content, proposal.page)
+              : parsed.body;
+            const bodyChanged = body !== undefined && body !== authoredBody;
             const pageChanged =
               bodyChanged ||
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
@@ -1573,7 +1614,6 @@ export class ScholarApplication {
       },
       "wiki:change",
       rollback,
-      async (report) => this.doctorAllowsWikiDrift(report, preexistingDrift, await this.wiki.list()),
     );
   }
   async applyWikiChange(input: WikiChangeInput): Promise<WikiChangeResult> {

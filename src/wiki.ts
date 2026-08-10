@@ -565,10 +565,16 @@ export class WikiService {
     const location = normalizePagePath(this.paths, input.path ?? page.relativePath);
     if (location.relativePath !== page.relativePath) throw new Error("page path changes must use rename");
     const current = await fs.readFile(location.absolutePath, "utf8");
-    const parsed = parseOkfConcept(current);
-    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
+    const currentParsed = parseOkfConcept(current);
+    if (currentParsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
     const expected = input.expectedDigest ?? page.digest;
-    if (expected !== digest(current)) throw new Error("page changed since it was read");
+    const currentDigest = digest(current);
+    if (expected !== currentDigest) throw new Error("page changed since it was read");
+    const authored = currentDigest !== page.digest ? this.authored(pageId) : undefined;
+    if (currentDigest !== page.digest && (!authored || authored.digest !== page.digest))
+      throw new Error("product-authored snapshot is unavailable");
+    const parsed = authored ? parseOkfConcept(authored.content) : currentParsed;
+    if (parsed.frontmatter.id !== pageId) throw new Error("page ID mismatch");
     const body = input.body ?? parsed.body;
     const title =
       input.title ??

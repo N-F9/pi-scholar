@@ -6,7 +6,7 @@ import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
-import { parseOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
+import { parseOkfConcept, serializeOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -1214,6 +1214,41 @@ describe("wiki mechanics", () => {
       beforeCatalog,
     );
     db.close();
+  });
+  it("repairs a directly drifted blank title through a guarded ingest update", async () => {
+    const { paths, db } = await fixture();
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      doctor,
+      commit: (_paths, subject) => ({ committed: false, subject }),
+    });
+    try {
+      const created = await app.wiki.create({ path: "drift-title.md", title: "Stable", body: "authored" });
+      const pagePath = join(paths.wikiRoot, created.page.relativePath);
+      const parsed = parseOkfConcept(await fs.readFile(pagePath, "utf8"));
+      parsed.frontmatter.title = " \t";
+      parsed.frontmatter.externallyAdded = "must not persist";
+      const drifted = serializeOkfConcept(parsed.frontmatter, parsed.body);
+      await fs.writeFile(pagePath, drifted);
+      const result = await app.applyIngestChange({
+        kind: "update-page",
+        pageId: created.page.pageId,
+        expectedDigest: sha256(drifted),
+        title: "Repaired",
+      });
+      expect(result.page?.title).toBe("Repaired");
+      const repaired = await app.wiki.get(created.page.pageId);
+      expect(repaired.status).toBe("active");
+      expect(parseOkfConcept(repaired.content).frontmatter.externallyAdded).toBeUndefined();
+      const report = doctor(paths.vaultRoot);
+      expect(report.ok).toBe(true);
+      expect(report.checks.find((check) => check.name === "okf")?.status).toBe("pass");
+    } finally {
+      await app.close();
+      db.close();
+    }
   });
 
   it("rejects orphan managed footnote definitions before persistence", async () => {
