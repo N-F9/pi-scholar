@@ -129,6 +129,9 @@ export function isExecutableHtml(value: string): boolean {
 function assertInertMarkdown(body: string): void {
   if (isExecutableHtml(body)) throw new Error("raw executable HTML is not allowed in wiki Markdown");
 }
+function assertPageTitle(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) throw new Error("wiki page title is required");
+}
 function serializePage(frontmatter: Record<string, unknown>, body: string): string {
   assertInertMarkdown(body);
   return serializeOkfConcept(frontmatter, body);
@@ -323,6 +326,7 @@ export class WikiService {
     }
   }
   private async writeCatalog(page: WikiPage, content: string, previousPath?: string): Promise<void> {
+    assertPageTitle(page.title);
     const snapshot = this.snapshotPath(page);
     await this.atomicWrite(snapshot, content);
     transaction(this.db, () => {
@@ -428,6 +432,11 @@ export class WikiService {
           isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar" && typeof source.id === "string",
       )
       .map((source) => String(source.id));
+    const references = new Set(labels.references);
+    for (const label of labels.definitions) {
+      if (!references.has(label) && (byId.has(label) || UUID_CHUNK_REFERENCE.test(label)))
+        throw new Error(`orphan managed footnote definition: ${label}`);
+    }
     const retainedSources = existingSources.filter(
       (source) => !(isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar"),
     );
@@ -469,6 +478,7 @@ export class WikiService {
     const pageId = randomUUID();
     const createdAt = now();
     const title = input.title ?? titleFromPath(location.relativePath);
+    assertPageTitle(title);
     const quizWorthiness = input.quizWorthiness ?? "unknown";
     const frontmatter: Record<string, unknown> = {
       ...(input.frontmatter ?? {}),
@@ -564,6 +574,7 @@ export class WikiService {
       input.title ??
       (typeof parsed.frontmatter.title === "string" ? parsed.frontmatter.title : undefined) ??
       page.title;
+    assertPageTitle(title);
     const quizWorthiness = input.quizWorthiness ?? page.quizWorthiness;
     const frontmatter: Record<string, unknown> = {
       ...parsed.frontmatter,
@@ -577,7 +588,7 @@ export class WikiService {
     validateMarkdownLinks(this.root(), page.relativePath, body);
     const updated: WikiPage = {
       ...page,
-      title: input.title ?? page.title,
+      title,
       digest: digest(content),
       revision: page.revision + 1,
       status: "active",
@@ -598,6 +609,9 @@ export class WikiService {
     prepared?: WikiPreparedUpdate,
   ): Promise<WikiCreateResult> {
     const next = prepared ?? (await this.prepareUpdate(pageId, input));
+    assertPageTitle(next.page.title);
+    const nextFrontmatter = parseOkfConcept(next.content).frontmatter;
+    assertPageTitle(nextFrontmatter.title);
     const priorPageRow = this.catalog(pageId);
     if (!priorPageRow) throw new Error("page not found");
     const page = rowToPage(priorPageRow);
@@ -799,6 +813,12 @@ export class WikiService {
     if (!priorPageRow) throw new Error("page not found");
     const page = rowToPage(priorPageRow);
     if (page.status !== "active") throw new Error("page is not active");
+    const unresolvedIssue = dbGet<{ issue_id: string }>(
+      this.db,
+      "SELECT issue_id FROM wiki_issues WHERE page_id = ? AND status IN ('open', 'reopened') LIMIT 1",
+      [pageId],
+    );
+    if (unresolvedIssue) throw new Error("page has an open or reopened linked issue");
     const location = normalizePagePath(this.paths, page.relativePath);
     if (!this.authored(pageId)) throw new Error("product-authored snapshot is unavailable");
     const priorPageBytes = readFileNoFollow(location.absolutePath);
@@ -1267,9 +1287,11 @@ export class WikiService {
     const backlinks: Record<string, string[]> = {};
     const projectionPages: OkfProjectionPage[] = [];
     for (const page of pages) {
+      assertPageTitle(page.title);
       const content = (await this.readExact(page.relativePath)).toString("utf8");
       const parsed = parseOkfConcept(content);
       validateOkfConcept(content);
+      assertPageTitle(parsed.frontmatter.title);
       projectionPages.push({
         title: page.title,
         path: page.relativePath,

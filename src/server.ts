@@ -258,6 +258,7 @@ async function receiveMultipartUpload(
     await new Promise<void>((resolvePromise, rejectPromise) => {
       const parser = busboy({
         headers: req.headers,
+        defParamCharset: "utf8",
         limits: {
           fieldSize: MULTIPART_FIELD_BYTES,
           fields: Object.keys(MULTIPART_FIELD_NAMES).length,

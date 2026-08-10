@@ -132,6 +132,22 @@ describe("source admission mechanics", () => {
       db.close();
     }
   });
+  it("preserves code blank runs inside native directory extraction", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "embedded");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "example.js"), "const value = 1;\n\n\nconst next = 2;\n");
+    await fs.writeFile(join(directory, "notes.md"), "before\n\n\nafter\n");
+    const staged = await sources.stage({ path: directory });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("embedded directory was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
+    expect(extracted).toContain("--- FILE: example.js ---\nconst value = 1;\n\n\nconst next = 2;\n");
+    expect(extracted).toContain("--- FILE: notes.md ---\nbefore\n\nafter\n");
+    expect(staged.kind).toBe("directory");
+    db.close();
+  });
   it("normalizes blank runs outside fences while preserving original bytes and fenced content", async () => {
     const { paths, db, sources } = await fixture();
     const original = "before\n\n\n```\ninside\n\n\n```\n\n\nafter\n";
@@ -251,6 +267,37 @@ describe("source admission mechanics", () => {
         ?.source_uri,
     ).toBe("https://example.com/path/remote.txt");
     db.close();
+  });
+  it("keeps streamed URL envelopes private until the payload is complete", async () => {
+    const firstChunk = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.write("partial\n", () => firstChunk.resolve());
+      void release.promise.then(() => response.end("complete\n"));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("URL test server address is unavailable");
+    const { paths, db } = await fixture();
+    const sources = new SourceService(db, paths);
+    const pending = sources.stage({ url: `http://127.0.0.1:${address.port}/stream.txt` });
+    try {
+      await firstChunk.promise;
+      expect(await sources.discover()).toEqual([]);
+      expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+      release.resolve();
+      const staged = await pending;
+      expect(await fs.readFile(join(staged.absolutePath, "payload"), "utf8")).toBe("partial\ncomplete\n");
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      db.close();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it("accepts loopback URLs and disk-backed uploads without a fixed size cap", async () => {
@@ -462,6 +509,8 @@ describe("source admission mechanics", () => {
   it("rejects incomplete endpoint plans and unsafe staging", async () => {
     const { root, paths, db, sources } = await fixture();
     expect(() => validateChunkEndpoints("a\nb\n", [1])).toThrow();
+    expect(() => validateChunkEndpoints("a\nb\n", [{ endAtom: 2 } as never])).toThrow();
+    expect(() => validateChunkEndpoints("a\nb\n", [{ endLine: 2, index: 2 } as never])).toThrow();
     await fs.writeFile(join(root, "outside.txt"), "outside");
     await expect(sources.stage({ path: join(root, "outside.txt"), name: "../escape.txt" })).rejects.toThrow();
     await fs.symlink(join(root, "outside.txt"), join(paths.inboxRoot, "link.txt"));
@@ -1099,6 +1148,104 @@ describe("wiki mechanics", () => {
       },
     });
     expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status).toBe("pass");
+    db.close();
+  });
+
+  it("ignores citation-shaped literals in HTML comments", async () => {
+    const { db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const created = await wiki.create({
+      path: "comment-literals.md",
+      body: `Visible.\n\n<!-- [^${sourceId}:0] -->\n<!-- [^${sourceId}:1]: invisible -->\n`,
+    });
+    const parsed = parseOkfConcept(created.content);
+    expect(parsed.frontmatter.sources).toBeUndefined();
+    expect(parsed.body).toContain(`<!-- [^${sourceId}:0] -->`);
+    expect(parsed.body).toContain(`<!-- [^${sourceId}:1]: invisible -->`);
+    db.close();
+  });
+
+  it("rejects blank page titles before mutating canonical state", async () => {
+    const { paths, db, wiki } = await fixture();
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const initialIndex = await fs.readFile(indexPath);
+    const initialLog = await fs.readFile(logPath);
+    await expect(wiki.create({ path: "blank-explicit.md", title: " \t", body: "should not persist" })).rejects.toThrow(
+      /title/u,
+    );
+    await expect(wiki.create({ path: "_-_.md", body: "path-derived title is blank" })).rejects.toThrow(/title/u);
+    expect(await wiki.list()).toEqual([]);
+    expect((await fs.readFile(indexPath)).equals(initialIndex)).toBe(true);
+    expect((await fs.readFile(logPath)).equals(initialLog)).toBe(true);
+    const created = await wiki.create({ path: "title-update.md", title: "Stable", body: "original" });
+    const pagePath = join(paths.wikiRoot, created.page.relativePath);
+    const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
+    const beforePage = await fs.readFile(pagePath);
+    const beforeSnapshot = await fs.readFile(snapshotPath);
+    const beforeIndex = await fs.readFile(indexPath);
+    const beforeLog = await fs.readFile(logPath);
+    const beforeCatalog = db.get<Record<string, unknown>>("SELECT * FROM pages WHERE page_id = ?", [
+      created.page.pageId,
+    ]);
+    await expect(
+      wiki.update(created.page.pageId, { title: " \n", expectedDigest: created.page.digest }),
+    ).rejects.toThrow(/title/u);
+    expect((await fs.readFile(pagePath)).equals(beforePage)).toBe(true);
+    expect((await fs.readFile(snapshotPath)).equals(beforeSnapshot)).toBe(true);
+    expect((await fs.readFile(indexPath)).equals(beforeIndex)).toBe(true);
+    expect((await fs.readFile(logPath)).equals(beforeLog)).toBe(true);
+    expect(db.get<Record<string, unknown>>("SELECT * FROM pages WHERE page_id = ?", [created.page.pageId])).toEqual(
+      beforeCatalog,
+    );
+    db.close();
+  });
+
+  it("rejects orphan managed footnote definitions before persistence", async () => {
+    const { paths, db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Grounding source", "a".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, "b".repeat(64)],
+    );
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const initialIndex = await fs.readFile(indexPath);
+    const initialLog = await fs.readFile(logPath);
+    const pagePath = join(paths.wikiRoot, "orphan-managed.md");
+    await expect(
+      wiki.create({ path: "orphan-managed.md", body: `[^${sourceId}:0]: orphan evidence\n` }),
+    ).rejects.toThrow(/orphan managed footnote definition/u);
+    expect(await wiki.list()).toEqual([]);
+    await expect(fs.access(pagePath)).rejects.toThrow();
+    expect((await fs.readFile(indexPath)).equals(initialIndex)).toBe(true);
+    expect((await fs.readFile(logPath)).equals(initialLog)).toBe(true);
+    db.close();
+  });
+
+  it("escapes inline delimiters in generated projection labels", async () => {
+    const { paths, db, wiki } = await fixture();
+    const title = "*Title_ `code` ~[literal] <tag> &";
+    const description = "_Description* `code` ~[literal] <tag> &";
+    await wiki.create({
+      path: "literal-labels.md",
+      title,
+      body: "Body.",
+      frontmatter: { description },
+    });
+    const escapedTitle = ["\\*Title\\_", "\\`code\\`", "\\~&#91;literal&#93;", "&lt;tag&gt;", "&amp;"].join(" ");
+    const escapedDescription = ["\\_Description\\*", "\\`code\\`", "\\~&#91;literal&#93;", "&lt;tag&gt;", "&amp;"].join(
+      " ",
+    );
+    const index = await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8");
+    const log = await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8");
+    expect(index).toContain(`* [${escapedTitle}](literal-labels.md) - ${escapedDescription}`);
+    expect(log).toContain(`* **Update**: [${escapedTitle}](literal-labels.md) - ${escapedDescription}`);
     db.close();
   });
 

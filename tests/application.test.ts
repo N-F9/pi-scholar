@@ -1251,3 +1251,161 @@ describe("application prerequisite mutation guards", () => {
     }
   });
 });
+
+describe("application capability boundaries", () => {
+  it("requires an immutable citation for ingest page edits but not generic lint edits", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const created = await app.createNote({
+        path: "ingest-citation.md",
+        body: "# Ingest citation\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const proposal = {
+        kind: "update-page" as const,
+        pageId: created.page.pageId,
+        expectedDigest: created.page.digest,
+        body: "# Ingest citation\n\nUpdated without a citation.\n",
+      };
+      await assert.rejects(app.applyIngestChange(proposal), /immutable source chunk citation/u);
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Original/u);
+
+      const lint = await app.applyWikiChange(proposal);
+      assert.equal(lint.page?.pageId, created.page.pageId);
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Updated without a citation/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("repairs multiple live-drift pages sequentially without over-blocking unrelated drift", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const first = await app.createNote({
+        path: "drift-first.md",
+        body: "# First\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const second = await app.createNote({
+        path: "drift-second.md",
+        body: "# Second\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
+      await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
+      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
+      const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: first.page.pageId,
+        expectedDigest: firstDrift.currentDigest,
+        body: "# First\n\nRepaired.\n",
+      });
+      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
+      assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, true);
+
+      await app.applyWikiChange({
+        kind: "update-page",
+        pageId: second.page.pageId,
+        expectedDigest: secondDrift.currentDigest,
+        body: "# Second\n\nRepaired.\n",
+      });
+      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
+      assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("refuses retirement with open or reopened linked issues without changing page bytes", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      for (const status of ["open", "reopened"] as const) {
+        const created = await app.createNote({
+          path: `blocked-retire-${status}.md`,
+          body: `# Blocked ${status}\n`,
+          quizWorthiness: "skip",
+        });
+        const issue = await app.wiki.report({
+          pageId: created.page.pageId,
+          heading: "Blocked",
+          description: "Keep this page until corrected.",
+        });
+        if (status === "reopened") await app.wiki.patchIssue(issue.issueId, { status });
+        const pagePath = join(paths.wikiRoot, created.page.relativePath);
+        const beforeBytes = await fs.readFile(pagePath);
+        await assert.rejects(
+          app.applyWikiChange({
+            kind: "retire-page",
+            pageId: created.page.pageId,
+            expectedDigest: created.page.digest,
+          }),
+          /open or reopened linked issue/u,
+        );
+        assert.equal((await fs.readFile(pagePath)).equals(beforeBytes), true);
+        const after = await app.wiki.get(created.page.pageId);
+        assert.equal(after.status, "active");
+        assert.equal(after.digest, created.page.digest);
+        assert.equal(after.revision, created.page.revision);
+        assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, status);
+      }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("persists EXTRACT_FAILED when extraction publication validation fails", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      await app.stageSource({ kind: "text", text: "extract me\n", name: "extract-failure.txt" });
+      const claim = (await app.getExtractContext()).claims[0];
+      if (!claim) throw new Error("extract claim is missing");
+      await fs.appendFile(join(paths.vaultRoot, claim.extractedPath), "\nTampered extraction.\n");
+      await assert.rejects(
+        app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        }),
+      );
+      const failure = db.get<{ status: string; error_code: string | null }>(
+        "SELECT status, error_code FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
+      );
+      assert.equal(failure?.status, "failed");
+      assert.equal(failure?.error_code, "EXTRACT_FAILED");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("reports successful ingest and lint facts independently", async () => {
+    const { app, db } = fixture();
+    try {
+      const ingest = await app.beginWorkflow("ingest");
+      const ingestResult = await app.finishWorkflow(ingest.workflow.requestId, "succeeded", {
+        message: "ingest complete",
+      });
+      const lint = await app.beginWorkflow("lint");
+      const lintResult = await app.finishWorkflow(lint.workflow.requestId, "succeeded", {
+        message: "lint complete",
+      });
+      const failedIngest = await app.beginWorkflow("ingest");
+      await app.finishWorkflow(failedIngest.workflow.requestId, "failed", { message: "ingest failed" });
+
+      const facts = (await app.getSettings()).settings.facts;
+      assert.equal(facts.lastIngestAt, ingestResult.workflow.finishedAt);
+      assert.equal(facts.lastIngestResult, "ingest complete");
+      assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
+      assert.equal(facts.lastLintResult, "lint complete");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});

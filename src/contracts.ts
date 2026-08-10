@@ -541,6 +541,8 @@ export interface SettingsFacts {
   readonly localDate: LocalDate;
   readonly pendingInboxCount: number;
   readonly openIssueCount: number;
+  readonly lastIngestAt?: IsoDateTime;
+  readonly lastIngestResult?: string;
   readonly lastLintAt?: IsoDateTime;
   readonly lastLintResult?: string;
   readonly recentChanges: readonly string[];

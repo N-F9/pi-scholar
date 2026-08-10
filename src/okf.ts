@@ -75,6 +75,7 @@ function validateFrontmatter(frontmatter: Record<string, unknown>): void {
 
 type MarkdownNode = {
   readonly type: string;
+  readonly value?: string;
   readonly position?: {
     readonly start: { readonly offset?: number };
     readonly end: { readonly offset?: number };
@@ -95,7 +96,11 @@ export function okfMarkdownEscapedAt(value: string, index: number): boolean {
 export function okfCitationText(body: string): string {
   const ranges: Array<readonly [number, number]> = [];
   const visit = (node: MarkdownNode): void => {
-    if (node.type === "code" || node.type === "inlineCode") {
+    if (
+      node.type === "code" ||
+      node.type === "inlineCode" ||
+      (node.type === "html" && typeof node.value === "string" && node.value.includes("<!--"))
+    ) {
       const start = node.position?.start.offset;
       const end = node.position?.end.offset;
       if (start !== undefined && end !== undefined) ranges.push([start, end]);
@@ -205,6 +210,10 @@ function markdownLabel(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll("\\", "\\\\")
     .replaceAll(">", "&gt;")
+    .replaceAll("*", "\\*")
+    .replaceAll("_", "\\_")
+    .replaceAll("`", "\\`")
+    .replaceAll("~", "\\~")
     .replaceAll("[", "&#91;")
     .replaceAll("]", "&#93;")
     .replace(/[\r\n]+/gu, " ");

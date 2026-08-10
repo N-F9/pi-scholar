@@ -409,6 +409,10 @@ export const isSettingsResult: ResultGuard<SettingsResult> = (value): value is S
   typeof value.settings.facts.localDate === "string" &&
   typeof value.settings.facts.pendingInboxCount === "number" &&
   typeof value.settings.facts.openIssueCount === "number" &&
+  (value.settings.facts.lastIngestAt === undefined || typeof value.settings.facts.lastIngestAt === "string") &&
+  (value.settings.facts.lastIngestResult === undefined || typeof value.settings.facts.lastIngestResult === "string") &&
+  (value.settings.facts.lastLintAt === undefined || typeof value.settings.facts.lastLintAt === "string") &&
+  (value.settings.facts.lastLintResult === undefined || typeof value.settings.facts.lastLintResult === "string") &&
   isStringArray(value.settings.facts.recentChanges) &&
   isRecord(value.settings.facts.git) &&
   typeof value.settings.facts.git.clean === "boolean" &&

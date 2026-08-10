@@ -20,7 +20,6 @@ export { createServer, serve, startServer } from "./server.js";
 export {
   atomizeExtraction,
   chunkExtraction,
-  nativeExtraction,
   reconstructChunks,
   SourceService,
   sha256,

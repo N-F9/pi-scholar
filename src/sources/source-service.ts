@@ -23,8 +23,8 @@ import { QuizService } from "../quiz.js";
 import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
 import {
   atomizeExtraction,
+  chunkEndpointNumber,
   chunkExtraction,
-  nativeExtraction,
   normalizeDoclingResult,
   normalizeMarkdownFile,
   planFileAtoms,
@@ -247,10 +247,7 @@ export interface DoclingResult {
   attachments?: Array<{ path: string; bytes: Uint8Array | string }>;
 }
 export interface ChunkPlanEndpoint {
-  endLine?: number;
-  endAtom?: number;
-  end?: number;
-  index?: number;
+  endLine: number;
 }
 
 const MAX_SOURCE_REDIRECTS = 5;
@@ -533,23 +530,37 @@ export class SourceService {
       return { mediaType: response.mediaType, name: basename(current.pathname) || undefined };
     }
   }
+  private async privateStageRoot(): Promise<string> {
+    await fs.mkdir(this.work(), { recursive: true, mode: 0o700 });
+    const stat = await lstatNoFollow(this.work());
+    if (!stat.isDirectory()) throw new Error("work root must be a real directory");
+    return fs.mkdtemp(join(this.work(), ".source-stage-"));
+  }
+  private async publishEnvelopeStage(
+    stageRoot: string,
+    metadata: StageMetadata,
+  ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
+    const name = `${randomUUID()}.pi-scholar`;
+    const target = safeRelativePath(this.inbox(), name);
+    await fs.writeFile(join(stageRoot, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await fs.rename(stageRoot, target);
+    return { relativePath: name, absolutePath: target, kind: metadata.kind, metadata };
+  }
   private async stageEnvelope(
     metadata: StageMetadata,
     bytes: Uint8Array,
   ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
-    const name = `${randomUUID()}.pi-scholar`;
-    const target = safeRelativePath(this.inbox(), name);
-    await fs.mkdir(target, { recursive: false, mode: 0o700 });
+    const stageRoot = await this.privateStageRoot();
     try {
-      const metadataPath = join(target, ENVELOPE_NAME);
-      const payloadPath = join(target, metadata.payload);
-      await fs.writeFile(metadataPath, `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-      await fs.writeFile(payloadPath, Buffer.from(bytes), { flag: "wx", mode: 0o600 });
+      await fs.writeFile(join(stageRoot, metadata.payload), Buffer.from(bytes), { flag: "wx", mode: 0o600 });
+      return await this.publishEnvelopeStage(stageRoot, metadata);
     } catch (error) {
-      await fs.rm(target, { recursive: true, force: true });
+      await fs.rm(stageRoot, { recursive: true, force: true });
       throw error;
     }
-    return { relativePath: name, absolutePath: target, kind: metadata.kind, metadata };
   }
   async stage(
     request: SourceStageRequest,
@@ -592,10 +603,8 @@ export class SourceService {
           fetched.bytes,
         );
       }
-      const name = `${randomUUID()}.pi-scholar`;
-      const target = safeRelativePath(this.inbox(), name);
-      const payloadPath = join(target, "payload");
-      await fs.mkdir(target, { recursive: false, mode: 0o700 });
+      const stageRoot = await this.privateStageRoot();
+      const payloadPath = join(stageRoot, "payload");
       try {
         const fetched = await this.defaultFetch(parsed, payloadPath);
         const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
@@ -617,10 +626,9 @@ export class SourceService {
           mediaType,
           payload: "payload",
         };
-        await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-        return { relativePath: name, absolutePath: target, kind: "url", metadata };
+        return await this.publishEnvelopeStage(stageRoot, metadata);
       } catch (error) {
-        await fs.rm(target, { recursive: true, force: true });
+        await fs.rm(stageRoot, { recursive: true, force: true });
         throw error;
       }
     }
@@ -695,17 +703,21 @@ export class SourceService {
         mediaType: request.mediaType,
         payload: "payload",
       };
-      const name = `${randomUUID()}.pi-scholar`;
-      const target = safeRelativePath(this.inbox(), name);
-      await fs.mkdir(target, { recursive: false, mode: 0o700 });
+      const stageRoot = await this.privateStageRoot();
       try {
-        await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-        await copyFileNoFollow(source, join(target, metadata.payload));
+        await fs.writeFile(join(stageRoot, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        await copyFileNoFollow(source, join(stageRoot, metadata.payload));
+        const name = `${randomUUID()}.pi-scholar`;
+        const target = safeRelativePath(this.inbox(), name);
+        await fs.rename(stageRoot, target);
+        return { relativePath: name, absolutePath: target, kind, metadata };
       } catch (error) {
-        await fs.rm(target, { recursive: true, force: true });
+        await fs.rm(stageRoot, { recursive: true, force: true });
         throw error;
       }
-      return { relativePath: name, absolutePath: target, kind, metadata };
     }
     const input = request.path ?? request.filePath;
     if (!input) throw new Error("source input is required");
@@ -956,7 +968,11 @@ export class SourceService {
       }
       const rawStat = await lstatNoFollow(rawExtracted);
       if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");
-      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code");
+      const codeFilePaths =
+        claim.snapshot.kind === "directory" || claim.snapshot.kind === "repository"
+          ? new Set(claim.snapshot.files.filter((file) => inferKind(file.path) === "code").map((file) => file.path))
+          : undefined;
+      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code", codeFilePaths);
       await fs.rm(rawExtracted, { force: true });
       const extractedHash = await hashFile(extractedAbsolute);
       if (extractedHash.size === 0) throw new Error("empty extraction");
@@ -1324,10 +1340,7 @@ export class SourceService {
     if (existing) return existing;
     const prepared = await this.prepareClaim(claim);
     const endpoints = options.endpoints?.map((endpoint) => {
-      const value =
-        typeof endpoint === "number"
-          ? endpoint
-          : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index);
+      const value = chunkEndpointNumber(endpoint);
       if (value === undefined) throw new Error("chunk line endpoint is missing");
       return value;
     });
@@ -1362,7 +1375,7 @@ export class SourceService {
             entry.metadata?.displayName ?? entry.relativePath,
             entry.metadata?.originalName ?? entry.relativePath,
             claim?.snapshot.digest ?? entry.digest ?? null,
-            "ADMISSION_FAILED",
+            "EXTRACT_FAILED",
             message,
             now,
             sourceId,
@@ -1384,7 +1397,7 @@ export class SourceService {
             now,
             claim?.snapshot.digest ?? entry.digest ?? null,
             null,
-            "ADMISSION_FAILED",
+            "EXTRACT_FAILED",
             message,
             now,
             now,
@@ -1392,7 +1405,7 @@ export class SourceService {
         );
     });
   }
-  recordAdmissionFailure(entry: InboxEntry, error: unknown, claim?: SourceClaim): void {
+  recordExtractFailure(entry: InboxEntry, error: unknown, claim?: SourceClaim): void {
     this.recordFailure(entry, error, claim);
   }
   async admitClaims(
@@ -1985,5 +1998,5 @@ export class SourceService {
   }
 }
 
-export { atomizeExtraction, chunkExtraction, nativeExtraction, reconstructChunks, validateChunkEndpoints };
+export { atomizeExtraction, chunkExtraction, reconstructChunks, validateChunkEndpoints };
 export const sha256 = digestBytes;

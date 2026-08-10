@@ -52,6 +52,7 @@ type ExtractWorkflowState = {
   readonly attemptedClaimKeys: ReadonlySet<string>;
   readonly completedClaimKeys: ReadonlySet<string>;
   readonly failed: boolean;
+  readonly replayContext?: ExtractContext;
 };
 
 type WorkflowState =
@@ -98,6 +99,7 @@ type ScholarApplication = {
   readonly getIngestContext: () => Promise<IngestContext>;
   readonly getLintContext: (input?: { readonly description?: string }) => Promise<LintContext>;
   readonly applyWikiChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
+  readonly applyIngestChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
   readonly getQuizEvidence: (input: QuizEvidenceRequest) => Promise<readonly QuizEvidenceRecord[]>;
   readonly getQuizContext: (input?: { readonly date?: string }) => Promise<QuizContext>;
   readonly publishQuiz: (input: QuizPublicationInput) => Promise<QuizDetailRecord>;
@@ -439,7 +441,15 @@ async function lifecycleContext<T>(
   progress(onUpdate, message);
   const app = await applicationFor(ctx);
   const key = workflowKey(app, kind);
-  if (workflowStates.has(key)) throw new Error(`${kind} workflow is already running`);
+  const existingState = workflowStates.get(key);
+  if (existingState) {
+    if ("expectedClaimKeys" in existingState && existingState.replayContext) {
+      const { replayContext, ...activeState } = existingState;
+      workflowStates.set(key, activeState);
+      return jsonResult(replayContext);
+    }
+    throw new Error(`${kind} workflow is already running`);
+  }
   let state: WorkflowState | undefined;
   let result: T;
   try {
@@ -498,7 +508,11 @@ async function lifecycleContext<T>(
       }
     } catch (persistenceError) {
       if (expectedClaimKeys.size === 0 && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
-      else workflowStates.set(key, extractState);
+      else
+        workflowStates.set(key, {
+          ...extractState,
+          ...(expectedClaimKeys.size === 0 ? {} : { replayContext: context }),
+        });
       throw persistenceError;
     }
   } else {
@@ -889,7 +903,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     parameters: wikiChangeInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded ingest change", "ingest", (app) =>
-        app.applyWikiChange(params as WikiChangeInput),
+        app.applyIngestChange(params as WikiChangeInput),
       );
     },
   });

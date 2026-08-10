@@ -91,7 +91,7 @@ export function SettingsPage() {
             <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-facts-heading">
               Vault activity
             </h2>
-            <dl className="mt-4 grid gap-px overflow-hidden rounded-lg border border-line bg-line sm:grid-cols-2 lg:grid-cols-4">
+            <dl className="mt-4 grid gap-px overflow-hidden rounded-lg border border-line bg-line sm:grid-cols-2 lg:grid-cols-5">
               <div className="bg-paper p-5">
                 <dt className="text-sm text-muted">Pending inbox entries</dt>
                 <dd className="mt-2 font-serif text-3xl font-semibold">
@@ -101,6 +101,20 @@ export function SettingsPage() {
               <div className="bg-paper p-5">
                 <dt className="text-sm text-muted">Open issues</dt>
                 <dd className="mt-2 font-serif text-3xl font-semibold">{query.data.settings.facts.openIssueCount}</dd>
+              </div>
+              <div className="bg-paper p-5">
+                <dt className="text-sm text-muted">Last ingest</dt>
+                <dd className="mt-2 font-bold">
+                  {query.data.settings.facts.lastIngestAt
+                    ? formatDate(query.data.settings.facts.lastIngestAt, {
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                      })
+                    : "No run recorded"}
+                </dd>
+                {query.data.settings.facts.lastIngestResult ? (
+                  <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastIngestResult}</dd>
+                ) : null}
               </div>
               <div className="bg-paper p-5">
                 <dt className="text-sm text-muted">Last lint</dt>

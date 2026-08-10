@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, promises as fs, openSync, readFileSync, readSync } from "node:fs";
-import { open as openFile } from "node:fs/promises";
+import { closeSync, constants, promises as fs, openSync, readSync } from "node:fs";
+import { type FileHandle, open as openFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import type { DoclingResult as ExternalDoclingResult } from "../external/docling.js";
 import { assertNoSymlinkPath } from "../vault.js";
@@ -132,11 +132,17 @@ interface FileChunkScanner {
   finish(): void;
 }
 
+export function chunkEndpointNumber(endpoint: number | ChunkPlanEndpoint): number | undefined {
+  if (typeof endpoint === "number") return endpoint;
+  if (typeof endpoint !== "object" || endpoint === null || Array.isArray(endpoint)) return undefined;
+  const record = endpoint as unknown as Record<string, unknown>;
+  if (Object.keys(record).length !== 1 || !Object.hasOwn(record, "endLine")) return undefined;
+  return typeof record.endLine === "number" ? record.endLine : undefined;
+}
+
 function fileEndpointNumbers(proposed: readonly (number | ChunkPlanEndpoint)[] | undefined): number[] | undefined {
   if (!proposed?.length) return undefined;
-  const endpoints = proposed.map((endpoint) =>
-    typeof endpoint === "number" ? endpoint : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index),
-  );
+  const endpoints = proposed.map(chunkEndpointNumber);
   for (const endpoint of endpoints)
     if (endpoint === undefined || !Number.isInteger(endpoint) || endpoint <= 0)
       throw new Error("chunk endpoints must be increasing line endpoints");
@@ -225,12 +231,7 @@ function createFileChunkScanner(proposed: readonly (number | ChunkPlanEndpoint)[
     },
   };
 }
-async function copySpoolRange(
-  input: Awaited<ReturnType<typeof openFile>>,
-  output: Awaited<ReturnType<typeof openFile>>,
-  start: number,
-  end: number,
-): Promise<void> {
+async function copySpoolRange(input: FileHandle, output: FileHandle, start: number, end: number): Promise<void> {
   const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
   let position = start;
   while (position < end) {
@@ -242,7 +243,12 @@ async function copySpoolRange(
   }
 }
 
-export async function normalizeMarkdownFile(source: string, target: string, collapseBlankRuns = true): Promise<void> {
+export async function normalizeMarkdownFile(
+  source: string,
+  target: string,
+  collapseBlankRuns = true,
+  codeFilePaths?: ReadonlySet<string>,
+): Promise<void> {
   const inputStat = await lstatNoFollow(source);
   if (!inputStat.isFile()) throw new Error(`Markdown source must be a regular file: ${source}`);
   assertNoSymlinkPath(target);
@@ -253,20 +259,48 @@ export async function normalizeMarkdownFile(source: string, target: string, coll
   await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
   const output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   const spoolPath = join(dirname(target), `.${basename(target)}.${randomUUID()}.line`);
-  let spoolWriter: Awaited<ReturnType<typeof openFile>> | undefined;
-  let spoolReader: Awaited<ReturnType<typeof openFile>> | undefined;
-  let input: Awaited<ReturnType<typeof openFile>> | undefined;
+  let spoolWriter: FileHandle | undefined;
+  let spoolReader: FileHandle | undefined;
+  let input: FileHandle | undefined;
   let inFence: { char: string; length: number } | undefined;
   let previousBlank = false;
   let lineStart = 0;
   let position = 0;
+  let pendingStart: number | undefined;
+  let pendingEnd = 0;
   let lineBlank = true;
+  let currentCodeFile = false;
+  let markerPrefixIndex = 0;
+  let markerCandidate = true;
+  let markerKind: "file" | "end" = "file";
+  let markerPathBytes: number[] | undefined;
   let leadingSpaces = 0;
   let fenceChar: string | undefined;
   let fenceLength = 0;
   let fenceTailOnly = true;
   let fencePhase: "leading" | "run" | "tail" | "invalid" = "leading";
+  const fileMarkerPrefix = Buffer.from("--- FILE: ");
+  const endFileMarkerPrefix = Buffer.from("--- END FILE: ");
+  const flushPending = async (): Promise<void> => {
+    if (pendingStart === undefined) return;
+    await copySpoolRange(spoolReader!, output, pendingStart, pendingEnd);
+    pendingStart = undefined;
+    pendingEnd = 0;
+  };
+  const scanMarkerByte = (byte: number): void => {
+    if (!markerCandidate) return;
+    if (markerPrefixIndex === 4 && byte === endFileMarkerPrefix[4]) markerKind = "end";
+    const prefix = markerKind === "end" ? endFileMarkerPrefix : fileMarkerPrefix;
+    if (markerPrefixIndex < prefix.length) {
+      if (byte === prefix[markerPrefixIndex]) markerPrefixIndex++;
+      else markerCandidate = false;
+      return;
+    }
+    if (!markerPathBytes) markerPathBytes = [];
+    markerPathBytes.push(byte);
+  };
   const scanLineByte = (byte: number): void => {
+    scanMarkerByte(byte);
     if (byte !== 32 && byte !== 9 && byte !== 13) lineBlank = false;
     if (fencePhase === "invalid") return;
     if (fencePhase === "leading") {
@@ -297,7 +331,13 @@ export async function normalizeMarkdownFile(source: string, target: string, coll
     const marker =
       fenceChar && fenceLength >= 3 ? { char: fenceChar, length: fenceLength, tailOnly: fenceTailOnly } : undefined;
     const blank = lineBlank;
-    if (inFence || !blank || !previousBlank) await copySpoolRange(spoolReader!, output, lineStart, end);
+    const preserveBlank = currentCodeFile && codeFilePaths !== undefined;
+    if (preserveBlank || inFence || !blank || !previousBlank) {
+      if (pendingStart === undefined) pendingStart = lineStart;
+      pendingEnd = end;
+    } else {
+      await flushPending();
+    }
     if (inFence) {
       if (marker?.tailOnly && marker.char === inFence.char && marker.length >= inFence.length) inFence = undefined;
     } else if (blank) {
@@ -306,8 +346,21 @@ export async function normalizeMarkdownFile(source: string, target: string, coll
       previousBlank = false;
       if (marker) inFence = { char: marker.char, length: marker.length };
     }
+    const markerPrefixLength = markerKind === "end" ? endFileMarkerPrefix.length : fileMarkerPrefix.length;
+    if (markerPrefixIndex === markerPrefixLength && markerPathBytes) {
+      const markerText = Buffer.from(markerPathBytes).toString("utf8");
+      if (markerText.endsWith(" ---")) {
+        const filePath = markerText.slice(0, -4);
+        currentCodeFile = markerKind === "file" && codeFilePaths?.has(filePath) === true;
+        inFence = undefined;
+      }
+    }
     lineStart = end;
     lineBlank = true;
+    markerPrefixIndex = 0;
+    markerCandidate = true;
+    markerKind = "file";
+    markerPathBytes = undefined;
     leadingSpaces = 0;
     fenceChar = undefined;
     fenceLength = 0;
@@ -331,6 +384,7 @@ export async function normalizeMarkdownFile(source: string, target: string, coll
       position += bytesRead;
     }
     if (lineStart < position) await finishLine(position);
+    await flushPending();
   } catch (error) {
     await output.close().catch(() => undefined);
     await fs.rm(target, { force: true });
@@ -343,7 +397,6 @@ export async function normalizeMarkdownFile(source: string, target: string, coll
   }
   await output.close();
 }
-
 export function atomizeExtraction(extracted: string | Uint8Array): Array<AtomMetadata & { body: Buffer }> {
   const bytes = Buffer.from(extracted);
   return atomRowsFromBuffer(bytes).map((atom) => ({
@@ -353,13 +406,7 @@ export function atomizeExtraction(extracted: string | Uint8Array): Array<AtomMet
 }
 
 function endpointsFrom(proposed: readonly (number | ChunkPlanEndpoint)[] | undefined, atomCount: number): number[] {
-  const endpoints = proposed?.length
-    ? proposed.map((endpoint) =>
-        typeof endpoint === "number"
-          ? endpoint
-          : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index),
-      )
-    : [atomCount];
+  const endpoints = proposed?.length ? proposed.map(chunkEndpointNumber) : [atomCount];
   for (const endpoint of endpoints)
     if (endpoint === undefined || !Number.isInteger(endpoint) || endpoint <= 0 || endpoint > atomCount)
       throw new Error("chunk endpoints must be increasing line endpoints");
@@ -533,20 +580,6 @@ export async function writeNativeExtraction(snapshot: TreeSnapshot, target: stri
   } finally {
     await output.close();
   }
-}
-
-export function nativeExtraction(snapshot: TreeSnapshot): Buffer {
-  const pieces: Buffer[] = [];
-  for (const file of snapshot.files) {
-    const body = readFileSync(file.absolutePath);
-    pieces.push(
-      Buffer.from(`--- FILE: ${file.path} ---\n`),
-      body,
-      Buffer.from(body.at(-1) === 10 ? "" : "\n"),
-      Buffer.from(`--- END FILE: ${file.path} ---\n`),
-    );
-  }
-  return Buffer.concat(pieces);
 }
 
 export function chunkExtraction(
