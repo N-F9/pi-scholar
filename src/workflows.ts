@@ -4,10 +4,6 @@ import { type ScholarDatabase, transaction } from "./database.js";
 
 export type WorkflowKind = WorkflowRecord["kind"];
 
-export interface MutationWorkerTaskOptions {
-  readonly signal?: AbortSignal;
-}
-
 interface QueueTask<T> {
   readonly run: () => T | PromiseLike<T>;
   readonly resolve: (value: T | PromiseLike<T>) => void;
@@ -21,7 +17,7 @@ export class BrowserMutationWorker {
   private closing = false;
   private idleWaiters: (() => void)[] = [];
 
-  enqueue<T>(run: () => T | PromiseLike<T>, _options?: MutationWorkerTaskOptions): Promise<T> {
+  enqueue<T>(run: () => T | PromiseLike<T>): Promise<T> {
     if (this.closing) return Promise.reject(new Error("browser mutation worker is closed"));
     return new Promise<T>((resolve, reject) => {
       this.queue.push({ run, resolve: resolve as (value: unknown) => void, reject });
@@ -49,23 +45,12 @@ export class BrowserMutationWorker {
     }
   }
 
-  async close(options: { readonly drain?: boolean } = {}): Promise<void> {
+  async close(): Promise<void> {
     this.closing = true;
-    if (!options.drain) {
-      const error = new Error("browser mutation worker is closing");
-      for (const task of this.queue.splice(0)) task.reject(error);
-    }
     if (this.running || this.queue.length) await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
-
-  get pending(): number {
-    return this.queue.length + (this.running ? 1 : 0);
-  }
 }
 
-export interface WorkflowCoordinatorOptions {
-  readonly worker?: BrowserMutationWorker;
-}
 export interface WorkflowUpdateInput {
   readonly progress?: number;
   readonly message?: string;
@@ -135,11 +120,9 @@ function cleanIdempotencyKey(value: string | undefined): string | undefined {
 
 export class WorkflowCoordinator {
   readonly db: ScholarDatabase;
-  readonly worker: BrowserMutationWorker;
 
-  constructor(db: ScholarDatabase, options: WorkflowCoordinatorOptions = {}) {
+  constructor(db: ScholarDatabase) {
     this.db = db;
-    this.worker = options.worker ?? new BrowserMutationWorker();
   }
 
   get(requestId: string): WorkflowRecord | undefined {
@@ -284,20 +267,4 @@ export class WorkflowCoordinator {
       return finished;
     });
   }
-
-  succeedWorkflow(requestId: string, options: WorkflowFinishOptions = {}): WorkflowRecord {
-    return this.finishWorkflow(requestId, "succeeded", options);
-  }
-
-  failWorkflow(requestId: string, options: WorkflowFinishOptions = {}): WorkflowRecord {
-    return this.finishWorkflow(requestId, "failed", options);
-  }
-
-  async close(options: { readonly drain?: boolean } = {}): Promise<void> {
-    await this.worker.close({ drain: options.drain ?? true });
-  }
-}
-
-export function workflowFromRow(row: Record<string, unknown>): WorkflowRecord {
-  return rowToWorkflow(row);
 }

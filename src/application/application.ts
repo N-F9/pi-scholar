@@ -147,7 +147,6 @@ export interface ApplicationOptions {
   readonly schedulerService?: SchedulerService;
   readonly quizService?: QuizService;
   readonly adapters?: ApplicationAdapters;
-  readonly worker?: BrowserMutationWorker;
   readonly doctor?: (explicitPath?: string) => DoctorReport;
   readonly commit?: (paths: VaultPaths, subject: string, excludedPaths?: readonly string[]) => GitCheckpointResult;
   readonly push?: (paths: VaultPaths) => GitPushResult;
@@ -313,8 +312,8 @@ export class ScholarApplication {
   readonly wiki: WikiService;
   readonly scheduler: SchedulerService;
   readonly quiz: QuizService;
-  readonly workflows: WorkflowCoordinator;
-  readonly worker: BrowserMutationWorker;
+  private readonly workflows: WorkflowCoordinator;
+  private readonly worker: BrowserMutationWorker;
   readonly version: string;
   private readonly ownsDatabase: boolean;
   private readonly doctorFn: (explicitPath?: string) => DoctorReport;
@@ -343,12 +342,12 @@ export class ScholarApplication {
       input.wikiService ?? new WikiService(this.db, this.paths, defaultWikiAdapters(this.paths, input.adapters?.wiki));
     this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths);
     this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
-    this.worker = input.worker ?? new BrowserMutationWorker();
+    this.worker = new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
     this.doctorFn = input.doctor ?? doctor;
     this.commitFn = input.commit ?? localCheckpointCommit;
     this.pushFn = input.push ?? ((paths) => safePush(paths));
-    this.workflows = new WorkflowCoordinator(this.db, { worker: this.worker });
+    this.workflows = new WorkflowCoordinator(this.db);
   }
   private async durableDirect<T, R = never>(
     operation: () => T | PromiseLike<T>,
@@ -1305,7 +1304,7 @@ export class ScholarApplication {
   async close(): Promise<void> {
     let closeError: unknown;
     try {
-      await this.workflows.close({ drain: true });
+      await this.worker.close();
     } catch (error) {
       closeError = error;
     }
