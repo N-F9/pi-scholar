@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type {
-  ApiEnvelope,
   DoctorReport,
   ExtractContext,
   ExtractFailureRecord,
@@ -53,7 +52,7 @@ import type {
   WorkflowRecord,
 } from "../contracts.js";
 import { openDatabase, type ScholarDatabase, transaction } from "../database.js";
-import { doctor as runDoctor } from "../doctor.js";
+import { doctor } from "../doctor.js";
 import { convertWithDocling } from "../external/docling.js";
 import {
   type GitCheckpointResult,
@@ -344,7 +343,7 @@ export class ScholarApplication {
     this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
     this.worker = input.worker ?? new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
-    this.doctorFn = input.doctor ?? runDoctor;
+    this.doctorFn = input.doctor ?? doctor;
     this.commitFn = input.commit ?? localCheckpointCommit;
     this.pushFn = input.push ?? ((paths) => safePush(paths));
     this.workflows = new WorkflowCoordinator(this.db, { worker: this.worker });
@@ -2179,7 +2178,4 @@ export function createApplication(input: ApplicationOptions | VaultPaths | strin
   if (typeof input === "string") return new ScholarApplication({ paths: input });
   if ("vaultRoot" in input && "databasePath" in input) return new ScholarApplication({ paths: input });
   return new ScholarApplication(input);
-}
-export function isApiEnvelope(value: unknown): value is ApiEnvelope<unknown> {
-  return isRecord(value) && typeof value.ok === "boolean";
 }
