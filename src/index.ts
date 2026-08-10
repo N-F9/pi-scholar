@@ -17,7 +17,7 @@ export * from "./okf.js";
 export { QuizConflictError, QuizService } from "./quiz.js";
 export { localDate, RevisionConflictError, SchedulerService, ValidationError } from "./scheduler.js";
 export type { ScholarServer, ServerOptions } from "./server.js";
-export { createServer, serve, startServer } from "./server.js";
+export { createServer, startServer } from "./server.js";
 export {
   atomizeExtraction,
   SourceService,

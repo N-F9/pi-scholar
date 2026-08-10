@@ -80,6 +80,8 @@ import {
 import {
   assertNoSymlinkPath,
   atomicWriteFile,
+  DEFAULT_VAULT_HOST,
+  DEFAULT_VAULT_PORT,
   readFileNoFollow,
   resolveVault,
   safeRelativePath,
@@ -1160,8 +1162,8 @@ export class ScholarApplication {
   async getSettings(): Promise<{ readonly settings: SettingsRecord }> {
     const initializationEnabled = await this.readSetting("initializationEnabled", true);
     const timezone = await this.readSetting("timezone", "local");
-    const port = await this.readSetting("port", 4816);
-    const host = await this.readSetting("host", "127.0.0.1");
+    const port = await this.readSetting("port", DEFAULT_VAULT_PORT);
+    const host = await this.readSetting("host", DEFAULT_VAULT_HOST);
     const pendingInboxCount = (await this.sources.discover()).length;
     const openIssueCount = Number(
       this.db.get<Record<string, unknown>>(
@@ -1265,7 +1267,8 @@ export class ScholarApplication {
             throw new ValidationError("port is invalid");
           updates.push(["port", input.port]);
         }
-        if (input.host !== undefined && input.host !== "127.0.0.1") throw new ValidationError("host must be 127.0.0.1");
+        if (input.host !== undefined && input.host !== DEFAULT_VAULT_HOST)
+          throw new ValidationError(`host must be ${DEFAULT_VAULT_HOST}`);
         if (input.host !== undefined) updates.push(["host", input.host]);
         transaction(this.db, () => {
           for (const [key, value] of updates)
