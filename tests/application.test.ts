@@ -65,6 +65,21 @@ function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?
   return { app, db, paths, calls };
 }
 
+async function publishedChunkId(app: ScholarApplication): Promise<string> {
+  await app.stageSource({ kind: "text", text: "ingest evidence\n", name: "ingest-evidence.txt" });
+  const claim = (await app.getExtractContext()).claims[0];
+  if (!claim) throw new Error("extract claim is missing");
+  await app.publishExtraction({
+    claimId: claim.claimId,
+    preparedId: claim.preparedId,
+    digest: claim.digest,
+    endpoints: [1],
+  });
+  const chunk = (await app.getIngestContext()).sources[0]?.chunks[0];
+  if (!chunk) throw new Error("published source chunk is missing");
+  return chunk.chunkId;
+}
+
 describe("durable application writes", () => {
   it("checkpoints, doctors, and commits exactly once after the operation", async () => {
     const { app, db, calls } = fixture();
@@ -1332,6 +1347,65 @@ describe("application capability boundaries", () => {
       db.close();
     }
   }, 15_000);
+  it("resolves directly drifted linked issues with separate authored and live digest guards", async () => {
+    const { app, db, paths } = fixture({ maintenance: true });
+    try {
+      const created = await app.createNote({
+        path: "resolve-drifted-issue.md",
+        body: "# Resolve drifted issue\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const staleIssue = await app.wiki.report({
+        pageId: created.page.pageId,
+        heading: "Resolve drifted issue",
+        description: "Correct the authored revision.",
+      });
+      const authoredRevision = await app.updateNote(created.page.pageId, {
+        body: "# Resolve drifted issue\n\nAuthored revision.\n",
+      });
+      const validIssue = await app.wiki.report({
+        pageId: created.page.pageId,
+        heading: "Resolve drifted issue",
+        description: "Correct the direct edit.",
+      });
+      await fs.appendFile(join(paths.wikiRoot, created.page.relativePath), "\nExternal direct edit.\n");
+      const drift = await app.wiki.inspectDrift(created.page.pageId);
+      const correctedBody = "# Resolve drifted issue\n\nCorrected.\n";
+
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "resolve-issue",
+          issueId: staleIssue.issueId,
+          page: { pageId: created.page.pageId, expectedDigest: drift.currentDigest, body: correctedBody },
+          resolution: "Corrected the authored revision.",
+        }),
+        /issue page version is stale/u,
+      );
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "resolve-issue",
+          issueId: validIssue.issueId,
+          page: { pageId: created.page.pageId, expectedDigest: authoredRevision.page.digest, body: correctedBody },
+          resolution: "Corrected the direct edit.",
+        }),
+        /issue page digest is stale/u,
+      );
+
+      const resolved = await app.applyWikiChange({
+        kind: "resolve-issue",
+        issueId: validIssue.issueId,
+        page: { pageId: created.page.pageId, expectedDigest: drift.currentDigest, body: correctedBody },
+        resolution: "Corrected the direct edit.",
+      });
+      assert.equal(resolved.issue?.status, "resolved");
+      assert.equal((await app.wiki.get(created.page.pageId)).status, "active");
+      assert.equal((await app.wiki.inspectDrift(created.page.pageId)).drifted, false);
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Corrected/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("leaves unrelated drift bytes outside a targeted checkpoint", async () => {
     const { app, db, paths } = fixture({ maintenance: true });
     try {
@@ -1462,6 +1536,122 @@ describe("application capability boundaries", () => {
       assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): source packet unavailable");
       assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
       assert.equal(facts.lastLintResult, "lint complete");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("ingest section-local citation boundaries", () => {
+  it("requires an authorized citation in every substantive created section", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "create-page",
+          path: "ingest-create-plain-rejected.md",
+          body: "Uncited plain prose without a heading.\n",
+        }),
+        /immutable source chunk citation/u,
+      );
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "create-page",
+          path: "ingest-create-rejected.md",
+          body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
+        }),
+        /immutable source chunk citation/u,
+      );
+      const created = await app.applyIngestChange({
+        kind: "create-page",
+        path: "ingest-create-accepted.md",
+        body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
+      });
+      assert.equal(created.page?.relativePath, "ingest-create-accepted.md");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("requires citations in changed update sections instead of reusing unchanged cited sections", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      const original = await app.createNote({
+        path: "ingest-update.md",
+        body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nOriginal unsupported text.\n`,
+        quizWorthiness: "skip",
+      });
+      const rejectedBody = `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nUpdated unsupported text.\n`;
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: original.page.pageId,
+          expectedDigest: original.page.digest,
+          body: rejectedBody,
+        }),
+        /immutable source chunk citation/u,
+      );
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Original unsupported text/u);
+      const accepted = await app.applyIngestChange({
+        kind: "update-page",
+        pageId: original.page.pageId,
+        expectedDigest: original.page.digest,
+        body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nUpdated support [^${chunkId}].\n`,
+      });
+      assert.equal(accepted.page?.pageId, original.page.pageId);
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Updated support/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("requires citations in changed resolve-issue sections instead of reusing unchanged cited sections", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      const chunkId = await publishedChunkId(app);
+      const original = await app.createNote({
+        path: "ingest-resolve.md",
+        body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nOriginal unsupported text.\n`,
+        quizWorthiness: "skip",
+      });
+      const issue = await app.wiki.report({
+        pageId: original.page.pageId,
+        pageDigest: original.page.digest,
+        heading: "Changed",
+        kind: "incorrect",
+        description: "Correct the changed section.",
+      });
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: original.page.pageId,
+            expectedDigest: original.page.digest,
+            body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nCorrected unsupported text.\n`,
+          },
+          resolution: "Correction needs source evidence.",
+        }),
+        /immutable source chunk citation/u,
+      );
+      assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, "open");
+      const resolved = await app.applyIngestChange({
+        kind: "resolve-issue",
+        issueId: issue.issueId,
+        page: {
+          pageId: original.page.pageId,
+          expectedDigest: original.page.digest,
+          body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nCorrected support [^${chunkId}].\n`,
+        },
+        resolution: "Correction is grounded in the cited source chunk.",
+      });
+      assert.equal(resolved.issue?.status, "resolved");
+      assert.match((await app.wiki.get(original.page.pageId)).content, /Corrected support/u);
     } finally {
       await app.close();
       db.close();

@@ -286,13 +286,13 @@ export async function normalizeMarkdownFile(
     pendingStart = undefined;
     pendingEnd = 0;
   };
-  const preserveBlankRuns = (lineStartByte: number): boolean => {
+  const boundaryAt = (lineStartByte: number): ExtractionFileBoundary | undefined => {
     let boundary = fileBoundaries?.[boundaryIndex];
     while (boundary && boundary.endByte <= lineStartByte) {
       boundaryIndex++;
       boundary = fileBoundaries?.[boundaryIndex];
     }
-    return boundary?.preserveBlankRuns === true && boundary.startByte <= lineStartByte;
+    return boundary && boundary.startByte <= lineStartByte ? boundary : undefined;
   };
   const scanLineByte = (byte: number): void => {
     if (byte !== 32 && byte !== 9 && byte !== 13) lineBlank = false;
@@ -325,7 +325,12 @@ export async function normalizeMarkdownFile(
     const marker =
       fenceChar && fenceLength >= 3 ? { char: fenceChar, length: fenceLength, tailOnly: fenceTailOnly } : undefined;
     const blank = lineBlank;
-    const preserveBlank = preserveBlankRuns(lineStart);
+    const boundary = boundaryAt(lineStart);
+    if (fileBoundaries && !boundary) {
+      inFence = undefined;
+      previousBlank = false;
+    }
+    const preserveBlank = boundary?.preserveBlankRuns === true;
     if (preserveBlank || inFence || !blank || !previousBlank) {
       if (pendingStart === undefined) pendingStart = lineStart;
       pendingEnd = end;

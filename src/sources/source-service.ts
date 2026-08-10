@@ -3,7 +3,7 @@ import { promises as fs, readFileSync, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   PreparedAdmission as ContractPreparedAdmission,
   SourceKind as ContractSourceKind,
@@ -926,9 +926,13 @@ export class SourceService {
       const mediaType = claim.snapshot.metadata?.mediaType;
       const useDocling =
         claim.snapshot.kind === "document" || (claim.snapshot.kind === "url" && !textualUrl(claim, mediaType));
-      const codeFilePaths =
+      const preserveBlankRuns =
         claim.snapshot.kind === "directory" || claim.snapshot.kind === "repository"
-          ? new Set(claim.snapshot.files.filter((file) => inferKind(file.path) === "code").map((file) => file.path))
+          ? new Set(
+              claim.snapshot.files
+                .filter((file) => ![".md", ".markdown"].includes(extname(file.path).toLowerCase()))
+                .map((file) => file.path),
+            )
           : undefined;
       let fileBoundaries: ExtractionFileBoundary[] | undefined;
       let converter: { name: string; version: string } | undefined;
@@ -970,7 +974,7 @@ export class SourceService {
             absolutePath: ensureWithin(originalRoot, join(originalRoot, validRelativePath(file.path))),
           })),
         };
-        fileBoundaries = await writeNativeExtraction(copiedSnapshot, rawExtracted, codeFilePaths);
+        fileBoundaries = await writeNativeExtraction(copiedSnapshot, rawExtracted, preserveBlankRuns);
       }
       const rawStat = await lstatNoFollow(rawExtracted);
       if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");

@@ -138,14 +138,32 @@ describe("source admission mechanics", () => {
     await fs.mkdir(directory);
     await fs.writeFile(join(directory, "example.js"), "const value = 1;\n\n\nconst next = 2;\n");
     await fs.writeFile(join(directory, "notes.md"), "before\n\n\nafter\n");
+    const ruby = ["message = <<~TEXT", "first", "", "", "last", "TEXT", ""].join("\n");
+    await fs.writeFile(join(directory, "example.rb"), ruby);
     const staged = await sources.stage({ path: directory });
     const [entry] = await sources.discover();
     if (!entry) throw new Error("embedded directory was not discovered");
     const result = await sources.admitClaim(await sources.claim(entry));
     const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
     expect(extracted).toContain("--- FILE: example.js ---\nconst value = 1;\n\n\nconst next = 2;\n");
+    expect(extracted).toContain(`--- FILE: example.rb ---\n${ruby}`);
     expect(extracted).toContain("--- FILE: notes.md ---\nbefore\n\nafter\n");
     expect(staged.kind).toBe("directory");
+    db.close();
+  });
+  it("resets Markdown fence normalization at native file boundaries", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "fence-boundaries");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "first.md"), "before\n\n\n```\ninside\n");
+    await fs.writeFile(join(directory, "second.md"), "before\n\n\nafter\n");
+    await sources.stage({ path: directory });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("fence-boundaries directory was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const extracted = await fs.readFile(join(result.packetPath, "extracted.md"), "utf8");
+    expect(extracted).toContain("--- FILE: first.md ---\nbefore\n\n```\ninside\n");
+    expect(extracted).toContain("--- FILE: second.md ---\nbefore\n\nafter\n");
     db.close();
   });
   it("preserves code blank runs after marker-looking text inside a multiline body", async () => {
@@ -1291,6 +1309,54 @@ describe("wiki mechanics", () => {
       db.close();
     }
   });
+  it("rejects a second edit to preexisting non-target drift during repair", async () => {
+    const { paths, db } = await fixture();
+    let mutateOther = false;
+    let otherPath = "";
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: {
+        wiki: {
+          qmd: {
+            search: () => [],
+            index: async () => {
+              if (!mutateOther) return;
+              mutateOther = false;
+              await fs.appendFile(otherPath, "\nsecond unsupported edit");
+            },
+          },
+        },
+      },
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: false, subject }),
+    });
+    try {
+      const target = await app.wiki.create({ path: "repair-target.md", body: "authored target" });
+      const other = await app.wiki.create({ path: "repair-other.md", body: "authored other" });
+      const targetPath = join(paths.wikiRoot, target.page.relativePath);
+      otherPath = join(paths.wikiRoot, other.page.relativePath);
+      await fs.appendFile(targetPath, "\nfirst unsupported edit");
+      await fs.appendFile(otherPath, "\nfirst unsupported edit");
+      const targetContent = await fs.readFile(targetPath, "utf8");
+      mutateOther = true;
+      await expect(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: target.page.pageId,
+          expectedDigest: sha256(targetContent),
+          body: "corrected target",
+        }),
+      ).rejects.toThrow(/Preexisting wiki drift changed during mutation/u);
+      expect(await fs.readFile(targetPath, "utf8")).toBe(targetContent);
+      expect(
+        db.get<{ status: string }>("SELECT status FROM pages WHERE page_id = ?", [target.page.pageId])?.status,
+      ).toBe("active");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 
   it("rejects orphan managed footnote definitions before persistence", async () => {
     const { paths, db, wiki } = await fixture();
@@ -1500,6 +1566,25 @@ describe("wiki mechanics", () => {
     await expect(wiki.resolveDrift(created.page.pageId, "restore")).rejects.toThrow(
       /semantic drift requires maintenance correction/u,
     );
+    db.close();
+  });
+  it("excludes catalogued drift from semantic qmd candidates", async () => {
+    const { paths, db, wiki } = await fixture();
+    await wiki.create({ path: "semantic-active.md", body: "active text" });
+    const drifted = await wiki.create({ path: "[x].md", body: "drifted text" });
+    await fs.appendFile(join(paths.wikiRoot, "[x].md"), "\nunsupported edit");
+    db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
+    let ignoredPaths: readonly string[] | undefined;
+    const semantic = new WikiService(db, paths, {
+      qmd: {
+        search: (_query, options) => {
+          ignoredPaths = options?.ignoredPaths;
+          return [{ path: "[x].md" }, { path: "semantic-active.md" }];
+        },
+      },
+    });
+    expect(await semantic.semanticSearch("text")).toEqual([{ path: "semantic-active.md" }]);
+    expect(ignoredPaths).toEqual(["[x].md"]);
     db.close();
   });
 

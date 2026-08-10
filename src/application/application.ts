@@ -62,8 +62,8 @@ import {
   localCheckpointCommit,
   safePush,
 } from "../external/git.js";
-import { qmdSearch, runQmd } from "../external/qmd.js";
-import { okfFootnoteLabels } from "../okf.js";
+import { qmdRefresh, qmdSearch } from "../external/qmd.js";
+import { okfFootnoteLabels, removeOkfFootnoteDefinitions } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
 import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
 import {
@@ -201,6 +201,12 @@ interface WikiChangeRollbackSnapshot {
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
+
+type IngestSection = {
+  readonly anchor: string;
+  readonly startOffset: number;
+  readonly endOffset: number;
+};
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -257,7 +263,12 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
   const qmd = overrides?.qmd ?? {
     search: async (
       query: string,
-      options?: { readonly collection?: string; readonly scope?: "wiki/**/*.md"; readonly limit?: number },
+      options?: {
+        readonly collection?: string;
+        readonly scope?: "wiki/**/*.md";
+        readonly limit?: number;
+        readonly ignoredPaths?: readonly string[];
+      },
     ) => {
       const result = await qmdSearch(paths, query, options?.limit);
       if (result.timedOut || result.signal || result.code !== 0)
@@ -276,8 +287,8 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
       if (isRecord(parsed) && Array.isArray(parsed.results)) return parsed.results;
       throw new Error("qmd search returned malformed results");
     },
-    index: async () => {
-      const result = await runQmd(paths, ["update"]);
+    index: async (options) => {
+      const result = await qmdRefresh(paths, options);
       if (result.timedOut || result.signal || result.code !== 0)
         throw new Error(
           `qmd update failed: ${(result.stderr.trim() || result.stdout.trim() || result.signal || "unknown error").slice(0, 500)}`,
@@ -431,15 +442,73 @@ export class ScholarApplication {
     )
       throw new ValidationError("Pages participating in prerequisites must remain quiz-eligible");
   }
-  private async assertIngestCitation(body: string): Promise<void> {
-    const references = okfFootnoteLabels(body).references;
-    if (!references.length)
-      throw new ValidationError("source-grounded ingest changes require an immutable source chunk citation");
+  private async assertIngestCitation(body: string, authoredBody?: string): Promise<void> {
     const authorized = new Set<string>();
     for (const { manifest } of await this.sources.publishedPackets())
       for (const chunk of manifest.chunks) authorized.add(chunk.chunkId);
-    if (!references.some((reference) => authorized.has(reference)))
-      throw new ValidationError("source-grounded ingest changes require an authorized immutable source chunk citation");
+    const sections = (markdown: string): IngestSection[] => {
+      const parsed = parseWikiSections(markdown, "");
+      const first = parsed[0];
+      if (!first) return markdown.trim() ? [{ anchor: "", startOffset: 0, endOffset: markdown.length }] : [];
+      return markdown.slice(0, first.startOffset).trim()
+        ? [{ anchor: "", startOffset: 0, endOffset: first.startOffset }, ...parsed]
+        : parsed;
+    };
+    const sectionText = (markdown: string, section: IngestSection): string =>
+      markdown.slice(section.startOffset, section.endOffset);
+    const withoutDefinitions = (text: string): string => {
+      const { definitions } = okfFootnoteLabels(text);
+      return removeOkfFootnoteDefinitions(text, definitions);
+    };
+    const substantive = (markdown: string, section: IngestSection): boolean => {
+      const text = sectionText(markdown, section);
+      const newline = text.indexOf("\n");
+      const content = section.anchor === "" ? text : newline < 0 ? "" : text.slice(newline + 1);
+      return withoutDefinitions(content).trim().length > 0;
+    };
+    const requireSectionCitation = (markdown: string, section: IngestSection): void => {
+      const references = okfFootnoteLabels(sectionText(markdown, section)).references;
+      if (!references.length)
+        throw new ValidationError("source-grounded ingest changes require an immutable source chunk citation");
+      if (!references.some((reference) => authorized.has(reference)))
+        throw new ValidationError(
+          "source-grounded ingest changes require an authorized immutable source chunk citation",
+        );
+    };
+    const nextSections = sections(body);
+    if (authoredBody === undefined) {
+      for (const section of nextSections) if (substantive(body, section)) requireSectionCitation(body, section);
+      return;
+    }
+    const priorSections = sections(authoredBody);
+    const priorByAnchor = new Map(priorSections.map((section, index) => [section.anchor, { index, section }]));
+    const nextByAnchor = new Map(nextSections.map((section, index) => [section.anchor, { index, section }]));
+    const paired = new Map<number, IngestSection>();
+    const usedPrior = new Set<number>();
+    for (const [index, section] of nextSections.entries()) {
+      const prior = priorByAnchor.get(section.anchor);
+      if (prior) {
+        paired.set(index, prior.section);
+        usedPrior.add(prior.index);
+      }
+    }
+    for (const [index] of nextSections.entries()) {
+      if (paired.has(index)) continue;
+      const prior = priorByAnchor.get(priorSections[index]?.anchor ?? "");
+      if (prior && !usedPrior.has(prior.index) && !nextByAnchor.has(prior.section.anchor)) {
+        paired.set(index, prior.section);
+        usedPrior.add(prior.index);
+      }
+    }
+    for (const [index, section] of nextSections.entries()) {
+      const prior = paired.get(index);
+      if (
+        prior &&
+        withoutDefinitions(sectionText(body, section)) === withoutDefinitions(sectionText(authoredBody, prior))
+      )
+        continue;
+      if (substantive(body, section)) requireSectionCitation(body, section);
+    }
   }
   private async readSetting<T>(key: string, fallback: T): Promise<T> {
     const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
@@ -1228,9 +1297,14 @@ export class ScholarApplication {
         : ({ kind: "targeted", description: input.description } as const);
     return { scope, pages, issues };
   }
-  private async liveDriftPageIds(): Promise<Set<string>> {
+  private async liveDriftDigests(): Promise<Map<string, string>> {
     const reports = await Promise.all((await this.wiki.list()).map((page) => this.wiki.inspectDrift(page.pageId)));
-    return new Set(reports.filter((report) => report.drifted).map((report) => report.page.pageId));
+    return new Map(
+      reports.filter((report) => report.drifted).map((report) => [report.page.pageId, report.currentDigest]),
+    );
+  }
+  private async liveDriftPageIds(): Promise<Set<string>> {
+    return new Set((await this.liveDriftDigests()).keys());
   }
   private catalogDriftExclusions(): readonly string[] {
     return this.db
@@ -1275,10 +1349,6 @@ export class ScholarApplication {
     const drifted = await this.liveDriftPageIds();
     return pages.filter((page) => !drifted.has(page.pageId));
   }
-  private async assertNoLiveWikiDrift(): Promise<void> {
-    const drifted = await this.liveDriftPageIds();
-    if (drifted.size) throw new ValidationError(`Wiki pages have unresolved live drift: ${[...drifted].join(", ")}`);
-  }
   private assertWikiChangeCoverage(
     pages?: readonly {
       readonly pageId: string;
@@ -1290,15 +1360,21 @@ export class ScholarApplication {
     if (!coverage.ok)
       throw new ValidationError(`Eligible wiki pages lack learning rows: ${coverage.missingPageIds.join(", ")}`);
   }
-  private async wikiChangePreflight(allowedDrift: ReadonlySet<string> = new Set()): Promise<void> {
-    if (!allowedDrift.size) await this.assertNoLiveWikiDrift();
+  private async wikiChangePreflight(allowedDrift: ReadonlyMap<string, string> = new Map()): Promise<void> {
+    const drifted = await this.liveDriftDigests();
+    if (!allowedDrift.size && drifted.size)
+      throw new ValidationError(`Wiki pages have unresolved live drift: ${[...drifted.keys()].join(", ")}`);
+    for (const [pageId, expectedDigest] of allowedDrift) {
+      if (drifted.get(pageId) !== expectedDigest)
+        throw new ValidationError(`Preexisting wiki drift changed before mutation: ${pageId}`);
+    }
     const pages = (await this.wiki.list()).filter((page) => page.status === "active");
     const projection = await this.wiki.refreshProjections(false);
     const lint = this.wiki.lintSync(pages, projection.backlinks);
     if (lint.length) throw new ValidationError(`wiki lint failed: ${lint.join("; ")}`);
-    const qmd = this.wiki.adapters.qmd;
-    if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
-    await qmd.index();
+    if (!this.wiki.adapters.qmd || typeof this.wiki.adapters.qmd.index !== "function")
+      throw new ValidationError("wiki maintenance requires qmd indexing");
+    await this.wiki.refreshQmdIndex();
   }
   private async captureWikiChangeRollback(proposal: WikiChangeInput): Promise<WikiChangeRollbackSnapshot> {
     const destinations = new Set<string>([join(this.paths.wikiRoot, "index.md"), join(this.paths.wikiRoot, "log.md")]);
@@ -1434,9 +1510,8 @@ export class ScholarApplication {
         if (!expectedSnapshots.has(entry))
           await fs.rm(join(snapshot.snapshotRoot, entry), { recursive: true, force: true });
       }
-      const qmd = this.wiki.adapters.qmd;
       try {
-        if (typeof qmd?.index === "function") await qmd?.index();
+        await this.wiki.refreshQmdIndex();
       } finally {
         this.db.checkpoint();
       }
@@ -1445,12 +1520,16 @@ export class ScholarApplication {
     }
   }
   private async wikiChangeChecks(
-    allowedDrift: ReadonlySet<string> = new Set(),
+    allowedDrift: ReadonlyMap<string, string> = new Map(),
     targetPageId?: string,
   ): Promise<{ readonly lint: readonly string[]; readonly doctor: DoctorReport }> {
-    const drifted = await this.liveDriftPageIds();
-    const introduced = [...drifted].filter((pageId) => !allowedDrift.has(pageId));
+    const drifted = await this.liveDriftDigests();
+    const introduced = [...drifted.keys()].filter((pageId) => !allowedDrift.has(pageId));
     if (introduced.length) throw new ValidationError(`Wiki mutation introduced live drift: ${introduced.join(", ")}`);
+    for (const [pageId, expectedDigest] of allowedDrift) {
+      if (pageId !== targetPageId && drifted.get(pageId) !== expectedDigest)
+        throw new ValidationError(`Preexisting wiki drift changed during mutation: ${pageId}`);
+    }
     if (targetPageId && drifted.has(targetPageId))
       throw new ValidationError(`Wiki mutation did not repair target drift: ${targetPageId}`);
     const pages = (await this.wiki.list()).filter((page) => page.status === "active");
@@ -1464,7 +1543,7 @@ export class ScholarApplication {
     this.assertWikiChangeCoverage(pages);
     const qmd = this.wiki.adapters.qmd;
     if (!qmd || typeof qmd.index !== "function") throw new ValidationError("wiki maintenance requires qmd indexing");
-    await qmd.index();
+    await this.wiki.refreshQmdIndex();
     const doctor = this.doctorFn(this.paths.vaultRoot);
     if (!doctor.ok) throw new ValidationError("doctor checks failed");
     return { lint, doctor };
@@ -1478,14 +1557,14 @@ export class ScholarApplication {
       restore: (snapshot: WikiChangeRollbackSnapshot) => this.restoreWikiChangeRollback(snapshot),
       dispose: (snapshot: WikiChangeRollbackSnapshot) => fs.rm(snapshot.workRoot, { recursive: true, force: true }),
     };
-    let preexistingDrift: ReadonlySet<string> = new Set();
+    let preexistingDrift: ReadonlyMap<string, string> = new Map();
     return this.durableDirect(
       async () => {
         const allowDrift = proposal.kind === "update-page" || proposal.kind === "resolve-issue";
-        preexistingDrift = allowDrift ? await this.liveDriftPageIds() : new Set<string>();
+        preexistingDrift = allowDrift ? await this.liveDriftDigests() : new Map();
         if (preexistingDrift.size)
           transaction(this.db, () => {
-            for (const pageId of preexistingDrift)
+            for (const pageId of preexistingDrift.keys())
               this.db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [pageId]);
           });
         await this.wikiChangePreflight(preexistingDrift);
@@ -1497,7 +1576,7 @@ export class ScholarApplication {
               created.page.quizWorthiness === "eligible"
                 ? this.scheduler.ensurePageLearning(created.page.pageId)
                 : undefined;
-            const checks = await this.wikiChangeChecks();
+            const checks = await this.wikiChangeChecks(preexistingDrift);
             return {
               kind: proposal.kind,
               page: pageRecord(created.page),
@@ -1516,7 +1595,7 @@ export class ScholarApplication {
               ? this.assertDriftRepairFields(proposal.pageId, current.content, proposal)
               : parsed.body;
             const bodyChanged = body !== undefined && body !== authoredBody;
-            if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body);
+            if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body, authoredBody);
             const updated = await this.wiki.update(proposal.pageId, proposal);
             const pageLearning =
               updated.page.quizWorthiness === "eligible"
@@ -1536,7 +1615,7 @@ export class ScholarApplication {
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
             const renamed = await this.wiki.rename(proposal.pageId, proposal.path);
-            const checks = await this.wikiChangeChecks();
+            const checks = await this.wikiChangeChecks(preexistingDrift);
             return { kind: proposal.kind, page: pageRecord(renamed), checks };
           }
           case "retire-page": {
@@ -1545,7 +1624,7 @@ export class ScholarApplication {
             if (current.digest !== proposal.expectedDigest)
               throw new RevisionConflictError("The wiki page digest is stale");
             const retired = await this.wiki.retire(proposal.pageId);
-            const checks = await this.wikiChangeChecks();
+            const checks = await this.wikiChangeChecks(preexistingDrift);
             return { kind: proposal.kind, page: pageRecord(retired), checks };
           }
           case "prerequisites": {
@@ -1554,7 +1633,7 @@ export class ScholarApplication {
             const pageLearning =
               page.quizWorthiness === "eligible" ? this.scheduler.ensurePageLearning(page.pageId) : undefined;
             this.scheduler.setPrerequisites(proposal.pageId, proposal.prerequisitePageIds, proposal.expectedRevision);
-            const checks = await this.wikiChangeChecks();
+            const checks = await this.wikiChangeChecks(preexistingDrift);
             return {
               kind: proposal.kind,
               prerequisites: this.scheduler.listPrerequisites(page.pageId),
@@ -1571,10 +1650,10 @@ export class ScholarApplication {
             if (issue.status === "resolved") throw new RevisionConflictError("The issue is already resolved");
             if (!issue.pageId || proposal.page.pageId !== issue.pageId)
               throw new ValidationError("resolve-issue page must match the issue page");
-            if (issue.pageDigest !== undefined && issue.pageDigest !== proposal.page.expectedDigest)
-              throw new RevisionConflictError("The issue page version is stale");
             const current = await this.wiki.get(issue.pageId);
-            if (current.digest !== proposal.page.expectedDigest)
+            if (issue.pageDigest !== undefined && issue.pageDigest !== current.digest)
+              throw new RevisionConflictError("The issue page version is stale");
+            if (sha256(current.content) !== proposal.page.expectedDigest)
               throw new RevisionConflictError("The issue page digest is stale");
             const parsed = parseWikiMarkdown(current.content);
             const body = proposal.page.body;
@@ -1587,7 +1666,7 @@ export class ScholarApplication {
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
               (proposal.page.quizWorthiness !== undefined && proposal.page.quizWorthiness !== current.quizWorthiness);
             if (!pageChanged) throw new ValidationError("resolve-issue requires an actual page correction");
-            if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body);
+            if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body, authoredBody);
             this.assertPageMutationAllowed(proposal.page.pageId, proposal.page.quizWorthiness);
             const prepared = await this.wiki.prepareUpdate(issue.pageId, {
               expectedDigest: proposal.page.expectedDigest,

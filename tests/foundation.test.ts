@@ -101,6 +101,37 @@ describe("vault foundation", () => {
     }));
     assert.equal(duplicate.ok, false);
   });
+  it("matches literal qmd ignore paths without treating glob metacharacters as patterns", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const collection = qmdCollection(paths);
+    const configDirectory = join(paths.qmdRoot, ".config", "qmd");
+    mkdirSync(configDirectory, { recursive: true });
+    const configPath = join(configDirectory, "index.yml");
+    const config = [
+      "collections:",
+      `  ${collection.name}:`,
+      `    path: ${JSON.stringify(collection.root)}`,
+      `    pattern: ${JSON.stringify(collection.include)}`,
+      "    ignore:",
+      '      - "\\\\[x\\\\].md"',
+      "",
+    ].join("\n");
+    writeFileSync(configPath, config);
+    const runner = (_paths: VaultPaths, args: readonly string[]) => ({
+      executable: "qmd",
+      args: [...args],
+      code: 0,
+      signal: null,
+      timedOut: false,
+      stdout: `Path: ${collection.root}\nPattern: ${collection.include}\n`,
+      stderr: "",
+    });
+    const result = qmdScopeCheck(paths, runner, ["[x].md"]);
+    assert.equal(result.ok, true);
+    writeFileSync(configPath, config.replace("\\\\[x\\\\].md", "[x].md"));
+    assert.equal(qmdScopeCheck(paths, runner, ["[x].md"]).ok, false);
+  });
 
   it("isolates qmd configuration/cache and requests bounded JSON search output", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -108,6 +139,7 @@ describe("vault foundation", () => {
     assert.deepEqual(qmdEnvironment(paths), {
       HOME: paths.qmdRoot,
       XDG_CACHE_HOME: join(paths.qmdRoot, "cache"),
+      XDG_CONFIG_HOME: join(paths.qmdRoot, ".config"),
       QMD_HOME: paths.qmdRoot,
     });
     const result = await qmdSearch(paths, "hybrid query", 7, (_paths, args) => {
@@ -425,6 +457,25 @@ describe("vault foundation", () => {
     writeFileSync(indexPath, index);
     writeFileSync(join(paths.wikiRoot, "malformed.md"), "---\ntitle: Missing type\n---\nbody\n");
     assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status, "fail");
+  });
+  it("doctor tolerates malformed bytes for a catalogued drifted page", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const wiki = new WikiService(db, paths);
+    const created = await wiki.create({ path: "unsupported.md", body: "authored" });
+    const pagePath = join(paths.wikiRoot, created.page.relativePath);
+    const unsupported = Buffer.from("not an OKF concept\n\nraw unsupported bytes\n");
+    writeFileSync(pagePath, unsupported);
+    db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [created.page.pageId]);
+    await wiki.refreshProjections();
+    const report = doctor(paths.vaultRoot);
+    assert.equal(report.checks.find((item) => item.name === "okf")?.status, "pass");
+    assert.equal(report.checks.find((item) => item.name === "page-ids")?.status, "pass");
+    assert.deepEqual(readFileSync(pagePath), unsupported);
+    db.run("UPDATE pages SET status = 'active' WHERE page_id = ?", [created.page.pageId]);
+    assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status, "fail");
+    db.close();
   });
 
   it("doctor rejects a tampered quiz answer without rewriting the sheet", () => {

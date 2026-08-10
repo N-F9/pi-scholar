@@ -113,7 +113,7 @@ src/
 ├── server.ts, cli.ts, contracts.ts, index.ts
 ```
 
-External adapters are narrow, pinned, bounded, and never parallel writers. qmd indexes only `wiki/`; if unavailable, exact and lexical navigation still work.
+External adapters are narrow, pinned, bounded, and never parallel writers. qmd indexes only active product-authored pages under `wiki/`, with exact ignores for catalogued drift; if unavailable, exact and lexical navigation still work.
 
 ## 4. Private work and recovery
 

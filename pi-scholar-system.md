@@ -366,9 +366,10 @@ lines fail rather than being partially accepted.
 
 Each authored page write updates the page file, `pages` row/revision, durable
 authored snapshot, deterministic index/log projections, and qmd when
-available. qmd is scoped to the vault wiki and is derived: exact and lexical
-search do not depend on qmd, and qmd can be rebuilt without changing
-canonical knowledge.
+available. qmd is scoped to active product-authored pages in the vault wiki;
+catalogued drift paths are exact collection ignores. qmd is derived: exact and
+lexical search do not depend on it, and rebuilding it cannot change canonical
+knowledge.
 
 ### Ingest and lint context
 

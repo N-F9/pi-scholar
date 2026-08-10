@@ -259,7 +259,7 @@ Questions are generated for a quiz and are not a durable question bank. There ar
 | Exact and lexical navigation | Validated physical files plus Pi native tools |
 | Version history and remote synchronization | Git and optional Git LFS |
 
-qmd indexes `wiki/**/*.md` only. It never indexes `sources/` or `quizzes/`, and qmd output never becomes canonical state. `.pi-scholar/work/` is private transient/rollback/Docling scratch and never canonical state or Git content. qmd unavailability disables semantic ranking, not exact reads, grep, find, normal Markdown navigation, or safe repository inspection. Native lookup is a separate exact/lexical path, never mislabeled as a semantic fallback.
+qmd indexes active product-authored `wiki/**/*.md` only; catalogued drift paths are exact collection ignores. It never indexes `sources/` or `quizzes/`, and qmd output never becomes canonical state. `.pi-scholar/work/` is private transient/rollback/Docling scratch and never canonical state or Git content. qmd unavailability disables semantic ranking, not exact reads, grep, find, normal Markdown navigation, or safe repository inspection. Native lookup is a separate exact/lexical path, never mislabeled as a semantic fallback.
 
 ## Runtime architecture
 

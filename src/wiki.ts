@@ -3,7 +3,7 @@ import { promises as fs, readFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
 import type { WikiIssueRecord } from "./contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
-import { qmdCollectionName } from "./external/qmd.js";
+import { type QmdIndexOptions, qmdCollectionName } from "./external/qmd.js";
 import {
   type OkfProjectionPage,
   okfCitationText,
@@ -43,9 +43,9 @@ export type DriftResolution = "record-issue" | "restore";
 export interface QmdAdapter {
   search(
     query: string,
-    options?: { collection: string; scope: "wiki/**/*.md"; limit?: number },
+    options?: { collection: string; scope: "wiki/**/*.md"; limit?: number; ignoredPaths?: readonly string[] },
   ): Promise<unknown> | unknown;
-  index?: () => Promise<void> | void;
+  index?: (options?: QmdIndexOptions) => Promise<void> | void;
 }
 export interface WikiAdapters {
   qmd?: QmdAdapter;
@@ -243,9 +243,19 @@ export class WikiService {
   private root(): string {
     return vaultRoot(this.paths);
   }
+  private qmdIgnoredPaths(): readonly string[] {
+    return dbAll<{ readonly relative_path: string }>(
+      this.db,
+      "SELECT relative_path FROM pages WHERE status = 'drifted' ORDER BY relative_path",
+    ).map(({ relative_path }) => relative_path);
+  }
+  async refreshQmdIndex(): Promise<void> {
+    const index = this.adapters.qmd?.index;
+    if (typeof index === "function") await index({ ignoredPaths: this.qmdIgnoredPaths() });
+  }
   private async refreshQmd(): Promise<void> {
     try {
-      if (typeof this.adapters.qmd?.index === "function") await this.adapters.qmd.index();
+      await this.refreshQmdIndex();
     } catch {
       /* application maintenance checks enforce qmd */
     }
@@ -1003,10 +1013,13 @@ export class WikiService {
       if (!this.adapters.qmd) throw new Error("semantic search unavailable: qmd adapter not configured");
       const vaultId = this.paths.vaultId;
       if (!vaultId) throw new Error("qmd search requires vault identity");
+      const ignoredPaths = this.qmdIgnoredPaths();
+      const searchLimit = limit === undefined ? undefined : Math.min(100, limit + ignoredPaths.length);
       const result = await this.adapters.qmd.search(query, {
         collection: qmdCollectionName(vaultId),
         scope: "wiki/**/*.md",
-        limit,
+        limit: searchLimit,
+        ignoredPaths,
       });
       if (!Array.isArray(result)) throw new Error("qmd returned malformed search results");
       const filtered: unknown[] = [];
