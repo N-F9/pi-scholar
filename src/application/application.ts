@@ -13,6 +13,7 @@ import type {
   GradingResult,
   HealthResult,
   IngestContext,
+  IngestSourceChunk,
   IngestSourceContext,
   LintContext,
   PageLearningRecord,
@@ -1151,7 +1152,7 @@ export class ScholarApplication {
   }
   async getIngestContext(): Promise<IngestContext> {
     const pages = await Promise.all(
-      (await this.wiki.list()).filter((page) => page.status === "active").map((page) => this.wikiResult(page.pageId)),
+      (await this.wiki.list()).filter((page) => page.status !== "retired").map((page) => this.wikiResult(page.pageId)),
     );
     const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
     const sources = await this.sources.publishedPackets();
@@ -1163,13 +1164,19 @@ export class ScholarApplication {
           source: { ...sourceRecord(source as unknown as Record<string, unknown>), manifestPath: packetPath },
           manifest,
           packetPath,
+          chunks: manifest.chunks.map(
+            (chunk): IngestSourceChunk => ({
+              ...chunk,
+              path: join(packetPath, "chunks", `${String(chunk.ordinal + 1).padStart(4, "0")}.md`),
+            }),
+          ),
         }),
       ),
     };
   }
   async getLintContext(input?: { readonly description?: string }): Promise<LintContext> {
     const pages = await Promise.all(
-      (await this.wiki.list()).filter((page) => page.status === "active").map((page) => this.wikiResult(page.pageId)),
+      (await this.wiki.list()).filter((page) => page.status !== "retired").map((page) => this.wikiResult(page.pageId)),
     );
     const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
     const scope =

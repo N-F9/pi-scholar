@@ -485,6 +485,14 @@ describe("knowledge capability contexts", () => {
       assert.equal(packet.source.manifestPath, packet.packetPath);
       assert.equal(packet.manifest.sourceId, published.sourceId);
       assert.equal(packet.packetPath, join(paths.sourcesRoot, published.sourceId));
+      assert.equal(packet.chunks.length, packet.manifest.chunks.length);
+      for (const [index, chunk] of packet.chunks.entries()) {
+        const expectedPath = join(packet.packetPath, "chunks", `${String(index + 1).padStart(4, "0")}.md`);
+        assert.equal(chunk.path, expectedPath);
+        assert.equal((await fs.stat(chunk.path)).isFile(), true);
+        const { path: _path, ...manifestChunk } = chunk;
+        assert.deepEqual(manifestChunk, packet.manifest.chunks[index]);
+      }
     } finally {
       await app.close();
       db.close();
@@ -520,6 +528,32 @@ describe("knowledge capability contexts", () => {
       const targeted = await app.getLintContext({ description: "repair backlinks" });
       assert.deepEqual(targeted.scope, { kind: "targeted", description: "repair backlinks" });
       assert.equal(Object.hasOwn(targeted, "sources"), false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("keeps drifted pages in ingest and lint repair contexts", async () => {
+    const { app, db } = fixture();
+    try {
+      const drifted = await app.createNote({ path: "drifted.md", body: "# Drifted\n", quizWorthiness: "skip" });
+      const retired = await app.createNote({ path: "retired.md", body: "# Retired\n", quizWorthiness: "skip" });
+      db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
+      db.run("UPDATE pages SET status = 'retired' WHERE page_id = ?", [retired.page.pageId]);
+
+      const ingest = await app.getIngestContext();
+      const lint = await app.getLintContext();
+      for (const pages of [ingest.pages, lint.pages]) {
+        assert.equal(
+          pages.some(({ page }) => page.pageId === drifted.page.pageId && page.status === "drifted"),
+          true,
+        );
+        assert.equal(
+          pages.some(({ page }) => page.pageId === retired.page.pageId),
+          false,
+        );
+      }
     } finally {
       await app.close();
       db.close();

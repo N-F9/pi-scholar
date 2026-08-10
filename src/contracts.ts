@@ -37,6 +37,10 @@ export interface SourceChunk {
   readonly atomEnd: number;
 }
 
+export interface IngestSourceChunk extends SourceChunk {
+  readonly path: string;
+}
+
 export interface SourceManifest {
   readonly sourceId: string;
   readonly kind: SourceKind;
@@ -269,6 +273,7 @@ export interface IngestSourceContext {
   readonly source: SourceRecord;
   readonly manifest: SourceManifest;
   readonly packetPath: string;
+  readonly chunks: readonly IngestSourceChunk[];
 }
 
 export interface IngestContext {
