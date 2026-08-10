@@ -6,6 +6,7 @@ import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
+import { parseOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { SourceService, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -557,6 +558,45 @@ describe("source admission mechanics", () => {
     expect((await fs.readFile(join(result.packetPath, "extracted.md"))).equals(before)).toBe(true);
     db.close();
   });
+  it("derives source dependents only from keyed OKF provenance", async () => {
+    const { paths, db, sources, wiki } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const chunkId = result.manifest.chunks[0]?.chunkId;
+    if (!chunkId) throw new Error("source chunk is missing");
+    await expect(
+      wiki.create({
+        path: "raw-id.md",
+        body: `# Raw ID\n\nThis text contains ${chunkId} without a keyed claim.\n`,
+      }),
+    ).rejects.toThrow();
+    const external = await wiki.create({
+      path: "external-id.md",
+      body: `# External ID\n\nThis text mentions ${result.sourceId} but does not cite it.\n`,
+    });
+    expect(sources.removalPreview(result.sourceId).dependentPageIds).not.toContain(external.page.pageId);
+    db.close();
+  });
+  it("fails removal preview on mismatched managed OKF provenance", async () => {
+    const { paths, db, sources, wiki } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    const result = await sources.admitClaim(await sources.claim(entry));
+    const chunkId = result.manifest.chunks[0]?.chunkId;
+    if (!chunkId) throw new Error("source chunk is missing");
+    const page = await wiki.create({
+      path: "mismatched-provenance.md",
+      body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
+    });
+    const pagePath = join(paths.wikiRoot, page.page.relativePath);
+    const markdown = await fs.readFile(pagePath, "utf8");
+    const tampered = markdown.replace(/^(\s*source_digest:\s*).+$/mu, "$1mismatched");
+    expect(tampered).not.toBe(markdown);
+    await fs.writeFile(pagePath, tampered);
+    expect(() => sources.removalPreview(result.sourceId)).toThrow(/provenance/i);
+    db.close();
+  });
   it("previews page and open-quiz dependents and restores the packet after a failed removal transaction", async () => {
     const { paths, db, sources, wiki } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
@@ -566,16 +606,11 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "grounded.md",
-      body: `# Grounded\n\nGrounded at ${chunkId}.\n`,
+      body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
       quizWorthiness: "eligible",
     });
     const pageId = page.page.pageId;
     const now = new Date().toISOString();
-    db.run("INSERT INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, 'citation')", [
-      result.sourceId,
-      pageId,
-      chunkId,
-    ]);
     const sheetPath = join(paths.quizzesRoot, "2099", "01", "2099-01-01.md");
     await fs.mkdir(join(paths.quizzesRoot, "2099", "01"), { recursive: true });
     const sheetBefore = Buffer.from("# canonical quiz\n");
@@ -606,7 +641,7 @@ describe("source admission mechanics", () => {
         page.page.digest,
         page.page.revision,
         "text-digest",
-        `Grounded at ${chunkId}.`,
+        `Grounded at [^${chunkId}].`,
         "excerpt-digest",
       ],
     );
@@ -639,16 +674,11 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "submitted-grounding.md",
-      body: `# Grounded\n\nGrounded at ${chunkId}.\n`,
+      body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
       quizWorthiness: "eligible",
     });
     const pageId = page.page.pageId;
     const now = new Date().toISOString();
-    db.run("INSERT INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, 'citation')", [
-      result.sourceId,
-      pageId,
-      chunkId,
-    ]);
     db.run(
       "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', NULL, ?, NULL, NULL, NULL)",
       ["quiz-submitted-removal", "2099-01-02", now],
@@ -673,9 +703,9 @@ describe("source admission mechanics", () => {
         "#grounded",
         "Grounded",
         page.page.digest,
-        page.page.revision,
+        1,
         "text-digest",
-        `Grounded at ${chunkId}.`,
+        `Grounded at [^${chunkId}].`,
         "excerpt-digest",
       ],
     );
@@ -763,12 +793,211 @@ describe("wiki mechanics", () => {
     expect((await wiki.get(created.page.pageId)).relativePath).toBe("notes/two.md");
     const index = await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8");
     const log = await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8");
+    validateOkfIndex(index, true);
+    validateOkfLog(log);
     expect(index).toContain("notes/two.md");
     expect(index).not.toContain("notes/one.md");
     expect(log).toContain("notes/two.md");
     expect(log).not.toContain("notes/one.md");
     db.close();
   });
+  it("rejects rename after an unsupported direct edit", async () => {
+    const { paths, db, wiki } = await fixture();
+    const created = await wiki.create({ path: "notes/drift-before-rename.md", body: "original" });
+    await fs.appendFile(join(paths.wikiRoot, created.page.relativePath), "\nexternal edit\n");
+    await expect(wiki.rename(created.page.pageId, "notes/renamed.md")).rejects.toThrow(/inspect drift/u);
+    expect((await wiki.get(created.page.pageId)).relativePath).toBe(created.page.relativePath);
+    await expect(fs.access(join(paths.wikiRoot, "notes", "renamed.md"))).rejects.toThrow();
+    db.close();
+  });
+
+  it("seeds and preserves conformant empty projections", async () => {
+    const { paths, db } = await fixture();
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const indexBefore = await fs.readFile(indexPath, "utf8");
+    const logBefore = await fs.readFile(logPath, "utf8");
+    validateOkfIndex(indexBefore, true);
+    validateOkfLog(logBefore);
+    expect(indexBefore).toContain('okf_version: "0.2"');
+    db.close();
+    await initVault(paths.vaultRoot);
+    expect(await fs.readFile(indexPath, "utf8")).toBe(indexBefore);
+    expect(await fs.readFile(logPath, "utf8")).toBe(logBefore);
+  });
+  it("repairs the wiki snapshot directory when reopening an existing vault", async () => {
+    const { paths, db } = await fixture();
+    db.close();
+    const snapshots = join(paths.metadataRoot, "snapshots", "wiki");
+    await fs.rm(snapshots, { recursive: true });
+    initVault(paths.vaultRoot);
+    expect((await fs.lstat(snapshots)).isDirectory()).toBe(true);
+  });
+
+  it("defaults type and preserves unknown nested frontmatter through update", async () => {
+    const { db, wiki } = await fixture();
+    const created = await wiki.create({
+      path: "nested.md",
+      body: "original",
+      frontmatter: { tags: ["one"], nested: { keep: true, values: ["a", "b"] } },
+    });
+    const updated = await wiki.update(created.page.pageId, { body: "updated", expectedDigest: created.page.digest });
+    const parsed = parseOkfConcept(updated.content);
+    expect(parsed.frontmatter.type).toBe("note");
+    expect(parsed.frontmatter.nested).toEqual({ keep: true, values: ["a", "b"] });
+    expect(parsed.frontmatter.tags).toEqual(["one"]);
+    db.close();
+  });
+  it("grounds keyed citations in live chunks and rejects raw or fabricated IDs", async () => {
+    const { paths, db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const sourceDigest = "a".repeat(64);
+    const chunkDigest = "b".repeat(64);
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Grounding source", sourceDigest, timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, chunkDigest],
+    );
+    const created = await wiki.create({ path: "grounded.md", body: `Claim.[^${sourceId}:0]` });
+    const parsed = parseOkfConcept(created.content);
+    expect(parsed.frontmatter.sources).toEqual([
+      {
+        id: `${sourceId}:0`,
+        resource: `pi-scholar://source/${sourceId}/chunk/0`,
+        title: "Grounding source",
+        pi_scholar: {
+          managed_by: "pi-scholar",
+          source_id: sourceId,
+          chunk_id: `${sourceId}:0`,
+          ordinal: 0,
+          source_digest: sourceDigest,
+          chunk_digest: chunkDigest,
+        },
+      },
+    ]);
+    expect(parsed.body).toContain(`[^${sourceId}:0]: Pi Scholar source evidence`);
+    const punctuated = await wiki.create({
+      path: "punctuated.md",
+      body: `Claim with trailing punctuation.[^${sourceId}:0]: explanation.`,
+    });
+    expect(parseOkfConcept(punctuated.content).frontmatter.sources).toHaveLength(1);
+    const containerBoundary = await wiki.create({
+      path: "container-boundary.md",
+      body: `> \`\`\`text\n> hidden\n\nClaim outside the blockquote.[^${sourceId}:0]`,
+    });
+    expect(parseOkfConcept(containerBoundary.content).frontmatter.sources).toHaveLength(1);
+    const delimiterBoundary = await wiki.create({
+      path: "delimiter-boundary.md",
+      body: `\`Claim with unmatched delimiters.[^${sourceId}:0]\`\``,
+    });
+    expect(parseOkfConcept(delimiterBoundary.content).frontmatter.sources).toHaveLength(1);
+    for (const ordinal of [2, 20])
+      db.run(
+        "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, ?, ?, 7, ?, 0, 1)",
+        [`${sourceId}:${ordinal}`, sourceId, ordinal, `chunk-${ordinal}.md`, String(ordinal).repeat(64).slice(0, 64)],
+      );
+    await expect(
+      wiki.create({ path: "ordinal-prefix.md", body: `Ordinal ten.[^${sourceId}:20]` }),
+    ).resolves.toBeDefined();
+    const otherSourceId = "33333333-3333-5333-8333-333333333333";
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [otherSourceId, "Other source", "c".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${otherSourceId}:0`, otherSourceId, "d".repeat(64)],
+    );
+    db.run("UPDATE sources SET display_name = ? WHERE source_id = ?", [
+      `Hostile [^${otherSourceId}:0] label`,
+      sourceId,
+    ]);
+    const safeDefinition = await wiki.create({
+      path: "safe-definition.md",
+      body: `Grounded despite the source label.[^${sourceId}:0]`,
+    });
+    expect(parseOkfConcept(safeDefinition.content).body).not.toContain(otherSourceId);
+    expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status).toBe("pass");
+    const ungrounded = parseOkfConcept(
+      (
+        await wiki.update(created.page.pageId, {
+          body: "No citation remains.",
+          expectedDigest: created.page.digest,
+        })
+      ).content,
+    );
+    expect(ungrounded.frontmatter.sources).toEqual([]);
+    expect(ungrounded.body).not.toContain(sourceId);
+    await expect(wiki.create({ path: "raw.md", body: `raw ${sourceId}:0` })).rejects.toThrow(/keyed footnote/u);
+    await expect(wiki.create({ path: "fabricated.md", body: `fake.[^${sourceId}:1]` })).rejects.toThrow(
+      /unknown source chunk citation/u,
+    );
+    db.close();
+  });
+  it("ignores citation-shaped literals in Markdown code and accepts external UUID source IDs", async () => {
+    const { paths, db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Grounding source", "a".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, "b".repeat(64)],
+    );
+    const code = await wiki.create({
+      path: "code-literals.md",
+      body: `Ordinary footnote.[^note]\n\n[^note]: A normal Markdown footnote.\n\nEscaped \\[^${sourceId}:0].\n\nInline \`${sourceId}:0\`.\n\n    ${sourceId}:0\n\n\`\`\`text\n[^${sourceId}:9]\n\`\`\`\n\n> \`\`\`text\n> [^${sourceId}:9]\n> \`\`\`\n\n- \`\`\`text\n  ${sourceId}:0\n  \`\`\`\n`,
+    });
+    expect(parseOkfConcept(code.content).frontmatter.sources).toBeUndefined();
+    const externalId = "22222222-2222-4222-8222-222222222222";
+    await wiki.create({
+      path: "external-source.md",
+      body: `External claim.[^${externalId}]\n\n[^${externalId}]: External reference\n`,
+      frontmatter: {
+        sources: [{ id: externalId, resource: "https://example.test/reference" }],
+      },
+    });
+    expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status).toBe("pass");
+    db.close();
+  });
+
+  it("encodes generated links, resolves absolute bundle links, and validates UTC log dates", async () => {
+    const { paths, db, wiki } = await fixture();
+    const target = await wiki.create({
+      path: "tables/customer metrics#1.md",
+      title: "Customer ] <script> Metrics \\",
+      body: "Metrics.",
+    });
+    await wiki.create({
+      path: "guides/consumer.md",
+      body: "[Metrics](/tables/customer%20metrics%231.md)",
+    });
+    const prepared = await wiki.prepareUpdate(
+      target.page.pageId,
+      { body: "Updated metrics.", expectedDigest: target.page.digest },
+      "2026-01-01T23:30:00-05:00",
+    );
+    await wiki.update(target.page.pageId, { expectedDigest: target.page.digest }, prepared);
+    const index = await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8");
+    const log = await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8");
+    expect(index).toContain("[Customer &#93; &lt;script&gt; Metrics \\\\](tables/customer%20metrics%231.md)");
+    expect(log).toContain("## 2026-01-02");
+    expect((await wiki.refreshProjections(false)).backlinks["tables/customer metrics#1.md"]).toEqual([
+      "guides/consumer.md",
+    ]);
+    await fs.writeFile(join(paths.wikiRoot, "index.md"), index.replace("Wiki index", "Tampered index"));
+    expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status).toBe("fail");
+    await fs.writeFile(join(paths.wikiRoot, "index.md"), index);
+    expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status).toBe("pass");
+    db.close();
+  });
+
   it("rejects create over an uncataloged filesystem entry without changing it", async () => {
     const { paths, db, wiki } = await fixture();
     const target = join(paths.wikiRoot, "untracked.md");
@@ -910,6 +1139,15 @@ describe("wiki mechanics", () => {
     expect(report.choices).toEqual(["record-issue", "restore"]);
     await wiki.resolveDrift(created.page.pageId, "restore");
     expect((await wiki.inspectDrift(created.page.pageId)).drifted).toBe(false);
+    db.close();
+  });
+  it("refuses to read a symlinked authored snapshot", async () => {
+    const { paths, db, wiki } = await fixture();
+    const created = await wiki.create({ path: "unsafe-snapshot.md", body: "authored" });
+    const snapshot = join(paths.metadataRoot, "snapshots", "wiki", `${created.page.pageId}.md`);
+    await fs.rm(snapshot);
+    await fs.symlink("/etc/passwd", snapshot);
+    await expect(wiki.inspectDrift(created.page.pageId)).rejects.toThrow(/symlink|symbolic link|regular file|unsafe/u);
     db.close();
   });
 

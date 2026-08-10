@@ -7,8 +7,10 @@ import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
+import { doctor } from "../src/doctor.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
+import { WikiService } from "../src/wiki.js";
 
 type DurableApplication = ScholarApplication & {
   durableDirect<T>(operation: () => T | PromiseLike<T>, subject: string): Promise<T>;
@@ -45,7 +47,7 @@ function fixture(options: { readonly maintenance?: boolean } = {}) {
     calls.push("checkpoint");
     checkpoint();
   };
-  return { app, db, calls };
+  return { app, db, paths, calls };
 }
 
 describe("durable application writes", () => {
@@ -171,6 +173,53 @@ describe("durable application writes", () => {
       db.close();
     }
   });
+  it("refreshes OKF projections after source removal drifts a dependent page", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      await app.stageSource({ kind: "text", text: "evidence\n", name: "evidence.txt" });
+      const claim = (await app.getAdmissionContext()).claims[0];
+      if (!claim) throw new Error("admission claim is missing");
+      const admitted = await app.admitSource({
+        claimId: claim.claimId,
+        preparedId: claim.preparedId,
+        digest: claim.digest,
+      });
+      const page = await app.createNote({
+        path: "grounded.md",
+        body: `# Grounded\n\nClaim.[^${admitted.sourceId}:0]`,
+      });
+      const preview = await app.removalPreview(admitted.sourceId);
+      assert.deepEqual(preview.dependentPageIds, [page.page.pageId]);
+      const wikiCandidate: unknown = Reflect.get(app, "wiki");
+      assert.ok(wikiCandidate instanceof WikiService);
+      const wiki = wikiCandidate;
+      const refreshProjections = wiki.refreshProjections.bind(wiki);
+      wiki.refreshProjections = async () => {
+        throw new Error("injected projection failure");
+      };
+      try {
+        await assert.rejects(
+          app.removeSource(admitted.sourceId, preview.confirmationId),
+          (error: Error & { code?: string; details?: Record<string, unknown> }) => {
+            assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+            assert.deepEqual(error.details, { applied: true, retryable: true, stage: "projection" });
+            return true;
+          },
+        );
+      } finally {
+        wiki.refreshProjections = refreshProjections;
+      }
+      await app.removeSource(admitted.sourceId, preview.confirmationId);
+      assert.equal((await fs.readFile(join(paths.wikiRoot, "index.md"), "utf8")).includes("grounded.md"), false);
+      assert.equal((await fs.readFile(join(paths.wikiRoot, "log.md"), "utf8")).includes("grounded.md"), false);
+      const report = doctor(paths.vaultRoot);
+      assert.equal(report.checks.find((check) => check.name === "okf")?.status, "pass");
+      assert.notEqual(report.checks.find((check) => check.name === "page-drift")?.status, "fail");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  }, 30_000);
   it("restores a page issue exactly when commit fails", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-"));
     const paths = initVault(join(root, "vault"));

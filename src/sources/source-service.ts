@@ -11,8 +11,15 @@ import type {
 } from "../contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "../database.js";
 import type { DoclingResult as ExternalDoclingResult } from "../external/docling.js";
+import {
+  okfCitationText,
+  okfFootnoteLabels,
+  okfMarkdownEscapedAt,
+  okfSourceReferences,
+  parseOkfConcept,
+} from "../okf.js";
 import { QuizService } from "../quiz.js";
-import { safeRelativePath, type VaultPaths } from "../vault.js";
+import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
 import {
   atomizeExtraction,
   chunkExtraction,
@@ -333,7 +340,15 @@ async function requestSourceToFile(
   return promise;
 }
 
+type CurrentCitationDependency = {
+  sourceId: string;
+  pageId: string;
+  chunkId: string;
+  pageDigest: string;
+};
 type Row = SqlRow;
+const PI_CHUNK_LABEL = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/iu;
+const PI_CHUNK_TOKEN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+/giu;
 function dbRun(db: ScholarDatabase, sql: string, params: unknown[] = []): SqlRunResult {
   return db.run(sql, params);
 }
@@ -1471,57 +1486,110 @@ export class SourceService {
   list(): Array<Record<string, unknown>> {
     return dbAll<Row>(this.db, "SELECT * FROM sources ORDER BY captured_at, source_id").map((row) => sourceRecord(row));
   }
+  private discoverCurrentCitationDependencies(): CurrentCitationDependency[] {
+    const sources = dbAll<{ source_id: string; digest: string | null; status: string }>(
+      this.db,
+      "SELECT source_id, digest, status FROM sources ORDER BY source_id",
+    );
+    const sourceById = new Map(sources.map((source) => [source.source_id, source]));
+    const chunks = dbAll<{
+      source_id: string;
+      chunk_id: string;
+      ordinal: number;
+      digest: string;
+    }>(this.db, "SELECT source_id, chunk_id, ordinal, digest FROM source_chunks ORDER BY source_id, ordinal");
+    const chunkById = new Map(chunks.map((chunk) => [chunk.chunk_id, chunk]));
+    const chunkByIdentity = new Map(chunks.map((chunk) => [`${chunk.source_id}\0${chunk.chunk_id}`, chunk]));
+    const pages = dbAll<Row>(
+      this.db,
+      "SELECT page_id, relative_path, status FROM pages WHERE status != 'retired' ORDER BY relative_path, page_id",
+    );
+    const wikiRoot = wikiPathFor(this.paths);
+    const dependencies: CurrentCitationDependency[] = [];
+    for (const page of pages) {
+      const pageId = String(page.page_id);
+      const pageStatus = String(page.status ?? "");
+      const path = validRelativePath(String(page.relative_path ?? ""));
+      const absolute = safeRelativePath(wikiRoot, path);
+      const markdown = readFileNoFollow(absolute).toString("utf8");
+      const pageDigest = digestBytes(Buffer.from(markdown));
+      const { body } = parseOkfConcept(markdown);
+      const references = okfSourceReferences(markdown);
+      const citationText = okfCitationText(body);
+      const footnoteLabels = okfFootnoteLabels(citationText);
+      const referenceLabels = new Set(footnoteLabels.references);
+      const definitionLabels = new Set(footnoteLabels.definitions);
+      const labels = new Set([...referenceLabels, ...definitionLabels]);
+      for (const match of citationText.matchAll(PI_CHUNK_TOKEN)) {
+        const label = match[0];
+        const offset = match.index;
+        if (
+          offset !== undefined &&
+          offset >= 2 &&
+          citationText.slice(offset - 2, offset) === "[^" &&
+          okfMarkdownEscapedAt(citationText, offset - 2)
+        )
+          continue;
+        if (
+          label &&
+          (offset === undefined ||
+            offset < 2 ||
+            citationText.slice(offset - 2, offset) !== "[^" ||
+            citationText[offset + label.length] !== "]")
+        )
+          throw new Error(`managed OKF source provenance mismatch on page ${path}`);
+      }
+      const managedByLabel = new Map(
+        references
+          .filter((reference) => reference.piScholar?.managedBy === "pi-scholar" && typeof reference.id === "string")
+          .map((reference) => [reference.id!, reference] as const),
+      );
+      for (const label of labels) {
+        const chunk = chunkById.get(label);
+        if ((PI_CHUNK_LABEL.test(label) || chunk !== undefined) && !managedByLabel.has(label))
+          throw new Error(`managed OKF source provenance mismatch on page ${path}`);
+      }
+      for (const reference of references) {
+        const identity = reference.piScholar;
+        if (identity?.managedBy !== "pi-scholar") continue;
+        const source = sourceById.get(identity.sourceId);
+        if (
+          typeof reference.id !== "string" ||
+          !referenceLabels.has(reference.id) ||
+          !definitionLabels.has(reference.id)
+        )
+          throw new Error(`managed OKF source provenance mismatch on page ${path}`);
+        const chunk = chunkByIdentity.get(`${identity.sourceId}\0${identity.chunkId}`);
+        const expectedChunkId = `${identity.sourceId}:${identity.ordinal}`;
+        if (
+          !source ||
+          (source.status === "removed" && pageStatus !== "drifted") ||
+          !chunk ||
+          !Number.isInteger(identity.ordinal) ||
+          chunk.ordinal !== identity.ordinal ||
+          chunk.chunk_id !== expectedChunkId ||
+          reference.id !== identity.chunkId ||
+          reference.resource !== `pi-scholar://source/${identity.sourceId}/chunk/${identity.ordinal}` ||
+          identity.sourceDigest !== source.digest ||
+          identity.chunkDigest !== chunk.digest
+        )
+          throw new Error(`managed OKF source provenance mismatch on page ${path}`);
+        if (source.status === "removed") continue;
+        dependencies.push({ sourceId: identity.sourceId, pageId, chunkId: identity.chunkId, pageDigest });
+      }
+    }
+    return dependencies;
+  }
   private refreshDependencies(): void {
+    const dependencies = this.discoverCurrentCitationDependencies();
     transaction(this.db, () => {
       dbRun(this.db, "DELETE FROM source_dependencies WHERE page_id IS NOT NULL OR relation <> 'citation'");
-      const sources = dbAll<{ source_id: string }>(
-        this.db,
-        "SELECT source_id FROM sources WHERE status != 'removed' ORDER BY source_id",
-      );
-      const chunks = dbAll<{ source_id: string; chunk_id: string }>(
-        this.db,
-        "SELECT source_id, chunk_id FROM source_chunks ORDER BY source_id, ordinal",
-      );
-      const chunksBySource = new Map<string, string[]>();
-      for (const chunk of chunks) {
-        const values = chunksBySource.get(chunk.source_id) ?? [];
-        values.push(chunk.chunk_id);
-        chunksBySource.set(chunk.source_id, values);
-      }
-      const pages = dbAll<Row>(
-        this.db,
-        "SELECT page_id, relative_path FROM pages WHERE status != 'retired' ORDER BY relative_path, page_id",
-      );
-      const wikiRoot = wikiPathFor(this.paths);
-      for (const page of pages) {
-        const pageId = String(page.page_id);
-        const path = validRelativePath(String(page.relative_path ?? ""));
-        const absolute = safeRelativePath(wikiRoot, path);
-        let body: string;
-        try {
-          body = readFileSync(absolute, "utf8");
-        } catch (error) {
-          if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw error;
-        }
-        for (const source of sources) {
-          const sourceId = String(source.source_id);
-          const citedChunks = (chunksBySource.get(sourceId) ?? []).filter((chunkId) => body.includes(chunkId));
-          if (citedChunks.length) {
-            for (const chunkId of citedChunks)
-              dbRun(
-                this.db,
-                "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, ?)",
-                [sourceId, pageId, chunkId, "citation"],
-              );
-          } else if (body.includes(sourceId)) {
-            dbRun(
-              this.db,
-              "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, ?)",
-              [sourceId, pageId, null, "citation"],
-            );
-          }
-        }
+      for (const dependency of dependencies) {
+        dbRun(
+          this.db,
+          "INSERT OR IGNORE INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, ?, ?, ?)",
+          [dependency.sourceId, dependency.pageId, dependency.chunkId, "citation"],
+        );
       }
       const coveredPages = dbAll<{ page_id: string }>(
         this.db,
@@ -1536,16 +1604,12 @@ export class SourceService {
       }
     });
   }
-  private currentDependentPageIds(sourceId: string): string[] {
+  private currentDependentPageIds(sourceId: string, dependencies: CurrentCitationDependency[]): string[] {
     return [
       ...new Set(
-        dbAll<{ page_id: string }>(
-          this.db,
-          "SELECT DISTINCT sd.page_id FROM source_dependencies sd JOIN pages p ON p.page_id = sd.page_id WHERE sd.source_id = ? AND sd.relation = 'citation' AND p.status != 'retired' AND sd.page_id IS NOT NULL ORDER BY sd.page_id",
-          [sourceId],
-        ).map((row) => row.page_id),
+        dependencies.filter((dependency) => dependency.sourceId === sourceId).map((dependency) => dependency.pageId),
       ),
-    ];
+    ].sort();
   }
   private affectedOpenQuizIds(sourceId: string): string[] {
     return dbAll<{ quiz_id: string }>(
@@ -1561,6 +1625,24 @@ export class SourceService {
       [sourceId],
     ).map((row) => row.quiz_id);
   }
+  private affectedOpenQuizIdsForPages(pageIds: readonly string[]): string[] {
+    if (!pageIds.length) return [];
+    const placeholders = pageIds.map(() => "?").join(", ");
+    return dbAll<{ quiz_id: string }>(
+      this.db,
+      `SELECT DISTINCT q.quiz_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_pages qp ON qp.question_id = qq.question_id JOIN quiz_evidence qe ON qe.quiz_id = q.quiz_id AND qe.page_id = qp.page_id JOIN pages p ON p.page_id = qp.page_id WHERE q.status = 'open' AND qp.page_id IN (${placeholders}) AND p.status != 'retired' ORDER BY q.quiz_id`,
+      [...pageIds],
+    ).map((row) => row.quiz_id);
+  }
+  private affectedSubmittedQuizIdsForPages(pageIds: readonly string[]): string[] {
+    if (!pageIds.length) return [];
+    const placeholders = pageIds.map(() => "?").join(", ");
+    return dbAll<{ quiz_id: string }>(
+      this.db,
+      `SELECT DISTINCT q.quiz_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_pages qp ON qp.question_id = qq.question_id JOIN quiz_evidence qe ON qe.quiz_id = q.quiz_id AND qe.page_id = qp.page_id JOIN pages p ON p.page_id = qp.page_id WHERE q.status = 'submitted' AND qp.page_id IN (${placeholders}) AND NOT EXISTS (SELECT 1 FROM page_results pr WHERE pr.quiz_id = q.quiz_id AND pr.page_id = qp.page_id) AND p.status != 'retired' ORDER BY q.quiz_id`,
+      [...pageIds],
+    ).map((row) => row.quiz_id);
+  }
   private sourceDependencyRows(sourceId: string): Row[] {
     return dbAll<Row>(
       this.db,
@@ -1568,16 +1650,78 @@ export class SourceService {
       [sourceId],
     );
   }
-  private removalConfirmationId(sourceId: string, currentDigest: string, dependentPageIds: string[]): string {
+  private removalConfirmationId(
+    sourceId: string,
+    currentDigest: string,
+    dependentPageIds: string[],
+    dependencies?: readonly CurrentCitationDependency[],
+  ): string {
+    let sourceDependencies: Row[];
+    if (dependencies === undefined) sourceDependencies = this.sourceDependencyRows(sourceId);
+    else {
+      const preserved = dbAll<Row>(
+        this.db,
+        "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies WHERE source_id = ? AND page_id IS NULL AND relation = 'citation' ORDER BY source_id, chunk_id",
+        [sourceId],
+      );
+      const current = new Map<string, { source_id: string; page_id: string; chunk_id: string }>();
+      for (const dependency of dependencies) {
+        if (dependency.sourceId === sourceId)
+          current.set(`${dependency.pageId}\0${dependency.chunkId}`, {
+            source_id: dependency.sourceId,
+            page_id: dependency.pageId,
+            chunk_id: dependency.chunkId,
+          });
+      }
+      const coveredPageIds = new Set(
+        dbAll<{ page_id: string }>(
+          this.db,
+          "SELECT DISTINCT qp.page_id FROM quizzes q JOIN quiz_questions qq ON qq.quiz_id = q.quiz_id JOIN question_pages qp ON qp.question_id = qq.question_id JOIN quiz_evidence qe ON qe.quiz_id = q.quiz_id AND qe.page_id = qp.page_id WHERE q.status = 'open' ORDER BY qp.page_id",
+        ).map((row) => row.page_id),
+      );
+      sourceDependencies = [
+        ...preserved,
+        ...[...current.values()].map((dependency) => ({ ...dependency, relation: "citation" })),
+        ...[...current.values()]
+          .filter((dependency) => coveredPageIds.has(dependency.page_id))
+          .map((dependency) => ({ ...dependency, relation: "question" })),
+      ];
+    }
+    const dependentPages =
+      dependencies === undefined
+        ? dbAll<{ page_id: string; digest: string }>(
+            this.db,
+            "SELECT page_id, digest FROM pages WHERE page_id IN (SELECT page_id FROM source_dependencies WHERE source_id = ? AND page_id IS NOT NULL) ORDER BY page_id",
+            [sourceId],
+          )
+        : [
+            ...new Map(
+              dependencies
+                .filter((dependency) => dependency.sourceId === sourceId)
+                .map((dependency) => [
+                  dependency.pageId,
+                  { page_id: dependency.pageId, digest: dependency.pageDigest },
+                ]),
+            ).values(),
+          ].sort((left, right) => left.page_id.localeCompare(right.page_id));
+    const affectedOpenQuizIds =
+      dependencies === undefined
+        ? this.affectedOpenQuizIds(sourceId)
+        : this.affectedOpenQuizIdsForPages(dependentPageIds);
+    const affectedSubmittedQuizIds =
+      dependencies === undefined
+        ? this.affectedSubmittedQuizIds(sourceId)
+        : this.affectedSubmittedQuizIdsForPages(dependentPageIds);
     return digestBytes(
       Buffer.from(
         canonical({
           sourceId,
           currentDigest,
           dependentPageIds,
-          sourceDependencies: this.sourceDependencyRows(sourceId),
-          affectedOpenQuizIds: this.affectedOpenQuizIds(sourceId),
-          affectedSubmittedQuizIds: this.affectedSubmittedQuizIds(sourceId),
+          dependentPages,
+          sourceDependencies,
+          affectedOpenQuizIds,
+          affectedSubmittedQuizIds,
         }),
       ),
     );
@@ -1653,10 +1797,10 @@ export class SourceService {
     const manifest = parseManifest(locations.packetPath);
     if (manifest.sourceId !== sourceId || manifest.originalDigest !== locations.digest)
       throw new Error("source packet identity mismatch");
-    this.refreshDependencies();
-    const dependentPageIds = this.currentDependentPageIds(sourceId);
+    const dependencies = this.discoverCurrentCitationDependencies();
+    const dependentPageIds = this.currentDependentPageIds(sourceId, dependencies);
     const currentDigest = manifest.originalDigest;
-    const confirmationId = this.removalConfirmationId(sourceId, currentDigest, dependentPageIds);
+    const confirmationId = this.removalConfirmationId(sourceId, currentDigest, dependentPageIds, dependencies);
     return { sourceId, packetPath: locations.packetPath, currentDigest, dependentPageIds, confirmationId };
   }
   async removeConfirmed(
@@ -1668,6 +1812,7 @@ export class SourceService {
     const locations = this.removalLocations(sourceId, source);
     const reconciled = await this.reconcileRemovalState(sourceId, source, locations);
     if (reconciled) return reconciled;
+    this.refreshDependencies();
     const preview = this.removalPreview(sourceId);
     const token = typeof confirmation === "string" ? confirmation : confirmation.confirmationId;
     if (token !== preview.confirmationId) throw new Error("stale removal confirmation");

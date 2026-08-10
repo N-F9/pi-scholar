@@ -395,6 +395,19 @@ describe("vault foundation", () => {
     assert.ok(report.checks.length > 0);
     assert.equal(readFileSync(paths.vaultConfigPath, "utf8"), before);
   });
+  it("doctor enforces OKF root and concept conformance", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const initial = doctor(paths.vaultRoot);
+    assert.equal(initial.checks.find((item) => item.name === "okf")?.status, "pass");
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const index = readFileSync(indexPath, "utf8");
+    writeFileSync(indexPath, index.replace('okf_version: "0.2"', 'okf_version: "0.1"'));
+    assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status, "fail");
+    writeFileSync(indexPath, index);
+    writeFileSync(join(paths.wikiRoot, "malformed.md"), "---\ntitle: Missing type\n---\nbody\n");
+    assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "okf")?.status, "fail");
+  });
 
   it("doctor rejects a tampered quiz answer without rewriting the sheet", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -529,6 +542,120 @@ describe("vault foundation", () => {
     db.close();
     const report = doctor(paths.vaultRoot);
     assert.equal(report.checks.find((item) => item.name === "source-packets")?.status, "fail");
+  });
+  it("previews current source dependents without mutating dependencies", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const sources = new SourceService(db, paths);
+    const wiki = new WikiService(db, paths);
+    try {
+      writeFileSync(join(paths.inboxRoot, "preview.txt"), "evidence\n");
+      const entry = (await sources.discover())[0];
+      if (!entry) throw new Error("source entry was not discovered");
+      const result = await sources.admitClaim(await sources.claim(entry));
+      const chunkId = result.manifest.chunks[0]?.chunkId;
+      if (!chunkId) throw new Error("source chunk is missing");
+      const page = await wiki.create({
+        path: "preview.md",
+        body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
+      });
+      const now = new Date().toISOString();
+      db.run(
+        "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'submitted', NULL, ?, ?, NULL, NULL)",
+        ["preview-submitted", "2099-01-03", now, now],
+      );
+      db.run(
+        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, ?)",
+        ["preview-question", "preview-submitted", "Explain", "[]"],
+      );
+      db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
+        "preview-question",
+        page.page.pageId,
+        JSON.stringify("Explain"),
+        1,
+      ]);
+      db.run(
+        "INSERT INTO quiz_evidence (quiz_id, reference, page_id, relative_path, anchor, heading, page_digest, page_revision, text_digest, excerpt, excerpt_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+          "preview-submitted",
+          "preview-evidence",
+          page.page.pageId,
+          page.page.relativePath,
+          "#grounded",
+          "Grounded",
+          page.page.digest,
+          page.page.revision,
+          "text-digest",
+          `Grounded at [^${chunkId}].`,
+          "excerpt-digest",
+        ],
+      );
+      const dependenciesBefore = db.all<Record<string, unknown>>(
+        "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies ORDER BY source_id, page_id, chunk_id, relation",
+      );
+      assert.deepEqual(dependenciesBefore, []);
+      const initialPreview = sources.removalPreview(result.sourceId);
+      assert.deepEqual(initialPreview.dependentPageIds, [page.page.pageId]);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies ORDER BY source_id, page_id, chunk_id, relation",
+        ),
+        dependenciesBefore,
+      );
+      assert.equal(sources.removalPreview(result.sourceId).confirmationId, initialPreview.confirmationId);
+      await assert.rejects(
+        sources.removeConfirmed(result.sourceId, initialPreview.confirmationId),
+        /submitted quizzes without page settlement/iu,
+      );
+      const pagePath = join(paths.wikiRoot, page.page.relativePath);
+      writeFileSync(pagePath, `${page.content}\nExternal edit.\n`);
+      const editedPreview = sources.removalPreview(result.sourceId);
+      assert.notEqual(editedPreview.confirmationId, initialPreview.confirmationId);
+      await assert.rejects(
+        sources.removeConfirmed(result.sourceId, initialPreview.confirmationId),
+        /stale removal confirmation/iu,
+      );
+      writeFileSync(pagePath, page.content);
+      assert.equal(sources.removalPreview(result.sourceId).confirmationId, initialPreview.confirmationId);
+      rmSync(pagePath);
+      assert.throws(() => sources.removalPreview(result.sourceId), /ENOENT|no such file/iu);
+      writeFileSync(pagePath, page.content);
+      db.run("INSERT INTO source_dependencies (source_id, page_id, chunk_id, relation) VALUES (?, NULL, ?, ?)", [
+        result.sourceId,
+        chunkId,
+        "citation",
+      ]);
+      const staleRows = db.all<Record<string, unknown>>(
+        "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies ORDER BY source_id, page_id, chunk_id, relation",
+      );
+      const confirmationPreview = sources.removalPreview(result.sourceId);
+      assert.deepEqual(confirmationPreview.dependentPageIds, [page.page.pageId]);
+      assert.deepEqual(
+        db.all<Record<string, unknown>>(
+          "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies ORDER BY source_id, page_id, chunk_id, relation",
+        ),
+        staleRows,
+      );
+      await assert.rejects(
+        sources.removeConfirmed(result.sourceId, confirmationPreview.confirmationId),
+        /submitted quizzes without page settlement/iu,
+      );
+      assert.deepEqual(
+        db
+          .all<Record<string, unknown>>(
+            "SELECT source_id, page_id, chunk_id, relation FROM source_dependencies ORDER BY source_id, page_id, chunk_id, relation",
+          )
+          .map((row) => ({ ...row })),
+        [
+          { source_id: result.sourceId, page_id: null, chunk_id: chunkId, relation: "citation" },
+          { source_id: result.sourceId, page_id: page.page.pageId, chunk_id: chunkId, relation: "citation" },
+        ],
+      );
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
   it("doctor streams source artifacts and rejects packet tampering", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));

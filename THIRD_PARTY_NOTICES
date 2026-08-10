@@ -24,3 +24,5 @@ Direct runtime dependencies used by this package include:
 - @mariozechner/pi-coding-agent — MIT, loaded as a Pi peer package.
 - typebox — MIT, loaded as a Pi peer package.
 - ts-fsrs — see its installed package LICENSE and upstream notices.
+- mdast-util-from-markdown — MIT, used to identify standard Markdown code spans and blocks during provenance parsing.
+- yaml — ISC, used for OKF v0.2 frontmatter parsing and serialization.
