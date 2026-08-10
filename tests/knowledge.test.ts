@@ -1275,6 +1275,7 @@ describe("wiki mechanics", () => {
       }),
     ).rejects.toThrow(/keyed footnote/u);
     for (const [path, body] of [
+      ["destination-shaped-footnote-body.md", `Claim.[^destination]\n\n[^destination]: ${sourceId}:0`],
       ["spaced-footnote-body.md", `Claim.[^spaced]\n\n[^spaced]:    visible ${sourceId}:0`],
       [
         "continued-footnote-body.md",
