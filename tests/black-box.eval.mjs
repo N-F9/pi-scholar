@@ -189,8 +189,8 @@ test("daily quiz is guarded in a fresh vault", async () => {
     assert.equal([dateBefore, dateAfter].includes(context?.date), true);
     assert.equal(context?.initializationEnabled, true);
     assert.equal(context?.expiredCount, 0);
-    assert.deepEqual(context?.eligiblePages, []);
-    assert.deepEqual(context?.evidence, []);
+    assert.deepEqual(context?.candidates, []);
+    assert.equal(Object.hasOwn(context, "evidence"), false);
     assert.equal(Object.hasOwn(context, "quiz"), false);
     assert.equal(context?.message, "Initialization maintenance is active; quiz publication is blocked.");
     assertDomainSnapshot(vault, initial);

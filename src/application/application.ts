@@ -23,9 +23,11 @@ import type {
   PublicQuizRecord,
   PublicSourceRecord,
   QuizAnswerInput,
+  QuizCandidateRecord,
   QuizContext,
   QuizDetailRecord,
   QuizEvidenceRecord,
+  QuizEvidenceRequest,
   QuizGradeRecord,
   QuizPageResultRecord,
   QuizPublicationInput,
@@ -1567,23 +1569,48 @@ export class ScholarApplication {
     }
     return evidence;
   }
+  private async quizCandidates(pages: readonly PageLearningRecord[]): Promise<readonly QuizCandidateRecord[]> {
+    const candidates = await Promise.all(
+      pages.map(async (learning) => {
+        const result = await this.wikiResult(learning.pageId);
+        if (
+          result.drift ||
+          result.page.status !== "active" ||
+          result.page.quizWorthiness !== "eligible" ||
+          sha256(result.markdown) !== result.page.digest ||
+          result.page.pageId !== learning.pageId
+        )
+          return undefined;
+        return {
+          pageId: result.page.pageId,
+          path: result.page.relativePath,
+          title: result.page.title,
+          dueAt: learning.dueAt,
+          sections: result.sections.map((section) => ({
+            anchor: section.anchor,
+            ...(section.heading === undefined ? {} : { heading: section.heading }),
+          })),
+        };
+      }),
+    );
+    return candidates.filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined);
+  }
   async getQuizContext(input: { readonly date?: string } = {}): Promise<QuizContext> {
     if (!isRecord(input)) throw new ValidationError("quiz context must be an object");
     exact(input, ["date"], "quiz context");
     const date = input.date === undefined ? await this.currentLocalDate() : requiredString(input, "date");
-    const currentDate = await this.currentLocalDate();
-    if (date !== currentDate) throw new ValidationError("quiz context is limited to the current local date");
     return this.durableDirect(async () => {
+      if (date !== (await this.currentLocalDate()))
+        throw new ValidationError("quiz context is limited to the current local date");
       const expiredCount = this.quiz.expirePrior(date);
       const settings = await this.getSettings();
-      const eligiblePages = await this.filterLiveDriftPages(this.scheduler.selectDuePages(date));
+      const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       const quiz = this.quiz.get(date);
       return {
         date,
         initializationEnabled: settings.settings.initializationEnabled,
         expiredCount,
-        eligiblePages,
-        evidence: await this.quizEvidence(eligiblePages),
+        candidates: await this.quizCandidates(duePages),
         ...(quiz ? { quiz: await this.quizDetail(quiz) } : {}),
         ...(settings.settings.initializationEnabled
           ? { message: "Initialization maintenance is active; quiz publication is blocked." }
@@ -1591,13 +1618,35 @@ export class ScholarApplication {
       };
     }, "quiz:context");
   }
+  async getQuizEvidence(input: QuizEvidenceRequest): Promise<readonly QuizEvidenceRecord[]> {
+    if (!isRecord(input)) throw new ValidationError("quiz evidence must be an object");
+    exact(input, ["date", "pageIds"], "quiz evidence");
+    const date = requiredString(input, "date");
+    if (
+      !Array.isArray(input.pageIds) ||
+      input.pageIds.length === 0 ||
+      input.pageIds.some((pageId) => typeof pageId !== "string" || !pageId.trim())
+    )
+      throw new ValidationError("pageIds must be a non-empty array of nonempty strings");
+    const pageIds = input.pageIds.map((pageId) => String(pageId).trim());
+    if (new Set(pageIds).size !== pageIds.length) throw new ValidationError("pageIds must be unique");
+    return withWriterLock(this.paths, async () => {
+      if (date !== (await this.currentLocalDate()))
+        throw new ValidationError("quiz evidence is limited to the current local date");
+      const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date, false));
+      const byId = new Map(duePages.map((page) => [page.pageId, page]));
+      const selectedPages = pageIds.map((pageId) => {
+        const page = byId.get(pageId);
+        if (!page) throw new ValidationError(`Quiz page is not currently eligible: ${pageId}`);
+        return page;
+      });
+      return this.quizEvidence(selectedPages);
+    });
+  }
   private async validateQuizEvidence(
     questions: readonly QuizQuestionProposal[],
     selectedPages: readonly PageLearningRecord[],
   ): Promise<void> {
-    if (questions.length > 4) throw new ValidationError("A quiz may contain at most four questions");
-    if (questions.filter((question) => question.pages.length > 1).length > 2)
-      throw new ValidationError("A quiz may contain at most two synthesis questions");
     const selected = new Set(selectedPages.map((page) => page.pageId));
     const evidence = await this.quizEvidence(selectedPages);
     const known = new Set(evidence.map((item) => item.reference));
@@ -1607,14 +1656,9 @@ export class ScholarApplication {
       references.add(item.reference);
       byPage.set(item.pageId, references);
     }
-    const singlePageCoverage = new Map<string, number>();
     for (const question of questions) {
       if (!question.pages.length) throw new ValidationError("Every quiz question must cover a wiki page");
       if (!question.sourceRefs.length) throw new ValidationError("Every quiz question requires source evidence");
-      if (question.pages.length === 1) {
-        const pageId = question.pages[0]!.pageId.trim();
-        singlePageCoverage.set(pageId, (singlePageCoverage.get(pageId) ?? 0) + 1);
-      }
       for (const page of question.pages) {
         if (!selected.has(page.pageId))
           throw new ValidationError(`Quiz question references an ineligible page: ${page.pageId}`);
@@ -1625,33 +1669,39 @@ export class ScholarApplication {
       if (question.sourceRefs.some((reference) => !known.has(reference)))
         throw new ValidationError("Quiz question references unknown source evidence");
     }
-    for (const page of selectedPages) {
-      if (singlePageCoverage.get(page.pageId) !== 1)
-        throw new ValidationError(`Every selected page requires exactly one single-page question: ${page.pageId}`);
-    }
   }
   async publishQuiz(input: QuizPublicationInput): Promise<QuizDetailRecord> {
     const proposal = decodeQuizPublication(input);
     const date = proposal.date;
-    const currentDate = await this.currentLocalDate();
-    if (date !== currentDate) throw new ValidationError("quiz publication is limited to the current local date");
     let blocked = false;
     const result = await this.durableDirect(async () => {
+      if (date !== (await this.currentLocalDate()))
+        throw new ValidationError("quiz publication is limited to the current local date");
       const settings = await this.getSettings();
       if (settings.settings.initializationEnabled) {
         blocked = true;
         return undefined;
       }
-      const selectedPages = await this.filterLiveDriftPages(this.scheduler.selectDuePages(date));
+      const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       if (proposal.status === "skipped") {
-        if (selectedPages.length) throw new ValidationError("A quiz may be skipped only when pages are eligible");
+        if (duePages.length) throw new ValidationError("A quiz may be skipped only when no pages are eligible");
         return this.quizDetail(this.quiz.createDailyQuiz({ date, selectedPageIds: [], questionSpecs: [] }));
       }
+      const selectedPageIds = [
+        ...new Set(proposal.questions.flatMap((question) => question.pages.map((page) => page.pageId))),
+      ];
+      if (!selectedPageIds.length) throw new ValidationError("A published quiz must select at least one wiki page");
+      const eligibleById = new Map(duePages.map((page) => [page.pageId, page]));
+      const selectedPages = selectedPageIds.map((pageId) => {
+        const page = eligibleById.get(pageId);
+        if (!page) throw new ValidationError(`Quiz question references an ineligible page: ${pageId}`);
+        return page;
+      });
       await this.validateQuizEvidence(proposal.questions, selectedPages);
       return this.quizDetail(
         this.quiz.createDailyQuiz({
           date,
-          selectedPageIds: selectedPages.map((page) => page.pageId),
+          selectedPageIds,
           questionSpecs: proposal.questions,
         }),
       );

@@ -211,7 +211,8 @@ function decodeQuestion(value: unknown): QuizQuestionProposal {
   });
   const choices = value.choices === undefined ? undefined : stringArray(value.choices, "choices");
   const kind = requiredString(value, "kind") as QuizQuestionProposal["kind"];
-  if (kind !== "short-answer" && kind !== "multiple-choice") throw new ValidationError("quiz question kind is invalid");
+  if (kind !== "free-response" && kind !== "multiple-choice")
+    throw new ValidationError("quiz question kind is invalid");
   return {
     kind,
     prompt: requiredString(value, "prompt"),

@@ -63,7 +63,8 @@ export function ReadOnlyQuestions({
           <li key={question.questionId}>
             <Card className="shadow-none">
               <p className="eyebrow">
-                Question {question.ordinal} · {question.kind === "multiple-choice" ? "Multiple choice" : "Short answer"}
+                Question {question.ordinal} ·{" "}
+                {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
               </p>
               <div className="mt-3">
                 <Markdown source={question.prompt} />

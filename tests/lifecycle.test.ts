@@ -28,6 +28,9 @@ type FakeLifecycleApp = {
   getExtractContext: () => Promise<unknown>;
   getIngestContext: () => Promise<unknown>;
   getLintContext: () => Promise<unknown>;
+  getQuizContext: () => Promise<unknown>;
+  getQuizEvidence: (input: unknown) => Promise<unknown>;
+  publishQuiz: (input: unknown) => Promise<unknown>;
   publishExtraction: (input: unknown) => Promise<unknown>;
   applyWikiChange: (input: unknown) => Promise<unknown>;
   finishWorkflow: (requestId: string, status: string, options?: unknown) => Promise<unknown>;
@@ -76,6 +79,9 @@ function fakeLifecycleApp(
     getExtractContext: async () => context,
     getIngestContext: async () => ({}),
     getLintContext: async () => ({}),
+    getQuizContext: async () => context,
+    getQuizEvidence: async () => [],
+    publishQuiz: async () => ({}),
     publishExtraction,
     applyWikiChange: async () => ({}),
     finishWorkflow: async (_requestId, status, options) => {
@@ -155,6 +161,7 @@ describe("Pi package lifecycle", () => {
       "scholar_finish_ingest",
       "scholar_finish_lint",
       "scholar_get_daily_context",
+      "scholar_get_daily_evidence",
       "scholar_get_extract_context",
       "scholar_get_grading_context",
       "scholar_get_ingest_context",
@@ -179,6 +186,7 @@ describe("Pi package lifecycle", () => {
         "scholar_finish_ingest",
         "scholar_finish_lint",
         "scholar_get_daily_context",
+        "scholar_get_daily_evidence",
         "scholar_get_extract_context",
         "scholar_get_grading_context",
         "scholar_get_ingest_context",
@@ -237,6 +245,79 @@ describe("Pi package lifecycle", () => {
     assert.equal(
       messages.some((message) => message.includes("/skill:lint")),
       false,
+    );
+  });
+  it("keeps the daily publish action available after context and evidence reads", async () => {
+    const calls: string[] = [];
+    const fixture = fakeLifecycleApp({ initializationEnabled: false }, async () => ({}));
+    fixture.app.getQuizContext = async () => {
+      calls.push("context");
+      return {
+        date: "2026-08-10",
+        initializationEnabled: false,
+        expiredCount: 0,
+        candidates: [
+          { pageId: "page-a", path: "page-a.md", title: "Page A", dueAt: "2026-08-10T00:00:00.000Z", sections: [] },
+        ],
+      };
+    };
+    fixture.app.getQuizEvidence = async (input) => {
+      calls.push(`evidence:${JSON.stringify(input)}`);
+      return [{ reference: "ref-a" }];
+    };
+    fixture.app.publishQuiz = async () => {
+      calls.push("publish");
+      return { status: "published" };
+    };
+
+    await invoke(fixture.tools, "scholar_get_daily_context", { date: "2026-08-10" }, fixture.root);
+    await invoke(
+      fixture.tools,
+      "scholar_get_daily_evidence",
+      { date: "2026-08-10", pageIds: ["page-a"] },
+      fixture.root,
+    );
+    await invoke(
+      fixture.tools,
+      "scholar_get_daily_evidence",
+      { date: "2026-08-10", pageIds: ["page-a"] },
+      fixture.root,
+    );
+    await invoke(
+      fixture.tools,
+      "scholar_publish_daily",
+      {
+        status: "published",
+        date: "2026-08-10",
+        questions: [
+          {
+            kind: "free-response",
+            prompt: "Explain page A",
+            pages: [{ pageId: "page-a", criterion: "Explain", weight: 1 }],
+            sourceRefs: ["ref-a"],
+          },
+        ],
+      },
+      fixture.root,
+    );
+    assert.deepEqual(calls, [
+      "context",
+      'evidence:{"date":"2026-08-10","pageIds":["page-a"]}',
+      'evidence:{"date":"2026-08-10","pageIds":["page-a"]}',
+      "publish",
+    ]);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+    await assert.rejects(
+      invoke(
+        fixture.tools,
+        "scholar_publish_daily",
+        { status: "skipped", date: "2026-08-10", reason: "none" },
+        fixture.root,
+      ),
+      /daily context is required/u,
     );
   });
 

@@ -298,7 +298,7 @@ export interface WikiChangeResult {
 }
 
 export type QuizStatus = "open" | "submitted" | "expired" | "skipped" | "failed";
-export type QuizQuestionKind = "short-answer" | "multiple-choice";
+export type QuizQuestionKind = "free-response" | "multiple-choice";
 
 export interface QuizQuestionPageRecord {
   readonly pageId: string;
@@ -426,6 +426,23 @@ export interface QuizEvidenceRecord {
   readonly textDigest: string;
   readonly excerpt: string;
 }
+export interface QuizCandidateSection {
+  readonly anchor: string;
+  readonly heading?: string;
+}
+
+export interface QuizCandidateRecord {
+  readonly pageId: string;
+  readonly path: string;
+  readonly title: string;
+  readonly dueAt: IsoDateTime;
+  readonly sections: readonly QuizCandidateSection[];
+}
+
+export interface QuizEvidenceRequest {
+  readonly date: LocalDate;
+  readonly pageIds: readonly string[];
+}
 
 export interface QuizQuestionProposal {
   readonly kind: QuizQuestionKind;
@@ -444,8 +461,7 @@ export interface QuizContext {
   readonly date: LocalDate;
   readonly initializationEnabled: boolean;
   readonly expiredCount: number;
-  readonly eligiblePages: readonly PageLearningRecord[];
-  readonly evidence: readonly QuizEvidenceRecord[];
+  readonly candidates: readonly QuizCandidateRecord[];
   readonly quiz?: QuizDetailRecord;
   readonly message?: string;
 }
