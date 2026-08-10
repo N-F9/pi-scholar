@@ -2,6 +2,26 @@
 
 Use a disposable vault for every destructive or failure-path check. Do not validate against a real user vault.
 
+## Release automation
+
+Complete the one-time setup before the first release:
+
+1. Create a protected GitHub environment named `npm`.
+2. In npm Trusted Publishers, add the GitHub Actions publisher with exactly:
+   - Owner: `N-F9`
+   - Repository: `pi-scholar`
+   - Workflow: `release.yml`
+   - Environment: `npm`
+   - Allowed action: `npm publish`
+3. Protect tags matching `v*`: restrict creation to release maintainers and block updates and deletion.
+
+Trusted publishing uses GitHub OIDC, so do not create or store an npm token secret or other npm credentials. npm provenance starts automatically once the repository is public. The workflow verifies and packs in an unprivileged job, publishes that exact tarball from the protected `npm` environment, then attaches the same tarball to the GitHub release from a separate job.
+
+Every version change must be a reviewed PR updating `package.json` and `package-lock.json`. Merge it to `main`, then tag that merged commit; never make a direct version commit, ask the release process to merge, reuse a tag, or force-push.
+
+- **Release candidate:** Push a matching `vX.Y.Z-rc.N` tag. The release publishes npm dist-tag `next` and creates a GitHub prerelease. System-test `pi-scholar@next` in a disposable vault, using this validation plan; never use a real vault.
+- **Stable release:** Only after the candidate passes this validation plan, push a matching `vX.Y.Z` tag for the reviewed, merged version. The release publishes npm dist-tag `latest` and creates a normal GitHub release.
+
 ## Package and Pi integration
 
 Test the packed artifact rather than loading the repository directly:
