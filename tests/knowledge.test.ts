@@ -1,14 +1,20 @@
 import { promises as fs } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
-import { parseOkfConcept, serializeOkfConcept, validateOkfIndex, validateOkfLog } from "../src/okf.js";
+import {
+  parseOkfConcept,
+  removeOkfFootnoteDefinitions,
+  serializeOkfConcept,
+  validateOkfIndex,
+  validateOkfLog,
+} from "../src/okf.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
-import { SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
+import { requestSourceToFile, SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
 import { isExecutableHtml, WikiService } from "../src/wiki.js";
 
@@ -332,6 +338,39 @@ describe("source admission mechanics", () => {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
   });
+  it("enforces a wall-clock deadline for slow-drip URL responses", async () => {
+    vi.useFakeTimers();
+    const requestSeen = Promise.withResolvers<void>();
+    const server = createServer((_request, response) => {
+      requestSeen.resolve();
+      response.setHeader("content-type", "text/plain");
+      response.write("partial\n");
+      const interval = setInterval(() => response.write("drip\n"), 5);
+      response.on("close", () => clearInterval(interval));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("URL timeout server address is unavailable");
+      const root = await fs.mkdtemp(join("/tmp", "pi-scholar-url-timeout-"));
+      try {
+        const target = join(root, "payload");
+        const pending = requestSourceToFile(new URL(`http://127.0.0.1:${address.port}/slow.txt`), target, 35);
+        const rejection = expect(pending).rejects.toThrow(/timed out/iu);
+        await requestSeen.promise;
+        await vi.advanceTimersByTimeAsync(35);
+        await rejection;
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      vi.useRealTimers();
+    }
+  });
 
   it("accepts loopback URLs and disk-backed uploads without a fixed size cap", async () => {
     const server = createServer((_request, response) => {
@@ -597,6 +636,23 @@ describe("source admission mechanics", () => {
     await expect(sources.publishedPackets()).rejects.toThrow(/unverified/iu);
     db.close();
   });
+  it("rejects converter and future-field tampering in retained manifests", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "converter-tamper.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const claim = await sources.claim(entry);
+    const result = await sources.admitClaim(claim);
+    const manifestPath = join(result.packetPath, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    manifest.converter = { name: "forged-converter", version: "9" };
+    manifest.futureProvenance = "forged";
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    await expect(sources.publishedPackets()).rejects.toThrow(/unverified/iu);
+    await expect(sources.admitClaim(claim)).rejects.toThrow(/manifest digest/iu);
+    expect(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status).toBe("fail");
+    db.close();
+  });
   it("rejects forged provenance before recovery can rewrite the source row", async () => {
     const { paths, db, sources } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "recovery-tamper.txt"), "evidence\n");
@@ -608,11 +664,30 @@ describe("source admission mechanics", () => {
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
     manifest.displayName = "recovery forgery";
     await fs.writeFile(manifestPath, JSON.stringify(manifest));
-    await expect(sources.admitClaim(claim)).rejects.toThrow(/provenance|unverified/iu);
+    await expect(sources.admitClaim(claim)).rejects.toThrow(/manifest digest|provenance|unverified/iu);
     expect(
       db.get<{ display_name: string }>("SELECT display_name FROM sources WHERE source_id = ?", [result.sourceId])
         ?.display_name,
     ).toBe(result.manifest.displayName);
+    db.close();
+  });
+  it("recovers a retained packet whose catalog write was interrupted", async () => {
+    const { paths, db, sources } = await fixture();
+    const inboxPath = join(paths.inboxRoot, "interrupted-catalog.txt");
+    await fs.writeFile(inboxPath, "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    const published = await sources.admitClaim(await sources.claim(entry));
+    db.run("DELETE FROM sources WHERE source_id = ?", [published.sourceId]);
+
+    await fs.writeFile(inboxPath, "evidence\n");
+    const [replacement] = await sources.discover();
+    if (!replacement) throw new Error("replacement source entry was not discovered");
+    const recovered = await sources.admitClaim(await sources.claim(replacement));
+    expect(recovered.sourceId).toBe(published.sourceId);
+    expect(
+      db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [published.sourceId])?.status,
+    ).toBe("published");
     db.close();
   });
 
@@ -938,6 +1013,16 @@ describe("source admission mechanics", () => {
 });
 
 describe("wiki mechanics", () => {
+  it("rejects YAML keys that collide after string normalization", () => {
+    expect(() => parseOkfConcept('---\ntrue: first\n"true": second\ntype: note\n---\n')).toThrow(/invalid OKF YAML/u);
+    expect(() => parseOkfConcept('---\ntype: note\nmetadata:\n  1: number\n  "1": string\n---\n')).toThrow(
+      /invalid OKF YAML/u,
+    );
+  });
+  it("removes complete managed footnote definitions without following content", () => {
+    const body = "[^managed]: first line\n    second line\n\n\tthird line\nFollowing content.\n[^keep]: ordinary\n";
+    expect(removeOkfFootnoteDefinitions(body, ["managed"])).toBe("Following content.\n[^keep]: ordinary\n");
+  });
   it("keeps a host page ID across guarded rename and refreshes projections", async () => {
     const { paths, db, wiki } = await fixture();
     const created = await wiki.create({ path: "notes/one.md", title: "One", body: "# One\n\nText." });
@@ -1153,6 +1238,122 @@ describe("wiki mechanics", () => {
     await expect(wiki.create({ path: "fabricated.md", body: `fake.[^${sourceId}:1]` })).rejects.toThrow(
       /unknown source chunk citation/u,
     );
+    db.close();
+  });
+  it("ignores source-shaped link and image destinations", async () => {
+    const { db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Destination source", "a".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, "b".repeat(64)],
+    );
+    const created = await wiki.create({
+      path: "destination-literals.md",
+      body: `[link](https://example.test/[^${sourceId}:0])\n\n![image](https://example.test/[^${sourceId}:0])`,
+    });
+    expect(parseOkfConcept(created.content).frontmatter.sources).toBeUndefined();
+    const hiddenFootnote = await wiki.create({
+      path: "hidden-footnote-markdown.md",
+      body: `Claim.[^note]\n\n[^note]: [link](https://example.test/${sourceId}:0) and \`${sourceId}:0\``,
+    });
+    expect(parseOkfConcept(hiddenFootnote.content).frontmatter.sources).toBeUndefined();
+    await expect(
+      wiki.create({ path: "visible-autolink.md", body: `<https://example.test/${sourceId}:0>` }),
+    ).rejects.toThrow(/keyed footnote/u);
+    await expect(
+      wiki.create({ path: "visible-image-alt.md", body: `![${sourceId}:0](https://example.test/image)` }),
+    ).rejects.toThrow(/keyed footnote/u);
+    await expect(
+      wiki.create({
+        path: "visible-footnote-body.md",
+        body: `Claim.[^note]\n\n[^note]: visible ${sourceId}:0`,
+      }),
+    ).rejects.toThrow(/keyed footnote/u);
+    for (const [path, body] of [
+      ["destination-shaped-footnote-body.md", `Claim.[^destination]\n\n[^destination]: ${sourceId}:0`],
+      ["spaced-footnote-body.md", `Claim.[^spaced]\n\n[^spaced]:    visible ${sourceId}:0`],
+      [
+        "continued-footnote-body.md",
+        `Claim.[^continued]\n\n[^continued]: first paragraph\n\n    visible ${sourceId}:0`,
+      ],
+    ] as const)
+      await expect(wiki.create({ path, body })).rejects.toThrow(/keyed footnote/u);
+    db.close();
+  });
+  it("retains custom metadata while regenerating managed source identity", async () => {
+    const { db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Initial source", "a".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, "b".repeat(64)],
+    );
+    const created = await wiki.create({
+      path: "managed-metadata.md",
+      body: `Claim.[^${sourceId}:0]`,
+      frontmatter: {
+        sources: [
+          {
+            id: `${sourceId}:0`,
+            resource: "https://author.example/source",
+            title: "Author title",
+            pi_scholar: {
+              managed_by: "pi-scholar",
+              source_id: "stale-source",
+              chunk_id: "stale-chunk",
+              ordinal: 99,
+            },
+            custom: "keep",
+            nested: { keep: true, labels: ["author"] },
+          },
+        ],
+      },
+    });
+    const initialSources = parseOkfConcept(created.content).frontmatter.sources as Array<Record<string, unknown>>;
+    const initialSource = initialSources[0];
+    expect(initialSource).toMatchObject({
+      id: `${sourceId}:0`,
+      resource: `pi-scholar://source/${sourceId}/chunk/0`,
+      title: "Initial source",
+      custom: "keep",
+      nested: { keep: true, labels: ["author"] },
+    });
+    db.run("UPDATE sources SET display_name = ?, digest = ? WHERE source_id = ?", [
+      "Updated source",
+      "c".repeat(64),
+      sourceId,
+    ]);
+    db.run("UPDATE source_chunks SET digest = ? WHERE chunk_id = ?", ["d".repeat(64), `${sourceId}:0`]);
+    const updated = await wiki.update(created.page.pageId, {
+      body: `Updated claim.[^${sourceId}:0]`,
+      expectedDigest: created.page.digest,
+    });
+    const updatedSources = parseOkfConcept(updated.content).frontmatter.sources as Array<Record<string, unknown>>;
+    const updatedSource = updatedSources[0];
+    expect(updatedSource).toMatchObject({
+      id: `${sourceId}:0`,
+      resource: `pi-scholar://source/${sourceId}/chunk/0`,
+      title: "Updated source",
+      custom: "keep",
+      nested: { keep: true, labels: ["author"] },
+      pi_scholar: {
+        managed_by: "pi-scholar",
+        source_id: sourceId,
+        chunk_id: `${sourceId}:0`,
+        ordinal: 0,
+        source_digest: "c".repeat(64),
+        chunk_digest: "d".repeat(64),
+      },
+    });
     db.close();
   });
   it("ignores citation-shaped literals in Markdown code and accepts external UUID source IDs", async () => {

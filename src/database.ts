@@ -33,7 +33,7 @@ export interface OpenDatabaseOptions {
   readonly initializeSchema?: boolean;
 }
 
-export const SCHEMA_VERSION = 4 as const;
+export const SCHEMA_VERSION = 5 as const;
 export const REQUIRED_TABLES = [
   "schema_meta",
   "sources",
@@ -70,6 +70,7 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     "repository_revision",
     "captured_at",
     "digest",
+    "manifest_digest",
     "manifest_path",
     "error_code",
     "error_message",
@@ -236,6 +237,7 @@ CREATE TABLE IF NOT EXISTS sources (
   repository_revision TEXT,
   captured_at TEXT,
   digest TEXT,
+  manifest_digest TEXT,
   manifest_path TEXT,
   error_code TEXT,
   error_message TEXT,

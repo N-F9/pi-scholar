@@ -176,7 +176,7 @@ Git adds `.git/`. Pi Scholar adds no other product content root.
 ```
 
 - `vault.json` owns the vault ID and format version.
-- `state.sqlite` owns source extraction/ingestion/removal status, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and initialization mode.
+- `state.sqlite` owns source extraction/ingestion/removal status, the source catalog's retained exact packet manifest digests for byte-identity verification and doctor checks, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and initialization mode.
 - `qmd/` is derived external-command state and may be rebuilt; it is never authority.
 - `work/` is private, ignored scratch for prepared admission snapshots, temporary packet publication, Docling output/cache isolation, quarantined removal bytes, and wiki-change rollback snapshots. It is never knowledge or Git content.
 
@@ -427,11 +427,11 @@ Rules:
 
 ## Daily quiz model
 
-### Page-level learning and schema v4
+### Page-level learning and schema v5
 
 The scheduler unit is a **wiki page**. Every eligible page has one `page_learning` row keyed by its stable `page_id` and one `ts-fsrs` state. Page creation and eligibility ensure that row exists. A page rename keeps the same ID and learning history. Drifted or retired pages are excluded from selection while their page learning and review history remain available for inspection.
 
-Schema v4 is the current page-oriented schema. `.pi-scholar/state.sqlite` stores:
+Schema v5 is the current exact page-oriented database schema. `.pi-scholar/state.sqlite` stores:
 
 - `page_learning`: one FSRS schedule/state per `page_id`;
 - `page_prerequisites`: directed `(page_id, prerequisite_page_id)` edges;

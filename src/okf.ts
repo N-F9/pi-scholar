@@ -1,4 +1,6 @@
 import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import { parseDocument, stringify } from "yaml";
 
 export interface OkfConcept {
@@ -46,7 +48,7 @@ function frontmatterBlock(markdown: string): { yaml: string; body: string } {
 }
 
 function parseMapping(yaml: string): Record<string, unknown> {
-  const document = parseDocument(yaml, { uniqueKeys: true });
+  const document = parseDocument(yaml, { stringKeys: true, uniqueKeys: true });
   if (document.errors.length > 0) throw new Error(`invalid OKF YAML: ${document.errors[0]?.message ?? "parse error"}`);
   const value = document.toJS({ mapAsMap: false }) as unknown;
   if (!isRecord(value)) throw new Error("OKF frontmatter must be a YAML mapping");
@@ -87,6 +89,26 @@ function blankMarkdown(value: string): string {
   return value.replace(/[^\r\n]/gu, " ");
 }
 
+function parseMarkdown(body: string): MarkdownNode {
+  return fromMarkdown(body, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as MarkdownNode;
+}
+
+export function okfRenderedText(body: string): string {
+  const text: string[] = [];
+  const visit = (node: MarkdownNode): void => {
+    if (node.type === "text" || node.type === "inlineCode" || node.type === "code") {
+      if (node.value) text.push(node.value);
+      return;
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(parseMarkdown(body));
+  return text.join("\n");
+}
+
 export function okfMarkdownEscapedAt(value: string, index: number): boolean {
   let backslashes = 0;
   for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor--) backslashes++;
@@ -96,19 +118,51 @@ export function okfMarkdownEscapedAt(value: string, index: number): boolean {
 export function okfCitationText(body: string): string {
   const ranges: Array<readonly [number, number]> = [];
   const visit = (node: MarkdownNode): void => {
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
     if (
-      node.type === "code" ||
-      node.type === "inlineCode" ||
-      (node.type === "html" && typeof node.value === "string" && node.value.includes("<!--"))
+      start !== undefined &&
+      end !== undefined &&
+      (node.type === "code" ||
+        node.type === "inlineCode" ||
+        (node.type === "html" && typeof node.value === "string" && node.value.includes("<!--")))
     ) {
-      const start = node.position?.start.offset;
-      const end = node.position?.end.offset;
-      if (start !== undefined && end !== undefined) ranges.push([start, end]);
+      ranges.push([start, end]);
       return;
+    }
+    if (start !== undefined && end !== undefined && node.type === "image") {
+      let depth = 0;
+      for (let cursor = start + 2; cursor < end; cursor++) {
+        if (body[cursor] === "\\") cursor++;
+        else if (body[cursor] === "[") depth++;
+        else if (body[cursor] === "]") {
+          if (depth > 0) depth--;
+          else {
+            ranges.push([cursor + 1, end]);
+            return;
+          }
+        }
+      }
+      ranges.push([start, end]);
+      return;
+    }
+    if (start !== undefined && end !== undefined && node.type === "definition") {
+      const definition = body.slice(start, end);
+      const destination = definition.indexOf("]:");
+      if (destination >= 0) ranges.push([start + destination + 2, end]);
+      else ranges.push([start, end]);
+      return;
+    }
+    if (start !== undefined && end !== undefined && node.type === "link") {
+      const childEnds = (node.children ?? [])
+        .map((child) => child.position?.end.offset)
+        .filter((offset): offset is number => offset !== undefined);
+      const labelEnd = childEnds.length ? Math.max(...childEnds) : start;
+      ranges.push([labelEnd, end]);
     }
     for (const child of node.children ?? []) visit(child);
   };
-  visit(fromMarkdown(body) as MarkdownNode);
+  visit(parseMarkdown(body));
   let visible = body;
   for (const [start, end] of ranges.sort((left, right) => right[0] - left[0]))
     visible = `${visible.slice(0, start)}${blankMarkdown(visible.slice(start, end))}${visible.slice(end)}`;
@@ -131,7 +185,10 @@ export function removeOkfFootnoteDefinitions(body: string, ids: Iterable<string>
   const labels = [...new Set(ids)].filter(Boolean).map((id) => id.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   if (!labels.length) return body;
   const visible = okfCitationText(body);
-  const pattern = new RegExp(`^[ \\t]{0,3}\\[\\^(?:${labels.join("|")})\\]:[^\\n]*(?:\\n|$)`, "gmu");
+  const pattern = new RegExp(
+    `^[ \\t]{0,3}\\[\\^(?:${labels.join("|")})\\]:[^\\r\\n]*(?:\\r?\\n|$)(?:(?:[ \\t]*\\r?\\n)*(?: {4,}|\\t)[^\\r\\n]*(?:\\r?\\n|$))*`,
+    "gmu",
+  );
   const ranges = [...visible.matchAll(pattern)]
     .map((match) => [match.index!, match.index! + match[0].length] as const)
     .reverse();

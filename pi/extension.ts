@@ -53,14 +53,17 @@ type ExtractWorkflowState = {
   readonly completedClaimKeys: ReadonlySet<string>;
   readonly failed: boolean;
   readonly replayContext?: ExtractContext;
+  readonly finalizedReplay?: boolean;
 };
 
-type WorkflowState =
-  | {
-      readonly requestId: string;
-      readonly remaining: number;
-    }
-  | ExtractWorkflowState;
+type ContextWorkflowState = {
+  readonly requestId: string;
+  readonly remaining: number;
+  readonly replayContext?: IngestContext | LintContext | QuizContext;
+  readonly finalizedReplay?: boolean;
+};
+
+type WorkflowState = ContextWorkflowState | ExtractWorkflowState;
 
 type WorkflowFinishOptions = {
   readonly progress?: number;
@@ -389,8 +392,10 @@ function recordExtractAttempt(
   attemptedClaimKeys.add(claimKey);
   const completedClaimKeys = new Set(state.completedClaimKeys);
   if (succeeded) completedClaimKeys.add(claimKey);
+  const activeState = { ...state };
+  if (succeeded) delete activeState.replayContext;
   const next = {
-    ...state,
+    ...activeState,
     attemptedClaimKeys,
     completedClaimKeys,
     failed: state.failed || !succeeded,
@@ -442,14 +447,35 @@ async function lifecycleContext<T>(
   const app = await applicationFor(ctx);
   const key = workflowKey(app, kind);
   const existingState = workflowStates.get(key);
-  if (existingState) {
-    if ("expectedClaimKeys" in existingState && existingState.replayContext) {
-      const { replayContext, ...activeState } = existingState;
-      workflowStates.set(key, activeState);
+  if (existingState && "replayContext" in existingState && existingState.replayContext !== undefined) {
+    const { replayContext, finalizedReplay, ...activeState } = existingState;
+    if (finalizedReplay) {
+      workflowStates.delete(key);
       return jsonResult(replayContext);
     }
-    throw new Error(`${kind} workflow is already running`);
+    const automaticallyFinalized =
+      ("remaining" in activeState && activeState.remaining === 0) ||
+      ("expectedClaimKeys" in activeState && activeState.expectedClaimKeys.size === 0);
+    if (automaticallyFinalized) {
+      const failed = "expectedClaimKeys" in activeState && activeState.failed;
+      try {
+        await app.finishWorkflow(
+          activeState.requestId,
+          failed ? "failed" : "succeeded",
+          failed ? extractWorkflowFailure() : { progress: 1, message: "Workflow completed" },
+        );
+        workflowStates.delete(key);
+      } catch (persistenceError) {
+        if (workflowFinalizationApplied(persistenceError))
+          workflowStates.set(key, { ...existingState, finalizedReplay: true });
+        throw persistenceError;
+      }
+    } else {
+      workflowStates.set(key, activeState);
+    }
+    return jsonResult(replayContext);
   }
+  if (existingState) throw new Error(`${kind} workflow is already running`);
   let state: WorkflowState | undefined;
   let result: T;
   try {
@@ -507,17 +533,18 @@ async function lifecycleContext<T>(
         await app.updateWorkflow(requestId, { progress: 0.25, message: "Context loaded" });
       }
     } catch (persistenceError) {
-      if (expectedClaimKeys.size === 0 && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
-      else
-        workflowStates.set(key, {
-          ...extractState,
-          ...(expectedClaimKeys.size === 0 ? {} : { replayContext: context }),
-        });
+      workflowStates.set(key, {
+        ...extractState,
+        replayContext: context,
+        ...(expectedClaimKeys.size === 0 && workflowFinalizationApplied(persistenceError)
+          ? { finalizedReplay: true }
+          : {}),
+      });
       throw persistenceError;
     }
   } else {
     const remaining = kind === "daily" && (result as QuizContext).initializationEnabled ? 0 : 1;
-    const nextState = { requestId, remaining };
+    const nextState: ContextWorkflowState = { requestId, remaining };
     workflowStates.set(key, nextState);
     try {
       if (remaining === 0) {
@@ -527,8 +554,11 @@ async function lifecycleContext<T>(
         await app.updateWorkflow(requestId, { progress: 0.25, message: "Context loaded" });
       }
     } catch (persistenceError) {
-      if (remaining === 0 && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
-      else workflowStates.set(key, nextState);
+      workflowStates.set(key, {
+        ...nextState,
+        replayContext: result as IngestContext | LintContext | QuizContext,
+        ...(remaining === 0 && workflowFinalizationApplied(persistenceError) ? { finalizedReplay: true } : {}),
+      });
       throw persistenceError;
     }
   }
@@ -592,11 +622,12 @@ async function lifecycleFinal<T>(
   }
 
   if (kind === "ingest" || kind === "lint") {
+    const { replayContext: _replayContext, ...activeState } = state as ContextWorkflowState;
+    workflowStates.set(key, activeState);
     await app.updateWorkflow(state.requestId, {
       progress: 0.5,
       message: "Wiki change applied; submit another or finish",
     });
-    workflowStates.set(key, state);
   } else if (kind === "extract") {
     const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, true);
     if (attempt.accepted) {

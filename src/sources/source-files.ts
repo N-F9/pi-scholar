@@ -404,8 +404,12 @@ async function repositoryRevision(root: string): Promise<string> {
 }
 async function repositoryFiles(root: string): Promise<FileSnapshot[]> {
   const result = await repositoryGit(root, "ls-files", 64 * 1024 * 1024);
-  if (result.timedOut || result.code !== 0)
-    throw new Error(`git file listing failed (${result.code ?? result.signal ?? "unknown"})`);
+  if (result.timedOut || result.code !== 0 || result.outputOverflowed)
+    throw new Error(
+      result.outputOverflowed
+        ? "git file listing exceeded the process output limit"
+        : `git file listing failed (${result.code ?? result.signal ?? "unknown"})`,
+    );
   const files: FileSnapshot[] = [];
   const seen = new Set<string>();
   for (const rawPath of result.stdout.split("\0")) {

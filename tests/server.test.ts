@@ -171,10 +171,19 @@ describe("server browser boundary", () => {
         issueCalls += 1;
         return issue;
       },
-      stageSource: async (request: { readonly filePath: string; readonly name: string }) => {
+      stageSource: async (request: {
+        readonly filePath: string;
+        readonly name: string;
+        readonly originalName: string;
+        readonly displayName: string;
+        readonly mediaType?: string;
+      }) => {
         sourceCalls += 1;
         receivedFilePath = request.filePath;
         assert.equal(request.name, "notes.txt");
+        assert.equal(request.originalName, "notes.txt");
+        assert.equal(request.displayName, "notes");
+        assert.equal(request.mediaType, "text/plain");
         assert.equal(readFileSync(request.filePath, "utf8"), "notes");
         assert.equal(statSync(request.filePath).mode & 0o777, 0o600);
         return { source: {} };
@@ -230,6 +239,8 @@ describe("server browser boundary", () => {
         const form = new FormData();
         form.set("kind", "upload");
         form.set("displayName", "notes");
+        form.set("mediaType", "text/plain");
+        form.set("originalName", "notes.txt");
         form.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
         const multipartResponse = await fetch(`${base}/api/v1/sources`, {
           method: "POST",
@@ -237,6 +248,21 @@ describe("server browser boundary", () => {
           body: form,
         });
         assert.equal(multipartResponse.status, 200);
+        assert.equal(sourceCalls, 1);
+
+        const extraPart = new FormData();
+        extraPart.set("kind", "upload");
+        extraPart.set("displayName", "notes");
+        extraPart.set("mediaType", "text/plain");
+        extraPart.set("originalName", "notes.txt");
+        extraPart.append("file", new Blob(["notes"], { type: "text/plain" }), "notes.txt");
+        extraPart.set("extra", "unexpected");
+        const extraPartResponse = await fetch(`${base}/api/v1/sources`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, { "Sec-Fetch-Site": "same-origin", "X-Pi-Scholar-Request": "1" }),
+          body: extraPart,
+        });
+        assert.equal(extraPartResponse.status, 400);
         assert.equal(sourceCalls, 1);
       });
       assert.ok(receivedFilePath);

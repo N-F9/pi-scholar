@@ -184,7 +184,13 @@ export function localCheckpointCommit(
     return pathspec;
   });
   if (exclusions.length) {
-    const stagedExcluded = runGitSync(paths, ["diff", "--cached", "--quiet", "--", ...exclusions]);
+    const stagedExcluded = runGitSync(paths, [
+      "diff",
+      "--cached",
+      "--quiet",
+      "--",
+      ...exclusions.map((path) => `:(literal)${path}`),
+    ]);
     if (stagedExcluded.code === 1) throw new Error("Git checkpoint has pre-staged excluded changes");
     if (stagedExcluded.code !== 0) throw commandFailure(stagedExcluded, "git diff");
   }
@@ -194,7 +200,7 @@ export function localCheckpointCommit(
   result = runGitSync(paths, ["diff", "--cached", "--quiet", "--", ...pathspecs]);
   if (result.code === 0) return { committed: false, subject };
   if (result.code !== 1) throw commandFailure(result, "git diff");
-  result = runGitSync(paths, ["commit", "--no-gpg-sign", "--only", "-m", subject, "--", ...pathspecs]);
+  result = runGitSync(paths, ["commit", "--no-gpg-sign", "-m", subject]);
   if (result.code !== 0) throw commandFailure(result, "git commit");
   const commitIdResult = runGitSync(paths, ["rev-parse", "HEAD"]);
   if (commitIdResult.code !== 0) throw commandFailure(commitIdResult, "git rev-parse");

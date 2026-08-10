@@ -1301,6 +1301,98 @@ describe("application capability boundaries", () => {
       db.close();
     }
   });
+  it("rejects empty ingest exposition while preserving cited updates and retirement", async () => {
+    const { app, db } = fixture({ maintenance: true });
+    try {
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "create-page",
+          path: "ingest-empty-create.md",
+          body: " \t\n",
+        }),
+        /non-empty/u,
+      );
+
+      const chunkId = await publishedChunkId(app);
+      for (const [index, body] of [
+        `[^${chunkId}]`,
+        `# Evidence\n\n[^${chunkId}]`,
+        `<!-- hidden -->[^${chunkId}]`,
+        `[](https://example.test)[^${chunkId}]`,
+        `---\n\n[^${chunkId}]`,
+        `- [^${chunkId}]`,
+      ].entries()) {
+        await assert.rejects(
+          app.applyIngestChange({
+            kind: "create-page",
+            path: `ingest-citation-only-${index}.md`,
+            body,
+          }),
+          /non-empty/u,
+        );
+      }
+      const created = await app.createNote({
+        path: "ingest-empty-replacement.md",
+        body: `# Ingest\n\nOriginal support [^${chunkId}].\n`,
+        quizWorthiness: "skip",
+      });
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "update-page",
+          pageId: created.page.pageId,
+          expectedDigest: created.page.digest,
+          body: " \n\t ",
+        }),
+        /non-empty/u,
+      );
+      assert.match((await app.wiki.get(created.page.pageId)).content, /Original support/u);
+
+      const issue = await app.wiki.report({
+        pageId: created.page.pageId,
+        pageDigest: created.page.digest,
+        heading: "Ingest",
+        kind: "incorrect",
+        description: "Replace the empty exposition.",
+      });
+      await assert.rejects(
+        app.applyIngestChange({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: created.page.pageId,
+            expectedDigest: created.page.digest,
+            body: "\n  ",
+          },
+          resolution: "The empty replacement is rejected.",
+        }),
+        /non-empty/u,
+      );
+      assert.equal((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status, "open");
+
+      const updated = await app.applyIngestChange({
+        kind: "update-page",
+        pageId: created.page.pageId,
+        expectedDigest: created.page.digest,
+        body: `# Ingest\n\nUpdated support [^${chunkId}].\n`,
+      });
+      assert.equal(updated.page?.pageId, created.page.pageId);
+
+      const retire = await app.createNote({
+        path: "ingest-retire.md",
+        body: "# Retire\n\nRemove this page explicitly.\n",
+        quizWorthiness: "skip",
+      });
+      const retired = await app.applyIngestChange({
+        kind: "retire-page",
+        pageId: retire.page.pageId,
+        expectedDigest: retire.page.digest,
+      });
+      assert.equal(retired.page?.status, "retired");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("repairs multiple live-drift pages sequentially without over-blocking unrelated drift", async () => {
     const { app, db, paths } = fixture({ maintenance: true });
     try {

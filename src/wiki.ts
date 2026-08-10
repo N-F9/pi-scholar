@@ -433,11 +433,18 @@ export class WikiService {
     const existingSources = Array.isArray(next.sources) ? next.sources : [];
     if (existingSources.some((source) => !isRecord(source)))
       throw new Error("OKF source entries must be YAML mappings");
+    const priorManagedById = new Map<string, Record<string, unknown>>();
     const priorManagedIds = existingSources
-      .filter(
-        (source) =>
-          isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar" && typeof source.id === "string",
-      )
+      .filter((source) => {
+        if (
+          !isRecord(source.pi_scholar) ||
+          source.pi_scholar.managed_by !== "pi-scholar" ||
+          typeof source.id !== "string"
+        )
+          return false;
+        priorManagedById.set(source.id, source);
+        return true;
+      })
       .map((source) => String(source.id));
     const references = new Set(labels.references);
     for (const label of labels.definitions) {
@@ -447,19 +454,23 @@ export class WikiService {
     const retainedSources = existingSources.filter(
       (source) => !(isRecord(source.pi_scholar) && source.pi_scholar.managed_by === "pi-scholar"),
     );
-    const managedSources = [...cited.values()].map((row) => ({
-      id: sourceCitationId(row),
-      resource: `pi-scholar://source/${row.source_id}/chunk/${row.ordinal}`,
-      title: row.display_name,
-      pi_scholar: {
-        managed_by: "pi-scholar",
-        source_id: row.source_id,
-        chunk_id: row.chunk_id,
-        ordinal: row.ordinal,
-        ...(row.source_digest ? { source_digest: row.source_digest } : {}),
-        chunk_digest: row.chunk_digest,
-      },
-    }));
+    const managedSources = [...cited.values()].map((row) => {
+      const id = sourceCitationId(row);
+      return {
+        ...(priorManagedById.get(id) ?? {}),
+        id,
+        resource: `pi-scholar://source/${row.source_id}/chunk/${row.ordinal}`,
+        title: row.display_name,
+        pi_scholar: {
+          managed_by: "pi-scholar",
+          source_id: row.source_id,
+          chunk_id: row.chunk_id,
+          ordinal: row.ordinal,
+          ...(row.source_digest ? { source_digest: row.source_digest } : {}),
+          chunk_digest: row.chunk_digest,
+        },
+      };
+    });
     if (retainedSources.length || managedSources.length || Array.isArray(next.sources))
       next.sources = [...retainedSources, ...managedSources];
     const definitions = managedSources.map((source) => `[^${source.id}]: Pi Scholar source evidence`);
