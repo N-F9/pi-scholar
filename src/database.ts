@@ -33,7 +33,7 @@ export interface OpenDatabaseOptions {
   readonly initializeSchema?: boolean;
 }
 
-export const SCHEMA_VERSION = 3 as const;
+export const SCHEMA_VERSION = 4 as const;
 export const REQUIRED_TABLES = [
   "schema_meta",
   "sources",
@@ -209,6 +209,7 @@ const REQUIRED_SCHEMA_FRAGMENTS: Readonly<Record<string, readonly string[]>> = {
     "foreign key (source_id, chunk_id) references source_chunks(source_id, chunk_id)",
   ],
   page_prerequisites: ["check (page_id <> prerequisite_page_id)"],
+  quiz_questions: ["check (kind in ('free-response','multiple-choice'))"],
   page_reviews: ["unique (quiz_id, page_id, revision)", "unique (settlement_id, page_id)"],
   question_pages: ["criterion_json text not null", "weight real not null"],
   page_results: ["unique (quiz_id, page_id)", "unique (review_id)"],
@@ -346,7 +347,7 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
   question_id TEXT PRIMARY KEY,
   quiz_id TEXT NOT NULL REFERENCES quizzes(quiz_id) ON DELETE CASCADE,
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-  kind TEXT NOT NULL CHECK (kind IN ('short-answer','multiple-choice')),
+  kind TEXT NOT NULL CHECK (kind IN ('free-response','multiple-choice')),
   prompt TEXT NOT NULL,
   choices_json TEXT,
   answer_key_json TEXT,

@@ -312,7 +312,7 @@ export class QuizService {
   }
 
   private selectedPagesFor(date: string, selectedPageIds?: readonly string[]): PageLearningRecord[] {
-    const due = this.scheduler.selectDuePages(date);
+    const due = this.scheduler.eligiblePages(date);
     if (selectedPageIds === undefined) return due;
     const ids = selectedPageIds.map((pageId) => pageId.trim());
     if (new Set(ids).size !== ids.length || ids.some((pageId) => !pageId))
@@ -807,7 +807,7 @@ export class QuizService {
       throw new ValidationError("Quiz sheet answers are incomplete");
     const sections = [
       ...markdown.matchAll(
-        /^## (\d+)\. Question\n\n<!--\s*pi-scholar:question id=([^\s]+)\s*-->\n\n\*\*Mode:\*\* (short-answer|multiple-choice)\n\n([\s\S]*?)(?=^## |(?![\s\S]))/gim,
+        /^## (\d+)\. Question\n\n<!--\s*pi-scholar:question id=([^\s]+)\s*-->\n\n\*\*Mode:\*\* (free-response|multiple-choice)\n\n([\s\S]*?)(?=^## |(?![\s\S]))/gim,
       ),
     ];
     if (sections.length !== stored.questions.length)
@@ -1065,14 +1065,10 @@ export class QuizService {
     selectedPageIds: readonly string[],
   ): readonly QuestionSpecInput[] {
     if (!specs.length) throw new ValidationError("Quiz generation produced no question specifications");
-    if (specs.length > 4) throw new ValidationError("A daily quiz may contain at most four questions");
-    if (specs.filter((question) => Array.isArray(question?.pages) && question.pages.length > 1).length > 2)
-      throw new ValidationError("A daily quiz may contain at most two synthesis questions");
     const selected = new Set(selectedPageIds);
     const covered = new Set<string>();
-    const singlePageCoverage = new Map<string, number>();
     for (const question of specs) {
-      if (!question || (question.kind !== "short-answer" && question.kind !== "multiple-choice"))
+      if (!question || (question.kind !== "free-response" && question.kind !== "multiple-choice"))
         throw new ValidationError("Question kind is invalid");
       const prompt = question.prompt.trim();
       if (!prompt || FORBIDDEN_SHEET_TEXT.test(prompt))
@@ -1094,10 +1090,6 @@ export class QuizService {
         covered.add(page.pageId);
         if (!selected.has(page.pageId)) throw new ValidationError("Question references an ineligible wiki page");
       }
-      if (question.pages.length === 1) {
-        const pageId = pageIds[0]!;
-        singlePageCoverage.set(pageId, (singlePageCoverage.get(pageId) ?? 0) + 1);
-      }
       if (
         question.sourceRefs !== undefined &&
         (!Array.isArray(question.sourceRefs) || question.sourceRefs.some((reference) => typeof reference !== "string"))
@@ -1116,8 +1108,8 @@ export class QuizService {
       if (question.choices?.some((choice) => !choice.trim() || FORBIDDEN_SHEET_TEXT.test(choice)))
         throw new ValidationError("Question options must be nonempty and answer-key-free");
     }
-    if (covered.size !== selected.size || [...selected].some((pageId) => singlePageCoverage.get(pageId) !== 1))
-      throw new ValidationError("Every selected/eligible page requires exactly one single-page question");
+    if (covered.size !== selected.size || [...selected].some((pageId) => !covered.has(pageId)))
+      throw new ValidationError("Every selected page must be referenced by a question");
     return specs;
   }
   private prepareGradeSubmission(quiz: QuizRecord, input: GradeSubmissionInput): PreparedGradeSubmission {

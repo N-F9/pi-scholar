@@ -46,7 +46,7 @@ function hasStrings(value: Record<string, unknown>, fields: readonly string[]): 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
-const QUESTION_KINDS = ["short-answer", "multiple-choice"] as const;
+const QUESTION_KINDS = ["free-response", "multiple-choice"] as const;
 const SOURCE_KINDS = ["document", "url", "text", "note", "code", "directory", "repository"] as const;
 const SOURCE_STATUSES = ["pending", "claimed", "processing", "published", "failed", "removed"] as const;
 const PAGE_STATUSES = ["active", "drifted", "retired"] as const;

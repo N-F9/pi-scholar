@@ -379,14 +379,16 @@ export class SchedulerService {
     return { ok: missingPageIds.length === 0, coveredPageIds, skippedPageIds, missingPageIds };
   }
 
-  eligiblePages(date: string | Date): PageLearningRecord[] {
+  eligiblePages(date: string | Date, initializeMissing = true): PageLearningRecord[] {
     const day = localDate(date);
-    const eligible = this.db.all<{ page_id: string }>(
-      "SELECT page_id FROM pages WHERE status = 'active' AND quiz_worthiness = 'eligible' ORDER BY page_id",
-    );
-    for (const page of eligible) {
-      if (!this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", page.page_id))
-        this.ensurePageLearning(page.page_id);
+    if (initializeMissing) {
+      const eligible = this.db.all<{ page_id: string }>(
+        "SELECT page_id FROM pages WHERE status = 'active' AND quiz_worthiness = 'eligible' ORDER BY page_id",
+      );
+      for (const page of eligible) {
+        if (!this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", page.page_id))
+          this.ensurePageLearning(page.page_id);
+      }
     }
     const learning = this.listPageLearning(true).filter((entry) => localDate(entry.dueAt) <= day);
     const prerequisites = this.db.all<Record<string, unknown>>(
@@ -418,11 +420,6 @@ export class SchedulerService {
         return prerequisite?.status === "active" && prerequisiteLearning?.fsrsState === "Review";
       }),
     );
-  }
-
-  selectDuePages(date: string | Date, limit = 4): PageLearningRecord[] {
-    if (!Number.isInteger(limit) || limit < 0) throw new ValidationError("limit must be a nonnegative integer");
-    return this.eligiblePages(date).slice(0, limit);
   }
 
   pageHistory(pageId: string): PageReviewRecord[] {

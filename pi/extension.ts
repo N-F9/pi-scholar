@@ -21,6 +21,8 @@ import type {
   LintContext,
   QuizContext,
   QuizDetailRecord,
+  QuizEvidenceRecord,
+  QuizEvidenceRequest,
   QuizPublicationInput,
   SourceRequest,
   WikiChangeInput,
@@ -96,6 +98,7 @@ type ScholarApplication = {
   readonly getIngestContext: () => Promise<IngestContext>;
   readonly getLintContext: (input?: { readonly description?: string }) => Promise<LintContext>;
   readonly applyWikiChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
+  readonly getQuizEvidence: (input: QuizEvidenceRequest) => Promise<readonly QuizEvidenceRecord[]>;
   readonly getQuizContext: (input?: { readonly date?: string }) => Promise<QuizContext>;
   readonly publishQuiz: (input: QuizPublicationInput) => Promise<QuizDetailRecord>;
   readonly getGradingContext: (input?: { readonly date?: string }, ownerToken?: string) => Promise<GradingContext>;
@@ -237,7 +240,7 @@ const quizQuestionPageInput = Type.Object({
 });
 
 const quizQuestionProposal = Type.Object({
-  kind: Type.Union([Type.Literal("short-answer"), Type.Literal("multiple-choice")]),
+  kind: Type.Union([Type.Literal("free-response"), Type.Literal("multiple-choice")]),
   prompt: Type.String({ minLength: 1 }),
   choices: Type.Optional(Type.Array(Type.String())),
   pages: Type.Array(quizQuestionPageInput, { minItems: 1 }),
@@ -248,7 +251,7 @@ const quizInput = Type.Union([
   Type.Object({
     status: Type.Literal("published"),
     date: Type.String({ minLength: 1 }),
-    questions: Type.Array(quizQuestionProposal, { maxItems: 4 }),
+    questions: Type.Array(quizQuestionProposal),
   }),
   Type.Object({
     status: Type.Literal("skipped"),
@@ -256,6 +259,10 @@ const quizInput = Type.Union([
     reason: Type.String({ minLength: 1 }),
   }),
 ]);
+const quizEvidenceInput = Type.Object({
+  date: Type.String({ minLength: 1 }),
+  pageIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+});
 const contextDateInput = Type.Object({ date: Type.Optional(Type.String({ minLength: 1 })) });
 const lintContextInput = Type.Object({ description: Type.Optional(Type.String()) });
 const gradeReadingInput = Type.Object({
@@ -945,6 +952,18 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleContext(ctx, _signal, onUpdate, "Loading daily context", "daily", (app) =>
         app.getQuizContext(params),
+      );
+    },
+  });
+  pi.registerTool({
+    name: "scholar_get_daily_evidence",
+    label: "scholar_get_daily_evidence",
+    executionMode: "sequential",
+    description: "Read authoritative evidence for a selected, currently eligible daily page subset.",
+    parameters: quizEvidenceInput,
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+      return call(ctx, _signal, onUpdate, "Loading daily evidence", (app) =>
+        app.getQuizEvidence(params as QuizEvidenceRequest),
       );
     },
   });

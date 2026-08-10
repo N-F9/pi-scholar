@@ -67,7 +67,7 @@ function publicQuizFixture(): QuizRecord {
         questionId: "question-1",
         quizId: "quiz-1",
         ordinal: 1,
-        kind: "short-answer",
+        kind: "free-response",
         prompt: "Explain the idea.",
         pages: [{ pageId: "page-1", criterion: "secret rubric", weight: 9 }],
         sourceRefs: ["private-source"],

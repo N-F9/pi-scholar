@@ -44,7 +44,7 @@ function ensureDue(scheduler: SchedulerService, pageIds: readonly string[], date
 
 function question(pageId: string, prompt = "Explain the page") {
   return {
-    kind: "short-answer" as const,
+    kind: "free-response" as const,
     prompt,
     pages: [{ pageId, criterion: `Explain ${pageId}`, weight: 1 }],
     sourceRefs: [],
@@ -57,7 +57,7 @@ test("page prerequisites gate due selection until every prerequisite is in Revie
   scheduler.setPrerequisites("p2", ["p1"]);
   assert.deepEqual(scheduler.listPrerequisites("p2"), [{ pageId: "p2", prerequisitePageId: "p1" }]);
   assert.deepEqual(
-    scheduler.selectDuePages(date, 4).map((page) => page.pageId),
+    scheduler.eligiblePages(date).map((page) => page.pageId),
     ["p1"],
   );
   db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", ["prerequisite-quiz", date]);
@@ -70,7 +70,7 @@ test("page prerequisites gate due selection until every prerequisite is in Revie
   assert.equal(review.pageId, "p1");
   assert.equal(scheduler.getPageLearning("p1").fsrsState, "Review");
   assert.deepEqual(
-    scheduler.selectDuePages(date, 4).map((page) => page.pageId),
+    scheduler.eligiblePages(date).map((page) => page.pageId),
     ["p2"],
   );
   assert.throws(() => scheduler.setPrerequisites("p1", ["p2"]), ValidationError);
@@ -138,22 +138,22 @@ test("page learning is created on demand, keeps stable IDs, and excludes drifted
   db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", ["p2"]);
   db.run("UPDATE pages SET status = 'retired' WHERE page_id = ?", ["p3"]);
   assert.deepEqual(
-    scheduler.selectDuePages(date, 4).map((page) => page.pageId),
+    scheduler.eligiblePages(date).map((page) => page.pageId),
     ["p1"],
   );
   db.close();
 });
 
-test("due page selection is bounded and coverage reports pages without learning state", () => {
+test("due page eligibility includes all due pages and coverage reports pages without learning state", () => {
   const { db, scheduler, date } = setup();
   const ids = ["p1", "p2", "p3", "p4", "p5", "p6"];
   for (const pageId of ids.slice(2)) addPage(db, pageId);
   ensureDue(scheduler, ids, date);
-  const selected = scheduler.selectDuePages(date, 4);
-  assert.equal(selected.length, 4);
+  const selected = scheduler.eligiblePages(date);
+  assert.equal(selected.length, ids.length);
   assert.deepEqual(
     selected.map((page) => page.pageId),
-    ids.slice(0, 4),
+    ids,
   );
 
   addPage(db, "untracked");
@@ -199,20 +199,30 @@ test("open quiz sheets use opaque comments, numeric headings, and no learner met
   assert.throws(() => quiz.parseSheet(`${sheet}\n## rubric\nprivate metadata`), ValidationError);
   db.close();
 });
-test("quiz rejects repeated single-page coverage before persistence", () => {
+test("quiz permits multiple questions sampling distinct sections of one page", () => {
   const { db, scheduler, date } = setup();
   ensureDue(scheduler, ["p1"], date);
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
-  assert.throws(
-    () =>
-      quiz.createDailyQuiz({
-        date,
-        selectedPageIds: ["p1"],
-        questionSpecs: [question("p1", "First explanation"), question("p1", "Second explanation")],
-      }),
-    (error) => error instanceof ValidationError && /exactly one single-page question/u.test(error.message),
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        ...question("p1", "Explain the first section"),
+        pages: [{ pageId: "p1", criterion: "Explain #part", weight: 1 }],
+      },
+      {
+        ...question("p1", "Explain the second section"),
+        pages: [{ pageId: "p1", criterion: "Explain #a", weight: 1 }],
+      },
+    ],
+  });
+  assert.equal(generated.questions.length, 2);
+  assert.deepEqual(
+    generated.questions.map((item) => item.pages[0]?.criterion),
+    ["Explain #part", "Explain #a"],
   );
-  assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM quizzes")?.count, 0);
+  assert.equal(db.get<{ count: number }>("SELECT COUNT(*) AS count FROM quizzes")?.count, 1);
   db.close();
 });
 
@@ -227,7 +237,7 @@ test("grading snapshots page sections directly and settles one FSRS transition p
       question("p1", "First explanation"),
       question("p2", "Second explanation"),
       {
-        kind: "short-answer" as const,
+        kind: "free-response" as const,
         prompt: "Compare both pages",
         pages: [
           { pageId: "p1", criterion: "Compare p1", weight: 1 },
@@ -297,11 +307,15 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [generated.quizId]).length, 3);
   assert.equal(scheduler.pageHistory("p1").length, 1);
   assert.equal(scheduler.pageHistory("p2").length, 1);
+  assert.equal(scheduler.getPageLearning("p1").reps, 1);
+  assert.equal(scheduler.getPageLearning("p2").reps, 1);
 
   const retry = quiz.settleGrade(grade);
   assert.equal(retry.pages.length, 2);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [generated.quizId]).length, 2);
   assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
+  assert.equal(scheduler.getPageLearning("p1").reps, 1);
+  assert.equal(scheduler.getPageLearning("p2").reps, 1);
   db.close();
 });
 
@@ -354,20 +368,43 @@ test("quiz revision checks prevent stale drafts and grading an open revision", (
   db.close();
 });
 
-test("quiz enforces the four-question publication bound", () => {
+test("quiz publishes more than four questions", () => {
   const { db, scheduler, date } = setup();
   const pageIds = ["p1", "p2", "p3", "p4", "p5"];
   for (const pageId of pageIds.slice(2)) addPage(db, pageId);
   ensureDue(scheduler, pageIds, date);
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
-  assert.throws(
-    () =>
-      quiz.createDailyQuiz({
-        date,
-        selectedPageIds: pageIds,
-        questionSpecs: pageIds.map((pageId) => question(pageId)),
-      }),
-    ValidationError,
-  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: pageIds,
+    questionSpecs: pageIds.map((pageId) => question(pageId)),
+  });
+  assert.equal(generated.status, "open");
+  assert.equal(generated.questions.length, 5);
+  db.close();
+});
+
+test("quiz publishes more than two synthesis questions", () => {
+  const { db, scheduler, date } = setup();
+  const pageIds = ["p1", "p2"];
+  ensureDue(scheduler, pageIds, date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const synthesis = (prompt: string) => ({
+    kind: "free-response" as const,
+    prompt,
+    pages: [
+      { pageId: "p1", criterion: "Compare p1", weight: 1 },
+      { pageId: "p2", criterion: "Compare p2", weight: 1 },
+    ],
+    sourceRefs: [],
+  });
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: pageIds,
+    questionSpecs: [synthesis("First comparison"), synthesis("Second comparison"), synthesis("Third comparison")],
+  });
+  assert.equal(generated.status, "open");
+  assert.equal(generated.questions.length, 3);
+  assert.ok(generated.questions.every((item) => item.pages.length === 2));
   db.close();
 });

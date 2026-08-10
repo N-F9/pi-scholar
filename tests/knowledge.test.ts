@@ -692,7 +692,7 @@ describe("source admission mechanics", () => {
     );
     db.run(
       "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?)",
-      ["question-removal", "quiz-removal", "short-answer", "Explain", "[]"],
+      ["question-removal", "quiz-removal", "free-response", "Explain", "[]"],
     );
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       "question-removal",
@@ -756,7 +756,7 @@ describe("source admission mechanics", () => {
     );
     db.run(
       "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?)",
-      ["question-submitted-removal", "quiz-submitted-removal", "short-answer", "Explain", "[]"],
+      ["question-submitted-removal", "quiz-submitted-removal", "free-response", "Explain", "[]"],
     );
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       "question-submitted-removal",

@@ -615,7 +615,7 @@ describe("knowledge capability contexts", () => {
         new Date().toISOString(),
       ]);
       db.run(
-        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, ?)",
+        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'free-response', ?, NULL, NULL, ?)",
         [questionId, quizId, "Explain", "[]"],
       );
       db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, 1)", [
@@ -710,7 +710,7 @@ describe("application quiz date guards", () => {
           date,
           questions: [
             {
-              kind: "short-answer",
+              kind: "free-response",
               prompt: "Explain",
               pages: [{ pageId, criterion: "Explain", weight: 1 }],
               sourceRefs: ["not-authorized"],
@@ -730,10 +730,10 @@ describe("application quiz date guards", () => {
 });
 
 describe("application quiz publication guards", () => {
-  it("rejects duplicate single-page coverage before persisting a quiz", async () => {
+  it("returns verified compact candidates without evidence excerpts", async () => {
     const { app, db } = fixture();
     const date = localDate(new Date());
-    const page = await app.wiki.create({
+    const page = await app.createNote({
       path: "publication-page.md",
       title: "Publication page",
       body: "# Section\n\nSection text\n",
@@ -744,19 +744,114 @@ describe("application quiz publication guards", () => {
     await app.updateSettings({ initializationEnabled: false });
     try {
       const context = await app.getQuizContext({ date });
-      const reference = context.evidence?.find((item) => item.pageId === pageId)?.reference;
-      assert.ok(reference);
-      const question = {
-        kind: "short-answer" as const,
-        prompt: "Explain the section",
+      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "initializationEnabled"]);
+      assert.equal(context.candidates.length, 1);
+      const candidate = context.candidates[0]!;
+      assert.deepEqual(Object.keys(candidate).sort(), ["dueAt", "pageId", "path", "sections", "title"]);
+      assert.equal(candidate.pageId, pageId);
+      assert.equal(candidate.path, page.page.relativePath);
+      assert.equal(candidate.title, "Publication page");
+      assert.equal(candidate.dueAt, app.scheduler.getPageLearning(pageId).dueAt);
+      assert.deepEqual(Object.keys(candidate.sections[0]!).sort(), ["anchor", "heading"]);
+      assert.equal("excerpt" in candidate, false);
+      assert.equal("excerpt" in candidate.sections[0]!, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("returns authoritative evidence only for the requested due subset", async () => {
+    const { app, db, calls } = fixture();
+    const date = localDate(new Date());
+    const first = await app.createNote({
+      path: "evidence-first.md",
+      body: "# First\n\nFirst text\n",
+      quizWorthiness: "eligible",
+    });
+    const second = await app.createNote({
+      path: "evidence-second.md",
+      body: "# Second\n\nSecond text\n",
+      quizWorthiness: "eligible",
+    });
+    const future = await app.createNote({
+      path: "evidence-future.md",
+      body: "# Future\n\nFuture text\n",
+      quizWorthiness: "eligible",
+    });
+    app.scheduler.ensurePageLearning(first.page.pageId, `${date}T00:00:00.000Z`);
+    app.scheduler.ensurePageLearning(second.page.pageId, `${date}T00:00:00.000Z`);
+    db.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", [
+      new Date(Date.now() + 2 * 86_400_000).toISOString(),
+      future.page.pageId,
+    ]);
+    calls.length = 0;
+    try {
+      const evidence = await app.getQuizEvidence({ date, pageIds: [second.page.pageId, first.page.pageId] });
+      assert.deepEqual([...new Set(evidence.map((item) => item.pageId))], [second.page.pageId, first.page.pageId]);
+      assert.ok(evidence.every((item) => item.excerpt.length > 0));
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: [future.page.pageId] }), /not currently eligible/u);
+      assert.deepEqual(calls, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects empty and duplicate evidence requests", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "evidence-validation.md",
+      body: "# Section\n\nSection text\n",
+      quizWorthiness: "eligible",
+    });
+    try {
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: [] }), /non-empty/u);
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: [page.page.pageId, page.page.pageId] }), /unique/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("publishes an uncapped quiz for a selected due subset with multiple questions per page", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "publication-page.md",
+      title: "Publication page",
+      body: "# Section\n\nSection text\n",
+      quizWorthiness: "eligible",
+    });
+    const unselected = await app.createNote({
+      path: "unselected-page.md",
+      title: "Unselected page",
+      body: "# Other\n\nOther text\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    app.scheduler.ensurePageLearning(unselected.page.pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    try {
+      const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
+      const sourceRefs = evidence.map((item) => item.reference);
+      const questions = Array.from({ length: 5 }, (_, index) => ({
+        kind: "free-response" as const,
+        prompt: `Explain point ${index + 1}`,
         pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
-        sourceRefs: [reference],
-      };
-      await assert.rejects(
-        app.publishQuiz({ status: "published", date, questions: [question, question] }),
-        /exactly one single-page question/u,
+        sourceRefs,
+      }));
+      const quiz = await app.publishQuiz({ status: "published", date, questions });
+      assert.equal(quiz.questions.length, 5);
+      assert.equal(
+        db.all(
+          "SELECT qp.question_id FROM question_pages qp JOIN quiz_questions qq ON qq.question_id = qp.question_id WHERE qq.quiz_id = ?",
+          [quiz.quizId],
+        ).length,
+        5,
       );
-      assert.equal(app.quiz.get(date), undefined);
     } finally {
       await app.close();
       db.close();
@@ -802,7 +897,7 @@ async function gradingFixture() {
     selectedPageIds: [pageId],
     questionSpecs: [
       {
-        kind: "short-answer",
+        kind: "free-response",
         prompt: "Explain the section",
         pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
         sourceRefs: [],

@@ -284,7 +284,7 @@ describe("vault foundation", () => {
     }
   });
 
-  it("creates schema v3 page learning tables and rolls back transactions", () => {
+  it("creates schema v4 page learning tables and rolls back transactions", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
@@ -303,7 +303,7 @@ describe("vault foundation", () => {
       "page_results",
       "quiz_evidence",
     ])
-      assert.equal(tables.includes(table), true, `missing schema v3 table ${table}`);
+      assert.equal(tables.includes(table), true, `missing schema v4 table ${table}`);
     for (const table of [
       "review_cards",
       "card_bindings",
@@ -317,7 +317,7 @@ describe("vault foundation", () => {
     assert.equal(
       db.get<{ schema_version: number }>("SELECT MAX(schema_version) AS schema_version FROM schema_meta")
         ?.schema_version,
-      3,
+      4,
     );
     const pagePrerequisitesSql = db.get<{ sql: string }>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'page_prerequisites'",
@@ -334,13 +334,31 @@ describe("vault foundation", () => {
     const quizEvidenceSql = db.get<{ sql: string }>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'quiz_evidence'",
     )?.sql;
+    const quizQuestionsSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'quiz_questions'",
+    )?.sql;
+    const legacyQuestionKind = ["short", "answer"].join("-");
     assert.match(pagePrerequisitesSql ?? "", /PRIMARY KEY\s*\(\s*page_id\s*,\s*prerequisite_page_id\s*\)/iu);
+    db.run(
+      "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', NULL, NULL, NULL, NULL, NULL)",
+      ["legacy-quiz", "2099-12-31"],
+    );
     assert.match(pagePrerequisitesSql ?? "", /CHECK\s*\(\s*page_id\s*<>\s*prerequisite_page_id\s*\)/iu);
     assert.match(pageReviewsSql ?? "", /UNIQUE\s*\([^)]*quiz_id[^)]*page_id/iu);
     assert.match(questionPagesSql ?? "", /criterion_json\s+TEXT\s+NOT\s+NULL/iu);
     assert.match(questionPagesSql ?? "", /weight\s+REAL\s+NOT\s+NULL/iu);
     assert.match(pageResultsSql ?? "", /UNIQUE\s*\([^)]*quiz_id[^)]*page_id/iu);
     assert.match(quizEvidenceSql ?? "", /PRIMARY KEY\s*\(\s*quiz_id\s*,\s*reference\s*\)/iu);
+    assert.match(
+      quizQuestionsSql ?? "",
+      /CHECK\s*\(\s*kind\s+IN\s*\(\s*'free-response'\s*,\s*'multiple-choice'\s*\)\s*\)/iu,
+    );
+    assert.throws(() =>
+      db.run(
+        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, ?, ?, NULL, NULL, '[]')",
+        ["legacy-question", "legacy-quiz", legacyQuestionKind, "Legacy question"],
+      ),
+    );
     assert.equal(/\bcard_id\b/iu.test(quizEvidenceSql ?? ""), false);
     const issueColumns = db.all<{ name: string }>("PRAGMA table_info(wiki_issues)").map((column) => column.name);
     assert.equal(issueColumns.includes("card_id"), false);
@@ -427,7 +445,7 @@ describe("vault foundation", () => {
       ["doctor-quiz", date, sheetPath, now],
     );
     db.run(
-      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, '[]')",
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'free-response', ?, NULL, NULL, '[]')",
       [questionId, "doctor-quiz", "Explain the page"],
     );
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
@@ -454,7 +472,7 @@ describe("vault foundation", () => {
             questionId,
             quizId: "doctor-quiz",
             ordinal: 0,
-            kind: "short-answer",
+            kind: "free-response",
             prompt: "Explain the page",
             pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
             sourceRefs: [],
@@ -489,7 +507,7 @@ describe("vault foundation", () => {
       ["expired-quiz", date, sheetPath, now],
     );
     db.run(
-      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, '[]')",
+      "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'free-response', ?, NULL, NULL, '[]')",
       [questionId, "expired-quiz", "Explain the page"],
     );
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
@@ -566,7 +584,7 @@ describe("vault foundation", () => {
         ["preview-submitted", "2099-01-03", now, now],
       );
       db.run(
-        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'short-answer', ?, NULL, NULL, ?)",
+        "INSERT INTO quiz_questions (question_id, quiz_id, ordinal, kind, prompt, choices_json, answer_key_json, source_refs_json) VALUES (?, ?, 0, 'free-response', ?, NULL, NULL, ?)",
         ["preview-question", "preview-submitted", "Explain", "[]"],
       );
       db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
