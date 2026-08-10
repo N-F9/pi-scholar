@@ -1317,11 +1317,15 @@ export class ScholarApplication {
     if (this.ownsDatabase) this.db.close();
     if (closeError) throw closeError;
   }
-  async getIngestContext(): Promise<IngestContext> {
+  private async wikiMaintenanceContext(): Promise<Pick<LintContext, "pages" | "issues">> {
     const pages = await Promise.all(
       (await this.wiki.list()).filter((page) => page.status !== "retired").map((page) => this.wikiResult(page.pageId)),
     );
     const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
+    return { pages, issues };
+  }
+  async getIngestContext(): Promise<IngestContext> {
+    const { pages, issues } = await this.wikiMaintenanceContext();
     const sources = await this.sources.publishedPackets();
     return {
       pages,
@@ -1342,10 +1346,7 @@ export class ScholarApplication {
     };
   }
   async getLintContext(input?: { readonly description?: string }): Promise<LintContext> {
-    const pages = await Promise.all(
-      (await this.wiki.list()).filter((page) => page.status !== "retired").map((page) => this.wikiResult(page.pageId)),
-    );
-    const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
+    const { pages, issues } = await this.wikiMaintenanceContext();
     const scope =
       input?.description === undefined
         ? ({ kind: "full" } as const)
@@ -1357,9 +1358,6 @@ export class ScholarApplication {
     return new Map(
       reports.filter((report) => report.drifted).map((report) => [report.page.pageId, report.currentDigest]),
     );
-  }
-  private async liveDriftPageIds(): Promise<Set<string>> {
-    return new Set((await this.liveDriftDigests()).keys());
   }
   private catalogDriftExclusions(): readonly string[] {
     return this.db
@@ -1410,7 +1408,7 @@ export class ScholarApplication {
     return authored.body;
   }
   private async filterLiveDriftPages(pages: readonly PageLearningRecord[]): Promise<PageLearningRecord[]> {
-    const drifted = await this.liveDriftPageIds();
+    const drifted = new Set((await this.liveDriftDigests()).keys());
     return pages.filter((page) => !drifted.has(page.pageId));
   }
   private assertWikiChangeCoverage(

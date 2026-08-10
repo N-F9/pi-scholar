@@ -567,18 +567,27 @@ describe("knowledge capability contexts", () => {
       const retired = await app.createNote({ path: "retired.md", body: "# Retired\n", quizWorthiness: "skip" });
       db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
       db.run("UPDATE pages SET status = 'retired' WHERE page_id = ?", [retired.page.pageId]);
+      const open = await app.wiki.report({ description: "open issue" });
+      const reopened = await app.wiki.report({ description: "reopened issue" });
+      await app.wiki.patchIssue(reopened.issueId, { status: "reopened" });
+      const resolved = await app.wiki.report({ description: "resolved issue" });
+      await app.wiki.resolveIssueAfterCorrection(resolved.issueId, "corrected");
 
       const ingest = await app.getIngestContext();
       const lint = await app.getLintContext();
-      for (const pages of [ingest.pages, lint.pages]) {
+      for (const context of [ingest, lint]) {
         assert.equal(
-          pages.some(({ page }) => page.pageId === drifted.page.pageId && page.status === "drifted"),
+          context.pages.some(({ page }) => page.pageId === drifted.page.pageId && page.status === "drifted"),
           true,
         );
         assert.equal(
-          pages.some(({ page }) => page.pageId === retired.page.pageId),
+          context.pages.some(({ page }) => page.pageId === retired.page.pageId),
           false,
         );
+        const issueIds = new Set(context.issues.map((issue) => issue.issueId));
+        assert.equal(issueIds.has(open.issueId), true);
+        assert.equal(issueIds.has(reopened.issueId), true);
+        assert.equal(issueIds.has(resolved.issueId), false);
       }
     } finally {
       await app.close();
@@ -818,6 +827,45 @@ describe("application quiz publication guards", () => {
       assert.ok(evidence.every((item) => item.excerpt.length > 0));
       await assert.rejects(app.getQuizEvidence({ date, pageIds: [future.page.pageId] }), /not currently eligible/u);
       assert.deepEqual(calls, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("excludes live-drift pages from quiz candidates, evidence, and publication", async () => {
+    const { app, db, paths } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "live-drift.md",
+      body: "# Live drift\n\nCataloged text\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    await fs.appendFile(join(paths.wikiRoot, page.page.relativePath), "\nPhysical edit\n");
+    try {
+      const context = await app.getQuizContext({ date });
+      assert.equal(
+        context.candidates.some((candidate) => candidate.pageId === pageId),
+        false,
+      );
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: [pageId] }), /Quiz page is not currently eligible/u);
+      await assert.rejects(
+        app.publishQuiz({
+          status: "published",
+          date,
+          questions: [
+            {
+              kind: "free-response",
+              prompt: "Explain the page",
+              pages: [{ pageId, criterion: "Explain", weight: 1 }],
+              sourceRefs: ["not-authorized"],
+            },
+          ],
+        }),
+        /Quiz question references an ineligible page/u,
+      );
     } finally {
       await app.close();
       db.close();
