@@ -22,8 +22,10 @@ type ToolExecutor = (
 ) => Promise<unknown>;
 type FakeLifecycleApp = {
   readonly paths: { readonly vaultRoot: string };
-  readonly finishes: { readonly status: string; readonly options: unknown }[];
+  readonly finishes: { readonly requestId: string; readonly status: string; readonly options: unknown }[];
   readonly updates: readonly unknown[];
+  readonly order: readonly string[];
+  recoverAbandonedWorkflows: () => Promise<unknown>;
   beginWorkflow: (kind: string) => Promise<{ readonly workflow: { readonly requestId: string } }>;
   getExtractContext: () => Promise<unknown>;
   getIngestContext: () => Promise<unknown>;
@@ -39,6 +41,7 @@ type FakeLifecycleApp = {
 };
 
 const runtimeApps = vi.hoisted(() => new Map<string, FakeLifecycleApp>());
+const vaultResolutionHooks = vi.hoisted(() => new Map<string, () => void>());
 vi.mock("../dist/application/application.js", () => ({
   createApplication: ({ paths }: { readonly paths: { readonly vaultRoot: string } }) => {
     const app = runtimeApps.get(paths.vaultRoot);
@@ -47,7 +50,11 @@ vi.mock("../dist/application/application.js", () => ({
   },
 }));
 vi.mock("../dist/vault.js", () => ({
-  resolveVault: (cwd?: string) => ({ vaultRoot: cwd ?? "test-vault" }),
+  resolveVault: (cwd?: string) => {
+    const vaultRoot = cwd ?? "test-vault";
+    vaultResolutionHooks.get(vaultRoot)?.();
+    return { vaultRoot };
+  },
 }));
 
 let lifecycleTestNumber = 0;
@@ -68,15 +75,28 @@ function registerLifecycleTools(): Map<string, ToolExecutor> {
 function fakeLifecycleApp(
   context: unknown,
   publishExtraction: (input: unknown) => Promise<unknown>,
-): { readonly app: FakeLifecycleApp; readonly root: string; readonly tools: Map<string, ToolExecutor> } {
+): {
+  readonly app: FakeLifecycleApp;
+  readonly root: string;
+  readonly tools: Map<string, ToolExecutor>;
+} {
   const root = `lifecycle-test-${++lifecycleTestNumber}`;
-  const finishes: { status: string; options: unknown }[] = [];
+  const finishes: { requestId: string; status: string; options: unknown }[] = [];
   const updates: unknown[] = [];
+  const order: string[] = [];
   const app: FakeLifecycleApp = {
     paths: { vaultRoot: root },
     finishes,
     updates,
-    beginWorkflow: async (kind) => ({ workflow: { requestId: `${kind}-${root}` } }),
+    order,
+    recoverAbandonedWorkflows: async () => {
+      order.push("recover");
+      return {};
+    },
+    beginWorkflow: async (kind) => {
+      order.push(`begin:${kind}`);
+      return { workflow: { requestId: `${kind}-${root}` } };
+    },
     getExtractContext: async () => context,
     getIngestContext: async () => ({}),
     getLintContext: async () => ({}),
@@ -86,8 +106,8 @@ function fakeLifecycleApp(
     publishExtraction,
     applyWikiChange: async () => ({}),
     applyIngestChange: async () => ({}),
-    finishWorkflow: async (_requestId, status, options) => {
-      finishes.push({ status, options });
+    finishWorkflow: async (requestId, status, options) => {
+      finishes.push({ requestId, status, options });
       return {};
     },
     updateWorkflow: async (_requestId, options) => {
@@ -204,6 +224,42 @@ describe("Pi package lifecycle", () => {
     assert.equal(toolModes.get("scholar_status"), undefined);
     assert.deepEqual([...commands].sort(), ["scholar-add", "scholar-issue", "scholar-lint", "scholar-status"]);
     assert.deepEqual(events, ["session_shutdown"]);
+  });
+
+  it("recovers abandoned workflows before starting tool work", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({}));
+
+    await invoke(fixture.tools, "scholar_get_lint_context", {}, fixture.root);
+
+    assert.deepEqual(fixture.app.order, ["recover", "begin:lint"]);
+  });
+
+  it("shares recovery across concurrent first tool calls", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({}));
+    const recovery = Promise.withResolvers<void>();
+    const bothResolved = Promise.withResolvers<void>();
+    let recoveries = 0;
+    let resolutions = 0;
+    vaultResolutionHooks.set(fixture.root, () => {
+      resolutions++;
+      if (resolutions === 2) bothResolved.resolve();
+    });
+    fixture.app.recoverAbandonedWorkflows = async () => {
+      recoveries++;
+      await recovery.promise;
+      return {};
+    };
+
+    const calls = Promise.all([
+      invoke(fixture.tools, "scholar_get_lint_context", {}, fixture.root),
+      invoke(fixture.tools, "scholar_get_ingest_context", {}, fixture.root),
+    ]);
+    await bothResolved.promise;
+    recovery.resolve();
+    await calls;
+    vaultResolutionHooks.delete(fixture.root);
+
+    assert.equal(recoveries, 1);
   });
 
   it("expands the current-session lint skill before sending the command", async () => {
@@ -755,6 +811,47 @@ describe("Pi package lifecycle", () => {
       assert.equal(failure.status, "failed");
       assert.ok(Buffer.byteLength(failure.errorCode ?? "", "utf8") <= 100);
       assert.ok(Buffer.byteLength(failure.errorMessage ?? "", "utf8") <= 500);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("fails only running workflows during session recovery", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-recovery-"));
+    const db = openDatabase(join(root, "state.sqlite"));
+    try {
+      const workflows = new WorkflowCoordinator(db);
+      const sync = workflows.beginWorkflow("sync", "recover-sync");
+      const updatedSync = workflows.updateWorkflow(sync.requestId, { progress: 0.5 });
+      const grader = workflows.beginWorkflow("quiz-grader", "recover-grader");
+      workflows.updateWorkflow(grader.requestId, { message: "private owner binding" });
+      const queuedId = "00000000-0000-4000-8000-000000000001";
+      workflows.queueInTransaction("quiz-grader", queuedId, "queued-grader");
+      const completed = workflows.beginWorkflow("daily", "completed-daily");
+      workflows.finishWorkflow(completed.requestId, "succeeded");
+
+      const recovered = workflows.failRunningWorkflows({
+        message: "Workflow interrupted",
+        errorCode: "PI_SESSION_INTERRUPTED",
+        errorMessage: "The previous Pi session ended before completing this workflow.",
+      });
+
+      assert.deepEqual(
+        recovered.map(({ requestId }) => requestId),
+        [sync.requestId, grader.requestId],
+      );
+      assert.equal(recovered[0]?.progress, 0.5);
+      assert.equal(recovered[0]?.startedAt, updatedSync.startedAt);
+      for (const workflow of recovered) {
+        assert.equal(workflow.status, "failed");
+        assert.equal(workflow.message, "Workflow interrupted");
+        assert.equal(workflow.errorCode, "PI_SESSION_INTERRUPTED");
+        assert.equal(workflow.errorMessage, "The previous Pi session ended before completing this workflow.");
+        assert.ok(workflow.finishedAt);
+      }
+      assert.equal(workflows.get(queuedId)?.status, "queued");
+      assert.equal(workflows.get(completed.requestId)?.status, "succeeded");
+      assert.deepEqual(workflows.failRunningWorkflows({}), []);
     } finally {
       db.close();
       rmSync(root, { recursive: true, force: true });

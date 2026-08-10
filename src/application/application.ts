@@ -1083,6 +1083,18 @@ export class ScholarApplication {
       }, "quiz:seal"),
     );
   }
+  async recoverAbandonedWorkflows(): Promise<{ readonly workflows: readonly WorkflowRecord[] }> {
+    return this.durableDirect(
+      () => ({
+        workflows: this.workflows.failRunningWorkflows({
+          message: "Workflow interrupted",
+          errorCode: "PI_SESSION_INTERRUPTED",
+          errorMessage: "The previous Pi session ended before completing this workflow.",
+        }),
+      }),
+      "workflow:recover-interrupted",
+    );
+  }
   async beginWorkflow(kind: WorkflowKind, idempotencyKey?: string): Promise<{ readonly workflow: WorkflowRecord }> {
     return this.durableDirect(
       async () => {

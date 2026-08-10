@@ -1684,6 +1684,27 @@ describe("application capability boundaries", () => {
     }
   });
 
+  it("recovers abandoned workflows through ScholarApplication", async () => {
+    const { app, db } = fixture();
+    try {
+      const running = await app.beginWorkflow("lint");
+
+      const recovered = await app.recoverAbandonedWorkflows();
+
+      assert.equal(recovered.workflows.length, 1);
+      assert.equal(recovered.workflows[0]?.requestId, running.workflow.requestId);
+      assert.equal(recovered.workflows[0]?.status, "failed");
+      assert.equal(recovered.workflows[0]?.errorCode, "PI_SESSION_INTERRUPTED");
+      assert.equal(
+        recovered.workflows[0]?.errorMessage,
+        "The previous Pi session ended before completing this workflow.",
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
   it("reports successful ingest and lint facts independently", async () => {
     const { app, db } = fixture();
     try {
