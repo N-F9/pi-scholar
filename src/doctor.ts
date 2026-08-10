@@ -32,6 +32,7 @@ import { QuizService } from "./quiz.js";
 import { localDate, SchedulerService } from "./scheduler.js";
 import { validateFileEndpointsSync } from "./sources/source-chunks.js";
 import { hashFileSync } from "./sources/source-files.js";
+import { readManifest } from "./sources/source-packets.js";
 import { assertNoSymlinkPath, readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
 
 function check(name: string, status: DoctorCheck["status"], message: string, details?: JsonValue): DoctorCheck {
@@ -230,19 +231,8 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         if (shouldBeDirectory ? !stat.isDirectory() : !stat.isFile())
           throw new Error(`Packet artifact has wrong type: ${entry.name}/${required}`);
       }
-      const manifest = JSON.parse(readFileNoFollow(join(packet, "manifest.json")).toString("utf8")) as Record<
-        string,
-        unknown
-      >;
-      const normalizer = manifest.normalizer;
-      if (
-        normalizer === null ||
-        typeof normalizer !== "object" ||
-        Array.isArray(normalizer) ||
-        (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
-        (normalizer as Record<string, unknown>).version !== "2"
-      )
-        throw new Error(`Invalid manifest normalizer: ${entry.name}`);
+      const { manifest, manifestDigest: retainedManifestDigest } = readManifest(packet);
+      const manifestRecord = manifest as unknown as Record<string, unknown>;
       if (manifest.id !== entry.name || manifest.sourceId !== entry.name)
         throw new Error(`Manifest id/sourceId mismatch: ${entry.name}`);
       const records = (value: unknown, label: string): Record<string, unknown>[] => {
@@ -255,7 +245,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       };
       const files = records(manifest.files, "files");
       const chunks = records(manifest.chunks, "chunks");
-      const attachments = manifest.attachments === undefined ? [] : records(manifest.attachments, "attachments");
+      const attachments = records(manifest.attachments, "attachments");
       const integer = (value: unknown, label: string): number => {
         if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
           throw new Error(`Invalid ${label}: ${entry.name}`);
@@ -349,7 +339,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       const originalTotal = checkFiles(join(packet, "original"), fileRecords, "Original");
       checkFiles(join(packet, "attachments"), attachmentRecords, "Attachment");
       const declaredOriginalTotal = aliasedInteger(
-        manifest,
+        manifestRecord,
         ["originalByteLength", "originalBytes"],
         "manifest original byte length",
       );
@@ -364,7 +354,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       const extractedPath = safeRelativePath(packet, "extracted.md");
       const extracted = hashFileSync(extractedPath);
       const declaredExtractionTotal = aliasedInteger(
-        manifest,
+        manifestRecord,
         ["extractedByteLength", "extractionBytes"],
         "manifest extracted byte length",
       );
@@ -373,7 +363,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
           `Extracted aggregate byte length mismatch: ${entry.name} (declared ${declaredExtractionTotal}, actual ${extracted.size})`,
         );
       const extractedDigest = aliasedDigest(
-        manifest,
+        manifestRecord,
         ["extractedDigest", "extractionDigest"],
         "manifest extracted digest",
       );
@@ -447,9 +437,10 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         status: string;
         repository_revision: string | null;
         digest: string | null;
+        manifest_digest: string | null;
         manifest_path: string | null;
       }>(
-        "SELECT source_id, kind, status, repository_revision, digest, manifest_path FROM sources WHERE source_id = ?",
+        "SELECT source_id, kind, status, repository_revision, digest, manifest_digest, manifest_path FROM sources WHERE source_id = ?",
         [entry.name],
       );
       const manifestRevision = manifest.repositoryRevision ?? manifest.revision;
@@ -466,6 +457,7 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         (source.repository_revision !== null && manifestRevision !== source.repository_revision) ||
         (source.repository_revision === null && manifest.repositoryRevision !== undefined) ||
         source.digest !== originalDigest ||
+        source.manifest_digest !== retainedManifestDigest ||
         !source.manifest_path ||
         resolve(source.manifest_path) !== resolve(packet)
       )
@@ -515,8 +507,14 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       )
         throw new Error(`Source chunk catalog identity/digest mismatch: ${entry.name}`);
     }
-    const sources = db.all<{ source_id: string; status: string; digest: string | null; manifest_path: string | null }>(
-      "SELECT source_id, status, digest, manifest_path FROM sources WHERE status != 'removed' ORDER BY source_id",
+    const sources = db.all<{
+      source_id: string;
+      status: string;
+      digest: string | null;
+      manifest_digest: string | null;
+      manifest_path: string | null;
+    }>(
+      "SELECT source_id, status, digest, manifest_digest, manifest_path FROM sources WHERE status != 'removed' ORDER BY source_id",
     );
     for (const source of sources) {
       if (source.manifest_path === null) {
@@ -533,11 +531,12 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
       const manifestStat = lstatSync(manifestPath);
       if (manifestStat.isSymbolicLink() || !manifestStat.isFile())
         throw new Error(`Source catalog manifest is not a regular file: ${source.source_id}`);
-      const manifest = JSON.parse(readFileNoFollow(manifestPath).toString("utf8")) as Record<string, unknown>;
+      const { manifest, manifestDigest: retainedManifestDigest } = readManifest(packet);
       if (
         manifest.id !== source.source_id ||
         manifest.sourceId !== source.source_id ||
-        manifest.originalDigest !== source.digest
+        manifest.originalDigest !== source.digest ||
+        source.manifest_digest !== retainedManifestDigest
       )
         throw new Error(`Source catalog reverse linkage is invalid: ${source.source_id}`);
     }

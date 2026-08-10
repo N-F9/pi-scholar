@@ -1,5 +1,7 @@
-import { promises as fs, lstatSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { promises as fs, lstatSync } from "node:fs";
 import { join } from "node:path";
+import { readFileNoFollow } from "../vault.js";
 import { validateFileEndpoints } from "./source-chunks.js";
 import {
   canonical,
@@ -114,11 +116,19 @@ function parseManifestValue(raw: unknown): SourceManifest {
   }
   return raw as SourceManifest;
 }
-export function parseManifest(packet: string): SourceManifest {
+
+export function readManifest(packet: string): { readonly manifest: SourceManifest; readonly manifestDigest: string } {
   const manifestPath = join(packet, "manifest.json");
   const stat = lstatSync(manifestPath);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("source manifest must be a regular file");
-  return parseManifestValue(JSON.parse(readFileSync(manifestPath, "utf8")) as unknown);
+  const bytes = readFileNoFollow(manifestPath);
+  return {
+    manifest: parseManifestValue(JSON.parse(bytes.toString("utf8")) as unknown),
+    manifestDigest: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+export function parseManifest(packet: string): SourceManifest {
+  return readManifest(packet).manifest;
 }
 function manifestInteger(value: unknown, key: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
@@ -155,7 +165,7 @@ function manifestAttachments(value: unknown): Array<{ path: string; byteLength: 
 export async function verifyRetainedPacket(
   packet: string,
   expected: { sourceId: string; originalDigest: string },
-): Promise<SourceManifest> {
+): Promise<{ readonly manifest: SourceManifest; readonly manifestDigest: string }> {
   const packetStat = await lstatNoFollow(packet);
   if (!packetStat.isDirectory()) throw new Error("source packet must be a directory");
   const names = (await fs.readdir(packet)).sort((left, right) => left.localeCompare(right));
@@ -174,7 +184,9 @@ export async function verifyRetainedPacket(
   const manifestPath = join(packet, "manifest.json");
   const manifestStat = await lstatNoFollow(manifestPath);
   if (!manifestStat.isFile()) throw new Error("source manifest must be a regular file");
-  const manifest = parseManifestValue(JSON.parse((await readNoFollow(manifestPath)).toString("utf8")) as unknown);
+  const manifestBytes = await readNoFollow(manifestPath);
+  const manifest = parseManifestValue(JSON.parse(manifestBytes.toString("utf8")) as unknown);
+  const manifestDigestValue = createHash("sha256").update(manifestBytes).digest("hex");
   for (const [label, entries] of [
     ["files", manifest.files],
     ["attachments", manifest.attachments],
@@ -307,7 +319,7 @@ export async function verifyRetainedPacket(
   }
   if (nextAtom !== planned.chunks.at(-1)?.endLine || nextByte !== extractedFile.size)
     throw new Error("retained source chunk reconstruction is incomplete");
-  return manifest;
+  return { manifest, manifestDigest: manifestDigestValue };
 }
 
 function objectRecord(value: unknown, label: string): Record<string, unknown> {

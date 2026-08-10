@@ -20,8 +20,8 @@ import { main } from "../src/cli.js";
 import { openDatabase, transaction } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { doclingDependencyIdentity, doclingEnvironment } from "../src/external/docling.js";
-import { gitDependencyIdentity, runGit, runGitSync } from "../src/external/git.js";
-import { runChildSync } from "../src/external/process.js";
+import { gitDependencyIdentity, localCheckpointCommit, runGit, runGitSync } from "../src/external/git.js";
+import { runChild, runChildSync } from "../src/external/process.js";
 import {
   qmdArgs,
   qmdCollection,
@@ -30,6 +30,7 @@ import {
   qmdScopeCheck,
   qmdSearch,
 } from "../src/external/qmd.js";
+import { API_VERSION } from "../src/index.js";
 import { QuizService } from "../src/quiz.js";
 import { writeFully } from "../src/sources/source-files.js";
 import { SourceService } from "../src/sources/source-service.js";
@@ -44,6 +45,9 @@ import {
 import { WikiService } from "../src/wiki.js";
 
 describe("vault foundation", () => {
+  it("keeps the package-root API version export", () => {
+    assert.equal(API_VERSION, "v1");
+  });
   it("initializes exactly the product roots and discovers from a child directory", { timeout: 30_000 }, async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const vaultPath = join(root, "vault");
@@ -316,7 +320,7 @@ describe("vault foundation", () => {
     }
   });
 
-  it("creates schema v4 page learning tables and rolls back transactions", () => {
+  it("creates schema v5 page learning tables and rolls back transactions", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
@@ -335,7 +339,7 @@ describe("vault foundation", () => {
       "page_results",
       "quiz_evidence",
     ])
-      assert.equal(tables.includes(table), true, `missing schema v4 table ${table}`);
+      assert.equal(tables.includes(table), true, `missing schema v5 table ${table}`);
     for (const table of [
       "review_cards",
       "card_bindings",
@@ -349,7 +353,7 @@ describe("vault foundation", () => {
     assert.equal(
       db.get<{ schema_version: number }>("SELECT MAX(schema_version) AS schema_version FROM schema_meta")
         ?.schema_version,
-      4,
+      5,
     );
     const pagePrerequisitesSql = db.get<{ sql: string }>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'page_prerequisites'",
@@ -369,6 +373,10 @@ describe("vault foundation", () => {
     const quizQuestionsSql = db.get<{ sql: string }>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'quiz_questions'",
     )?.sql;
+    const sourcesSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'",
+    )?.sql;
+    assert.match(sourcesSql ?? "", /manifest_digest\s+TEXT/iu);
     const legacyQuestionKind = ["short", "answer"].join("-");
     assert.match(pagePrerequisitesSql ?? "", /PRIMARY KEY\s*\(\s*page_id\s*,\s*prerequisite_page_id\s*\)/iu);
     db.run(
@@ -589,6 +597,26 @@ describe("vault foundation", () => {
     assert.equal(result.stdout, "ok");
     assert.throws(() => runChildSync(process.execPath, ["-e\u0000bad"], { cwd: root }));
     writeFileSync(join(root, "kept.txt"), "doctor must not mutate");
+  });
+  it("caps child output and reports truncation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const result = await runChild(process.execPath, ["-e", "process.stdout.write('abcdef')"], {
+      cwd: root,
+      timeoutMs: 5_000,
+      maxOutputBytes: 4,
+    });
+    assert.equal(result.stdout, "abcd");
+    assert.equal(result.outputOverflowed, true);
+  });
+  it("counts capped child output by raw bytes across split UTF-8 chunks", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const result = await runChild(
+      process.execPath,
+      ["-e", "process.stdout.write(Buffer.from([0xe2]), () => process.stdout.write(Buffer.from([0x82, 0xac])))"],
+      { cwd: root, timeoutMs: 5_000, maxOutputBytes: 4 },
+    );
+    assert.equal(result.stdout, "€");
+    assert.equal(result.outputOverflowed, false);
   });
   it("doctor rejects a non-removed source row whose packet is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -885,6 +913,79 @@ describe("vault foundation", () => {
     assert.throws(() => runGitSync(paths, assignment), /Git options must use separate argv values/u);
     await assert.rejects(runGit(paths, assignment), /Git options must use separate argv values/u);
     assert.equal(runGitSync(paths, ["status", "--porcelain=v2", "--branch", "--ahead-behind"]).code, 0);
+  });
+  it("treats Git checkpoint exclusions as literal path names", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const wildcardPath = join(paths.wikiRoot, "a*b.md");
+    const siblingPath = join(paths.wikiRoot, "ab.md");
+    writeFileSync(wildcardPath, "excluded\n");
+    writeFileSync(siblingPath, "included\n");
+    assert.equal(runGitSync(paths, ["add", "--", "wiki/ab.md"]).code, 0);
+    const result = localCheckpointCommit(paths, "test: literal exclusion", [wildcardPath]);
+    assert.equal(result.committed, true);
+    assert.equal(runGitSync(paths, ["show", "HEAD:wiki/ab.md"]).stdout, "included\n");
+    assert.equal(runGitSync(paths, ["ls-files", "--", ":(literal)wiki/a*b.md"]).stdout, "");
+
+    writeFileSync(wildcardPath, "excluded and staged\n");
+    assert.equal(runGitSync(paths, ["add", "--", ":(literal)wiki/a*b.md"]).code, 0);
+    assert.throws(
+      () => localCheckpointCommit(paths, "test: reject staged exclusion", [wildcardPath]),
+      /Git checkpoint has pre-staged excluded changes/u,
+    );
+  });
+  it("commits the validated index while a child Git wrapper edits the worktree", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const includedPath = join(paths.wikiRoot, "included.md");
+    writeFileSync(includedPath, "validated\n");
+    const realGit = runChildSync("git", ["--version"], { cwd: paths.vaultRoot, timeoutMs: 5_000 }).executable;
+    const wrapperDirectory = join(root, "bin");
+    mkdirSync(wrapperDirectory);
+    writeFileSync(
+      join(wrapperDirectory, "git"),
+      `#!/bin/sh
+for arg
+do
+  if [ "$arg" = "commit" ]; then
+    printf '%s\n' "later" > ${JSON.stringify(includedPath)}
+    break
+  fi
+done
+exec ${JSON.stringify(realGit)} "$@"
+`,
+      { mode: 0o700 },
+    );
+    const child = runChildSync(
+      process.execPath,
+      [
+        "--import",
+        "jiti/register",
+        "--input-type=module",
+        "-e",
+        `const modulePath = process.env.PI_GIT_MODULE;
+const vaultRoot = process.env.PI_VAULT_ROOT;
+if (!modulePath || !vaultRoot) throw new Error("checkpoint child environment is incomplete");
+const loaded = await import(modulePath);
+const { localCheckpointCommit } = loaded.default ?? loaded;
+const result = localCheckpointCommit({ vaultRoot }, "test: indexed checkpoint");
+if (!result.committed) throw new Error("checkpoint did not commit");
+`,
+      ],
+      {
+        cwd: process.cwd(),
+        timeoutMs: 30_000,
+        env: {
+          PATH: `${wrapperDirectory}${delimiter}${process.env.PATH ?? ""}`,
+          PI_GIT_MODULE: "./src/external/git.ts",
+          PI_VAULT_ROOT: paths.vaultRoot,
+        },
+      },
+    );
+    assert.equal(child.code, 0, child.stderr || child.stdout);
+    assert.equal(readFileSync(includedPath, "utf8"), "later\n");
+    assert.equal(runGitSync(paths, ["show", "HEAD:wiki/included.md"]).stdout, "validated\n");
+    assert.match(runGitSync(paths, ["status", "--porcelain=v2"]).stdout, /wiki\/included\.md/u);
   });
 
   it("rejects Git dependency identity outside a work tree", () => {

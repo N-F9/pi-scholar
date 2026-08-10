@@ -409,6 +409,138 @@ describe("Pi package lifecycle", () => {
       );
     }
   });
+  it("replays ingest, lint, and daily contexts after applied and unapplied progress failures", async () => {
+    for (const applied of [false, true]) {
+      for (const kind of ["ingest", "lint", "daily"] as const) {
+        const context =
+          kind === "daily" ? { date: "2026-08-10", initializationEnabled: false, marker: kind } : { marker: kind };
+        const fixture = fakeLifecycleApp(context, async () => ({}));
+        const contextTool = `scholar_get_${kind}_context`;
+        const finishTool =
+          kind === "ingest" ? "scholar_finish_ingest" : kind === "lint" ? "scholar_finish_lint" : undefined;
+        if (kind === "ingest") fixture.app.getIngestContext = async () => context;
+        if (kind === "lint") fixture.app.getLintContext = async () => context;
+        if (kind === "daily") fixture.app.getQuizContext = async () => context;
+        const update = fixture.app.updateWorkflow.bind(fixture.app);
+        let failUpdate = true;
+        fixture.app.updateWorkflow = async (requestId, options) => {
+          if (failUpdate) {
+            failUpdate = false;
+            const error = new Error("injected context update failure");
+            if (applied) Object.assign(error, { details: { applied: true } });
+            throw error;
+          }
+          return update(requestId, options);
+        };
+
+        await assert.rejects(invoke(fixture.tools, contextTool, {}, fixture.root), /injected context update failure/u);
+        const replay = (await invoke(fixture.tools, contextTool, {}, fixture.root)) as { readonly details: unknown };
+        assert.strictEqual(replay.details, context);
+        await assert.rejects(invoke(fixture.tools, contextTool, {}, fixture.root), /workflow is already running/u);
+
+        if (finishTool) {
+          await invoke(fixture.tools, finishTool, {}, fixture.root);
+          await assert.rejects(invoke(fixture.tools, finishTool, {}, fixture.root), /context is required/u);
+        } else {
+          await invoke(
+            fixture.tools,
+            "scholar_publish_daily",
+            { status: "skipped", date: "2026-08-10", reason: "initialization disabled" },
+            fixture.root,
+          );
+          await assert.rejects(
+            invoke(
+              fixture.tools,
+              "scholar_publish_daily",
+              { status: "skipped", date: "2026-08-10", reason: "initialization disabled" },
+              fixture.root,
+            ),
+            /context is required/u,
+          );
+        }
+        assert.deepEqual(
+          fixture.app.finishes.map(({ status }) => status),
+          ["succeeded"],
+        );
+      }
+    }
+  });
+  it("does not replay stale context after a direct successful wiki change", async () => {
+    for (const kind of ["ingest", "lint"] as const) {
+      const context = { marker: kind };
+      const fixture = fakeLifecycleApp(context, async () => ({}));
+      if (kind === "ingest") fixture.app.getIngestContext = async () => context;
+      else fixture.app.getLintContext = async () => context;
+      const update = fixture.app.updateWorkflow.bind(fixture.app);
+      let failUpdate = true;
+      fixture.app.updateWorkflow = async (requestId, options) => {
+        if (failUpdate) {
+          failUpdate = false;
+          throw new Error("injected context update failure");
+        }
+        return update(requestId, options);
+      };
+
+      await assert.rejects(
+        invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root),
+        /injected context update failure/u,
+      );
+      await invoke(fixture.tools, `scholar_apply_${kind}`, {}, fixture.root);
+      await assert.rejects(
+        invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root),
+        /workflow is already running/u,
+      );
+      await invoke(fixture.tools, `scholar_finish_${kind}`, {}, fixture.root);
+    }
+  });
+
+  it("replays exact daily initialization context after applied and unapplied automatic finish failures", async () => {
+    for (const applied of [false, true]) {
+      const context = { date: "2026-08-10", initializationEnabled: true, expiredCount: 1 };
+      const fixture = fakeLifecycleApp(context, async () => ({}));
+      let contextCalls = 0;
+      fixture.app.getQuizContext = async () => ({ ...context, expiredCount: ++contextCalls });
+      const finish = fixture.app.finishWorkflow.bind(fixture.app);
+      let failFinish = true;
+      fixture.app.finishWorkflow = async (requestId, status, options) => {
+        if (failFinish) {
+          failFinish = false;
+          const error = new Error("injected daily automatic finish failure");
+          if (applied) Object.assign(error, { details: { applied: true } });
+          throw error;
+        }
+        return finish(requestId, status, options);
+      };
+
+      await assert.rejects(
+        invoke(fixture.tools, "scholar_get_daily_context", { date: "2026-08-10" }, fixture.root),
+        /injected daily automatic finish failure/u,
+      );
+      const replay = (await invoke(
+        fixture.tools,
+        "scholar_get_daily_context",
+        { date: "2026-08-10" },
+        fixture.root,
+      )) as {
+        readonly details: unknown;
+      };
+      assert.deepEqual(replay.details, context);
+      assert.equal(contextCalls, 1);
+      assert.deepEqual(
+        fixture.app.finishes.map(({ status }) => status),
+        applied ? [] : ["succeeded"],
+      );
+      await assert.rejects(
+        invoke(
+          fixture.tools,
+          "scholar_publish_daily",
+          { status: "skipped", date: "2026-08-10", reason: "initialization disabled" },
+          fixture.root,
+        ),
+        /context is required/u,
+      );
+    }
+  });
 
   it("retains a publication failure through later successful claims", async () => {
     const first = claim("claim-failing", "prepared-failing");
@@ -539,30 +671,35 @@ describe("Pi package lifecycle", () => {
     assert.deepEqual(fixture.app.finishes, []);
   });
 
-  it("does not fail an empty extract after an applied automatic finish error", async () => {
-    const fixture = fakeLifecycleApp({ claims: [] }, async () => ({
+  it("replays an empty extract exactly after an applied automatic finish error", async () => {
+    const context = { claims: [], failures: [{ message: "nothing extractable" }] };
+    const fixture = fakeLifecycleApp(context, async () => ({
       sourceId: "unused",
       manifest: {},
       removedInbox: false,
     }));
-    const finish = fixture.app.finishWorkflow.bind(fixture.app);
+    let contextCalls = 0;
+    fixture.app.getExtractContext = async () => {
+      contextCalls++;
+      return context;
+    };
     let failFinish = true;
-    fixture.app.finishWorkflow = async (requestId, status, options) => {
+    fixture.app.finishWorkflow = async () => {
       if (failFinish) {
         failFinish = false;
         throw Object.assign(new Error("applied empty finish failure"), { details: { applied: true } });
       }
-      return finish(requestId, status, options);
+      return {};
     };
     await assert.rejects(
       invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root),
       /applied empty finish failure/u,
     );
-    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
-    assert.deepEqual(
-      fixture.app.finishes.map(({ status }) => status),
-      ["succeeded"],
-    );
+    const replay = (await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root)) as {
+      readonly details: unknown;
+    };
+    assert.strictEqual(replay.details, context);
+    assert.equal(contextCalls, 1);
   });
 
   it("does not issue a failed finish after an applied lint finish error", async () => {

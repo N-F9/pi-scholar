@@ -8,7 +8,7 @@ Pi Scholar is a local-first, single-user, single-writer Markdown wiki and daily 
 
 Learning is page-level: each eligible wiki page has one FSRS schedule and remains addressable by its stable page ID across renames. A retained page prerequisite DAG blocks a due page until every prerequisite is in FSRS `Review`; drifted or retired pages are excluded without losing history. The daily skill sees every compact due, prerequisite-unblocked, non-drifted candidate, chooses a varied related subset, and retrieves authoritative evidence for it. It targets 15–45 minutes of combined reading and questions, with a mental median near 30 minutes, but imposes no fixed question or page count. Questions are `free-response` or `multiple-choice`; multiple questions may cover one page and a question may connect related pages. Every covered page receives one bundled result, rating, review, and FSRS transition when the sealed revision is graded. The host mints opaque question UUIDs; visible Markdown headings are numeric and the only quiz comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`.
 
-Schema v4 is the only supported database schema.
+Schema v5 is the only supported database schema.
 
 ## Install and initialize
 
@@ -28,7 +28,7 @@ pi-scholar init /absolute/path/to/vault
 pi-scholar doctor /absolute/path/to/vault
 ```
 
-`doctor` is read-only. It validates the schema (v4), the strict OKF v0.2 wiki, and path prerequisites. Fix reported failing prerequisites before running Pi skills; a qmd warning disables semantic search while exact and lexical paths remain available.
+`doctor` is read-only. It validates the schema (v5), the strict OKF v0.2 wiki, and path prerequisites. Fix reported failing prerequisites before running Pi skills; a qmd warning disables semantic search while exact and lexical paths remain available.
 
 Source capture accepts documents, URLs, pasted text, code, directories, and repositories without a fixed product source-size limit. Handling is streamed or disk-backed and bounded by available free space, operation time, and model/context limits. Derived Markdown normalizes blank-line runs fence-aware while preserving original bytes. Direct notes use the guarded wiki mutation path and do not become source packets.
 

@@ -22,6 +22,7 @@ export interface ChildResult {
   readonly timedOut: boolean;
   readonly stdout: string;
   readonly stderr: string;
+  readonly outputOverflowed?: boolean;
 }
 
 function validateArgv(executable: string, args: readonly string[]): void {
@@ -120,10 +121,15 @@ function terminateTree(pid: number | undefined, signal: NodeJS.Signals): void {
   }
 }
 
-function boundedAppend(current: string, chunk: Buffer, maxBytes: number): string {
-  if (Buffer.byteLength(current, "utf8") >= maxBytes) return current;
-  const remaining = maxBytes - Buffer.byteLength(current, "utf8");
-  return current + chunk.subarray(0, remaining).toString("utf8");
+function boundedAppend(
+  chunks: Buffer[],
+  currentBytes: number,
+  chunk: Buffer,
+  maxBytes: number,
+): { bytes: number; overflowed: boolean } {
+  const retainedBytes = Math.min(chunk.byteLength, maxBytes - currentBytes);
+  if (retainedBytes > 0) chunks.push(chunk.subarray(0, retainedBytes));
+  return { bytes: currentBytes + retainedBytes, overflowed: retainedBytes < chunk.byteLength };
 }
 
 export function runChild(executable: string, args: readonly string[], options: ChildRunOptions): Promise<ChildResult> {
@@ -141,14 +147,21 @@ export function runChild(executable: string, args: readonly string[], options: C
     stdio: ["pipe", "pipe", "pipe"],
   });
   child.stdin.end(options.stdin === undefined ? undefined : Buffer.from(options.stdin));
-  let stdout = "";
-  let stderr = "";
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let outputOverflowed = false;
   let timedOut = false;
   child.stdout.on("data", (chunk: Buffer) => {
-    stdout = boundedAppend(stdout, chunk, maxOutputBytes);
+    const appended = boundedAppend(stdoutChunks, stdoutBytes, chunk, maxOutputBytes);
+    stdoutBytes = appended.bytes;
+    outputOverflowed ||= appended.overflowed;
   });
   child.stderr.on("data", (chunk: Buffer) => {
-    stderr = boundedAppend(stderr, chunk, maxOutputBytes);
+    const appended = boundedAppend(stderrChunks, stderrBytes, chunk, maxOutputBytes);
+    stderrBytes = appended.bytes;
+    outputOverflowed ||= appended.overflowed;
   });
   let killTimer: NodeJS.Timeout | undefined;
   const timer = setTimeout(() => {
@@ -168,7 +181,16 @@ export function runChild(executable: string, args: readonly string[], options: C
   });
   child.once("close", (code, signal) => {
     clearTimers();
-    resolve({ executable: pinnedExecutable, args: [...args], code, signal, timedOut, stdout, stderr });
+    resolve({
+      executable: pinnedExecutable,
+      args: [...args],
+      code,
+      signal,
+      timedOut,
+      stdout: Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8"),
+      stderr: Buffer.concat(stderrChunks, stderrBytes).toString("utf8"),
+      outputOverflowed,
+    });
   });
   return promise;
 }
@@ -191,6 +213,13 @@ export function runChildSync(executable: string, args: readonly string[], option
   const result = spawnSync(pinnedExecutable, [...args], spawnOptions);
   const timedOut = Boolean(result.error && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT");
   if (timedOut) terminateTree(result.pid, "SIGKILL");
+  const outputOverflowed =
+    Boolean(
+      result.error &&
+        ["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"].includes((result.error as NodeJS.ErrnoException).code ?? ""),
+    ) ||
+    (Buffer.isBuffer(result.stdout) && result.stdout.byteLength > maxOutputBytes) ||
+    (Buffer.isBuffer(result.stderr) && result.stderr.byteLength > maxOutputBytes);
   return {
     executable: pinnedExecutable,
     args: [...args],
@@ -203,5 +232,6 @@ export function runChildSync(executable: string, args: readonly string[], option
     stderr: Buffer.isBuffer(result.stderr)
       ? result.stderr.subarray(0, maxOutputBytes).toString("utf8")
       : String(result.stderr ?? ""),
+    outputOverflowed,
   };
 }

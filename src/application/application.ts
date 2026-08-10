@@ -63,7 +63,7 @@ import {
   safePush,
 } from "../external/git.js";
 import { qmdRefresh, qmdScopeCheck, qmdSearch } from "../external/qmd.js";
-import { okfCitationText, okfFootnoteLabels, removeOkfFootnoteDefinitions } from "../okf.js";
+import { okfCitationText, okfFootnoteLabels, okfMarkdownEscapedAt, removeOkfFootnoteDefinitions } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
 import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
 import {
@@ -469,11 +469,27 @@ export class ScholarApplication {
       const managed = okfFootnoteLabels(text).definitions.filter((label) => authorized.has(label));
       return removeOkfFootnoteDefinitions(text, managed).trimEnd();
     };
+    const withoutEvidence = (text: string): string => {
+      let content = withoutDefinitions(text);
+      const visible = okfCitationText(content);
+      for (const match of content.matchAll(/\[\^([^\]\s]+)\]/gu)) {
+        if (
+          !authorized.has(match[1]!) ||
+          okfMarkdownEscapedAt(visible, match.index!) ||
+          visible.slice(match.index!, match.index! + match[0].length) !== match[0]
+        )
+          continue;
+        content = `${content.slice(0, match.index)}${" ".repeat(match[0].length)}${content.slice(
+          match.index! + match[0].length,
+        )}`;
+      }
+      return content;
+    };
     const substantive = (markdown: string, section: IngestSection): boolean => {
       const text = sectionText(markdown, section);
       const newline = text.indexOf("\n");
       const content = section.anchor === "" ? text : newline < 0 ? "" : text.slice(newline + 1);
-      return withoutDefinitions(content).trim().length > 0;
+      return okfCitationText(withoutEvidence(content)).trim().length > 0;
     };
     const requireSectionCitation = (markdown: string, section: IngestSection): void => {
       const references = okfFootnoteLabels(sectionText(markdown, section)).references;
@@ -485,6 +501,8 @@ export class ScholarApplication {
         );
     };
     const nextSections = sections(body);
+    if (!nextSections.some((section) => substantive(body, section)))
+      throw new ValidationError("ingest page exposition must be non-empty; use retire-page to remove a page");
     if (authoredBody === undefined) {
       for (const section of nextSections) if (substantive(body, section)) requireSectionCitation(body, section);
       return;
@@ -1599,7 +1617,9 @@ export class ScholarApplication {
         await this.wikiChangePreflight(preexistingDrift);
         switch (proposal.kind) {
           case "create-page": {
-            if (requireIngestCitation) await this.assertIngestCitation(proposal.body);
+            if (requireIngestCitation) {
+              await this.assertIngestCitation(proposal.body);
+            }
             const created = await this.wiki.create(proposal);
             const pageLearning =
               created.page.quizWorthiness === "eligible"

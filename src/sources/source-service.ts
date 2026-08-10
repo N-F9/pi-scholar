@@ -253,23 +253,27 @@ export interface ChunkPlanEndpoint {
 
 const MAX_SOURCE_REDIRECTS = 5;
 const DEFAULT_SOURCE_TIMEOUT_MS = 300_000;
-interface SourceHttpResponse {
+export interface SourceHttpResponse {
   status: number;
   location?: string;
   mediaType?: string;
 }
-async function requestSourceToFile(
+export async function requestSourceToFile(
   url: URL,
   target: string,
   timeoutMs = DEFAULT_SOURCE_TIMEOUT_MS,
 ): Promise<SourceHttpResponse> {
   const { promise, resolve: resolveRequest, reject: rejectRequest } = Promise.withResolvers<SourceHttpResponse>();
   let request: ClientRequest | undefined;
+  let response: IncomingMessage | undefined;
+  let deadline: NodeJS.Timeout | undefined;
   let settled = false;
   const fail = (error: unknown): void => {
     if (settled) return;
     settled = true;
+    clearTimeout(deadline);
     request?.destroy();
+    response?.destroy();
     void fs.rm(target, { force: true }).catch(() => undefined);
     rejectRequest(error instanceof Error ? error : new Error(String(error)));
   };
@@ -282,26 +286,28 @@ async function requestSourceToFile(
     method: "GET",
     agent: false,
   };
-  const onResponse = (response: IncomingMessage): void => {
-    const status = response.statusCode ?? 0;
+  const onResponse = (incoming: IncomingMessage): void => {
+    response = incoming;
+    const status = incoming.statusCode ?? 0;
     if ([301, 302, 303, 307, 308].includes(status)) {
-      const location = response.headers.location;
-      response.destroy();
+      const location = incoming.headers.location;
+      incoming.destroy();
       if (typeof location !== "string" || !location) fail(new Error("source redirect has no location"));
       else {
         settled = true;
+        clearTimeout(deadline);
         resolveRequest({ status, location });
       }
       return;
     }
     if (status < 200 || status >= 300) {
-      response.destroy();
+      incoming.destroy();
       fail(new Error(`source fetch failed: ${status}`));
       return;
     }
-    const advertised = response.headers["content-length"];
+    const advertised = incoming.headers["content-length"];
     if (Array.isArray(advertised) && advertised.length !== 1) {
-      response.destroy();
+      incoming.destroy();
       fail(new Error("source content length is invalid"));
       return;
     }
@@ -310,7 +316,7 @@ async function requestSourceToFile(
       contentLength !== undefined &&
       (!/^\d+$/u.test(contentLength) || !Number.isSafeInteger(Number(contentLength)))
     ) {
-      response.destroy();
+      incoming.destroy();
       fail(new Error("source content length is invalid"));
       return;
     }
@@ -318,13 +324,14 @@ async function requestSourceToFile(
       let output: FileHandle | undefined;
       try {
         output = await fs.open(target, "wx", 0o600);
-        for await (const chunk of response)
+        for await (const chunk of incoming)
           await writeFully(output, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         await output.close();
         output = undefined;
         if (!settled) {
           settled = true;
-          resolveRequest({ status, mediaType: response.headers["content-type"]?.toString() });
+          clearTimeout(deadline);
+          resolveRequest({ status, mediaType: incoming.headers["content-type"]?.toString() });
         }
       } catch (error) {
         await output?.close().catch(() => undefined);
@@ -332,10 +339,16 @@ async function requestSourceToFile(
       }
     })();
   };
-  request = url.protocol === "https:" ? httpsRequest(options, onResponse) : httpRequest(options, onResponse);
-  request.setTimeout(timeoutMs, () => fail(new Error("source fetch timed out")));
-  request.once("error", fail);
-  request.end();
+  deadline = setTimeout(() => fail(new Error("source fetch timed out")), timeoutMs);
+  deadline.unref();
+  try {
+    request = url.protocol === "https:" ? httpsRequest(options, onResponse) : httpRequest(options, onResponse);
+    request.setTimeout(timeoutMs, () => fail(new Error("source fetch timed out")));
+    request.once("error", fail);
+    request.end();
+  } catch (error) {
+    fail(error);
+  }
   return promise;
 }
 
@@ -358,14 +371,17 @@ function dbAll<T = Row>(db: ScholarDatabase, sql: string, params: unknown[] = []
   return db.all<T>(sql, params);
 }
 function sourceRecord(row: Row): Record<string, unknown> {
-  const { source_uri: _sourceUri, ...rest } = row;
   return {
-    ...rest,
     sourceId: row.source_id,
+    kind: row.kind,
+    status: row.status,
     displayName: row.display_name,
     originalName: row.original_name,
     sourceUri: publicSourceUri(row.source_uri),
+    mediaType: row.media_type,
     repositoryRevision: row.repository_revision,
+    capturedAt: row.captured_at,
+    digest: row.digest,
     manifestPath: row.manifest_path,
     errorCode: row.error_code,
     errorMessage: row.error_message,
@@ -1071,12 +1087,13 @@ export class SourceService {
         createdPacketIdentity = statIdentity(await lstatNoFollow(packet));
         temporaryPresent = false;
       }
-      publishedManifest = await verifyRetainedPacket(packet, {
+      const verified = await verifyRetainedPacket(packet, {
         sourceId: manifest.sourceId,
         originalDigest: claim.snapshot.digest,
       });
+      publishedManifest = verified.manifest;
       assertManifestClaimProvenance(publishedManifest, claim, manifest);
-      this.recordSource(publishedManifest, packet);
+      this.recordSource(publishedManifest, packet, verified.manifestDigest);
     } catch (error) {
       if (createdPacket && createdPacketIdentity) {
         try {
@@ -1332,9 +1349,15 @@ export class SourceService {
         return undefined;
       throw error;
     }
-    const manifest = await verifyRetainedPacket(packet, { sourceId, originalDigest: claim.snapshot.digest });
-    assertManifestClaimProvenance(manifest, claim);
-    this.recordSource(manifest, packet);
+    const verified = await verifyRetainedPacket(packet, { sourceId, originalDigest: claim.snapshot.digest });
+    const { manifest, manifestDigest } = verified;
+    const durableDigest = dbGet<Row>(this.db, "SELECT manifest_digest FROM sources WHERE source_id = ?", [
+      sourceId,
+    ])?.manifest_digest;
+    if (typeof durableDigest === "string") {
+      if (durableDigest !== manifestDigest) throw new Error("source manifest digest mismatch");
+    } else assertManifestClaimProvenance(manifest, claim);
+    this.recordSource(manifest, packet, manifestDigest);
     return { sourceId, manifest, packetPath: packet, removedInbox: await this.removeInboxAfterAdmission(claim), claim };
   }
   async admitClaim(
@@ -1439,7 +1462,7 @@ export class SourceService {
     }
     return results;
   }
-  private recordSource(manifest: SourceManifest, packet: string): void {
+  private recordSource(manifest: SourceManifest, packet: string, retainedManifestDigest: string): void {
     transaction(this.db, () => {
       const existing = dbGet<Row>(this.db, "SELECT * FROM sources WHERE source_id = ?", [manifest.sourceId]);
       const values = [
@@ -1453,6 +1476,7 @@ export class SourceService {
         manifest.repositoryRevision ?? null,
         manifest.capturedAt,
         manifest.originalDigest,
+        retainedManifestDigest,
         packet,
         manifest.capturedAt,
         manifest.capturedAt,
@@ -1460,16 +1484,23 @@ export class SourceService {
       if (!existing)
         dbRun(
           this.db,
-          "INSERT INTO sources (source_id, kind, status, display_name, original_name, source_uri, media_type, repository_revision, captured_at, digest, manifest_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO sources (source_id, kind, status, display_name, original_name, source_uri, media_type, repository_revision, captured_at, digest, manifest_digest, manifest_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           values,
         );
       else {
         if (String(existing.digest ?? "") !== manifest.originalDigest)
           throw new Error("source identity conflicts with existing database record");
+        if (
+          existing.status === "published" &&
+          existing.manifest_digest !== null &&
+          existing.manifest_digest !== undefined &&
+          String(existing.manifest_digest) !== retainedManifestDigest
+        )
+          throw new Error("source manifest identity conflicts with existing database record");
         const now = new Date().toISOString();
         dbRun(
           this.db,
-          "UPDATE sources SET kind = ?, status = ?, display_name = ?, original_name = ?, source_uri = ?, media_type = ?, repository_revision = ?, captured_at = ?, digest = ?, manifest_path = ?, error_code = NULL, error_message = NULL, updated_at = ? WHERE source_id = ?",
+          "UPDATE sources SET kind = ?, status = ?, display_name = ?, original_name = ?, source_uri = ?, media_type = ?, repository_revision = ?, captured_at = ?, digest = ?, manifest_digest = ?, manifest_path = ?, error_code = NULL, error_message = NULL, updated_at = ? WHERE source_id = ?",
           [
             manifest.kind,
             "published",
@@ -1480,6 +1511,7 @@ export class SourceService {
             manifest.repositoryRevision ?? null,
             manifest.capturedAt,
             manifest.originalDigest,
+            retainedManifestDigest,
             packet,
             now,
             manifest.sourceId,
@@ -1565,7 +1597,9 @@ export class SourceService {
         const sourceId = String(row.source_id);
         const digest = String(row.digest ?? "");
         const packetPath = safeChildPath(this.sources(), String(row.manifest_path ?? join(this.sources(), sourceId)));
-        const manifest = await verifyRetainedPacket(packetPath, { sourceId, originalDigest: digest });
+        const verified = await verifyRetainedPacket(packetPath, { sourceId, originalDigest: digest });
+        const { manifest, manifestDigest } = verified;
+        if (row.manifest_digest !== manifestDigest) throw new Error("source manifest digest mismatch");
         if (
           row.source_id !== manifest.sourceId ||
           row.kind !== manifest.kind ||

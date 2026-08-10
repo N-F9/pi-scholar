@@ -263,7 +263,7 @@ async function receiveMultipartUpload(
           fieldSize: MULTIPART_FIELD_BYTES,
           fields: Object.keys(MULTIPART_FIELD_NAMES).length,
           ...(maxFileBytes === undefined ? {} : { fileSize: maxFileBytes + 1 }),
-          parts: Object.keys(MULTIPART_FIELD_NAMES).length + 1,
+          parts: Object.keys(MULTIPART_FIELD_NAMES).length + 2,
         },
       });
       const fail = (error: unknown): void => {
