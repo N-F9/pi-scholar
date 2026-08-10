@@ -12,6 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative } from "node:path";
 import { describe, it } from "vitest";
@@ -30,6 +31,8 @@ import {
   qmdSearch,
 } from "../src/external/qmd.js";
 import { QuizService } from "../src/quiz.js";
+import { writeFully } from "../src/sources/source-files.js";
+import { SourceService } from "../src/sources/source-service.js";
 import {
   acquireWriterLock,
   initVault,
@@ -527,6 +530,46 @@ describe("vault foundation", () => {
     const report = doctor(paths.vaultRoot);
     assert.equal(report.checks.find((item) => item.name === "source-packets")?.status, "fail");
   });
+  it("doctor streams source artifacts and rejects packet tampering", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const sources = new SourceService(db, paths);
+    let dbClosed = false;
+    const input = Buffer.from(Array.from({ length: 512 }, (_, index) => `line-${index}-${"x".repeat(240)}\n`).join(""));
+    writeFileSync(join(paths.inboxRoot, "doctor.txt"), input);
+    try {
+      const entry = (await sources.discover())[0];
+      if (!entry) throw new Error("source entry was not discovered");
+      const result = await sources.admitClaim(await sources.claim(entry));
+      db.close();
+      dbClosed = true;
+      assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status, "pass");
+
+      const originalRecord = result.manifest.files[0];
+      const chunkRecord = result.manifest.chunks[0];
+      if (!originalRecord || !chunkRecord) throw new Error("source packet records are incomplete");
+      const originalPath = join(result.packetPath, "original", originalRecord.path);
+      const extractedPath = join(result.packetPath, "extracted.md");
+      const chunkPath = join(result.packetPath, "chunks", "0001.md");
+      const originalBytes = readFileSync(originalPath);
+      const extractedBytes = readFileSync(extractedPath);
+      const chunkBytes = readFileSync(chunkPath);
+      writeFileSync(originalPath, Buffer.from("tampered original\n"));
+      assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status, "fail");
+      writeFileSync(originalPath, originalBytes);
+      writeFileSync(extractedPath, Buffer.from("tampered extraction\n"));
+      assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status, "fail");
+      writeFileSync(extractedPath, extractedBytes);
+      writeFileSync(chunkPath, Buffer.from("tampered chunk\n"));
+      assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status, "fail");
+      writeFileSync(chunkPath, chunkBytes);
+      assert.equal(doctor(paths.vaultRoot).checks.find((item) => item.name === "source-packets")?.status, "pass");
+    } finally {
+      if (!dbClosed) db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it("doctor rejects a missing authored wiki snapshot file", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -652,5 +695,26 @@ describe("vault foundation", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = { vaultRoot: root } as VaultPaths;
     assert.throws(() => gitDependencyIdentity(paths), /git rev-parse --is-inside-work-tree failed/u);
+  });
+  it("completes every byte when a file handle short-writes", async () => {
+    const chunks: number[] = [];
+    const handle = {
+      write: async (
+        _buffer: Uint8Array,
+        _offset: number,
+        length: number,
+      ): Promise<{ bytesWritten: number; buffer: Uint8Array }> => {
+        const bytesWritten = Math.min(2, length);
+        chunks.push(bytesWritten);
+        return { bytesWritten, buffer: _buffer };
+      },
+    } as unknown as FileHandle;
+    const bytes = Buffer.from("short writes must not lose bytes");
+    await writeFully(handle, bytes);
+    assert.equal(
+      chunks.reduce((sum, size) => sum + size, 0),
+      bytes.byteLength,
+    );
+    assert.ok(chunks.length > 1);
   });
 });

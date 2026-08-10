@@ -104,10 +104,10 @@ export function decodeAdmissionInput(value: unknown): AdmissionPublicationInput 
   const endpoints =
     value.endpoints === undefined
       ? undefined
-      : Array.isArray(value.endpoints) && value.endpoints.every((item) => Number.isInteger(item) && Number(item) >= 0)
+      : Array.isArray(value.endpoints) && value.endpoints.every((item) => Number.isInteger(item) && Number(item) >= 1)
         ? value.endpoints.map((item) => Number(item))
         : (() => {
-            throw new ValidationError("endpoints must be an array of nonnegative integers");
+            throw new ValidationError("endpoints must be an array of positive line endpoints");
           })();
   return {
     claimId: requiredString(value, "claimId"),

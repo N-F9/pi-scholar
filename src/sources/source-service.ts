@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { lookup as dnsLookup } from "node:dns/promises";
 import { promises as fs, readFileSync, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { isIP, type LookupFunction } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   PreparedAdmission as ContractPreparedAdmission,
@@ -19,20 +18,26 @@ import {
   chunkExtraction,
   nativeExtraction,
   normalizeDoclingResult,
+  normalizeMarkdownFile,
+  planFileAtoms,
   reconstructChunks,
   validateChunkEndpoints,
+  validateFileEndpoints,
+  writeFileChunks,
+  writeNativeExtraction,
 } from "./source-chunks.js";
 import {
   canonical,
+  copyFileNoFollow,
   copyPathNoFollow,
   copyRepositoryNoSecrets,
   deterministicUuid,
   digestBytes,
   ENVELOPE_NAME,
   ensureWithin,
+  hashFile,
   inferKind,
   lstatNoFollow,
-  MAX_SOURCE_BYTES,
   measurePath,
   pathFor,
   provenanceUrl,
@@ -44,7 +49,6 @@ import {
   SOURCE_KINDS,
   safeChildPath,
   sameIdentity,
-  sanitizedSourceUri,
   snapshotPath,
   stagedMetadata,
   statIdentity,
@@ -54,6 +58,7 @@ import {
   walkFiles,
   wikiPathFor,
   workArtifactRelative,
+  writeFully,
   writeTree,
 } from "./source-files.js";
 import { parseManifest, parsePreparedMetadata, verifyRetainedPacket } from "./source-packets.js";
@@ -92,7 +97,8 @@ export interface FileSnapshot {
   path: string;
   size: number;
   digest: string;
-  bytes: Buffer;
+  absolutePath: string;
+  identity?: PhysicalIdentity;
 }
 export interface PhysicalIdentity {
   device: string;
@@ -169,6 +175,7 @@ export interface SourceManifest extends Omit<ContractSourceManifest, "converter"
   stagedMetadata?: StageMetadata;
   capturedAt: string;
   converter?: { name: string; version: string };
+  normalizer: { name: "markdown-blank-lines"; version: "1" };
   originalBytes: number;
   originalByteLength: number;
   originalDigest: string;
@@ -232,134 +239,24 @@ export interface DoclingResult {
   attachments?: Array<{ path: string; bytes: Uint8Array | string }>;
 }
 export interface ChunkPlanEndpoint {
+  endLine?: number;
   endAtom?: number;
   end?: number;
   index?: number;
 }
 
 const MAX_SOURCE_REDIRECTS = 5;
-const METADATA_HOSTNAMES: Record<string, true> = {
-  metadata: true,
-  "metadata.google.internal": true,
-  "metadata.google.com": true,
-  "instance-data.ec2.internal": true,
-  "100.100.100.200": true,
-};
-type SafeAddress = { address: string; family: 4 | 6 };
-function ipv4Unsafe(address: string): boolean {
-  const parts = address.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-  const [first, second, third] = parts;
-  if (first === undefined || second === undefined || third === undefined) return true;
-  return (
-    first === 0 ||
-    first === 10 ||
-    first === 127 ||
-    first >= 224 ||
-    (first === 169 && second === 254) ||
-    (first === 172 && second >= 16 && second <= 31) ||
-    (first === 192 && second === 168) ||
-    (first === 100 && second >= 64 && second <= 127) ||
-    (first === 192 && second === 0) ||
-    (first === 198 && (second === 18 || second === 19)) ||
-    (first === 198 && second === 51 && third === 100) ||
-    (first === 203 && second === 0 && third === 113) ||
-    (first === 169 && second === 254 && third === 169)
-  );
-}
-function ipv6Bytes(address: string): number[] | undefined {
-  const value = address.toLowerCase().split("%", 1)[0] ?? "";
-  const halves = value.split("::");
-  if (halves.length > 2) return undefined;
-  const parse = (part: string): number[] | undefined => {
-    if (!part) return [];
-    const values: number[] = [];
-    for (const piece of part.split(":")) {
-      if (piece.includes(".")) {
-        const octets = piece.split(".").map(Number);
-        if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255))
-          return undefined;
-        values.push(((octets[0] ?? 0) << 8) | (octets[1] ?? 0), ((octets[2] ?? 0) << 8) | (octets[3] ?? 0));
-      } else {
-        if (!/^[0-9a-f]{1,4}$/u.test(piece)) return undefined;
-        values.push(Number.parseInt(piece, 16));
-      }
-    }
-    return values;
-  };
-  const left = parse(halves[0] ?? "");
-  const right = halves.length === 2 ? parse(halves[1] ?? "") : [];
-  if (
-    !left ||
-    !right ||
-    (halves.length === 1 && left.length !== 8) ||
-    (halves.length === 2 && left.length + right.length >= 8)
-  )
-    return undefined;
-  const groups = [
-    ...left,
-    ...(halves.length === 2 ? Array.from({ length: 8 - left.length - right.length }, () => 0) : []),
-    ...right,
-  ];
-  if (groups.length !== 8) return undefined;
-  return groups.flatMap((group) => [(group >>> 8) & 0xff, group & 0xff]);
-}
-function unsafeAddress(address: string): boolean {
-  const family = isIP(address);
-  if (family === 4) return ipv4Unsafe(address);
-  if (family !== 6) return true;
-  const bytes = ipv6Bytes(address);
-  if (bytes?.length !== 16) return true;
-  const allZero = bytes.every((byte) => byte === 0);
-  const loopback = allZero || (bytes.slice(0, 15).every((byte) => byte === 0) && bytes[15]! === 1);
-  if (
-    loopback ||
-    bytes[0]! === 0xff ||
-    (bytes[0]! & 0xfe) === 0xfc ||
-    (bytes[0]! === 0xfe && (bytes[1]! & 0xc0) === 0x80)
-  )
-    return true;
-  const mapped = bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10]! === 0xff && bytes[11]! === 0xff;
-  return mapped ? ipv4Unsafe(bytes.slice(12).join(".")) : bytes.slice(0, 12).every((byte) => byte === 0);
-}
-async function safeAddressFor(url: URL): Promise<SafeAddress> {
-  const hostname = url.hostname
-    .replace(/^\[|\]$/gu, "")
-    .toLowerCase()
-    .replace(/\.$/u, "");
-  if (METADATA_HOSTNAMES[hostname]) throw new Error("source URL targets cloud metadata");
-  const literalFamily = isIP(hostname);
-  if (literalFamily) {
-    if (unsafeAddress(hostname)) throw new Error("source URL targets a private or special address");
-    return { address: hostname, family: literalFamily as 4 | 6 };
-  }
-  if (!hostname) throw new Error("source URL hostname is required");
-  const answers = await dnsLookup(hostname, { all: true, verbatim: true });
-  if (!answers.length) throw new Error("source URL hostname has no addresses");
-  const addresses = answers.map((answer) => ({ address: answer.address, family: answer.family as 4 | 6 }));
-  if (addresses.some(({ address }) => unsafeAddress(address)))
-    throw new Error("source URL resolves to a private or special address");
-  const first = addresses[0];
-  if (!first || (first.family !== 4 && first.family !== 6)) throw new Error("source URL address family is unsupported");
-  return first;
-}
+const DEFAULT_SOURCE_TIMEOUT_MS = 300_000;
 interface SourceHttpResponse {
   status: number;
   location?: string;
-  bytes?: Buffer;
   mediaType?: string;
 }
-export function pinnedSourceLookup(address: string, family: 4 | 6): LookupFunction {
-  return (_hostname, options, callback) => {
-    if (options.all) {
-      callback(null, [{ address, family }]);
-      return;
-    }
-    callback(null, address, family);
-  };
-}
-
-function requestSource(url: URL, address: SafeAddress): Promise<SourceHttpResponse> {
+async function requestSourceToFile(
+  url: URL,
+  target: string,
+  timeoutMs = DEFAULT_SOURCE_TIMEOUT_MS,
+): Promise<SourceHttpResponse> {
   const { promise, resolve: resolveRequest, reject: rejectRequest } = Promise.withResolvers<SourceHttpResponse>();
   let request: ClientRequest | undefined;
   let settled = false;
@@ -367,17 +264,17 @@ function requestSource(url: URL, address: SafeAddress): Promise<SourceHttpRespon
     if (settled) return;
     settled = true;
     request?.destroy();
+    void fs.rm(target, { force: true }).catch(() => undefined);
     rejectRequest(error instanceof Error ? error : new Error(String(error)));
   };
   const pathname = `${url.pathname || "/"}${url.search}`;
-  const baseOptions = {
+  const options = {
     protocol: url.protocol,
-    hostname: url.hostname.replace(/^\[|\]$/gu, ""),
+    hostname: url.hostname.startsWith("[") && url.hostname.endsWith("]") ? url.hostname.slice(1, -1) : url.hostname,
     port: url.port || undefined,
     path: pathname,
     method: "GET",
     agent: false,
-    lookup: pinnedSourceLookup(address.address, address.family),
   };
   const onResponse = (response: IncomingMessage): void => {
     const status = response.statusCode ?? 0;
@@ -397,47 +294,40 @@ function requestSource(url: URL, address: SafeAddress): Promise<SourceHttpRespon
       return;
     }
     const advertised = response.headers["content-length"];
-    if (advertised !== undefined) {
-      const length = Number(Array.isArray(advertised) ? advertised[0] : advertised);
-      if (!Number.isSafeInteger(length) || length < 0) {
-        response.destroy();
-        fail(new Error("source content length is invalid"));
-        return;
-      }
-      if (length > MAX_SOURCE_BYTES) {
-        response.destroy();
-        fail(new Error("source exceeds 100 MiB limit"));
-        return;
-      }
+    if (Array.isArray(advertised) && advertised.length !== 1) {
+      response.destroy();
+      fail(new Error("source content length is invalid"));
+      return;
     }
-    const chunks: Buffer[] = [];
-    let total = 0;
-    response.on("data", (chunk: Buffer | Uint8Array) => {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      total += bytes.byteLength;
-      if (total > MAX_SOURCE_BYTES) {
-        response.destroy();
-        fail(new Error("source exceeds 100 MiB limit"));
-        return;
+    const contentLength = Array.isArray(advertised) ? advertised[0] : advertised;
+    if (
+      contentLength !== undefined &&
+      (!/^\d+$/u.test(contentLength) || !Number.isSafeInteger(Number(contentLength)))
+    ) {
+      response.destroy();
+      fail(new Error("source content length is invalid"));
+      return;
+    }
+    void (async () => {
+      let output: FileHandle | undefined;
+      try {
+        output = await fs.open(target, "wx", 0o600);
+        for await (const chunk of response)
+          await writeFully(output, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        await output.close();
+        output = undefined;
+        if (!settled) {
+          settled = true;
+          resolveRequest({ status, mediaType: response.headers["content-type"]?.toString() });
+        }
+      } catch (error) {
+        await output?.close().catch(() => undefined);
+        fail(error);
       }
-      chunks.push(bytes);
-    });
-    response.once("aborted", () => fail(new Error("source response aborted")));
-    response.once("error", fail);
-    response.once("end", () => {
-      if (settled) return;
-      settled = true;
-      resolveRequest({
-        status,
-        bytes: Buffer.concat(chunks, total),
-        mediaType: response.headers["content-type"]?.toString(),
-      });
-    });
+    })();
   };
-  request =
-    url.protocol === "https:"
-      ? httpsRequest({ ...baseOptions, servername: baseOptions.hostname }, onResponse)
-      : httpRequest(baseOptions, onResponse);
+  request = url.protocol === "https:" ? httpsRequest(options, onResponse) : httpRequest(options, onResponse);
+  request.setTimeout(timeoutMs, () => fail(new Error("source fetch timed out")));
   request.once("error", fail);
   request.end();
   return promise;
@@ -468,6 +358,30 @@ function sourceRecord(row: Row): Record<string, unknown> {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+function fileSnapshotRecord(file: FileSnapshot): {
+  path: string;
+  size: number;
+  digest: string;
+  identity?: PhysicalIdentity;
+} {
+  return { path: file.path, size: file.size, digest: file.digest, identity: file.identity };
+}
+function sameFileSnapshots(left: FileSnapshot[], right: FileSnapshot[]): boolean {
+  return (
+    canonical(left.map(fileSnapshotRecord).sort((a, b) => a.path.localeCompare(b.path))) ===
+    canonical(right.map(fileSnapshotRecord).sort((a, b) => a.path.localeCompare(b.path)))
+  );
+}
+function sameFileContents(left: FileSnapshot[], right: FileSnapshot[]): boolean {
+  return (
+    canonical(
+      left.map(({ path, size, digest }) => ({ path, size, digest })).sort((a, b) => a.path.localeCompare(b.path)),
+    ) ===
+    canonical(
+      right.map(({ path, size, digest }) => ({ path, size, digest })).sort((a, b) => a.path.localeCompare(b.path)),
+    )
+  );
 }
 export class SourceService {
   readonly db: ScholarDatabase;
@@ -550,25 +464,24 @@ export class SourceService {
     }));
     if (canonical(expectedFiles) !== canonical(prepared.files)) throw new Error("prepared source files changed");
   }
-  private async defaultFetch(url: URL): Promise<{ bytes: Uint8Array; mediaType?: string; name?: string }> {
+  private async defaultFetch(url: URL, target: string): Promise<{ mediaType?: string; name?: string }> {
     let current = new URL(url.toString());
     for (let redirect = 0; ; redirect++) {
       if (!["http:", "https:"].includes(current.protocol)) throw new Error("source redirect protocol is not allowed");
-      const response = await requestSource(current, await safeAddressFor(current));
+      if (redirect > 0) await fs.rm(target, { force: true });
+      const response = await requestSourceToFile(current, target);
       if (response.location !== undefined) {
         if (redirect >= MAX_SOURCE_REDIRECTS) throw new Error("source redirect limit exceeded");
         current = new URL(response.location, current);
         continue;
       }
-      if (!response.bytes) throw new Error("source response body is missing");
-      return { bytes: response.bytes, mediaType: response.mediaType, name: basename(current.pathname) || undefined };
+      return { mediaType: response.mediaType, name: basename(current.pathname) || undefined };
     }
   }
   private async stageEnvelope(
     metadata: StageMetadata,
     bytes: Uint8Array,
   ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
-    if (bytes.byteLength > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
     const name = `${randomUUID()}.pi-scholar`;
     const target = safeRelativePath(this.inbox(), name);
     await fs.mkdir(target, { recursive: false, mode: 0o700 });
@@ -599,30 +512,62 @@ export class SourceService {
       if (request.kind !== undefined && request.kind !== "url") throw new Error("URL source kind must be url");
       const parsed = new URL(request.url);
       if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("only HTTP(S) URLs are accepted");
-      const fetched = this.adapters.fetchUrl
-        ? await this.adapters.fetchUrl(parsed.toString())
-        : await this.defaultFetch(parsed);
-      if (fetched.bytes.byteLength > MAX_SOURCE_BYTES) throw new Error("source exceeds 100 MiB limit");
-      const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
-      const originalName = validRelativePath(request.originalName ?? rawName);
-      const displayName = request.displayName ?? originalName;
-      const mediaType = request.mediaType ?? fetched.mediaType;
-      if (
-        /[\u0000-\u001f\u007f]/u.test(displayName) ||
-        (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
-      )
-        throw new Error("invalid staged source metadata");
-      const metadata: StageMetadata = {
-        version: 1,
-        requestedKind: request.kind ?? "url",
-        kind: "url",
-        displayName,
-        originalName,
-        sourceUri: provenanceUrl(parsed),
-        mediaType,
-        payload: "payload",
-      };
-      return this.stageEnvelope(metadata, fetched.bytes);
+      if (this.adapters.fetchUrl) {
+        const fetched = await this.adapters.fetchUrl(parsed.toString());
+        const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
+        const originalName = validRelativePath(request.originalName ?? rawName);
+        const displayName = request.displayName ?? originalName;
+        const mediaType = request.mediaType ?? fetched.mediaType;
+        if (
+          /[\u0000-\u001f\u007f]/u.test(displayName) ||
+          (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
+        )
+          throw new Error("invalid staged source metadata");
+        return this.stageEnvelope(
+          {
+            version: 1,
+            requestedKind: request.kind ?? "url",
+            kind: "url",
+            displayName,
+            originalName,
+            sourceUri: provenanceUrl(parsed),
+            mediaType,
+            payload: "payload",
+          },
+          fetched.bytes,
+        );
+      }
+      const name = `${randomUUID()}.pi-scholar`;
+      const target = safeRelativePath(this.inbox(), name);
+      const payloadPath = join(target, "payload");
+      await fs.mkdir(target, { recursive: false, mode: 0o700 });
+      try {
+        const fetched = await this.defaultFetch(parsed, payloadPath);
+        const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
+        const originalName = validRelativePath(request.originalName ?? rawName);
+        const displayName = request.displayName ?? originalName;
+        const mediaType = request.mediaType ?? fetched.mediaType;
+        if (
+          /[\u0000-\u001f\u007f]/u.test(displayName) ||
+          (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
+        )
+          throw new Error("invalid staged source metadata");
+        const metadata: StageMetadata = {
+          version: 1,
+          requestedKind: request.kind ?? "url",
+          kind: "url",
+          displayName,
+          originalName,
+          sourceUri: provenanceUrl(parsed),
+          mediaType,
+          payload: "payload",
+        };
+        await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+        return { relativePath: name, absolutePath: target, kind: "url", metadata };
+      } catch (error) {
+        await fs.rm(target, { recursive: true, force: true });
+        throw error;
+      }
     }
     if (request.text !== undefined) {
       if (request.kind !== undefined && request.kind !== "text" && request.kind !== "pasted")
@@ -650,7 +595,7 @@ export class SourceService {
     }
     if (request.bytes !== undefined) {
       if (request.kind !== "upload") throw new Error("bytes source kind must be upload");
-      if (!(request.bytes instanceof Uint8Array)) throw new Error("bytes source payload must be binary");
+      if (!(request.bytes instanceof Uint8Array)) throw new Error("source payload must be binary");
       const rawName = request.name ?? "source.txt";
       const originalName = validRelativePath(request.originalName ?? rawName);
       const bytes = Buffer.from(request.bytes);
@@ -672,6 +617,41 @@ export class SourceService {
       };
       return this.stageEnvelope(metadata, bytes);
     }
+    if (request.filePath !== undefined) {
+      if (request.kind !== "upload") throw new Error("filePath source kind must be upload");
+      const source = resolve(request.filePath);
+      const stat = await lstatNoFollow(source);
+      if (!stat.isFile()) throw new Error("upload filePath must be a regular file");
+      const rawName = request.name ?? basename(source);
+      const originalName = validRelativePath(request.originalName ?? rawName);
+      const kind = inferKind(originalName);
+      const displayName = request.displayName ?? originalName;
+      if (
+        /[\u0000-\u001f\u007f]/u.test(displayName) ||
+        (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
+      )
+        throw new Error("invalid staged source metadata");
+      const metadata: StageMetadata = {
+        version: 1,
+        requestedKind: "upload",
+        kind,
+        displayName,
+        originalName,
+        mediaType: request.mediaType,
+        payload: "payload",
+      };
+      const name = `${randomUUID()}.pi-scholar`;
+      const target = safeRelativePath(this.inbox(), name);
+      await fs.mkdir(target, { recursive: false, mode: 0o700 });
+      try {
+        await fs.writeFile(join(target, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+        await copyFileNoFollow(source, join(target, metadata.payload));
+      } catch (error) {
+        await fs.rm(target, { recursive: true, force: true });
+        throw error;
+      }
+      return { relativePath: name, absolutePath: target, kind, metadata };
+    }
     const input = request.path ?? request.filePath;
     if (!input) throw new Error("source input is required");
     if (request.kind !== undefined && !SOURCE_KINDS.includes(request.kind as SourceKind))
@@ -683,30 +663,24 @@ export class SourceService {
     const repository = stat.isDirectory() && (await this.isRepository(source));
     const kind: SourceKind = repository ? "repository" : inferKind(source, stat);
     if (!repository && inferKind(name, stat) !== kind) throw new Error(`staging name kind must be ${kind}`);
-    let initialRevision: string | undefined;
-    let verifiedGitRevision = false;
-    if (repository) {
-      try {
-        initialRevision = await repositoryRevision(source);
-        verifiedGitRevision = true;
-      } catch (error) {
-        if (!this.adapters.gitRevision) throw error;
-        initialRevision = await this.revision(source);
-      }
-    }
+    const gitRevision = this.adapters.gitRevision;
+    const revisionProvider = repository
+      ? typeof gitRevision === "function"
+        ? gitRevision
+        : gitRevision
+          ? (root: string) => gitRevision.revision(root)
+          : repositoryRevision
+      : undefined;
+    const readRevision = async (): Promise<string | undefined> =>
+      revisionProvider ? (await revisionProvider(source)) || undefined : undefined;
+    const initialRevision = repository ? await readRevision() : undefined;
     const files = repository ? await repositoryFiles(source) : undefined;
-    if (repository && verifiedGitRevision) {
-      const finalRevision = await repositoryRevision(source);
-      if (initialRevision !== finalRevision) throw new Error("repository changed during staging");
-    }
+    const beforeCopyRevision = repository ? await readRevision() : undefined;
+    if (repository && beforeCopyRevision !== initialRevision) throw new Error("repository changed during staging");
     if (repository && !initialRevision) throw new Error("repository revision is unavailable");
     if (!repository) await measurePath(source);
     if (request.kind !== undefined && request.kind !== kind) throw new Error(`path source kind must be ${kind}`);
-    const revision = repository
-      ? this.adapters.gitRevision
-        ? await this.revision(source)
-        : initialRevision
-      : undefined;
+    const revision = repository ? initialRevision : undefined;
     const metadata = repository
       ? (() => {
           const originalName = validRelativePath(request.originalName ?? name);
@@ -743,6 +717,14 @@ export class SourceService {
       try {
         if (repository) await copyRepositoryNoSecrets(target, files ?? [], metadata!);
         else await copyPathNoFollow(source, target);
+        if (repository) {
+          const copiedFiles = await walkFiles(join(target, metadata!.payload), "", false);
+          if (!sameFileContents(files ?? [], copiedFiles)) throw new Error("repository copy digest mismatch");
+          const afterFiles = await repositoryFiles(source);
+          const afterRevision = await readRevision();
+          if (afterRevision !== initialRevision || !sameFileSnapshots(files ?? [], afterFiles))
+            throw new Error("repository changed during staging");
+        }
       } catch (error) {
         if (!targetExisted) {
           try {
@@ -865,6 +847,7 @@ export class SourceService {
     const root = this.preparedRoot(preparedId);
     const originalRoot = join(root, "original");
     const attachmentsRoot = join(root, "attachments");
+    const rawExtracted = join(root, ".extracted.raw");
     const extractedAbsolute = join(root, "extracted.md");
     await fs.mkdir(this.work(), { recursive: true, mode: 0o700 });
     try {
@@ -875,8 +858,6 @@ export class SourceService {
       const mediaType = claim.snapshot.metadata?.mediaType;
       const useDocling =
         claim.snapshot.kind === "document" || (claim.snapshot.kind === "url" && !textualUrl(claim, mediaType));
-      let extracted: Buffer;
-      let attachments: Array<{ path: string; bytes: Uint8Array | string }> = [];
       let converter: { name: string; version: string } | undefined;
       if (useDocling) {
         if (!this.adapters.docling) throw new Error("Docling adapter is required for document extraction");
@@ -884,40 +865,48 @@ export class SourceService {
         const originalFile = claim.snapshot.files[0];
         if (!originalFile) throw new Error("Docling requires a document file");
         const originalPath = ensureWithin(originalRoot, join(originalRoot, validRelativePath(originalFile.path)));
-        const originalStat = await lstatNoFollow(originalPath);
-        if (!originalStat.isFile()) throw new Error("Docling input must be a regular file");
         const converted =
           typeof this.adapters.docling === "function"
             ? await this.adapters.docling({ claim, originalPath, kind: claim.snapshot.kind, mediaType })
             : await this.adapters.docling.convert({ claim, originalPath, kind: claim.snapshot.kind, mediaType });
         const normalizedResult = await normalizeDoclingResult(converted);
-        extracted = Buffer.from(normalizedResult.extracted);
         converter = {
           name: normalizedResult.converter?.name ?? "docling",
           version: normalizedResult.converter?.version ?? "unknown",
         };
-        attachments = normalizedResult.attachments ?? [];
-      } else extracted = nativeExtraction(claim.snapshot);
-      if (!extracted.length) throw new Error("empty extraction");
-      if (extracted.byteLength > MAX_SOURCE_BYTES) throw new Error("extraction exceeds 100 MiB limit");
-      await fs.writeFile(extractedAbsolute, extracted, { flag: "wx", mode: 0o600 });
-      const attachmentSnapshots: FileSnapshot[] = [];
-      let attachmentBytes = 0;
-      for (const attachment of attachments) {
-        const attachmentPath = validRelativePath(attachment.path);
-        const bytes = Buffer.from(attachment.bytes);
-        attachmentBytes += bytes.byteLength;
-        if (bytes.byteLength > MAX_SOURCE_BYTES || attachmentBytes > MAX_SOURCE_BYTES)
-          throw new Error("attachment exceeds 100 MiB limit");
-        attachmentSnapshots.push({ path: attachmentPath, size: bytes.byteLength, digest: digestBytes(bytes), bytes });
+        if ("extractedPath" in normalizedResult) {
+          await copyFileNoFollow(normalizedResult.extractedPath, rawExtracted);
+          for (const attachment of normalizedResult.attachments) {
+            const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, validRelativePath(attachment.path)));
+            await copyFileNoFollow(attachment.absolutePath, target);
+          }
+        } else {
+          await fs.writeFile(rawExtracted, Buffer.from(normalizedResult.extracted), { flag: "wx", mode: 0o600 });
+          for (const attachment of normalizedResult.attachments ?? []) {
+            const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, validRelativePath(attachment.path)));
+            await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+            await fs.writeFile(target, Buffer.from(attachment.bytes), { flag: "wx", mode: 0o600 });
+          }
+        }
+      } else {
+        const copiedSnapshot = {
+          ...claim.snapshot,
+          root: originalRoot,
+          files: claim.snapshot.files.map((file) => ({
+            ...file,
+            absolutePath: ensureWithin(originalRoot, join(originalRoot, validRelativePath(file.path))),
+          })),
+        };
+        await writeNativeExtraction(copiedSnapshot, rawExtracted);
       }
-      await writeTree(attachmentsRoot, attachmentSnapshots);
-      const atoms = atomizeExtraction(extracted).map((atom) => ({
-        index: atom.index,
-        startByte: atom.startByte,
-        endByte: atom.endByte,
-        byteLength: atom.endByte - atom.startByte,
-      }));
+      const rawStat = await lstatNoFollow(rawExtracted);
+      if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");
+      await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code");
+      await fs.rm(rawExtracted, { force: true });
+      const extractedHash = await hashFile(extractedAbsolute);
+      if (extractedHash.size === 0) throw new Error("empty extraction");
+      const attachmentSnapshots = await walkFiles(attachmentsRoot, "", false);
+      const atoms = await planFileAtoms(extractedAbsolute);
       const prepared: PreparedAdmission = {
         preparedId,
         claimId: claim.claimId,
@@ -946,8 +935,8 @@ export class SourceService {
         metadata: claim.snapshot.metadata,
         converter,
         attachments: attachmentRecords,
-        extractedDigest: digestBytes(extracted),
-        extractedByteLength: extracted.byteLength,
+        extractedDigest: extractedHash.digest,
+        extractedByteLength: extractedHash.size,
       };
       const seal = canonical(persisted);
       await fs.writeFile(this.preparedMetadataPath(preparedId), `${JSON.stringify(persisted, null, 2)}\n`, {
@@ -1067,7 +1056,7 @@ export class SourceService {
     if (!entry) throw new Error("source claim entry is missing");
     const claim = await this.claim(entry);
     this.assertPreparedClaim(prepared, claim, input.digest);
-    const preparedFiles = await walkFiles(originalRoot);
+    const preparedFiles = await walkFiles(originalRoot, "", false);
     const preparedFileRecords = preparedFiles.map((file) => ({
       relativePath: file.path,
       byteLength: file.size,
@@ -1075,21 +1064,16 @@ export class SourceService {
     }));
     if (
       canonical(preparedFileRecords) !== canonical(prepared.files) ||
-      treeDigest(preparedFiles, prepared.snapshotIdentity, prepared.revision) !== prepared.digest
+      treeDigest(preparedFiles, prepared.revision) !== prepared.digest
     )
       throw new Error("prepared snapshot digest mismatch");
-    const extracted = await readNoFollow(extractedPath);
-    if (extracted.byteLength !== prepared.extractedByteLength || digestBytes(extracted) !== prepared.extractedDigest)
+    const extractedHash = await hashFile(extractedPath);
+    if (extractedHash.size !== prepared.extractedByteLength || extractedHash.digest !== prepared.extractedDigest)
       throw new Error("prepared extraction digest mismatch");
-    const actualAtoms = atomizeExtraction(extracted).map((atom) => ({
-      index: atom.index,
-      startByte: atom.startByte,
-      endByte: atom.endByte,
-      byteLength: atom.endByte - atom.startByte,
-    }));
+    const actualAtoms = await planFileAtoms(extractedPath);
     if (canonical(actualAtoms) !== canonical(prepared.atoms)) throw new Error("prepared atom index mismatch");
     const preparedAttachmentsRoot = ensureWithin(preparedRoot, join(preparedRoot, "attachments"));
-    const preparedAttachmentFiles = await walkFiles(preparedAttachmentsRoot);
+    const preparedAttachmentFiles = await walkFiles(preparedAttachmentsRoot, "", false);
     const preparedAttachmentRecords = preparedAttachmentFiles.map((file) => ({
       path: file.path,
       byteLength: file.size,
@@ -1097,34 +1081,26 @@ export class SourceService {
     }));
     if (canonical(preparedAttachmentRecords) !== canonical(prepared.attachments))
       throw new Error("prepared attachment digest mismatch");
-    const chunks = validateChunkEndpoints(extracted, input.endpoints === undefined ? undefined : [...input.endpoints]);
-    const existing = await this.normalizeExistingPacket(claim, {});
+    const planned = await validateFileEndpoints(extractedPath, input.endpoints);
+    const existing = await this.normalizeExistingPacket(claim);
     if (existing) {
       this.completedPrepared.set(prepared.preparedId, { prepared: input.prepared, result: existing });
-      try {
-        await this.cleanupPrepared(prepared.preparedId);
-      } catch {
-        /* Retain the idempotent result; transient work cleanup can be retried. */
-      }
+      await this.cleanupPrepared(prepared.preparedId).catch(() => undefined);
       return existing;
     }
-    const sourceId = this.sourceIdFor(claim, {});
+    const sourceId = this.sourceIdFor(claim);
     const packet = join(this.sources(), sourceId);
     const temporary = join(this.work(), `packet-${sourceId}-${randomUUID()}`);
     await fs.mkdir(temporary, { recursive: false, mode: 0o700 });
     let manifest!: SourceManifest;
     try {
       await writeTree(join(temporary, "original"), preparedFiles);
-      await fs.mkdir(join(temporary, "chunks"), { recursive: false, mode: 0o700 });
+      const packetChunks = join(temporary, "chunks");
       const packetAttachments = join(temporary, "attachments");
       await fs.mkdir(packetAttachments, { recursive: false, mode: 0o700 });
       await writeTree(packetAttachments, preparedAttachmentFiles);
-      await fs.writeFile(join(temporary, "extracted.md"), extracted, { flag: "wx", mode: 0o600 });
-      for (const chunk of chunks)
-        await fs.writeFile(join(temporary, "chunks", `${String(chunk.index + 1).padStart(4, "0")}.md`), chunk.body, {
-          flag: "wx",
-          mode: 0o600,
-        });
+      await copyFileNoFollow(extractedPath, join(temporary, "extracted.md"));
+      const chunkFiles = await writeFileChunks(join(temporary, "extracted.md"), packetChunks, planned.chunks);
       const mediaType = prepared.metadata?.mediaType;
       const originalName = validRelativePath(prepared.metadata?.originalName ?? claim.entry.relativePath);
       const capturedAt = new Date().toISOString();
@@ -1143,13 +1119,14 @@ export class SourceService {
         stagedMetadata: prepared.metadata,
         capturedAt,
         converter: prepared.converter,
+        normalizer: { name: "markdown-blank-lines", version: "1" },
         originalBytes: claim.snapshot.bytes,
         originalByteLength: claim.snapshot.bytes,
         originalDigest: claim.snapshot.digest,
-        extractionBytes: extracted.byteLength,
-        extractedByteLength: extracted.byteLength,
-        extractionDigest: prepared.extractedDigest,
-        extractedDigest: prepared.extractedDigest,
+        extractionBytes: extractedHash.size,
+        extractedByteLength: extractedHash.size,
+        extractionDigest: extractedHash.digest,
+        extractedDigest: extractedHash.digest,
         files: claim.snapshot.files.map(({ path, size, digest }) => ({
           path,
           relativePath: path,
@@ -1166,21 +1143,33 @@ export class SourceService {
           digest,
           mediaType,
         })),
-        chunks: chunks.map(({ index, startAtom, endAtom, startByte, endByte, digest }) => ({
-          index,
-          chunkId: `${sourceId}:${index}`,
-          sourceId,
-          ordinal: index,
-          relativePath: "extracted.md",
-          byteLength: endByte - startByte,
-          atomStart: startAtom,
-          atomEnd: endAtom,
-          startAtom,
-          endAtom,
-          startByte,
-          endByte,
-          digest,
-        })),
+        chunks: chunkFiles.map(({ index, startByte, endByte, digest }) => {
+          const plannedChunk = planned.chunks[index];
+          const startAtom =
+            plannedChunk && plannedChunk.index === index && plannedChunk.startByte === startByte
+              ? plannedChunk.startLine - 1
+              : -1;
+          const endAtom =
+            plannedChunk && plannedChunk.index === index && plannedChunk.endByte === endByte
+              ? plannedChunk.endLine
+              : -1;
+          if (startAtom < 0 || endAtom <= startAtom) throw new Error("chunk atom mapping failed");
+          return {
+            index,
+            chunkId: `${sourceId}:${index}`,
+            sourceId,
+            ordinal: index,
+            relativePath: "extracted.md",
+            byteLength: endByte - startByte,
+            atomStart: startAtom,
+            atomEnd: endAtom,
+            startAtom,
+            endAtom,
+            startByte,
+            endByte,
+            digest,
+          };
+        }),
       };
       await fs.writeFile(join(temporary, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
         flag: "wx",
@@ -1188,11 +1177,7 @@ export class SourceService {
       });
       await fs.mkdir(this.sources(), { recursive: true, mode: 0o700 });
     } catch (error) {
-      try {
-        await fs.rm(temporary, { recursive: true, force: true });
-      } catch {
-        /* Best-effort cleanup after packet construction failure. */
-      }
+      await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
       throw error;
     }
     const published = await this.publishPacket(manifest, temporary, packet, claim);
@@ -1204,11 +1189,7 @@ export class SourceService {
       claim,
     };
     this.completedPrepared.set(prepared.preparedId, { prepared: input.prepared, result });
-    try {
-      await this.cleanupPrepared(prepared.preparedId);
-    } catch {
-      /* Retain the idempotent result; transient work cleanup can be retried. */
-    }
+    await this.cleanupPrepared(prepared.preparedId).catch(() => undefined);
     return result;
   }
 
@@ -1230,22 +1211,20 @@ export class SourceService {
       return undefined;
     }
   }
-  private sourceIdFor(
-    claim: SourceClaim,
-    options: { mediaType?: string; originalName?: string; url?: string },
-  ): string {
-    const sourceUri = options.url === undefined ? claim.snapshot.metadata?.sourceUri : sanitizedSourceUri(options.url);
+  private sourceIdFor(claim: SourceClaim): string {
+    const metadata = claim.snapshot.metadata;
     return deterministicUuid(
       canonical({
         scope: "source",
         digest: claim.snapshot.digest,
-        identity: claim.snapshot.identity,
         revision: claim.snapshot.revision,
         kind: claim.snapshot.kind,
-        metadata: claim.snapshot.metadata,
-        mediaType: options.mediaType ?? claim.snapshot.metadata?.mediaType,
-        originalName: options.originalName ?? claim.snapshot.metadata?.originalName ?? claim.entry.relativePath,
-        sourceUri,
+        sourceUri: metadata?.sourceUri,
+        displayName: metadata?.displayName ?? claim.entry.relativePath,
+        originalName: metadata?.originalName ?? claim.entry.relativePath,
+        mediaType: metadata?.mediaType,
+        requestedKind: metadata?.requestedKind,
+        repositoryRevision: metadata?.repositoryRevision,
       }),
     );
   }
@@ -1263,11 +1242,8 @@ export class SourceService {
       return false;
     }
   }
-  private async normalizeExistingPacket(
-    claim: SourceClaim,
-    options: { mediaType?: string; originalName?: string; url?: string },
-  ): Promise<AdmissionResult | undefined> {
-    const sourceId = this.sourceIdFor(claim, options);
+  private async normalizeExistingPacket(claim: SourceClaim): Promise<AdmissionResult | undefined> {
+    const sourceId = this.sourceIdFor(claim);
     const packet = join(this.sources(), sourceId);
     try {
       const stat = await lstatNoFollow(packet);
@@ -1285,162 +1261,26 @@ export class SourceService {
     claim: SourceClaim,
     options: {
       endpoints?: Array<number | ChunkPlanEndpoint>;
-      mediaType?: string;
-      originalName?: string;
-      url?: string;
     } = {},
   ): Promise<AdmissionResult> {
-    const existing = await this.normalizeExistingPacket(claim, options);
+    const existing = await this.normalizeExistingPacket(claim);
     if (existing) return existing;
-    try {
-      claim = await this.revalidateClaim(claim);
-    } catch (error) {
-      const sourceId = this.sourceIdFor(claim, options);
-      const row = dbGet<Row>(this.db, "SELECT status FROM sources WHERE source_id = ?", [sourceId]);
-      if (String(row?.status ?? "") !== "removed") throw error;
-    }
-    const sourceId = this.sourceIdFor(claim, options);
-    const packet = join(this.sources(), sourceId);
-    const temporary = join(this.work(), `packet-${sourceId}-${randomUUID()}`);
-    await fs.mkdir(temporary, { recursive: false, mode: 0o700 });
-    let manifest!: SourceManifest;
-    try {
-      await fs.mkdir(join(temporary, "original"), { recursive: false, mode: 0o700 });
-      await fs.mkdir(join(temporary, "chunks"), { recursive: false, mode: 0o700 });
-      await fs.mkdir(join(temporary, "attachments"), { recursive: false, mode: 0o700 });
-      await writeTree(join(temporary, "original"), claim.snapshot.files);
-      let extracted: Buffer;
-      let attachments: Array<{ path: string; bytes: Uint8Array | string }> = [];
-      let converter: { name: string; version: string } | undefined;
-      const mediaType = options.mediaType ?? claim.snapshot.metadata?.mediaType;
-      const useDocling =
-        claim.snapshot.kind === "document" || (claim.snapshot.kind === "url" && !textualUrl(claim, mediaType));
-      if (useDocling) {
-        if (!this.adapters.docling) throw new Error("Docling adapter is required for document extraction");
-        if (claim.snapshot.files.length !== 1) throw new Error("Docling requires a single regular document file");
-        const originalFile = claim.snapshot.files[0];
-        if (!originalFile) throw new Error("Docling requires a document file");
-        const originalRoot = join(temporary, "original");
-        const originalPath = ensureWithin(originalRoot, join(originalRoot, validRelativePath(originalFile.path)));
-        const originalStat = await lstatNoFollow(originalPath);
-        if (!originalStat.isFile()) throw new Error("Docling input must be a regular file");
-        const converted =
-          typeof this.adapters.docling === "function"
-            ? await this.adapters.docling({ claim, originalPath, kind: claim.snapshot.kind, mediaType })
-            : await this.adapters.docling.convert({ claim, originalPath, kind: claim.snapshot.kind, mediaType });
-        const normalizedResult = await normalizeDoclingResult(converted);
-        extracted = Buffer.from(normalizedResult.extracted);
-        converter = {
-          name: normalizedResult.converter?.name ?? "docling",
-          version: normalizedResult.converter?.version ?? "unknown",
-        };
-        attachments = normalizedResult.attachments ?? [];
-      } else extracted = nativeExtraction(claim.snapshot);
-      if (!extracted.length) throw new Error("empty extraction");
-      if (extracted.byteLength > MAX_SOURCE_BYTES) throw new Error("extraction exceeds 100 MiB limit");
-      const chunks = validateChunkEndpoints(extracted, options.endpoints);
-      await fs.writeFile(join(temporary, "extracted.md"), extracted, { flag: "wx", mode: 0o600 });
-      let attachmentBytes = 0;
-      for (const attachment of attachments) {
-        const target = ensureWithin(
-          join(temporary, "attachments"),
-          join(join(temporary, "attachments"), validRelativePath(attachment.path)),
-        );
-        const bytes = Buffer.from(attachment.bytes);
-        attachmentBytes += bytes.byteLength;
-        if (bytes.byteLength > MAX_SOURCE_BYTES || attachmentBytes > MAX_SOURCE_BYTES)
-          throw new Error("attachment exceeds 100 MiB limit");
-        await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
-        await fs.writeFile(target, bytes, { flag: "wx", mode: 0o600 });
-      }
-      for (const chunk of chunks)
-        await fs.writeFile(join(temporary, "chunks", `${String(chunk.index + 1).padStart(4, "0")}.md`), chunk.body, {
-          flag: "wx",
-          mode: 0o600,
-        });
-      const attachmentFiles = await walkFiles(join(temporary, "attachments"), "", false);
-      const originalName = validRelativePath(
-        options.originalName ?? claim.snapshot.metadata?.originalName ?? claim.entry.relativePath,
-      );
-      const displayName = options.originalName ?? claim.snapshot.metadata?.displayName ?? originalName;
-      const sourceUri =
-        options.url === undefined ? claim.snapshot.metadata?.sourceUri : sanitizedSourceUri(options.url);
-      const capturedAt = new Date().toISOString();
-      manifest = {
-        id: sourceId,
-        sourceId,
-        kind: claim.snapshot.kind,
-        displayName,
-        originalName,
-        originalUrl: sourceUri,
-        sourceUri,
-        revision: claim.snapshot.revision,
-        repositoryRevision: claim.snapshot.revision,
-        mediaType,
-        inputKind: claim.snapshot.metadata?.requestedKind,
-        stagedMetadata: claim.snapshot.metadata,
-        capturedAt,
-        converter,
-        originalBytes: claim.snapshot.bytes,
-        originalByteLength: claim.snapshot.bytes,
-        originalDigest: claim.snapshot.digest,
-        extractionBytes: extracted.byteLength,
-        extractedByteLength: extracted.byteLength,
-        extractionDigest: digestBytes(extracted),
-        extractedDigest: digestBytes(extracted),
-        files: claim.snapshot.files.map(({ path, size, digest }) => ({
-          path,
-          relativePath: path,
-          bytes: size,
-          byteLength: size,
-          digest,
-          mediaType,
-        })),
-        attachments: attachmentFiles.map(({ path, size, digest }) => ({
-          path,
-          relativePath: path,
-          bytes: size,
-          byteLength: size,
-          digest,
-          mediaType,
-        })),
-        chunks: chunks.map(({ index, startAtom, endAtom, startByte, endByte, digest }) => ({
-          index,
-          chunkId: `${sourceId}:${index}`,
-          sourceId,
-          ordinal: index,
-          relativePath: "extracted.md",
-          byteLength: endByte - startByte,
-          atomStart: startAtom,
-          atomEnd: endAtom,
-          startAtom,
-          endAtom,
-          startByte,
-          endByte,
-          digest,
-        })),
-      };
-      await fs.writeFile(join(temporary, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
-        flag: "wx",
-        mode: 0o600,
-      });
-      await fs.mkdir(this.sources(), { recursive: true, mode: 0o700 });
-    } catch (error) {
-      try {
-        await fs.rm(temporary, { recursive: true, force: true });
-      } catch {
-        /* Best-effort cleanup after packet construction failure. */
-      }
-      throw error;
-    }
-    const published = await this.publishPacket(manifest, temporary, packet, claim);
-    return {
-      sourceId: published.manifest.sourceId,
-      manifest: published.manifest,
-      packetPath: packet,
-      removedInbox: published.removedInbox,
-      claim,
-    };
+    const prepared = await this.prepareClaim(claim);
+    const endpoints = options.endpoints?.map((endpoint) => {
+      const value =
+        typeof endpoint === "number"
+          ? endpoint
+          : (endpoint.endLine ?? endpoint.endAtom ?? endpoint.end ?? endpoint.index);
+      if (value === undefined) throw new Error("chunk line endpoint is missing");
+      return value;
+    });
+    return this.publishPreparedClaim({
+      prepared,
+      preparedId: prepared.preparedId,
+      claimId: prepared.claimId,
+      digest: prepared.digest,
+      endpoints,
+    });
   }
   private recordFailure(entry: InboxEntry, error: unknown, claim?: SourceClaim): void {
     const now = new Date().toISOString();

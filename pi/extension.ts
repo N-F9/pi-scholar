@@ -151,7 +151,7 @@ const admissionInput = Type.Object({
   claimId: Type.String({ minLength: 1 }),
   preparedId: Type.String({ minLength: 1 }),
   digest: Type.String({ minLength: 1 }),
-  endpoints: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))),
+  endpoints: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }))),
 });
 
 const maintenanceIssuePageInput = Type.Object({
@@ -664,7 +664,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_admit_source",
     label: "scholar_admit_source",
     executionMode: "sequential",
-    description: "Publish one claimed source packet with validated chunk endpoints.",
+    description: "Publish one claimed source packet with validated 1-based line endpoints.",
     parameters: admissionInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Publishing source admission", "source-admission", (app) =>

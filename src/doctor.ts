@@ -1,5 +1,16 @@
 import { createHash } from "node:crypto";
-import { type Dirent, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  type Dirent,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { DoctorCheck, DoctorReport, JsonValue } from "./contracts.js";
 import { openDatabase, SCHEMA_VERSION, type ScholarDatabase, validateSchema } from "./database.js";
@@ -8,8 +19,9 @@ import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import { QuizService } from "./quiz.js";
 import { localDate, SchedulerService } from "./scheduler.js";
-import { atomizeExtraction } from "./sources/source-service.js";
-import { readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
+import { validateFileEndpointsSync } from "./sources/source-chunks.js";
+import { hashFileSync } from "./sources/source-files.js";
+import { assertNoSymlinkPath, readFileNoFollow, resolveVault, safeRelativePath, type VaultPaths } from "./vault.js";
 
 function check(name: string, status: DoctorCheck["status"], message: string, details?: JsonValue): DoctorCheck {
   return details === undefined ? { name, status, message } : { name, status, message, details };
@@ -18,6 +30,57 @@ function check(name: string, status: DoctorCheck["status"], message: string, det
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+const DOCTOR_READ_BUFFER_SIZE = 64 * 1024;
+
+type OpenRegularFile = {
+  readonly fd: number;
+  readonly size: number;
+};
+
+function openRegularFile(path: string): OpenRegularFile {
+  assertNoSymlinkPath(path);
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Packet path is not a regular file: ${path}`);
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new Error(`Packet path is not a regular file: ${path}`);
+    return { fd, size: opened.size };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function fileRangeEquals(sourcePath: string, startByte: number, endByte: number, targetPath: string): boolean {
+  const source = openRegularFile(sourcePath);
+  const target = openRegularFile(targetPath);
+  try {
+    const expectedSize = endByte - startByte;
+    if (expectedSize !== target.size) return false;
+    const sourceBuffer = Buffer.allocUnsafe(DOCTOR_READ_BUFFER_SIZE);
+    const targetBuffer = Buffer.allocUnsafe(DOCTOR_READ_BUFFER_SIZE);
+    let sourceOffset = startByte;
+    let targetOffset = 0;
+    let remaining = expectedSize;
+    while (remaining > 0) {
+      const requested = Math.min(remaining, DOCTOR_READ_BUFFER_SIZE);
+      const sourceRead = readSync(source.fd, sourceBuffer, 0, requested, sourceOffset);
+      const targetRead = readSync(target.fd, targetBuffer, 0, requested, targetOffset);
+      if (sourceRead !== targetRead || sourceRead === 0) return false;
+      if (!sourceBuffer.subarray(0, sourceRead).equals(targetBuffer.subarray(0, targetRead))) return false;
+      sourceOffset += sourceRead;
+      targetOffset += targetRead;
+      remaining -= sourceRead;
+    }
+    return true;
+  } finally {
+    closeSync(source.fd);
+    closeSync(target.fd);
+  }
+}
+
 type DependencyCache = { readonly fingerprint: string; readonly check: DoctorCheck };
 const dependencyCheckCache = new Map<string, DependencyCache>();
 
@@ -148,11 +211,6 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         throw new Error(`Packet contains unexpected artifacts: ${entry.name}`);
       const unsafeEntry = collectFiles(packet, "\u0000").find((item) => item.startsWith("SYMLINK:"));
       if (unsafeEntry) throw new Error(`Packet contains symlink: ${entry.name}/${unsafeEntry.slice(8)}`);
-      const readRegular = (target: string): Buffer => {
-        const stat = lstatSync(target);
-        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Packet path is not a regular file: ${target}`);
-        return readFileNoFollow(target);
-      };
       for (const required of ["manifest.json", "extracted.md", "original", "chunks", "attachments"]) {
         const target = join(packet, required);
         const stat = lstatSync(target);
@@ -161,10 +219,19 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         if (shouldBeDirectory ? !stat.isDirectory() : !stat.isFile())
           throw new Error(`Packet artifact has wrong type: ${entry.name}/${required}`);
       }
-      const manifest = JSON.parse(readRegular(join(packet, "manifest.json")).toString("utf8")) as Record<
+      const manifest = JSON.parse(readFileNoFollow(join(packet, "manifest.json")).toString("utf8")) as Record<
         string,
         unknown
       >;
+      const normalizer = manifest.normalizer;
+      if (
+        normalizer === null ||
+        typeof normalizer !== "object" ||
+        Array.isArray(normalizer) ||
+        (normalizer as Record<string, unknown>).name !== "markdown-blank-lines" ||
+        (normalizer as Record<string, unknown>).version !== "1"
+      )
+        throw new Error(`Invalid manifest normalizer: ${entry.name}`);
       if (manifest.id !== entry.name || manifest.sourceId !== entry.name)
         throw new Error(`Manifest id/sourceId mismatch: ${entry.name}`);
       const records = (value: unknown, label: string): Record<string, unknown>[] => {
@@ -261,9 +328,9 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
           throw new Error(`${label} file set mismatch: ${entry.name}`);
         let total = 0;
         for (const file of expected) {
-          const body = readRegular(safeRelativePath(root, file.path));
-          total += body.byteLength;
-          if (body.byteLength !== file.byteLength || createHash("sha256").update(body).digest("hex") !== file.digest)
+          const actual = hashFileSync(safeRelativePath(root, file.path));
+          total += actual.size;
+          if (actual.size !== file.byteLength || actual.digest !== file.digest)
             throw new Error(`${label} identity/digest mismatch: ${entry.name}/${file.path}`);
         }
         return total;
@@ -283,28 +350,30 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
           `Original aggregate byte length mismatch: ${entry.name} (declared ${declaredOriginalTotal}, actual ${originalTotal})`,
         );
       const originalDigest = digest(manifest.originalDigest, "manifest originalDigest");
-      const extracted = readRegular(join(packet, "extracted.md"));
+      const extractedPath = safeRelativePath(packet, "extracted.md");
+      const extracted = hashFileSync(extractedPath);
       const declaredExtractionTotal = aliasedInteger(
         manifest,
         ["extractedByteLength", "extractionBytes"],
         "manifest extracted byte length",
       );
-      if (declaredExtractionTotal !== extracted.byteLength)
+      if (declaredExtractionTotal !== extracted.size)
         throw new Error(
-          `Extracted aggregate byte length mismatch: ${entry.name} (declared ${declaredExtractionTotal}, actual ${extracted.byteLength})`,
+          `Extracted aggregate byte length mismatch: ${entry.name} (declared ${declaredExtractionTotal}, actual ${extracted.size})`,
         );
       const extractedDigest = aliasedDigest(
         manifest,
         ["extractedDigest", "extractionDigest"],
         "manifest extracted digest",
       );
-      if (createHash("sha256").update(extracted).digest("hex") !== extractedDigest)
-        throw new Error(`Extracted digest mismatch: ${entry.name}`);
-      const atoms = atomizeExtraction(extracted);
+      if (extracted.digest !== extractedDigest) throw new Error(`Extracted digest mismatch: ${entry.name}`);
       const chunkNames = readdirSync(join(packet, "chunks")).sort((left, right) => left.localeCompare(right));
       if (chunks.length === 0 || chunkNames.length !== chunks.length)
         throw new Error(`Chunk file set is incomplete: ${entry.name}`);
-      const chunkBodies: Buffer[] = [];
+      const planned = validateFileEndpointsSync(
+        extractedPath,
+        chunks.map((record, index) => aliasedInteger(record, ["endAtom", "atomEnd"], `chunks[${index}].endAtom`)),
+      );
       let atomCursor = 0;
       let byteCursor = 0;
       let chunkByteTotal = 0;
@@ -312,18 +381,19 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         const expectedName = `${String(index + 1).padStart(4, "0")}.md`;
         if (chunkNames[index] !== expectedName)
           throw new Error(`Chunk file order is invalid: ${entry.name}/${expectedName}`);
-        const body = readRegular(join(packet, "chunks", expectedName));
+        const chunkPath = safeRelativePath(join(packet, "chunks"), expectedName);
+        const chunk = hashFileSync(chunkPath);
         const chunkIndex = aliasedInteger(record, ["index", "ordinal"], `chunks[${index}].index`);
         const ordinal = aliasedInteger(record, ["ordinal", "index"], `chunks[${index}].ordinal`);
         const chunkId = record.chunkId;
         const chunkSourceId = record.sourceId;
-        const chunkPath = record.relativePath;
+        const chunkRelativePath = record.relativePath;
         if (
           chunkIndex !== index ||
           ordinal !== index ||
           chunkSourceId !== entry.name ||
           chunkId !== `${entry.name}:${index}` ||
-          chunkPath !== "extracted.md"
+          chunkRelativePath !== "extracted.md"
         )
           throw new Error(`Chunk source/chunk id or relative path mismatch: ${entry.name}/${index}`);
         const startAtom = aliasedInteger(record, ["startAtom", "atomStart"], `chunks[${index}].startAtom`);
@@ -331,38 +401,33 @@ function checkPackets(paths: VaultPaths): DoctorCheck {
         const startByte = integer(record.startByte, `chunks[${index}].startByte`);
         const endByte = integer(record.endByte, `chunks[${index}].endByte`);
         const byteLength = aliasedInteger(record, ["byteLength", "bytes"], `chunks[${index}].byteLength`);
+        const plannedChunk = planned.chunks[index];
         if (
           startAtom !== atomCursor ||
           endAtom <= startAtom ||
-          endAtom > atoms.length ||
           startByte !== byteCursor ||
           endByte < startByte ||
-          endByte - startByte !== body.byteLength ||
-          endByte - startByte !== byteLength
+          endByte - startByte !== chunk.size ||
+          endByte - startByte !== byteLength ||
+          !plannedChunk ||
+          plannedChunk.startLine - 1 !== startAtom ||
+          plannedChunk.endLine !== endAtom ||
+          plannedChunk.startByte !== startByte ||
+          plannedChunk.endByte !== endByte
         )
           throw new Error(`Chunk atom/byte range is not contiguous: ${entry.name}/${index}`);
-        const firstAtom = atoms[startAtom];
-        const lastAtom = atoms[endAtom - 1];
-        if (
-          !firstAtom ||
-          !lastAtom ||
-          firstAtom.startByte !== startByte ||
-          lastAtom.endByte !== endByte ||
-          !body.equals(extracted.subarray(startByte, endByte))
-        )
+        if (!fileRangeEquals(extractedPath, startByte, endByte, chunkPath))
           throw new Error(`Chunk atom/byte range does not match extraction: ${entry.name}/${index}`);
-        if (createHash("sha256").update(body).digest("hex") !== digest(record.digest, `chunks[${index}].digest`))
+        if (chunk.digest !== digest(record.digest, `chunks[${index}].digest`))
           throw new Error(`Chunk digest mismatch: ${entry.name}/${index}`);
-        chunkBodies.push(body);
         atomCursor = endAtom;
         byteCursor = endByte;
-        chunkByteTotal += body.byteLength;
+        chunkByteTotal += chunk.size;
       }
       if (
-        atomCursor !== atoms.length ||
-        byteCursor !== extracted.byteLength ||
-        chunkByteTotal !== extracted.byteLength ||
-        !Buffer.concat(chunkBodies, chunkByteTotal).equals(extracted)
+        atomCursor !== planned.chunks.at(-1)?.endLine ||
+        byteCursor !== extracted.size ||
+        chunkByteTotal !== extracted.size
       )
         throw new Error(`Chunk final totals/reconstruction mismatch: ${entry.name}`);
       const source = db.get<{
