@@ -1441,6 +1441,47 @@ function gradeFor(context: GradingContext, pageId: string, questionId: string, e
 }
 
 describe("quiz grading workflow lifecycle", () => {
+  it("rejects workflow request IDs in question and page feedback before persistence", async () => {
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
+    const owner = randomUUID();
+    try {
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const first = await app.getGradingContext({ date }, owner);
+      const firstEvidence = first.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(firstEvidence);
+      const firstGrade = gradeFor(first, pageId, questionId, [firstEvidence]);
+      await assert.rejects(
+        app.settleGrade(
+          {
+            ...firstGrade,
+            questions: [{ questionId, feedback: `x${first.requestId}` }],
+          },
+          owner,
+        ),
+        /private metadata/u,
+      );
+      const retry = await app.getGradingContext({ date }, owner);
+      const retryEvidence = retry.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(retryEvidence);
+      const retryGrade = gradeFor(retry, pageId, questionId, [retryEvidence]);
+      await assert.rejects(
+        app.settleGrade(
+          {
+            ...retryGrade,
+            questions: [{ questionId, feedback: "visible feedback" }],
+            pages: [{ ...retryGrade.pages[0]!, feedback: `x${retry.requestId}` }],
+          },
+          owner,
+        ),
+        /private metadata/u,
+      );
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("atomically queues, claims, validates ownership, and settles one sealed submission", async () => {
     const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const owner = randomUUID();

@@ -2159,6 +2159,7 @@ export class ScholarApplication {
             date: proposal.date,
             revision: proposal.revision,
             submissionId: proposal.submissionId,
+            requestId: proposal.requestId,
             questions: proposal.questions,
             pages: proposal.pages,
           },

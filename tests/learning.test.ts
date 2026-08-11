@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, test } from "vitest";
 import { openDatabase, type ScholarDatabase } from "../src/database.js";
-import { QuizConflictError, QuizService } from "../src/quiz.js";
+import { QuizConflictError, QuizService, validateQuizVisibleText } from "../src/quiz.js";
 import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
 import { parseWikiBodySections, parseWikiDocumentSections } from "../src/wiki-sections.js";
 
@@ -23,17 +23,20 @@ const PAGE_BODY = `${[
 function pageDocument(pageId: string, body: string): string {
   return `---\ntype: note\nid: ${pageId}\ntitle: ${pageId}\ndescription: ${pageId} description\n---\n${body}`;
 }
+function syntheticPagePath(pageId: string): string {
+  return `fixture-${createHash("sha256").update(pageId).digest("hex").slice(0, 12)}.md`;
+}
 const PAGE_MARKDOWN = pageDocument("p1", PAGE_BODY);
 afterAll(() => rmSync(LEARNING_WIKI_ROOT, { recursive: true, force: true }));
 
 function addPage(db: ScholarDatabase, pageId: string, markdown = PAGE_BODY): void {
   const document = markdown.startsWith("---\n") ? markdown : pageDocument(pageId, markdown);
-  writeFileSync(join(LEARNING_WIKI_ROOT, `${pageId}.md`), document);
+  writeFileSync(join(LEARNING_WIKI_ROOT, syntheticPagePath(pageId)), document);
   const digest = createHash("sha256").update(document).digest("hex");
   const now = new Date().toISOString();
   db.run(
     "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
-    [pageId, `${pageId}.md`, pageId, digest, now, now],
+    [pageId, syntheticPagePath(pageId), pageId, digest, now, now],
   );
 }
 
@@ -250,7 +253,7 @@ test("headingless eligible pages publish page evidence and authorize page-only r
     ],
   });
   assert.equal(settled.pages[0]!.readings[0]!.anchor, "");
-  assert.equal(quiz.readingHref({ pageId: "headingless", anchor: "" }), "wiki/headingless.md");
+  assert.equal(quiz.readingHref({ pageId: "headingless", anchor: "" }), `wiki/${syntheticPagePath("headingless")}`);
   db.close();
 });
 test("grading rejects malformed stored evidence paths without a live vault", () => {
@@ -532,6 +535,39 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   db.close();
 });
 
+test("grading rejects generated reading targets that expose page IDs before persistence", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({ date, selectedPageIds: ["p1"], questionSpecs: [question("p1")] });
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  db.run("UPDATE pages SET relative_path = ? WHERE page_id = ?", ["p1.md", "p1"]);
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        date,
+        revision: sealed.revision,
+        submissionId: "generated-reading-target",
+        questions: [{ questionId, feedback: "Valid feedback." }],
+        pages: [
+          {
+            pageId: "p1",
+            rating: "Good",
+            evidence: [evidence.reference],
+            readings: [{ pageId: "p1", anchor: evidence.anchor }],
+          },
+        ],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
 test("grading rejects fabricated or stale direct evidence before page transition", () => {
   const { db, scheduler, date } = setup();
   ensureDue(scheduler, ["p1"], date);
@@ -551,7 +587,7 @@ test("grading rejects fabricated or stale direct evidence before page transition
   assert.throws(() => quiz.settleGrade(makeGrade("fabricated-reference")), ValidationError);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   writeFileSync(
-    join(LEARNING_WIKI_ROOT, "p1.md"),
+    join(LEARNING_WIKI_ROOT, syntheticPagePath("p1")),
     PAGE_MARKDOWN.replace("# Part\nsection text", "# Part\nchanged section text"),
   );
   assert.throws(() => quiz.settleGrade(makeGrade(authorized.reference)), ValidationError);
@@ -627,6 +663,10 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   ensureDue(scheduler, ["p1"], date);
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
   const pageDigest = db.get<{ digest: string }>("SELECT digest FROM pages WHERE page_id = ?", ["p1"])!.digest;
+  const opaqueId = randomUUID();
+  assert.throws(() => validateQuizVisibleText(`x${opaqueId}`, [opaqueId]), ValidationError);
+  assert.throws(() => validateQuizVisibleText(`x${pageDigest}`, [pageDigest]), ValidationError);
+  assert.doesNotThrow(() => validateQuizVisibleText("xp1", ["p1"]));
   assert.throws(
     () =>
       quiz.createDailyQuiz({
@@ -656,7 +696,7 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
       quiz.createDailyQuiz({
         date,
         selectedPageIds: ["p1"],
-        questionSpecs: [question("p1", `Explain ${pageDigest}`)],
+        questionSpecs: [question("p1", `Explain x${pageDigest}`)],
       }),
     ValidationError,
   );
@@ -696,6 +736,25 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "valid answer" } });
   const sealed = quiz.sealSubmission({ date, revision: draft.revision });
   const evidence = quiz.gradingEvidence(sealed)[0]!;
+  const requestId = randomUUID();
+  const requestGrade = {
+    date,
+    revision: sealed.revision,
+    requestId,
+    submissionId: "hidden-request-feedback",
+    questions: [{ questionId, feedback: `x${requestId}` }],
+    pages: [{ pageId: "p1", rating: "Good" as const, evidence: [evidence.reference] }],
+  };
+  assert.throws(() => quiz.settleGrade(requestGrade), ValidationError);
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        questions: [{ questionId, feedback: "visible feedback" }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: `x${requestId}` }],
+      }),
+    ValidationError,
+  );
   assert.throws(
     () =>
       quiz.settleGrade({

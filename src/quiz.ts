@@ -67,6 +67,7 @@ export interface GradeSubmissionInput {
   readonly date: string | Date;
   readonly revision?: number;
   readonly submissionId?: string;
+  readonly requestId?: string;
   readonly questions: readonly QuestionGradeInput[];
   readonly pages: readonly PageGradeInput[];
 }
@@ -108,11 +109,27 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
+function isOpaqueIdentifier(value: string): boolean {
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value) || /^[0-9a-f]{64}$/iu.test(value)
+  );
+}
+
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly string[]): void {
   const tokens = [...new Set(hiddenTokens.map((token) => token.trim()).filter(Boolean))];
   if (!tokens.length) return;
-  const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])(?:${tokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`, "iu");
-  if (pattern.test(value)) throw new ValidationError("Quiz Markdown contains private metadata");
+  const opaqueTokens = tokens.filter(isOpaqueIdentifier);
+  const ambiguousTokens = tokens.filter((token) => !isOpaqueIdentifier(token));
+  if (
+    (opaqueTokens.length && new RegExp(`(?:${opaqueTokens.map(escapeRegExp).join("|")})`, "iu").test(value)) ||
+    (ambiguousTokens.length &&
+      new RegExp(
+        `(?<![\\p{L}\\p{N}_])(?:${ambiguousTokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`,
+        "iu",
+      ).test(value))
+  ) {
+    throw new ValidationError("Quiz Markdown contains private metadata");
+  }
 }
 
 function nowIso(): string {
@@ -674,7 +691,7 @@ export class QuizService {
       readings: page.readings,
     }));
     const rendered = this.renderSheet(quiz, this.answerMap(quiz.quizId), previewResults, previewPages);
-    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(quiz));
+    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(quiz, undefined, input.requestId));
     const settled = this.replaceSheet(quiz.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
       let committed: SettledQuizResult | undefined;
       transaction(this.source, () => {
@@ -867,7 +884,11 @@ export class QuizService {
     if (!quiz) throw new ValidationError(`No quiz for ${date}`);
     return quiz;
   }
-  private hiddenTokensForQuiz(quiz: QuizRecord, evidence?: readonly QuizEvidenceRecord[]): readonly string[] {
+  private hiddenTokensForQuiz(
+    quiz: QuizRecord,
+    evidence?: readonly QuizEvidenceRecord[],
+    requestId?: string,
+  ): readonly string[] {
     const evidenceTokens = evidence
       ? evidence.flatMap((item) => [item.reference, item.pageId, item.pageDigest, item.textDigest])
       : this.db
@@ -889,6 +910,7 @@ export class QuizService {
           ...(question.sourceRefs ?? []),
         ]),
         ...evidenceTokens,
+        ...(requestId ? [requestId] : []),
       ]),
     ].filter(Boolean);
   }
@@ -1171,7 +1193,7 @@ export class QuizService {
     ) {
       throw new ValidationError("Grading must cover every displayed question exactly once");
     }
-    const hiddenTokens = this.hiddenTokensForQuiz(quiz);
+    const hiddenTokens = this.hiddenTokensForQuiz(quiz, undefined, input.requestId);
     const expectedPageIds = new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)));
     if (input.pages.length !== expectedPageIds.size || input.pages.some((page) => !expectedPageIds.has(page.pageId))) {
       throw new ValidationError("Grading must cover every covered page exactly once");
@@ -1484,9 +1506,10 @@ export class QuizService {
       comments.filter((comment) => /^<!--\s*pi-scholar:quiz\b/u.test(comment)).length !== 1
     )
       throw new ValidationError("Rendered quiz sheet comments are invalid");
-    const visibleMarkdown = markdown
-      .replace(/<!--\s*pi-scholar:(?:quiz format=1 id=[^\s]+ revision=\d+|question id=[^\s]+)\s*-->/gu, "")
-      .replace(/\]\(wiki\/[^)\n]*\)/gu, "]");
+    const visibleMarkdown = markdown.replace(
+      /<!--\s*pi-scholar:(?:quiz format=1 id=[^\s]+ revision=\d+|question id=[^\s]+)\s*-->/gu,
+      "",
+    );
     validateQuizVisibleText(visibleMarkdown, hiddenTokens);
   }
 
