@@ -361,6 +361,7 @@ export class ScholarApplication {
     operation: () => T | PromiseLike<T>,
     subject: string,
     rollback?: DurableRollback<R>,
+    afterCommit?: () => void | PromiseLike<void>,
   ): Promise<T> {
     return withWriterLock(this.paths, async () => {
       let snapshot: R | undefined;
@@ -410,6 +411,7 @@ export class ScholarApplication {
             throw mutationFinalizationError("rollback", error);
           }
         }
+        await afterCommit?.();
         return value;
       } catch (error) {
         if (rollback && captured && !committed) {
@@ -733,23 +735,28 @@ export class ScholarApplication {
     confirmationId: string,
     context?: ApplicationMutationContext,
   ): Promise<SourceRemovalResult> {
-    return this.mutate(context, async () => {
-      const result = await this.durableDirect(async () => {
-        const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
-        try {
-          await this.wiki.refreshProjections();
-        } catch (error) {
-          throw mutationFinalizationError("projection", error, true);
-        }
-        return { sourceId, status: "removed" as const, dependentPageIds: removed.dependentPageIds };
-      }, "source:remove");
-      try {
-        await this.wiki.refreshQmdIndex();
-      } catch (error) {
-        throw mutationFinalizationError("qmd", error, true);
-      }
-      return result;
-    });
+    return this.mutate(context, () =>
+      this.durableDirect(
+        async () => {
+          const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
+          try {
+            await this.wiki.refreshProjections();
+          } catch (error) {
+            throw mutationFinalizationError("projection", error, true);
+          }
+          return { sourceId, status: "removed" as const, dependentPageIds: removed.dependentPageIds };
+        },
+        "source:remove",
+        undefined,
+        async () => {
+          try {
+            await this.wiki.refreshQmdIndex();
+          } catch (error) {
+            throw mutationFinalizationError("qmd", error, true);
+          }
+        },
+      ),
+    );
   }
   private async quizDetail(quiz: QuizRecord): Promise<QuizDetailRecord> {
     const answers = this.db

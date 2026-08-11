@@ -13,7 +13,7 @@ import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { QuizService } from "../src/quiz.js";
 import { localDate, SchedulerService } from "../src/scheduler.js";
-import { initVault } from "../src/vault.js";
+import { acquireWriterLock, initVault, LockBusyError } from "../src/vault.js";
 import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
 it("requires non-empty extraction line endpoints", () => {
@@ -292,6 +292,7 @@ describe("durable application writes", () => {
           qmd: {
             search: () => [],
             index: async () => {
+              assert.throws(() => acquireWriterLock(paths), LockBusyError);
               calls.push("qmd");
               qmdIndexes += 1;
               if (qmdIndexes === 1) throw new Error("injected source qmd failure");

@@ -20,7 +20,7 @@ import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import type { QuizRecord } from "../src/contracts.js";
 import { type ServerOptions, startServer } from "../src/server.js";
-import { LockBusyError } from "../src/vault.js";
+import { initVault, LockBusyError } from "../src/vault.js";
 
 async function withServer(
   application: ScholarApplication,
@@ -641,6 +641,32 @@ describe("server browser boundary", () => {
       }
       assert.equal(calls, 0);
     });
+  });
+
+  it("returns source URL validation failures as actionable client errors", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-source-url-"));
+    const application = new ScholarApplication({
+      paths: initVault(join(root, "vault")),
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    try {
+      await withServer(application, async (base) => {
+        const response = await fetch(`${base}/api/v1/sources`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+          body: JSON.stringify({ kind: "url", url: "ftp://example.com/source.txt" }),
+        });
+        const body = (await response.json()) as {
+          readonly error: { readonly code: string; readonly message: string };
+        };
+        assert.equal(response.status, 400);
+        assert.equal(body.error.code, "validation-error");
+        assert.equal(body.error.message, "only HTTP(S) URLs are accepted");
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("sanitizes lock diagnostics at the HTTP boundary", async () => {

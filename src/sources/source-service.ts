@@ -20,6 +20,7 @@ import {
   parseOkfConcept,
 } from "../okf.js";
 import { QuizService } from "../quiz.js";
+import { ValidationError } from "../scheduler.js";
 import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
 import {
   atomizeExtraction,
@@ -588,11 +589,17 @@ export class SourceService {
       request.path !== undefined,
       request.filePath !== undefined,
     ].filter(Boolean).length;
-    if (forms > 1) throw new Error("source input has multiple payloads");
+    if (forms > 1) throw new ValidationError("source input has multiple payloads");
     if (request.url !== undefined) {
-      if (request.kind !== undefined && request.kind !== "url") throw new Error("URL source kind must be url");
-      const parsed = new URL(request.url);
-      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("only HTTP(S) URLs are accepted");
+      if (request.kind !== undefined && request.kind !== "url")
+        throw new ValidationError("URL source kind must be url");
+      let parsed: URL;
+      try {
+        parsed = new URL(request.url);
+      } catch {
+        throw new ValidationError("source URL is invalid");
+      }
+      if (!["http:", "https:"].includes(parsed.protocol)) throw new ValidationError("only HTTP(S) URLs are accepted");
       if (this.adapters.fetchUrl) {
         const fetched = await this.adapters.fetchUrl(parsed.toString());
         const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
@@ -603,7 +610,7 @@ export class SourceService {
           /[\u0000-\u001f\u007f]/u.test(displayName) ||
           (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
         )
-          throw new Error("invalid staged source metadata");
+          throw new ValidationError("invalid staged source metadata");
         return this.stageEnvelope(
           {
             version: 1,
@@ -649,7 +656,7 @@ export class SourceService {
     }
     if (request.text !== undefined) {
       if (request.kind !== undefined && request.kind !== "text" && request.kind !== "pasted")
-        throw new Error("text source kind must be text or pasted");
+        throw new ValidationError("text source kind must be text or pasted");
       const rawName = request.name ?? "source.txt";
       const originalName = validRelativePath(request.originalName ?? rawName);
       const requestedKind = request.kind ?? "pasted";
@@ -659,7 +666,7 @@ export class SourceService {
         /[\u0000-\u001f\u007f]/u.test(displayName) ||
         (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
       )
-        throw new Error("invalid staged source metadata");
+        throw new ValidationError("invalid staged source metadata");
       const metadata: StageMetadata = {
         version: 1,
         requestedKind,
@@ -672,8 +679,8 @@ export class SourceService {
       return this.stageEnvelope(metadata, bytes);
     }
     if (request.bytes !== undefined) {
-      if (request.kind !== "upload") throw new Error("bytes source kind must be upload");
-      if (!(request.bytes instanceof Uint8Array)) throw new Error("source payload must be binary");
+      if (request.kind !== "upload") throw new ValidationError("bytes source kind must be upload");
+      if (!(request.bytes instanceof Uint8Array)) throw new ValidationError("source payload must be binary");
       const rawName = request.name ?? "source.txt";
       const originalName = validRelativePath(request.originalName ?? rawName);
       const bytes = Buffer.from(request.bytes);
@@ -683,7 +690,7 @@ export class SourceService {
         /[\u0000-\u001f\u007f]/u.test(displayName) ||
         (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
       )
-        throw new Error("invalid staged source metadata");
+        throw new ValidationError("invalid staged source metadata");
       const metadata: StageMetadata = {
         version: 1,
         requestedKind: "upload",
@@ -696,10 +703,10 @@ export class SourceService {
       return this.stageEnvelope(metadata, bytes);
     }
     if (request.filePath !== undefined) {
-      if (request.kind !== "upload") throw new Error("filePath source kind must be upload");
+      if (request.kind !== "upload") throw new ValidationError("filePath source kind must be upload");
       const source = resolve(request.filePath);
       const stat = await lstatNoFollow(source);
-      if (!stat.isFile()) throw new Error("upload filePath must be a regular file");
+      if (!stat.isFile()) throw new ValidationError("upload filePath must be a regular file");
       const rawName = request.name ?? basename(source);
       const originalName = validRelativePath(request.originalName ?? rawName);
       const kind = inferKind(originalName);
@@ -708,7 +715,7 @@ export class SourceService {
         /[\u0000-\u001f\u007f]/u.test(displayName) ||
         (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
       )
-        throw new Error("invalid staged source metadata");
+        throw new ValidationError("invalid staged source metadata");
       const metadata: StageMetadata = {
         version: 1,
         requestedKind: "upload",
@@ -735,16 +742,16 @@ export class SourceService {
       }
     }
     const input = request.path ?? request.filePath;
-    if (!input) throw new Error("source input is required");
+    if (!input) throw new ValidationError("source input is required");
     if (request.kind !== undefined && !SOURCE_KINDS.includes(request.kind as SourceKind))
-      throw new Error("invalid source kind");
+      throw new ValidationError("invalid source kind");
     const source = resolve(input);
     const name = validRelativePath(request.name ?? basename(source));
-    if (name.includes("/")) throw new Error("staging name must be a single filename");
+    if (name.includes("/")) throw new ValidationError("staging name must be a single filename");
     const stat = await lstatNoFollow(source);
     const repository = stat.isDirectory() && (await this.isRepository(source));
     const kind: SourceKind = repository ? "repository" : inferKind(source, stat);
-    if (!repository && inferKind(name, stat) !== kind) throw new Error(`staging name kind must be ${kind}`);
+    if (!repository && inferKind(name, stat) !== kind) throw new ValidationError(`staging name kind must be ${kind}`);
     const gitRevision = this.adapters.gitRevision;
     const revisionProvider = repository
       ? typeof gitRevision === "function"
@@ -761,7 +768,8 @@ export class SourceService {
     if (repository && beforeCopyRevision !== initialRevision) throw new Error("repository changed during staging");
     if (repository && !initialRevision) throw new Error("repository revision is unavailable");
     if (!repository) await measurePath(source);
-    if (request.kind !== undefined && request.kind !== kind) throw new Error(`path source kind must be ${kind}`);
+    if (request.kind !== undefined && request.kind !== kind)
+      throw new ValidationError(`path source kind must be ${kind}`);
     const revision = repository ? initialRevision : undefined;
     const metadata = repository
       ? (() => {
@@ -771,7 +779,7 @@ export class SourceService {
             /[\u0000-\u001f\u007f]/u.test(displayName) ||
             (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
           )
-            throw new Error("invalid staged source metadata");
+            throw new ValidationError("invalid staged source metadata");
           return {
             version: 1 as const,
             requestedKind: (request.kind ?? kind) as InputKind,
