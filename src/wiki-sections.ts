@@ -1,6 +1,18 @@
 import { createHash } from "node:crypto";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import type { WikiPageSection } from "./contracts.js";
 import { okfRenderedText, parseOkfConcept } from "./okf.js";
+
+type MarkdownNode = {
+  readonly type: string;
+  readonly children?: readonly MarkdownNode[];
+  readonly position?: {
+    readonly start?: { readonly offset?: number };
+    readonly end?: { readonly offset?: number };
+  };
+};
 
 function headingAnchor(heading: string, used: Set<string>): string {
   const slug = heading
@@ -33,49 +45,62 @@ function section(
     textDigest: createHash("sha256").update(text).digest("hex"),
   };
 }
+type SectionHeading = { readonly startOffset: number; readonly heading: string };
+
+function parseHeadings(markdown: string): SectionHeading[] {
+  const tree = fromMarkdown(markdown, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as MarkdownNode;
+  const headings: SectionHeading[] = [];
+  for (const node of tree.children ?? []) {
+    if (node.type !== "heading") continue;
+    const startOffset = node.position?.start?.offset;
+    const endOffset = node.position?.end?.offset;
+    if (startOffset === undefined || endOffset === undefined) continue;
+    const source = markdown.slice(startOffset, endOffset).replace(/(?:\r?\n)+$/u, "");
+    const lines = source.split("\n");
+    const underline = lines.at(-1)?.replace(/\r$/u, "") ?? "";
+    let heading: string | undefined;
+    if (lines.length > 1 && /^( {0,3})(?:=+|-+)[ \t]*$/u.test(underline)) {
+      heading = lines.slice(0, -1).join("\n").trim();
+    } else {
+      const line = lines[0]?.replace(/\r$/u, "") ?? "";
+      const match = /^( {0,3})#{1,6}(?:[ \t]+|$)(.*)$/.exec(line);
+      if (match) heading = match[2]!.replace(/[ \t]+#+[ \t]*$/u, "").trim();
+    }
+    if (heading) headings.push({ startOffset, heading });
+  }
+  return headings;
+}
 
 function parseBodySections(markdown: string, pageId: string, baseOffset: number): WikiPageSection[] {
   const output: WikiPageSection[] = [];
   const used = new Set<string>();
-  let fence: { readonly marker: string; readonly length: number } | undefined;
-  let offset = 0;
-  while (offset <= markdown.length) {
-    const newline = markdown.indexOf("\n", offset);
-    const end = newline < 0 ? markdown.length : newline + 1;
-    const rawLine = markdown.slice(offset, end);
-    const line = rawLine.endsWith("\n") ? rawLine.slice(0, -1) : rawLine;
-    const content = line.endsWith("\r") ? line.slice(0, -1) : line;
-    const fenceMatch = /^( {0,3})(`{3,}|~{3,})/.exec(content);
-    if (fenceMatch) {
-      const marker = fenceMatch[2]![0]!;
-      const length = fenceMatch[2]!.length;
-      if (!fence) fence = { marker, length };
-      else if (marker === fence.marker && length >= fence.length) fence = undefined;
-    } else if (!fence) {
-      const headingMatch = /^( {0,3})#{1,6}(?:[ \t]+|$)(.*)$/.exec(content);
-      if (headingMatch) {
-        const heading = headingMatch[2]!.replace(/[ \t]+#+[ \t]*$/u, "").trim();
-        const anchor = headingAnchor(heading, used);
-        if (heading && anchor) {
-          const previous = output.at(-1);
-          if (previous) {
-            const sectionText = markdown.slice(previous.startOffset - baseOffset, offset);
-            output[output.length - 1] = {
-              ...previous,
-              endOffset: baseOffset + offset,
-              textDigest: createHash("sha256").update(sectionText).digest("hex"),
-            };
-          } else if (okfRenderedText(markdown.slice(0, offset)).trim()) {
-            output.push(section(pageId, "", baseOffset, baseOffset + offset, markdown.slice(0, offset)));
-          }
-          output.push(
-            section(pageId, anchor, baseOffset + offset, baseOffset + markdown.length, markdown.slice(offset), heading),
-          );
-        }
-      }
+  for (const { startOffset, heading } of parseHeadings(markdown)) {
+    const anchor = headingAnchor(heading, used);
+    if (!anchor) continue;
+    const previous = output.at(-1);
+    if (previous) {
+      const sectionText = markdown.slice(previous.startOffset - baseOffset, startOffset);
+      output[output.length - 1] = {
+        ...previous,
+        endOffset: baseOffset + startOffset,
+        textDigest: createHash("sha256").update(sectionText).digest("hex"),
+      };
+    } else if (okfRenderedText(markdown.slice(0, startOffset)).trim()) {
+      output.push(section(pageId, "", baseOffset, baseOffset + startOffset, markdown.slice(0, startOffset)));
     }
-    offset = end;
-    if (newline < 0) break;
+    output.push(
+      section(
+        pageId,
+        anchor,
+        baseOffset + startOffset,
+        baseOffset + markdown.length,
+        markdown.slice(startOffset),
+        heading,
+      ),
+    );
   }
   if (output.length) {
     const last = output.at(-1)!;

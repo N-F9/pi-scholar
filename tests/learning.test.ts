@@ -99,6 +99,44 @@ test("section parsers keep headed preambles and exclude OKF frontmatter", () => 
   );
 });
 
+test("section parser recognizes Setext headings and keeps their boundaries", () => {
+  const setextBody = "Topic\n=====\nTopic evidence.\n\nNext\n-----\nNext evidence.\n";
+  const sections = parseWikiBodySections(setextBody, "setext");
+  assert.deepEqual(
+    sections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#topic", heading: "Topic" },
+      { anchor: "#next", heading: "Next" },
+    ],
+  );
+  assert.equal(setextBody.slice(sections[0]!.startOffset, sections[0]!.endOffset), "Topic\n=====\nTopic evidence.\n\n");
+  assert.equal(setextBody.slice(sections[1]!.startOffset, sections[1]!.endOffset), "Next\n-----\nNext evidence.\n");
+
+  const mixedBody = "Topic\n=====\nSetext evidence.\n\n# Topic\nATX evidence.\n";
+  assert.deepEqual(
+    parseWikiBodySections(mixedBody, "mixed").map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#topic", heading: "Topic" },
+      { anchor: "#topic-1", heading: "Topic" },
+    ],
+  );
+
+  const fencedBody = "```md\nIgnored\n-----\nIgnored body.\n```\nActual\n=====\nActual evidence.\n";
+  const fencedSections = parseWikiBodySections(fencedBody, "fenced");
+  assert.deepEqual(
+    fencedSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "", heading: undefined },
+      { anchor: "#actual", heading: "Actual" },
+    ],
+  );
+  assert.equal(
+    fencedBody.slice(fencedSections[0]!.startOffset, fencedSections[0]!.endOffset),
+    "```md\nIgnored\n-----\nIgnored body.\n```\n",
+  );
+  assert.equal(fencedBody.slice(fencedSections[1]!.startOffset), "Actual\n=====\nActual evidence.\n");
+});
+
 test("headingless eligible pages publish page evidence and authorize page-only readings", () => {
   const { db, scheduler, date } = setup();
   addPage(db, "headingless", pageDocument("headingless", "Only page-level exposition.\n"));
