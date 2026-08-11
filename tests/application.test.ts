@@ -775,6 +775,29 @@ describe("application quiz date guards", () => {
 });
 
 describe("application quiz publication guards", () => {
+  it("blocks quiz evidence and publication while initialization is active", async () => {
+    const { app, db, calls } = fixture();
+    const date = localDate(new Date());
+    try {
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: ["nonexistent-page"] }), (error: Error) => {
+        assert.equal(error.message, "Initialization maintenance is active; quiz evidence is blocked");
+        return true;
+      });
+      calls.length = 0;
+      await assert.rejects(
+        app.publishQuiz({ status: "skipped", date, reason: "Initialization maintenance is active" }),
+        (error: Error) => {
+          assert.equal(error.message, "Initialization maintenance is active; quiz publication is blocked");
+          return true;
+        },
+      );
+      assert.equal(db.get("SELECT 1 FROM quizzes LIMIT 1"), undefined);
+      assert.deepEqual(calls, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("returns verified compact candidates without evidence excerpts", async () => {
     const { app, db } = fixture();
     const date = localDate(new Date());
@@ -895,6 +918,7 @@ describe("application quiz publication guards", () => {
       new Date(Date.now() + 2 * 86_400_000).toISOString(),
       future.page.pageId,
     ]);
+    await app.updateSettings({ initializationEnabled: false });
     calls.length = 0;
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [second.page.pageId, first.page.pageId] });

@@ -640,24 +640,20 @@ async function lifecycleFinal<T>(
     result = await operation(app);
   } catch (error) {
     if (kind === "ingest" || kind === "lint") {
-      try {
-        await app.updateWorkflow(state.requestId, {
-          progress: 0.5,
-          message: "Wiki change rejected; submit another or finish",
-        });
-      } catch {
-        // Preserve the tool error if progress persistence is unavailable.
-      }
       workflowStates.set(key, state);
     } else if (kind === "extract") {
-      const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, false);
-      if (attempt.accepted) {
-        workflowStates.set(key, attempt.state);
-        try {
-          await persistExtractAttempt(app, key, attempt);
-        } catch (persistenceError) {
-          if (attempt.finished && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
-          else workflowStates.set(key, attempt.state);
+      if (workflowFinalizationApplied(error)) {
+        workflowStates.set(key, state);
+      } else {
+        const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, false);
+        if (attempt.accepted) {
+          workflowStates.set(key, attempt.state);
+          try {
+            await persistExtractAttempt(app, key, attempt);
+          } catch (persistenceError) {
+            if (attempt.finished && workflowFinalizationApplied(persistenceError)) workflowStates.delete(key);
+            else workflowStates.set(key, attempt.state);
+          }
         }
       }
     } else {
@@ -676,10 +672,6 @@ async function lifecycleFinal<T>(
   if (kind === "ingest" || kind === "lint") {
     const { replayContext: _replayContext, ...activeState } = state as ContextWorkflowState;
     workflowStates.set(key, activeState);
-    await app.updateWorkflow(state.requestId, {
-      progress: 0.5,
-      message: "Wiki change applied; submit another or finish",
-    });
   } else if (kind === "extract") {
     const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, true);
     if (attempt.accepted) {
