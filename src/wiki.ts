@@ -259,11 +259,7 @@ export class WikiService {
     if (typeof index === "function") await index({ ignoredPaths: this.qmdIgnoredPaths() });
   }
   private async refreshQmd(): Promise<void> {
-    try {
-      await this.refreshQmdIndex();
-    } catch {
-      /* application maintenance checks enforce qmd */
-    }
+    await this.refreshQmdIndex();
   }
   private async atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
     await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });

@@ -21,6 +21,8 @@ import { localDate, RevisionConflictError, ValidationError } from "./scheduler.j
 import { DEFAULT_VAULT_HOST, DEFAULT_VAULT_PORT, LockBusyError, resolveVault, type VaultPaths } from "./vault.js";
 
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
+const INTERNAL_ERROR_CODE = "INTERNAL_ERROR";
+const INTERNAL_ERROR_MESSAGE = "Internal server error";
 const MULTIPART_FIELD_BYTES = 64 * 1024;
 const MULTIPART_FIELD_NAMES: Record<string, true> = {
   kind: true,
@@ -158,7 +160,8 @@ function errorStatus(error: unknown): number {
   )
     return 409;
   if (/not found|unknown page|no quiz for/iu.test(errorText(error))) return 404;
-  return 400;
+  if (error instanceof ValidationError) return 400;
+  return 500;
 }
 function jsonSafe(value: unknown): JsonValue {
   if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean")
@@ -186,12 +189,17 @@ function sendJson<T>(res: ServerResponse, status: number, data: T, requestId: st
   res.end(body);
 }
 function sendError(res: ServerResponse, status: number, error: unknown, requestId: string): void {
+  const internal = status >= 500;
   const body: ApiEnvelope<never> = {
     ok: false,
     error: {
-      code: errorCode(error),
-      message: error instanceof LockBusyError ? "Pi Scholar is busy; try again later." : errorText(error),
-      ...(error instanceof Error && "details" in error && isRecord(error.details)
+      code: internal ? INTERNAL_ERROR_CODE : errorCode(error),
+      message: internal
+        ? INTERNAL_ERROR_MESSAGE
+        : error instanceof LockBusyError
+          ? "Pi Scholar is busy; try again later."
+          : errorText(error),
+      ...(!internal && error instanceof Error && "details" in error && isRecord(error.details)
         ? { details: jsonSafe(error.details) }
         : {}),
       requestId,
@@ -251,8 +259,9 @@ async function receiveMultipartUpload(
     let writePromise: Promise<void> | undefined;
     let failure: unknown;
 
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      const parser = busboy({
+    let parser: ReturnType<typeof busboy>;
+    try {
+      parser = busboy({
         headers: req.headers,
         defParamCharset: "utf8",
         limits: {
@@ -262,6 +271,10 @@ async function receiveMultipartUpload(
           parts: Object.keys(MULTIPART_FIELD_NAMES).length + 2,
         },
       });
+    } catch (error) {
+      throw new ValidationError(errorText(error));
+    }
+    await new Promise<void>((resolvePromise, rejectPromise) => {
       const fail = (error: unknown): void => {
         failure ??= error;
       };
@@ -326,7 +339,7 @@ async function receiveMultipartUpload(
       parser.on("filesLimit", () => fail(new ValidationError("multipart request contains multiple files")));
       parser.on("fieldsLimit", () => fail(new ValidationError("multipart request contains too many fields")));
       parser.on("partsLimit", () => fail(new ValidationError("multipart request contains too many parts")));
-      parser.on("error", fail);
+      parser.on("error", (error) => fail(new ValidationError(errorText(error))));
       parser.on("close", () => {
         req.off("error", requestError);
         void (async () => {

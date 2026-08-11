@@ -239,7 +239,7 @@ function boundedUtf8(value: string, maxBytes: number): string {
   return value.slice(0, end);
 }
 function mutationFinalizationError(
-  stage: "checkpoint" | "doctor" | "commit" | "projection" | "rollback",
+  stage: "checkpoint" | "doctor" | "commit" | "projection" | "qmd" | "rollback",
   cause: unknown,
   retryable = false,
 ): Error {
@@ -315,11 +315,11 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
 }
 export class ScholarApplication {
   readonly paths: VaultPaths;
-  readonly db: ScholarDatabase;
-  readonly sources: SourceService;
-  readonly wiki: WikiService;
-  readonly scheduler: SchedulerService;
-  readonly quiz: QuizService;
+  private readonly db: ScholarDatabase;
+  private readonly sources: SourceService;
+  private readonly wiki: WikiService;
+  private readonly scheduler: SchedulerService;
+  private readonly quiz: QuizService;
   private readonly workflows: WorkflowCoordinator;
   private readonly worker: BrowserMutationWorker;
   readonly version: string;
@@ -733,18 +733,23 @@ export class ScholarApplication {
     confirmationId: string,
     context?: ApplicationMutationContext,
   ): Promise<SourceRemovalResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
+    return this.mutate(context, async () => {
+      const result = await this.durableDirect(async () => {
         const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
         try {
           await this.wiki.refreshProjections();
-          await this.wiki.refreshQmdIndex().catch(() => undefined);
         } catch (error) {
           throw mutationFinalizationError("projection", error, true);
         }
-        return { sourceId, status: "removed", dependentPageIds: removed.dependentPageIds };
-      }, "source:remove"),
-    );
+        return { sourceId, status: "removed" as const, dependentPageIds: removed.dependentPageIds };
+      }, "source:remove");
+      try {
+        await this.wiki.refreshQmdIndex();
+      } catch (error) {
+        throw mutationFinalizationError("qmd", error, true);
+      }
+      return result;
+    });
   }
   private async quizDetail(quiz: QuizRecord): Promise<QuizDetailRecord> {
     const answers = this.db
@@ -848,8 +853,8 @@ export class ScholarApplication {
     return { pages: (await this.wiki.list()).map(pageRecord) };
   }
   private async wikiResult(pageIdOrPath: string): Promise<WikiPageResult> {
-    const inspected = await this.wiki.inspectDrift(pageIdOrPath);
-    const value = await this.wiki.get(inspected.page.pageId);
+    const value = await this.wiki.get(pageIdOrPath);
+    const inspected = await this.wiki.inspectDrift(value.pageId);
     const page = pageRecord(inspected.page);
     const markdown = value.content;
     const pageSections = parseWikiDocumentSections(markdown, page.pageId);

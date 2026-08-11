@@ -600,7 +600,7 @@ describe("server browser boundary", () => {
               throw new Error("multipart failure response was not received");
             }),
           ]),
-          400,
+          500,
         );
         await setImmediate();
         assert.deepEqual(unhandled, []);
@@ -666,6 +666,52 @@ describe("server browser boundary", () => {
       assert.equal(body.error.message, "Pi Scholar is busy; try again later.");
       assert.equal(payload.includes("/private"), false);
       assert.equal(payload.includes("writer.lock"), false);
+    });
+  });
+  it("hides unexpected internal failures while preserving validation errors", async () => {
+    const sensitiveMessage = "SQLITE_ERROR: unable to open /private/vault/.pi-scholar/vault.sqlite";
+    const application = {
+      listSources: async () => {
+        throw Object.assign(new Error(sensitiveMessage), {
+          code: "SQLITE_ERROR",
+          details: { path: "/private/vault/.pi-scholar/vault.sqlite", query: "SELECT * FROM sources" },
+        });
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/sources`);
+      const payload = await response.text();
+      const body = JSON.parse(payload) as {
+        readonly error: {
+          readonly code: string;
+          readonly message: string;
+          readonly requestId: string;
+          readonly details?: unknown;
+        };
+      };
+      assert.equal(response.status, 500);
+      assert.equal(body.error.code, "INTERNAL_ERROR");
+      assert.equal(body.error.message, "Internal server error");
+      assert.ok(body.error.requestId);
+      assert.equal("details" in body.error, false);
+      assert.equal(payload.includes(sensitiveMessage), false);
+      assert.equal(payload.includes("vault.sqlite"), false);
+      assert.equal(payload.includes("SELECT * FROM sources"), false);
+
+      const validationResponse = await fetch(`${base}/api/v1/sources`, {
+        method: "POST",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ kind: "invalid", text: "payload" }),
+      });
+      const validationBody = (await validationResponse.json()) as {
+        readonly error: { readonly code: string; readonly message: string; readonly requestId: string };
+      };
+      assert.equal(validationResponse.status, 400);
+      assert.equal(validationBody.error.code, "validation-error");
+      assert.equal(validationBody.error.message, "source kind is invalid");
+      assert.ok(validationBody.error.requestId);
     });
   });
   it("accepts deterministic RFC v5 source IDs for removal preview", async () => {

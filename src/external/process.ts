@@ -173,7 +173,7 @@ export function runChild(executable: string, args: readonly string[], options: C
   }, timeoutMs);
   const clearTimers = (): void => {
     clearTimeout(timer);
-    clearTimeout(killTimer);
+    if (!timedOut) clearTimeout(killTimer);
   };
   child.once("error", (error) => {
     clearTimers();
