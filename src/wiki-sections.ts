@@ -7,12 +7,43 @@ import { okfRenderedText, parseOkfConcept } from "./okf.js";
 
 type MarkdownNode = {
   readonly type: string;
+  readonly value?: string;
   readonly children?: readonly MarkdownNode[];
   readonly position?: {
     readonly start?: { readonly offset?: number };
     readonly end?: { readonly offset?: number };
   };
 };
+
+function parseMarkdown(markdown: string): MarkdownNode {
+  return fromMarkdown(markdown, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as MarkdownNode;
+}
+
+function renderedHeading(heading: MarkdownNode): string {
+  const text: string[] = [];
+  const visit = (node: MarkdownNode): void => {
+    if (node.type === "text" || node.type === "inlineCode") {
+      if (node.value) text.push(node.value);
+      return;
+    }
+    if (node.type === "break") {
+      text.push("\n");
+      return;
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  for (const child of heading.children ?? []) visit(child);
+  return text.join("");
+}
+
+export function hasRenderedEmptyHeading(markdown: string): boolean {
+  return (parseMarkdown(markdown).children ?? []).some(
+    (node) => node.type === "heading" && !renderedHeading(node).trim(),
+  );
+}
 
 function headingAnchor(heading: string, used: Set<string>): string {
   const slug = heading
@@ -48,30 +79,24 @@ function section(
 type SectionHeading = { readonly startOffset: number; readonly heading: string };
 
 function parseHeadings(markdown: string): SectionHeading[] {
-  const tree = fromMarkdown(markdown, {
-    extensions: [gfm()],
-    mdastExtensions: [gfmFromMarkdown()],
-  }) as MarkdownNode;
+  const tree = parseMarkdown(markdown);
   const headings: SectionHeading[] = [];
   for (const node of tree.children ?? []) {
     if (node.type !== "heading") continue;
-    const startOffset = node.position?.start?.offset;
+    const sourceStartOffset = node.position?.start?.offset;
     const endOffset = node.position?.end?.offset;
-    if (startOffset === undefined || endOffset === undefined) continue;
-    const source = markdown.slice(startOffset, endOffset).replace(/(?:\r?\n)+$/u, "");
-    const lines = source.split("\n");
-    const underline = lines.at(-1)?.replace(/\r$/u, "") ?? "";
-    let heading: string | undefined;
-    if (lines.length > 1 && /^( {0,3})(?:=+|-+)[ \t]*$/u.test(underline)) {
-      heading = lines.slice(0, -1).join("\n").trim();
-    } else {
-      const line = lines[0]?.replace(/\r$/u, "") ?? "";
-      const match = /^( {0,3})#{1,6}(?:[ \t]+|$)(.*)$/.exec(line);
-      if (match) heading = match[2]!.replace(/[ \t]+#+[ \t]*$/u, "").trim();
-    }
+    if (sourceStartOffset === undefined || endOffset === undefined) continue;
+    const startOffset = markdown.lastIndexOf("\n", sourceStartOffset - 1) + 1;
+    const heading = renderedHeading(node);
     if (heading) headings.push({ startOffset, heading });
   }
   return headings;
+}
+/** Remove the first root heading, including its complete source syntax. */
+export function stripFirstHeading(markdown: string): string {
+  const first = parseMarkdown(markdown).children?.[0];
+  const endOffset = first?.type === "heading" ? first.position?.end?.offset : undefined;
+  return endOffset === undefined ? markdown : markdown.slice(endOffset);
 }
 
 function parseBodySections(markdown: string, pageId: string, baseOffset: number): WikiPageSection[] {

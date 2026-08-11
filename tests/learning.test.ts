@@ -120,6 +120,33 @@ test("section parser recognizes Setext headings and keeps their boundaries", () 
       { anchor: "#topic-1", heading: "Topic" },
     ],
   );
+  const inlineSetextSections = parseWikiBodySections(
+    "[Topic](https://example.test)\n=====\nSetext evidence.\n",
+    "inline-setext",
+  );
+  assert.deepEqual(
+    inlineSetextSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [{ anchor: "#topic", heading: "Topic" }],
+  );
+  const richAtxSections = parseWikiBodySections("# **ATX** [link](x) `code`\n\nATX evidence.\n", "rich-atx");
+  assert.deepEqual(
+    richAtxSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [{ anchor: "#atx-link-code", heading: "ATX link code" }],
+  );
+
+  const hardBreakSetext = "One\\\nTwo\n===\nEvidence.\n";
+  assert.deepEqual(
+    parseWikiBodySections(hardBreakSetext, "hard-break").map((item) => ({
+      anchor: item.anchor,
+      heading: item.heading,
+    })),
+    [{ anchor: "#one-two", heading: "One\nTwo" }],
+  );
+
+  const indentedBody = "Preamble.\n\n  # Heading\n\nBody.\n";
+  const indentedSections = parseWikiBodySections(indentedBody, "indented");
+  assert.equal(indentedBody.slice(indentedSections[0]!.startOffset, indentedSections[0]!.endOffset), "Preamble.\n\n");
+  assert.equal(indentedBody.slice(indentedSections[1]!.startOffset), "  # Heading\n\nBody.\n");
 
   const fencedBody = "```md\nIgnored\n-----\nIgnored body.\n```\nActual\n=====\nActual evidence.\n";
   const fencedSections = parseWikiBodySections(fencedBody, "fenced");

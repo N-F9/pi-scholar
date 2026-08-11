@@ -1489,8 +1489,10 @@ describe("application capability boundaries", () => {
       for (const [index, body] of [
         `[^${chunkId}]`,
         `# Evidence\n\n[^${chunkId}]`,
-        `<!-- hidden -->[^${chunkId}]`,
+        `Topic\n=====\n[^${chunkId}]`,
         `[](https://example.test)[^${chunkId}]`,
+        `# Grounded\n\nSupported [^${chunkId}].\n\n# [](https://example.test)\n\nUnsupported claim.`,
+        `# Grounded\n\nSupported [^${chunkId}].\n\n# [][empty]\n\nUnsupported claim.\n\n[empty]: https://example.test`,
         `---\n\n[^${chunkId}]`,
         `- [^${chunkId}]`,
       ].entries()) {

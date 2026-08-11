@@ -89,7 +89,12 @@ import {
   withWriterLock,
 } from "../vault.js";
 import { parseWikiMarkdown, type WikiAdapters, WikiService } from "../wiki.js";
-import { parseWikiBodySections, parseWikiDocumentSections } from "../wiki-sections.js";
+import {
+  hasRenderedEmptyHeading,
+  parseWikiBodySections,
+  parseWikiDocumentSections,
+  stripFirstHeading,
+} from "../wiki-sections.js";
 import {
   BrowserMutationWorker,
   WorkflowCoordinator,
@@ -459,12 +464,7 @@ export class ScholarApplication {
     const authorized = new Set<string>();
     for (const { manifest } of await this.sources.publishedPackets())
       for (const chunk of manifest.chunks) authorized.add(chunk.chunkId);
-    if (
-      [body, authoredBody].some(
-        (markdown) =>
-          markdown !== undefined && /^ {0,3}#{1,6}(?:[ \t]+#*[ \t]*)?\r?$/mu.test(okfCitationText(markdown)),
-      )
-    )
+    if ([body, authoredBody].some((markdown) => markdown !== undefined && hasRenderedEmptyHeading(markdown)))
       throw new ValidationError("source-grounded ingest sections require non-empty headings");
     const sections = (markdown: string): IngestSection[] =>
       parseWikiBodySections(markdown, "").map(({ anchor, startOffset, endOffset }) => ({
@@ -496,8 +496,7 @@ export class ScholarApplication {
     };
     const substantive = (markdown: string, section: IngestSection): boolean => {
       const text = sectionText(markdown, section);
-      const newline = text.indexOf("\n");
-      const content = section.anchor === "" ? text : newline < 0 ? "" : text.slice(newline + 1);
+      const content = section.anchor === "" ? text : stripFirstHeading(text);
       return okfRenderedText(withoutEvidence(content)).trim().length > 0;
     };
     const requireSectionCitation = (markdown: string, section: IngestSection): void => {
