@@ -621,3 +621,128 @@ test("quiz publishes more than two synthesis questions", () => {
   assert.ok(generated.questions.every((item) => item.pages.length === 2));
   db.close();
 });
+
+test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedback", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const pageDigest = db.get<{ digest: string }>("SELECT digest FROM pages WHERE page_id = ?", ["p1"])!.digest;
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", "Explain p1")],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [
+          {
+            ...question("p1"),
+            kind: "multiple-choice",
+            choices: ["p1", "other"],
+          },
+        ],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", `Explain ${pageDigest}`)],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [{ ...question("p1", "Explain evidence-reference"), sourceRefs: ["evidence-reference"] }],
+      }),
+    ValidationError,
+  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        ...question("p1"),
+        sourceRefs: ["evidence-reference"],
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  assert.throws(
+    () => quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "p1" } }),
+    ValidationError,
+  );
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "valid answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        date,
+        revision: sealed.revision,
+        submissionId: "hidden-feedback",
+        questions: [{ questionId, feedback: "p1" }],
+        pages: [{ pageId: "p1", rating: "Good", evidence: [evidence.reference] }],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
+test("quiz keeps permitted identity comments and does not block answer-key values", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        kind: "multiple-choice",
+        prompt: "Choose the correct statement",
+        choices: ["correct", "incorrect"],
+        pages: [{ pageId: "p1", criterion: "Explain the page", weight: 1 }],
+        sourceRefs: [],
+        answerKey: "correct",
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "correct" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const sheet = quiz.renderSheet(sealed, { [questionId]: "correct" });
+  assert.match(sheet, new RegExp(`pi-scholar:quiz format=1 id=${generated.quizId} revision=`, "u"));
+  assert.match(sheet, new RegExp(`pi-scholar:question id=${questionId}`, "u"));
+  assert.match(sheet, /correct/u);
+  db.close();
+});
+
+test("quiz rejects quiz and question identifiers outside identity comments", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [question("p1")],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  db.run("UPDATE quiz_questions SET prompt = ? WHERE question_id = ?", [generated.quizId, questionId]);
+  assert.throws(() => quiz.parseSheet(quiz.renderSheet(quiz.get(date)!)), ValidationError);
+  db.run("UPDATE quiz_questions SET prompt = ? WHERE question_id = ?", [questionId, questionId]);
+  assert.throws(() => quiz.parseSheet(quiz.renderSheet(quiz.get(date)!)), ValidationError);
+  db.close();
+});
