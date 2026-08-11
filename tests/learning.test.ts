@@ -7,9 +7,10 @@ import { afterAll, test } from "vitest";
 import { openDatabase, type ScholarDatabase } from "../src/database.js";
 import { QuizConflictError, QuizService } from "../src/quiz.js";
 import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
+import { parseWikiBodySections, parseWikiDocumentSections } from "../src/wiki-sections.js";
 
 const LEARNING_WIKI_ROOT = mkdtempSync(join(tmpdir(), "pi-scholar-learning-"));
-const PAGE_MARKDOWN = `${[
+const PAGE_BODY = `${[
   "# Part",
   "section text",
   "# A",
@@ -19,11 +20,16 @@ const PAGE_MARKDOWN = `${[
   "# Later",
   "later section text",
 ].join("\n")}\n`;
+function pageDocument(pageId: string, body: string): string {
+  return `---\ntype: note\nid: ${pageId}\ntitle: ${pageId}\ndescription: ${pageId} description\n---\n${body}`;
+}
+const PAGE_MARKDOWN = pageDocument("p1", PAGE_BODY);
 afterAll(() => rmSync(LEARNING_WIKI_ROOT, { recursive: true, force: true }));
 
-function addPage(db: ScholarDatabase, pageId: string, markdown = PAGE_MARKDOWN): void {
-  writeFileSync(join(LEARNING_WIKI_ROOT, `${pageId}.md`), markdown);
-  const digest = createHash("sha256").update(markdown).digest("hex");
+function addPage(db: ScholarDatabase, pageId: string, markdown = PAGE_BODY): void {
+  const document = markdown.startsWith("---\n") ? markdown : pageDocument(pageId, markdown);
+  writeFileSync(join(LEARNING_WIKI_ROOT, `${pageId}.md`), document);
+  const digest = createHash("sha256").update(document).digest("hex");
   const now = new Date().toISOString();
   db.run(
     "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
@@ -50,6 +56,98 @@ function question(pageId: string, prompt = "Explain the page") {
     sourceRefs: [],
   };
 }
+test("section parsers keep headed preambles and exclude OKF frontmatter", () => {
+  const body = "Meaningful preamble.\n\n# Heading\n\nHeading text.\n";
+  const document = pageDocument("parser", body);
+  const bodySections = parseWikiBodySections(body, "parser");
+  assert.deepEqual(
+    bodySections.map((section) => ({ anchor: section.anchor, heading: section.heading })),
+    [
+      { anchor: "", heading: undefined },
+      { anchor: "#heading", heading: "Heading" },
+    ],
+  );
+  const commentPreambleSections = parseWikiBodySections(
+    "<!-- comment-only -->\n\n# Heading\n\nHeading text.\n",
+    "parser",
+  );
+  assert.deepEqual(
+    commentPreambleSections.map((section) => section.anchor),
+    ["#heading"],
+  );
+  assert.deepEqual(parseWikiBodySections("<!-- comment-only -->\n", "parser"), []);
+  const headinglessSections = parseWikiBodySections("Only page text.\n", "parser");
+  assert.deepEqual(
+    headinglessSections.map((section) => ({ anchor: section.anchor, heading: section.heading })),
+    [{ anchor: "", heading: undefined }],
+  );
+  const documentSections = parseWikiDocumentSections(document, "parser");
+  assert.equal(documentSections.length, 2);
+  assert.equal(
+    document.slice(documentSections[0]!.startOffset, documentSections[0]!.endOffset),
+    "Meaningful preamble.\n\n",
+  );
+  assert.equal(
+    document.slice(documentSections[1]!.startOffset, documentSections[1]!.endOffset),
+    "# Heading\n\nHeading text.\n",
+  );
+  assert.equal(documentSections[0]!.startOffset, document.indexOf(body));
+  assert.equal(documentSections[0]!.textDigest, createHash("sha256").update("Meaningful preamble.\n\n").digest("hex"));
+  assert.equal(
+    document.slice(documentSections[0]!.startOffset, documentSections[0]!.endOffset).includes("description"),
+    false,
+  );
+});
+
+test("headingless eligible pages publish page evidence and authorize page-only readings", () => {
+  const { db, scheduler, date } = setup();
+  addPage(db, "headingless", pageDocument("headingless", "Only page-level exposition.\n"));
+  ensureDue(scheduler, ["headingless"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["headingless"],
+    questionSpecs: [question("headingless")],
+  });
+  const evidence = quiz.gradingEvidence(generated);
+  assert.deepEqual(
+    evidence.map((item) => item.anchor),
+    [""],
+  );
+  assert.equal(evidence[0]?.heading, undefined);
+  assert.equal(evidence[0]?.excerpt.includes("---"), false);
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const authorized = quiz.gradingEvidence(sealed)[0]!;
+  const settled = quiz.settleGrade({
+    date,
+    revision: sealed.revision,
+    submissionId: "headingless-submission",
+    questions: [{ questionId, feedback: "Good explanation." }],
+    pages: [
+      {
+        pageId: "headingless",
+        rating: "Good",
+        evidence: [authorized.reference],
+        readings: [{ pageId: "headingless", anchor: "" }],
+      },
+    ],
+  });
+  assert.equal(settled.pages[0]!.readings[0]!.anchor, "");
+  assert.equal(quiz.readingHref({ pageId: "headingless", anchor: "" }), "wiki/headingless.md");
+  db.close();
+});
+test("grading rejects malformed stored evidence paths without a live vault", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({ date, selectedPageIds: ["p1"], questionSpecs: [question("p1")] });
+  db.run("UPDATE quiz_evidence SET relative_path = ? WHERE quiz_id = ?", ["../escape.md", generated.quizId]);
+  const snapshotOnly = new QuizService(db, undefined, scheduler);
+  assert.throws(() => snapshotOnly.gradingEvidence(generated), ValidationError);
+  db.close();
+});
 
 test("page prerequisites gate due selection until every prerequisite is in Review and reject cycles", () => {
   const { db, scheduler, date } = setup();

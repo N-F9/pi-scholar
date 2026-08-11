@@ -834,6 +834,7 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "grounded.md",
+      description: "Grounded page removal behavior.",
       body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
       quizWorthiness: "eligible",
     });
@@ -902,6 +903,7 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "submitted-grounding.md",
+      description: "Submitted quiz removal guard.",
       body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
       quizWorthiness: "eligible",
     });
@@ -1043,6 +1045,7 @@ describe("wiki mechanics", () => {
     const { paths, db, wiki } = await fixture();
     const created = await wiki.create({
       path: "notes/retire.md",
+      description: "Retired page history.",
       body: "# Retire\n\nKeep this history.",
       quizWorthiness: "eligible",
     });
@@ -1880,7 +1883,12 @@ describe("wiki mechanics", () => {
     try {
       const originalBody = "# Section\n\noriginal\n";
       const correctedBody = "# Section\n\ncorrected\n";
-      const page = await app.wiki.create({ path: "page-issue.md", body: originalBody, quizWorthiness: "eligible" });
+      const page = await app.wiki.create({
+        path: "page-issue.md",
+        description: "Issue correction behavior.",
+        body: originalBody,
+        quizWorthiness: "eligible",
+      });
       const issue = await app.wiki.report({
         pageId: page.page.pageId,
         heading: "Section",

@@ -315,7 +315,13 @@ describe("Pi package lifecycle", () => {
         initializationEnabled: false,
         expiredCount: 0,
         candidates: [
-          { pageId: "page-a", path: "page-a.md", title: "Page A", dueAt: "2026-08-10T00:00:00.000Z", sections: [] },
+          {
+            pageId: "page-a",
+            path: "page-a.md",
+            title: "Page A",
+            description: "Page A description.",
+            dueAt: "2026-08-10T00:00:00.000Z",
+          },
         ],
       };
     };

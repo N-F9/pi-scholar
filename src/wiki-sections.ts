@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { WikiPageSection } from "./contracts.js";
+import { okfRenderedText, parseOkfConcept } from "./okf.js";
 
 function headingAnchor(heading: string, used: Set<string>): string {
   const slug = heading
@@ -15,7 +16,25 @@ function headingAnchor(heading: string, used: Set<string>): string {
   return `#${candidate}`;
 }
 
-export function parseWikiSections(markdown: string, pageId: string): WikiPageSection[] {
+function section(
+  pageId: string,
+  anchor: string,
+  startOffset: number,
+  endOffset: number,
+  text: string,
+  heading?: string,
+): WikiPageSection {
+  return {
+    pageId,
+    ...(heading === undefined ? {} : { heading }),
+    anchor,
+    startOffset,
+    endOffset,
+    textDigest: createHash("sha256").update(text).digest("hex"),
+  };
+}
+
+function parseBodySections(markdown: string, pageId: string, baseOffset: number): WikiPageSection[] {
   const output: WikiPageSection[] = [];
   const used = new Set<string>();
   let fence: { readonly marker: string; readonly length: number } | undefined;
@@ -40,14 +59,18 @@ export function parseWikiSections(markdown: string, pageId: string): WikiPageSec
         if (heading && anchor) {
           const previous = output.at(-1);
           if (previous) {
-            const sectionText = markdown.slice(previous.startOffset, offset);
+            const sectionText = markdown.slice(previous.startOffset - baseOffset, offset);
             output[output.length - 1] = {
               ...previous,
-              endOffset: offset,
+              endOffset: baseOffset + offset,
               textDigest: createHash("sha256").update(sectionText).digest("hex"),
             };
+          } else if (okfRenderedText(markdown.slice(0, offset)).trim()) {
+            output.push(section(pageId, "", baseOffset, baseOffset + offset, markdown.slice(0, offset)));
           }
-          output.push({ pageId, heading, anchor, startOffset: offset, endOffset: markdown.length, textDigest: "" });
+          output.push(
+            section(pageId, anchor, baseOffset + offset, baseOffset + markdown.length, markdown.slice(offset), heading),
+          );
         }
       }
     }
@@ -56,12 +79,25 @@ export function parseWikiSections(markdown: string, pageId: string): WikiPageSec
   }
   if (output.length) {
     const last = output.at(-1)!;
-    const sectionText = markdown.slice(last.startOffset);
+    const sectionText = markdown.slice(last.startOffset - baseOffset);
     output[output.length - 1] = {
       ...last,
-      endOffset: markdown.length,
+      endOffset: baseOffset + markdown.length,
       textDigest: createHash("sha256").update(sectionText).digest("hex"),
     };
+  } else if (okfRenderedText(markdown).trim()) {
+    output.push(section(pageId, "", baseOffset, baseOffset + markdown.length, markdown));
   }
   return output;
+}
+
+/** Parse Markdown body text whose offsets are relative to the supplied string. */
+export function parseWikiBodySections(markdown: string, pageId: string): WikiPageSection[] {
+  return parseBodySections(markdown, pageId, 0);
+}
+
+/** Parse a complete OKF document while keeping section offsets in that document. */
+export function parseWikiDocumentSections(markdown: string, pageId: string): WikiPageSection[] {
+  const { body } = parseOkfConcept(markdown);
+  return parseBodySections(body, pageId, markdown.length - body.length);
 }

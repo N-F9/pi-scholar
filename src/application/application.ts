@@ -89,7 +89,7 @@ import {
   withWriterLock,
 } from "../vault.js";
 import { parseWikiMarkdown, type WikiAdapters, WikiService } from "../wiki.js";
-import { parseWikiSections } from "../wiki-sections.js";
+import { parseWikiBodySections, parseWikiDocumentSections } from "../wiki-sections.js";
 import {
   BrowserMutationWorker,
   WorkflowCoordinator,
@@ -168,6 +168,7 @@ export interface WikiIssueListResult {
 export interface WikiNoteInput {
   readonly path: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body: string;
   readonly pageId?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
@@ -175,6 +176,7 @@ export interface WikiNoteInput {
 export interface WikiNoteUpdateInput {
   readonly body?: string;
   readonly title?: string;
+  readonly description?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
   readonly expectedDigest?: string;
   readonly path?: string;
@@ -464,14 +466,12 @@ export class ScholarApplication {
       )
     )
       throw new ValidationError("source-grounded ingest sections require non-empty headings");
-    const sections = (markdown: string): IngestSection[] => {
-      const parsed = parseWikiSections(markdown, "");
-      const first = parsed[0];
-      if (!first) return markdown.trim() ? [{ anchor: "", startOffset: 0, endOffset: markdown.length }] : [];
-      return markdown.slice(0, first.startOffset).trim()
-        ? [{ anchor: "", startOffset: 0, endOffset: first.startOffset }, ...parsed]
-        : parsed;
-    };
+    const sections = (markdown: string): IngestSection[] =>
+      parseWikiBodySections(markdown, "").map(({ anchor, startOffset, endOffset }) => ({
+        anchor,
+        startOffset,
+        endOffset,
+      }));
     const sectionText = (markdown: string, section: IngestSection): string =>
       markdown.slice(section.startOffset, section.endOffset);
     const withoutDefinitions = (text: string): string => {
@@ -852,7 +852,7 @@ export class ScholarApplication {
     const value = await this.wiki.get(inspected.page.pageId);
     const page = pageRecord(inspected.page);
     const markdown = value.content;
-    const pageSections = parseWikiSections(markdown, page.pageId);
+    const pageSections = parseWikiDocumentSections(markdown, page.pageId);
     const schedule =
       page.quizWorthiness === "eligible" ||
       this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", [page.pageId])
@@ -1370,6 +1370,7 @@ export class ScholarApplication {
     proposed: {
       readonly body?: string;
       readonly title?: string;
+      readonly description?: string;
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     },
   ): string {
@@ -1391,6 +1392,9 @@ export class ScholarApplication {
       missing = [
         current.body !== authored.body && proposed.body === undefined ? "body" : undefined,
         current.frontmatter.title !== authored.frontmatter.title && proposed.title === undefined ? "title" : undefined,
+        current.frontmatter.description !== authored.frontmatter.description && proposed.description === undefined
+          ? "description"
+          : undefined,
         current.frontmatter["quiz-worthiness"] !== authored.frontmatter["quiz-worthiness"] &&
         proposed.quizWorthiness === undefined
           ? "quizWorthiness"
@@ -1400,6 +1404,7 @@ export class ScholarApplication {
       missing = [
         proposed.body === undefined ? "body" : undefined,
         proposed.title === undefined ? "title" : undefined,
+        proposed.description === undefined ? "description" : undefined,
         proposed.quizWorthiness === undefined ? "quizWorthiness" : undefined,
       ].filter((field): field is string => field !== undefined);
     }
@@ -1729,6 +1734,12 @@ export class ScholarApplication {
             if (sha256(await this.wiki.readExact(current.relativePath)) !== proposal.page.expectedDigest)
               throw new RevisionConflictError("The issue page digest is stale");
             const body = proposal.page.body;
+            let currentDescription: unknown;
+            try {
+              currentDescription = parseWikiMarkdown(current.content).frontmatter.description;
+            } catch {
+              currentDescription = undefined;
+            }
             const authoredBody = preexistingDrift.has(issue.pageId)
               ? this.assertDriftRepairFields(issue.pageId, current.content, proposal.page)
               : parseWikiMarkdown(current.content).body;
@@ -1737,6 +1748,7 @@ export class ScholarApplication {
               preexistingDrift.has(issue.pageId) ||
               bodyChanged ||
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
+              (proposal.page.description !== undefined && proposal.page.description !== currentDescription) ||
               (proposal.page.quizWorthiness !== undefined && proposal.page.quizWorthiness !== current.quizWorthiness);
             if (!pageChanged) throw new ValidationError("resolve-issue requires an actual page correction");
             if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body, authoredBody);
@@ -1745,6 +1757,7 @@ export class ScholarApplication {
               expectedDigest: proposal.page.expectedDigest,
               ...(proposal.page.body === undefined ? {} : { body: proposal.page.body }),
               ...(proposal.page.title === undefined ? {} : { title: proposal.page.title }),
+              ...(proposal.page.description === undefined ? {} : { description: proposal.page.description }),
               ...(proposal.page.quizWorthiness === undefined ? {} : { quizWorthiness: proposal.page.quizWorthiness }),
             });
             const updatedPage = await this.wiki.update(
@@ -1753,6 +1766,7 @@ export class ScholarApplication {
                 expectedDigest: proposal.page.expectedDigest,
                 ...(proposal.page.body === undefined ? {} : { body: proposal.page.body }),
                 ...(proposal.page.title === undefined ? {} : { title: proposal.page.title }),
+                ...(proposal.page.description === undefined ? {} : { description: proposal.page.description }),
                 ...(proposal.page.quizWorthiness === undefined ? {} : { quizWorthiness: proposal.page.quizWorthiness }),
               },
               prepared,
@@ -1819,7 +1833,7 @@ export class ScholarApplication {
       if (sha256(bytes) !== pageDigest)
         throw new ValidationError(`Learning page is stale or unavailable: ${learning.pageId}`);
       const content = bytes.toString("utf8");
-      for (const section of parseWikiSections(content, learning.pageId)) {
+      for (const section of parseWikiDocumentSections(content, learning.pageId)) {
         const sectionText = content.slice(section.startOffset, section.endOffset);
         if (!sectionText || sha256(sectionText) !== section.textDigest)
           throw new ValidationError(`Learning section is stale: ${learning.pageId}${section.anchor}`);
@@ -1850,15 +1864,15 @@ export class ScholarApplication {
           result.page.pageId !== learning.pageId
         )
           return undefined;
+        const parsed = parseWikiMarkdown(result.markdown);
+        const description = parsed.frontmatter.description;
+        if (typeof description !== "string" || !description.trim()) return undefined;
         return {
           pageId: result.page.pageId,
           path: result.page.relativePath,
           title: result.page.title,
+          description,
           dueAt: learning.dueAt,
-          sections: result.sections.map((section) => ({
-            anchor: section.anchor,
-            ...(section.heading === undefined ? {} : { heading: section.heading }),
-          })),
         };
       }),
     );

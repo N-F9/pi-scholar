@@ -50,6 +50,11 @@ export function optionalString(value: Record<string, unknown>, key: string, labe
   if (value[key] === undefined) return undefined;
   return requiredString(value, key, label);
 }
+function optionalText(value: Record<string, unknown>, key: string, label = key): string | undefined {
+  if (value[key] === undefined) return undefined;
+  if (typeof value[key] !== "string") throw new ValidationError(`${label} must be a string`);
+  return value[key];
+}
 
 export function requiredInteger(value: Record<string, unknown>, key: string, label = key): number {
   const result = value[key];
@@ -59,14 +64,16 @@ export function requiredInteger(value: Record<string, unknown>, key: string, lab
 
 function decodeWikiChangePage(value: unknown): WikiChangeIssuePageInput {
   if (!isRecord(value)) throw new ValidationError("resolve-issue page must be an object");
-  exact(value, ["pageId", "expectedDigest", "title", "body", "quizWorthiness"], "resolve-issue page");
+  exact(value, ["pageId", "expectedDigest", "title", "description", "body", "quizWorthiness"], "resolve-issue page");
   const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
+  const description = optionalText(value, "description");
   if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
     throw new ValidationError("quizWorthiness is invalid");
   return {
     pageId: requiredString(value, "pageId"),
     expectedDigest: requiredString(value, "expectedDigest"),
     ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
+    ...(description === undefined ? {} : { description }),
     ...(value.body === undefined
       ? {}
       : {
@@ -121,14 +128,16 @@ export function decodeWikiChangeInput(value: unknown): WikiChangeInput {
   const kind = requiredString(value, "kind") as WikiChangeInput["kind"];
   switch (kind) {
     case "create-page": {
-      exact(value, ["kind", "path", "title", "body", "quizWorthiness"], "create-page");
+      exact(value, ["kind", "path", "title", "description", "body", "quizWorthiness"], "create-page");
       const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
+      const description = optionalText(value, "description");
       if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
         throw new ValidationError("quizWorthiness is invalid");
       return {
         kind,
         path: requiredString(value, "path"),
         ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
+        ...(description === undefined ? {} : { description }),
         body:
           typeof value.body === "string"
             ? value.body
@@ -139,8 +148,13 @@ export function decodeWikiChangeInput(value: unknown): WikiChangeInput {
       };
     }
     case "update-page": {
-      exact(value, ["kind", "pageId", "expectedDigest", "title", "body", "quizWorthiness"], "update-page");
+      exact(
+        value,
+        ["kind", "pageId", "expectedDigest", "title", "description", "body", "quizWorthiness"],
+        "update-page",
+      );
       const quizWorthiness = value.quizWorthiness === undefined ? undefined : requiredString(value, "quizWorthiness");
+      const description = optionalText(value, "description");
       if (quizWorthiness !== undefined && !["eligible", "skip", "unknown"].includes(quizWorthiness))
         throw new ValidationError("quizWorthiness is invalid");
       return {
@@ -148,6 +162,7 @@ export function decodeWikiChangeInput(value: unknown): WikiChangeInput {
         pageId: requiredString(value, "pageId"),
         expectedDigest: requiredString(value, "expectedDigest"),
         ...(value.title === undefined ? {} : { title: requiredString(value, "title") }),
+        ...(description === undefined ? {} : { description }),
         ...(value.body === undefined
           ? {}
           : {
@@ -247,7 +262,12 @@ export function decodeReading(value: unknown): { pageId: string; anchor: string;
   const heading = optionalString(value, "heading");
   return {
     pageId: requiredString(value, "pageId"),
-    anchor: requiredString(value, "anchor"),
+    anchor:
+      typeof value.anchor === "string"
+        ? value.anchor
+        : (() => {
+            throw new ValidationError("anchor must be a string");
+          })(),
     ...(heading === undefined ? {} : { heading }),
   };
 }

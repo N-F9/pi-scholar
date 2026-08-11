@@ -32,6 +32,7 @@ import type {
 type WikiNoteInput = {
   readonly path: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body: string;
   readonly pageId?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
@@ -39,6 +40,7 @@ type WikiNoteInput = {
 type WikiNoteUpdateInput = {
   readonly path?: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
   readonly expectedDigest?: string;
@@ -145,6 +147,7 @@ const noteInput = Type.Object({
   pageId: Type.Optional(Type.String({ minLength: 1 })),
   path: Type.Optional(Type.String()),
   title: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
   body: Type.Optional(
     Type.String({
       description:
@@ -182,6 +185,7 @@ const wikiChangeIssuePageInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
   expectedDigest: Type.String({ minLength: 1 }),
   title: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
   body: Type.Optional(Type.String()),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
 });
@@ -191,6 +195,7 @@ const wikiChangeInput = Type.Union([
     kind: Type.Literal("create-page"),
     path: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
+    description: Type.Optional(Type.String()),
     body: Type.String({
       description:
         "Complete Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks.",
@@ -204,6 +209,7 @@ const wikiChangeInput = Type.Union([
     pageId: Type.String({ minLength: 1 }),
     expectedDigest: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
+    description: Type.Optional(Type.String()),
     body: Type.Optional(
       Type.String({
         description:
@@ -273,7 +279,7 @@ const contextDateInput = Type.Object({ date: Type.Optional(Type.String({ minLeng
 const lintContextInput = Type.Object({ description: Type.Optional(Type.String()) });
 const gradeReadingInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
-  anchor: Type.String({ minLength: 1 }),
+  anchor: Type.String(),
   heading: Type.Optional(Type.String()),
 });
 const gradePageInput = Type.Object({
@@ -735,6 +741,7 @@ async function note(app: ScholarApplication, params: Record<string, unknown>): P
   const body =
     typeof params.body === "string" ? params.body : typeof params.content === "string" ? params.content : undefined;
   const title = typeof params.title === "string" ? params.title : undefined;
+  const description = typeof params.description === "string" ? params.description : undefined;
   const quizWorthinessValue = params.quizWorthiness;
   const quizWorthiness =
     quizWorthinessValue === "eligible" || quizWorthinessValue === "skip" || quizWorthinessValue === "unknown"
@@ -742,18 +749,25 @@ async function note(app: ScholarApplication, params: Record<string, unknown>): P
       : undefined;
   const path = typeof params.path === "string" ? params.path : undefined;
   if (typeof params.pageId === "string") {
-    if (body === undefined && title === undefined && quizWorthiness === undefined && path === undefined)
+    if (
+      body === undefined &&
+      title === undefined &&
+      description === undefined &&
+      quizWorthiness === undefined &&
+      path === undefined
+    )
       throw new Error("an update is required");
     const update: WikiNoteUpdateInput = {
       ...(body === undefined ? {} : { body }),
       ...(title === undefined ? {} : { title }),
+      ...(description === undefined ? {} : { description }),
       ...(quizWorthiness === undefined ? {} : { quizWorthiness }),
       ...(path === undefined ? {} : { path }),
     };
     return app.updateNote(params.pageId, update);
   }
   if (typeof body !== "string" || !body.trim()) throw new Error("body or content is required");
-  const input: WikiNoteInput = { path: path ?? "", title, body, quizWorthiness };
+  const input: WikiNoteInput = { path: path ?? "", title, description, body, quizWorthiness };
   return app.createNote(input);
 }
 
