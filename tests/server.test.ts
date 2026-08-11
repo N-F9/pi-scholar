@@ -740,6 +740,43 @@ describe("server browser boundary", () => {
       assert.ok(validationBody.error.requestId);
     });
   });
+
+  it("retains only safe metadata for applied finalization failures", async () => {
+    const secretCause = "SQLITE_ERROR: unable to open /private/vault/.pi-scholar/vault.sqlite";
+    const application = {
+      listSources: async () => {
+        throw Object.assign(new Error(`mutation applied but projection failed: ${secretCause}`), {
+          code: "MUTATION_APPLIED_FINALIZATION_FAILED",
+          details: {
+            applied: true,
+            retryable: true,
+            stage: "projection",
+            secret: secretCause,
+          },
+        });
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/sources`);
+      const payload = await response.text();
+      const body = JSON.parse(payload) as {
+        readonly error: {
+          readonly code: string;
+          readonly message: string;
+          readonly details: Record<string, unknown>;
+        };
+      };
+      assert.equal(response.status, 500);
+      assert.equal(body.error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+      assert.equal(body.error.message, "Internal server error");
+      assert.deepEqual(body.error.details, { applied: true, retryable: true, stage: "projection" });
+      assert.equal(payload.includes(secretCause), false);
+      assert.equal(payload.includes("secret"), false);
+    });
+  });
+
   it("accepts deterministic RFC v5 source IDs for removal preview", async () => {
     const sourceId = "886313e1-3b8a-5372-9b90-0c9aee199e5d";
     let received: string | undefined;

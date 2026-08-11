@@ -15,6 +15,7 @@ import {
 import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { main } from "../src/cli.js";
 import { openDatabase, SCHEMA_SQL, transaction, validateSchema } from "../src/database.js";
@@ -705,11 +706,10 @@ describe("vault foundation", () => {
     });
     assert.equal(result.timedOut, true);
     const descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
+    const heartbeatAtReturn = readFileSync(heartbeatPath, "utf8");
     try {
-      assert.doesNotThrow(() => process.kill(descendantPid, 0));
-      await new Promise((resolve) => setTimeout(resolve, 1_250));
-      const heartbeat = Number(readFileSync(heartbeatPath, "utf8"));
-      assert.ok(Date.now() - heartbeat >= 100);
+      await delay(150);
+      assert.equal(readFileSync(heartbeatPath, "utf8"), heartbeatAtReturn);
     } finally {
       try {
         process.kill(descendantPid, "SIGKILL");

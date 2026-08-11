@@ -23,6 +23,9 @@ import { DEFAULT_VAULT_HOST, DEFAULT_VAULT_PORT, LockBusyError, resolveVault, ty
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
 const INTERNAL_ERROR_CODE = "INTERNAL_ERROR";
 const INTERNAL_ERROR_MESSAGE = "Internal server error";
+const APPLIED_FINALIZATION_CODE = "MUTATION_APPLIED_FINALIZATION_FAILED";
+const FINALIZATION_STAGES = ["checkpoint", "doctor", "commit", "projection", "qmd", "rollback"] as const;
+type FinalizationStage = (typeof FINALIZATION_STAGES)[number];
 const MULTIPART_FIELD_BYTES = 64 * 1024;
 const MULTIPART_FIELD_NAMES: Record<string, true> = {
   kind: true,
@@ -151,6 +154,22 @@ function errorCode(error: unknown): string {
   if (error instanceof Error && "code" in error && typeof error.code === "string") return error.code;
   return "REQUEST_FAILED";
 }
+function safeFinalizationDetails(
+  error: unknown,
+): { readonly applied: true; readonly retryable: boolean; readonly stage: FinalizationStage } | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const candidate = error as Error & { code?: unknown; details?: unknown };
+  if (
+    candidate.code !== APPLIED_FINALIZATION_CODE ||
+    !isRecord(candidate.details) ||
+    candidate.details.applied !== true ||
+    typeof candidate.details.retryable !== "boolean"
+  )
+    return undefined;
+  const stage = candidate.details.stage;
+  if (typeof stage !== "string" || !(FINALIZATION_STAGES as readonly string[]).includes(stage)) return undefined;
+  return { applied: true, retryable: candidate.details.retryable, stage: stage as FinalizationStage };
+}
 function errorStatus(error: unknown): number {
   if (
     error instanceof LockBusyError ||
@@ -190,18 +209,21 @@ function sendJson<T>(res: ServerResponse, status: number, data: T, requestId: st
 }
 function sendError(res: ServerResponse, status: number, error: unknown, requestId: string): void {
   const internal = status >= 500;
+  const finalizationDetails = internal ? safeFinalizationDetails(error) : undefined;
   const body: ApiEnvelope<never> = {
     ok: false,
     error: {
-      code: internal ? INTERNAL_ERROR_CODE : errorCode(error),
+      code: finalizationDetails ? APPLIED_FINALIZATION_CODE : internal ? INTERNAL_ERROR_CODE : errorCode(error),
       message: internal
         ? INTERNAL_ERROR_MESSAGE
         : error instanceof LockBusyError
           ? "Pi Scholar is busy; try again later."
           : errorText(error),
-      ...(!internal && error instanceof Error && "details" in error && isRecord(error.details)
-        ? { details: jsonSafe(error.details) }
-        : {}),
+      ...(finalizationDetails
+        ? { details: finalizationDetails }
+        : !internal && error instanceof Error && "details" in error && isRecord(error.details)
+          ? { details: jsonSafe(error.details) }
+          : {}),
       requestId,
     },
   };
