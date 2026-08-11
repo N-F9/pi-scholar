@@ -193,6 +193,11 @@ test("section parser recognizes Setext headings and keeps their boundaries", () 
   assert.equal(indentedBody.slice(indentedSections[0]!.startOffset, indentedSections[0]!.endOffset), "Preamble.\n\n");
   assert.equal(indentedBody.slice(indentedSections[1]!.startOffset), "  # Heading\n\nBody.\n");
 
+  const crBody = "# First\rFirst evidence.\r# Second\rSecond evidence.\r";
+  const crSections = parseWikiBodySections(crBody, "cr");
+  assert.equal(crBody.slice(crSections[0]!.startOffset, crSections[0]!.endOffset), "# First\rFirst evidence.\r");
+  assert.equal(crBody.slice(crSections[1]!.startOffset), "# Second\rSecond evidence.\r");
+
   const fencedBody = "```md\nIgnored\n-----\nIgnored body.\n```\nActual\n=====\nActual evidence.\n";
   const fencedSections = parseWikiBodySections(fencedBody, "fenced");
   assert.deepEqual(

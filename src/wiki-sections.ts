@@ -87,7 +87,9 @@ function parseHeadings(markdown: string): SectionHeading[] {
     const sourceStartOffset = node.position?.start?.offset;
     const endOffset = node.position?.end?.offset;
     if (sourceStartOffset === undefined || endOffset === undefined) continue;
-    const startOffset = markdown.lastIndexOf("\n", sourceStartOffset - 1) + 1;
+    const startOffset =
+      Math.max(markdown.lastIndexOf("\n", sourceStartOffset - 1), markdown.lastIndexOf("\r", sourceStartOffset - 1)) +
+      1;
     const heading = renderedHeading(node);
     if (heading) headings.push({ startOffset, heading });
   }
