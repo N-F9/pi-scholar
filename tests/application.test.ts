@@ -13,7 +13,7 @@ import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
-import { WikiService } from "../src/wiki.js";
+import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
 it("requires non-empty extraction line endpoints", () => {
   const base = { claimId: "claim", preparedId: "prepared", digest: "digest" };
@@ -300,7 +300,12 @@ describe("durable application writes", () => {
     try {
       const originalBody = "# Section\n\nauthored\n";
       const correctedBody = "# Section\n\ncorrected\n";
-      const page = await app.wiki.create({ path: "rollback.md", body: originalBody, quizWorthiness: "eligible" });
+      const page = await app.wiki.create({
+        path: "rollback.md",
+        description: "Rollback page correction.",
+        body: originalBody,
+        quizWorthiness: "eligible",
+      });
       const issue = await app.wiki.report({
         pageId: page.page.pageId,
         heading: "Section",
@@ -599,6 +604,7 @@ describe("knowledge capability contexts", () => {
     try {
       const page = await app.createNote({
         path: "missing-learning.md",
+        description: "Missing learning guard.",
         body: "# Missing learning\n",
         quizWorthiness: "eligible",
       });
@@ -634,11 +640,13 @@ describe("knowledge capability contexts", () => {
     try {
       const page = await app.createNote({
         path: "quiz-guarded.md",
+        description: "Quiz guard page.",
         body: "# Quiz guarded\n",
         quizWorthiness: "eligible",
       });
       const prerequisite = await app.createNote({
         path: "quiz-prerequisite.md",
+        description: "Quiz prerequisite page.",
         body: "# Quiz prerequisite\n",
         quizWorthiness: "eligible",
       });
@@ -684,11 +692,13 @@ describe("knowledge capability contexts", () => {
     try {
       const dependent = await app.createNote({
         path: "dependent.md",
+        description: "Dependent prerequisite page.",
         body: "# Dependent\n",
         quizWorthiness: "eligible",
       });
       const prerequisite = await app.createNote({
         path: "prerequisite.md",
+        description: "Prerequisite edge page.",
         body: "# Prerequisite\n",
         quizWorthiness: "eligible",
       });
@@ -770,6 +780,7 @@ describe("application quiz publication guards", () => {
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "publication-page.md",
+      description: "A page for publication.",
       title: "Publication page",
       body: "# Section\n\nSection text\n",
       quizWorthiness: "eligible",
@@ -782,14 +793,75 @@ describe("application quiz publication guards", () => {
       assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "initializationEnabled"]);
       assert.equal(context.candidates.length, 1);
       const candidate = context.candidates[0]!;
-      assert.deepEqual(Object.keys(candidate).sort(), ["dueAt", "pageId", "path", "sections", "title"]);
+      assert.deepEqual(Object.keys(candidate).sort(), ["description", "dueAt", "pageId", "path", "title"]);
       assert.equal(candidate.pageId, pageId);
       assert.equal(candidate.path, page.page.relativePath);
       assert.equal(candidate.title, "Publication page");
+      assert.equal(candidate.description, "A page for publication.");
       assert.equal(candidate.dueAt, app.scheduler.getPageLearning(pageId).dueAt);
-      assert.deepEqual(Object.keys(candidate.sections[0]!).sort(), ["anchor", "heading"]);
       assert.equal("excerpt" in candidate, false);
-      assert.equal("excerpt" in candidate.sections[0]!, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("bounds daily descriptions without changing canonical OKF", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const description = `  ${"é".repeat(600)}  `;
+    const page = await app.createNote({
+      path: "bounded-description.md",
+      title: "Bounded description",
+      description,
+      body: "# Section\n\nSection text.\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    try {
+      const candidate = (await app.getQuizContext({ date })).candidates.find((item) => item.pageId === pageId);
+      assert.equal(candidate?.description, "é".repeat(512));
+      assert.equal(Buffer.byteLength(candidate?.description ?? "", "utf8"), 1024);
+      const stored = parseWikiMarkdown((await app.wiki.get(pageId)).content);
+      assert.equal(stored.frontmatter.description, description);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("publishes a grounded quiz for a described headingless page", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "headingless-publication.md",
+      title: "Headingless publication",
+      description: "A page described without a heading.",
+      body: "Meaningful page-level exposition without a Markdown heading.\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    try {
+      const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
+      assert.equal(evidence.length, 1);
+      assert.equal(evidence[0]?.anchor, "");
+      assert.equal(evidence[0]?.heading, undefined);
+      assert.equal(evidence[0]?.excerpt.includes("---"), false);
+      const quiz = await app.publishQuiz({
+        status: "published",
+        date,
+        questions: [
+          {
+            kind: "free-response",
+            prompt: "Explain the page",
+            pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
+            sourceRefs: evidence.map((item) => item.reference),
+          },
+        ],
+      });
+      assert.equal(quiz.questions.length, 1);
     } finally {
       await app.close();
       db.close();
@@ -801,16 +873,19 @@ describe("application quiz publication guards", () => {
     const date = localDate(new Date());
     const first = await app.createNote({
       path: "evidence-first.md",
+      description: "First evidence page.",
       body: "# First\n\nFirst text\n",
       quizWorthiness: "eligible",
     });
     const second = await app.createNote({
       path: "evidence-second.md",
+      description: "Second evidence page.",
       body: "# Second\n\nSecond text\n",
       quizWorthiness: "eligible",
     });
     const future = await app.createNote({
       path: "evidence-future.md",
+      description: "Future evidence page.",
       body: "# Future\n\nFuture text\n",
       quizWorthiness: "eligible",
     });
@@ -837,6 +912,7 @@ describe("application quiz publication guards", () => {
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "live-drift.md",
+      description: "Live drift page.",
       body: "# Live drift\n\nCataloged text\n",
       quizWorthiness: "eligible",
     });
@@ -877,6 +953,7 @@ describe("application quiz publication guards", () => {
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "evidence-validation.md",
+      description: "Evidence validation page.",
       body: "# Section\n\nSection text\n",
       quizWorthiness: "eligible",
     });
@@ -894,12 +971,14 @@ describe("application quiz publication guards", () => {
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "publication-page.md",
+      description: "Selected publication page.",
       title: "Publication page",
       body: "# Section\n\nSection text\n",
       quizWorthiness: "eligible",
     });
     const unselected = await app.createNote({
       path: "unselected-page.md",
+      description: "Unselected publication page.",
       title: "Unselected page",
       body: "# Other\n\nOther text\n",
       quizWorthiness: "eligible",
@@ -1011,6 +1090,7 @@ async function gradingFixture() {
   const date = localDate(new Date());
   const page = await app.wiki.create({
     path: "page-1.md",
+    description: "Grading fixture page.",
     title: "Page 1",
     body: "# Section\n\nSection text\n",
     quizWorthiness: "eligible",
@@ -1039,12 +1119,14 @@ async function prerequisiteFixture() {
   const { app } = fixtureValue;
   const dependent = await app.wiki.create({
     path: "dependent.md",
+    description: "Dependent grading page.",
     title: "Dependent",
     body: "# Section\n\ndependent\n",
     quizWorthiness: "eligible",
   });
   const prerequisite = await app.wiki.create({
     path: "prerequisite.md",
+    description: "Prerequisite grading page.",
     title: "Prerequisite",
     body: "# Section\n\nprerequisite\n",
     quizWorthiness: "eligible",
@@ -1330,6 +1412,19 @@ describe("application prerequisite mutation guards", () => {
           page: {
             pageId: dependent.pageId,
             expectedDigest: before.digest,
+            description: "Dependent grading page.",
+          },
+          resolution: "No page correction.",
+        }),
+        /actual page correction/u,
+      );
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: dependent.pageId,
+            expectedDigest: before.digest,
             body: "# Section\n\ncorrected\n",
             quizWorthiness: "skip",
           },
@@ -1419,8 +1514,10 @@ describe("application capability boundaries", () => {
       for (const [index, body] of [
         `[^${chunkId}]`,
         `# Evidence\n\n[^${chunkId}]`,
-        `<!-- hidden -->[^${chunkId}]`,
+        `Topic\n=====\n[^${chunkId}]`,
         `[](https://example.test)[^${chunkId}]`,
+        `# Grounded\n\nSupported [^${chunkId}].\n\n# [](https://example.test)\n\nUnsupported claim.`,
+        `# Grounded\n\nSupported [^${chunkId}].\n\n# [][empty]\n\nUnsupported claim.\n\n[empty]: https://example.test`,
         `---\n\n[^${chunkId}]`,
         `- [^${chunkId}]`,
       ].entries()) {
@@ -1500,6 +1597,7 @@ describe("application capability boundaries", () => {
     try {
       const first = await app.createNote({
         path: "drift-first.md",
+        description: "Original first description.",
         body: "# First\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
@@ -1508,6 +1606,13 @@ describe("application capability boundaries", () => {
         body: "# Second\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
+      const firstPath = join(paths.wikiRoot, first.page.relativePath);
+      const firstContent = await fs.readFile(firstPath, "utf8");
+      assert.match(firstContent, /description: Original first description\./u);
+      await fs.writeFile(
+        firstPath,
+        firstContent.replace("description: Original first description.", "description: External first description."),
+      );
       await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
       await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
       const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
@@ -1521,6 +1626,16 @@ describe("application capability boundaries", () => {
         }),
         /body/u,
       );
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: first.page.pageId,
+          expectedDigest: firstDrift.currentDigest,
+          title: "First repaired",
+          body: "# First\n\nRepaired.\n",
+        }),
+        /description/u,
+      );
       (app as unknown as { doctorFn: typeof doctor }).doctorFn = doctor;
 
       await app.applyWikiChange({
@@ -1528,6 +1643,7 @@ describe("application capability boundaries", () => {
         pageId: first.page.pageId,
         expectedDigest: firstDrift.currentDigest,
         body: "# First\n\nRepaired.\n",
+        description: "External first description.",
       });
       assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
       assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, true);
@@ -1551,6 +1667,7 @@ describe("application capability boundaries", () => {
     try {
       const created = await app.createNote({
         path: "malformed-drift.md",
+        description: "Authored description.",
         body: "# Authored\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
@@ -1561,12 +1678,24 @@ describe("application capability boundaries", () => {
       await fs.writeFile(join(paths.wikiRoot, created.page.relativePath), malformed);
       const drift = await app.wiki.inspectDrift(created.page.pageId);
       assert.equal(drift.currentDigest, createHash("sha256").update(malformed).digest("hex"));
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: created.page.pageId,
+          expectedDigest: drift.currentDigest,
+          title: "Repaired",
+          body: "# Repaired\n\nCorrected.\n",
+          quizWorthiness: "skip",
+        }),
+        /description/u,
+      );
 
       const repaired = await app.applyWikiChange({
         kind: "update-page",
         pageId: created.page.pageId,
         expectedDigest: drift.currentDigest,
         title: "Repaired",
+        description: "Repaired description.",
         body: "# Repaired\n\nCorrected.\n",
         quizWorthiness: "skip",
       });

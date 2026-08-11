@@ -22,6 +22,7 @@ import {
   okfDate,
   okfFootnoteLabels,
   okfMarkdownEscapedAt,
+  okfRenderedText,
   parseOkfConcept,
   renderOkfIndex,
   renderOkfLog,
@@ -1015,9 +1016,10 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
       digest: string;
       revision: number;
       status: string;
+      quiz_worthiness: string;
       updated_at: string;
     }>(
-      "SELECT page_id, relative_path, title, digest, revision, status, updated_at FROM pages ORDER BY relative_path, page_id",
+      "SELECT page_id, relative_path, title, digest, revision, status, quiz_worthiness, updated_at FROM pages ORDER BY relative_path, page_id",
     );
     const byPath = new Map(rows.map((row) => [row.relative_path, row]));
     const snapshots = db.all<{ relative_path: string; digest: string; revision: number }>(
@@ -1049,6 +1051,12 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
     const projectionPages = active.map((row) => {
       const concept = conceptByPath.get(row.relative_path);
       if (!concept) throw new Error(`Page catalog has no matching wiki artifact: ${row.relative_path}`);
+      if (row.quiz_worthiness === "eligible") {
+        if (typeof concept.frontmatter.description !== "string" || !concept.frontmatter.description.trim())
+          throw new Error(`${row.relative_path}: eligible wiki pages require a non-empty OKF description`);
+        if (!okfRenderedText(concept.body).trim())
+          throw new Error(`${row.relative_path}: eligible wiki pages require a non-empty rendered body`);
+      }
       return {
         title: row.title,
         path: row.relative_path,

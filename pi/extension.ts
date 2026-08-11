@@ -32,6 +32,7 @@ import type {
 type WikiNoteInput = {
   readonly path: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body: string;
   readonly pageId?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
@@ -39,6 +40,7 @@ type WikiNoteInput = {
 type WikiNoteUpdateInput = {
   readonly path?: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
   readonly expectedDigest?: string;
@@ -145,16 +147,23 @@ const noteInput = Type.Object({
   pageId: Type.Optional(Type.String({ minLength: 1 })),
   path: Type.Optional(Type.String()),
   title: Type.Optional(Type.String()),
+  description: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description:
+        "Compact OKF selection summary metadata for this page, not source evidence or instructions. Optional for skip/unknown; required and non-empty when the resulting quizWorthiness is eligible. For an eligible update, omit only to preserve the existing valid description or provide a non-empty replacement. Eligible pages also require a renderable body.",
+    }),
+  ),
   body: Type.Optional(
     Type.String({
       description:
-        "Complete Markdown body. Preserve user-authored prose; model-authored source notes must be self-contained textbook-style exposition with nearby source-chunk citations.",
+        "Complete Markdown body. Preserve user-authored prose; model-authored source notes must be self-contained textbook-style exposition with nearby source-chunk citations. An eligible page must have a renderable body.",
     }),
   ),
   content: Type.Optional(
     Type.String({
       description:
-        "Alias for body. Preserve user-authored prose; model-authored source notes must teach the topic in depth rather than summarize it.",
+        "Alias for body. Preserve user-authored prose; model-authored source notes must teach the topic in depth rather than summarize it. An eligible page must have a renderable body.",
     }),
   ),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
@@ -182,7 +191,19 @@ const wikiChangeIssuePageInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
   expectedDigest: Type.String({ minLength: 1 }),
   title: Type.Optional(Type.String()),
-  body: Type.Optional(Type.String()),
+  description: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description:
+        "Compact OKF selection summary metadata for this page, not source evidence or instructions. Optional for skip/unknown; when resolve-issue leaves or makes the page eligible, omit only to preserve the existing valid description or provide a non-empty replacement. Eligible pages also require a renderable body.",
+    }),
+  ),
+  body: Type.Optional(
+    Type.String({
+      description:
+        "Replacement Markdown body. When resolve-issue leaves or makes the page eligible, the resulting page must have a renderable body.",
+    }),
+  ),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
 });
 
@@ -191,9 +212,16 @@ const wikiChangeInput = Type.Union([
     kind: Type.Literal("create-page"),
     path: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
+    description: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Compact OKF selection summary metadata for this page, not source evidence or instructions. Required and non-empty when quizWorthiness is eligible; optional for skip/unknown. An eligible page also requires a renderable body.",
+      }),
+    ),
     body: Type.String({
       description:
-        "Complete Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks.",
+        "Complete Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks. An eligible page must have a renderable body.",
     }),
     quizWorthiness: Type.Optional(
       Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")]),
@@ -204,10 +232,17 @@ const wikiChangeInput = Type.Union([
     pageId: Type.String({ minLength: 1 }),
     expectedDigest: Type.String({ minLength: 1 }),
     title: Type.Optional(Type.String()),
+    description: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Compact OKF selection summary metadata for this page, not source evidence or instructions. Optional for skip/unknown; when the resulting page is eligible, omit only to preserve the existing valid description or provide a non-empty replacement. Eligible pages also require a renderable body.",
+      }),
+    ),
     body: Type.Optional(
       Type.String({
         description:
-          "Complete replacement Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks.",
+          "Complete replacement Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks. An eligible resulting page must have a renderable body.",
       }),
     ),
     quizWorthiness: Type.Optional(
@@ -273,7 +308,7 @@ const contextDateInput = Type.Object({ date: Type.Optional(Type.String({ minLeng
 const lintContextInput = Type.Object({ description: Type.Optional(Type.String()) });
 const gradeReadingInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
-  anchor: Type.String({ minLength: 1 }),
+  anchor: Type.String(),
   heading: Type.Optional(Type.String()),
 });
 const gradePageInput = Type.Object({
@@ -735,6 +770,7 @@ async function note(app: ScholarApplication, params: Record<string, unknown>): P
   const body =
     typeof params.body === "string" ? params.body : typeof params.content === "string" ? params.content : undefined;
   const title = typeof params.title === "string" ? params.title : undefined;
+  const description = typeof params.description === "string" ? params.description : undefined;
   const quizWorthinessValue = params.quizWorthiness;
   const quizWorthiness =
     quizWorthinessValue === "eligible" || quizWorthinessValue === "skip" || quizWorthinessValue === "unknown"
@@ -742,18 +778,25 @@ async function note(app: ScholarApplication, params: Record<string, unknown>): P
       : undefined;
   const path = typeof params.path === "string" ? params.path : undefined;
   if (typeof params.pageId === "string") {
-    if (body === undefined && title === undefined && quizWorthiness === undefined && path === undefined)
+    if (
+      body === undefined &&
+      title === undefined &&
+      description === undefined &&
+      quizWorthiness === undefined &&
+      path === undefined
+    )
       throw new Error("an update is required");
     const update: WikiNoteUpdateInput = {
       ...(body === undefined ? {} : { body }),
       ...(title === undefined ? {} : { title }),
+      ...(description === undefined ? {} : { description }),
       ...(quizWorthiness === undefined ? {} : { quizWorthiness }),
       ...(path === undefined ? {} : { path }),
     };
     return app.updateNote(params.pageId, update);
   }
   if (typeof body !== "string" || !body.trim()) throw new Error("body or content is required");
-  const input: WikiNoteInput = { path: path ?? "", title, body, quizWorthiness };
+  const input: WikiNoteInput = { path: path ?? "", title, description, body, quizWorthiness };
   return app.createNote(input);
 }
 

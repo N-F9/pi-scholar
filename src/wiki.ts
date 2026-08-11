@@ -9,6 +9,7 @@ import {
   okfCitationText,
   okfFootnoteLabels,
   okfMarkdownEscapedAt,
+  okfRenderedText,
   parseOkfConcept,
   removeOkfFootnoteDefinitions,
   renderOkfIndex,
@@ -31,6 +32,7 @@ export interface WikiPage {
 export interface WikiPageInput {
   path: string;
   title?: string;
+  description?: string;
   body: string;
   pageId?: string;
   quizWorthiness?: "eligible" | "skip" | "unknown";
@@ -124,6 +126,16 @@ function assertInertMarkdown(body: string): void {
 }
 function assertPageTitle(value: unknown): asserts value is string {
   if (typeof value !== "string" || !value.trim()) throw new Error("wiki page title is required");
+}
+function assertQuizEligibleContent(
+  quizWorthiness: WikiPage["quizWorthiness"],
+  frontmatter: Record<string, unknown>,
+  body: string,
+): void {
+  if (quizWorthiness !== "eligible") return;
+  if (typeof frontmatter.description !== "string" || !frontmatter.description.trim())
+    throw new Error("eligible wiki pages require a non-empty OKF description");
+  if (!okfRenderedText(body).trim()) throw new Error("eligible wiki pages require a non-empty rendered body");
 }
 function serializePage(frontmatter: Record<string, unknown>, body: string): string {
   assertInertMarkdown(body);
@@ -493,6 +505,7 @@ export class WikiService {
     const quizWorthiness = input.quizWorthiness ?? "unknown";
     const frontmatter: Record<string, unknown> = {
       ...(input.frontmatter ?? {}),
+      ...(input.description === undefined ? {} : { description: input.description }),
       id: pageId,
       title,
       type: input.frontmatter?.type ?? "note",
@@ -500,6 +513,7 @@ export class WikiService {
       updated: createdAt,
       "quiz-worthiness": quizWorthiness,
     };
+    assertQuizEligibleContent(quizWorthiness, frontmatter, input.body);
     const content = this.serializeContent(frontmatter, input.body);
     validateMarkdownLinks(this.root(), location.relativePath, input.body);
     const page: WikiPage = {
@@ -564,6 +578,7 @@ export class WikiService {
     input: {
       body?: string;
       title?: string;
+      description?: string;
       quizWorthiness?: WikiPage["quizWorthiness"];
       expectedDigest?: string;
       path?: string;
@@ -593,12 +608,14 @@ export class WikiService {
     const quizWorthiness = input.quizWorthiness ?? page.quizWorthiness;
     const frontmatter: Record<string, unknown> = {
       ...parsed.frontmatter,
+      ...(input.description === undefined ? {} : { description: input.description }),
       id: pageId,
       title,
       created: typeof parsed.frontmatter.created === "string" ? parsed.frontmatter.created : updatedAt,
       updated: updatedAt,
       "quiz-worthiness": quizWorthiness,
     };
+    assertQuizEligibleContent(quizWorthiness, frontmatter, body);
     const content = this.serializeContent(frontmatter, body);
     validateMarkdownLinks(this.root(), page.relativePath, body);
     const updated: WikiPage = {
@@ -617,6 +634,7 @@ export class WikiService {
     input: {
       body?: string;
       title?: string;
+      description?: string;
       quizWorthiness?: WikiPage["quizWorthiness"];
       expectedDigest?: string;
       path?: string;
@@ -625,8 +643,10 @@ export class WikiService {
   ): Promise<WikiCreateResult> {
     const next = prepared ?? (await this.prepareUpdate(pageId, input));
     assertPageTitle(next.page.title);
-    const nextFrontmatter = parseOkfConcept(next.content).frontmatter;
+    const parsedNext = parseOkfConcept(next.content);
+    const nextFrontmatter = parsedNext.frontmatter;
     assertPageTitle(nextFrontmatter.title);
+    assertQuizEligibleContent(next.page.quizWorthiness, nextFrontmatter, parsedNext.body);
     const priorPageRow = this.catalog(pageId);
     if (!priorPageRow) throw new Error("page not found");
     const page = rowToPage(priorPageRow);

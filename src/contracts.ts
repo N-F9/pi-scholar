@@ -232,6 +232,7 @@ export interface WikiChangeIssuePageInput {
   readonly pageId: string;
   readonly expectedDigest: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body?: string;
   readonly quizWorthiness?: PageRecord["quizWorthiness"];
 }
@@ -241,6 +242,7 @@ export type WikiChangeInput =
       readonly kind: "create-page";
       readonly path: string;
       readonly title?: string;
+      readonly description?: string;
       readonly body: string;
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     }
@@ -249,6 +251,7 @@ export type WikiChangeInput =
       readonly pageId: string;
       readonly expectedDigest: string;
       readonly title?: string;
+      readonly description?: string;
       readonly body?: string;
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     }
@@ -422,17 +425,13 @@ export interface QuizEvidenceRecord {
   readonly textDigest: string;
   readonly excerpt: string;
 }
-export interface QuizCandidateSection {
-  readonly anchor: string;
-  readonly heading?: string;
-}
 
 export interface QuizCandidateRecord {
   readonly pageId: string;
   readonly path: string;
   readonly title: string;
+  readonly description: string;
   readonly dueAt: IsoDateTime;
-  readonly sections: readonly QuizCandidateSection[];
 }
 
 export interface QuizEvidenceRequest {

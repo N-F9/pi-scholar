@@ -23,7 +23,7 @@ import {
   ValidationError,
 } from "./scheduler.js";
 import { atomicWriteFile, readFileNoFollow, safeRelativePath } from "./vault.js";
-import { parseWikiSections } from "./wiki-sections.js";
+import { parseWikiDocumentSections } from "./wiki-sections.js";
 export interface QuestionSpecInput {
   readonly kind: QuizQuestionKind;
   readonly prompt: string;
@@ -216,7 +216,8 @@ function validReading(value: unknown): value is ReadingLink {
     typeof reading.pageId === "string" &&
     Boolean(reading.pageId) &&
     typeof reading.anchor === "string" &&
-    Boolean(reading.anchor) &&
+    (reading.anchor === "" || (reading.anchor.startsWith("#") && reading.anchor.length > 1)) &&
+    (reading.anchor !== "" || reading.heading === undefined) &&
     (reading.heading === undefined || typeof reading.heading === "string")
   );
 }
@@ -721,7 +722,9 @@ export class QuizService {
       throw new ValidationError(`Reading page path is unavailable: ${reading.pageId}`);
     }
     const encodedPath = relativePath.split("/").map(encodeHrefComponent).join("/");
-    return `wiki/${encodedPath}#${encodeHrefComponent(anchorFragment(reading.anchor))}`;
+    return reading.anchor === ""
+      ? `wiki/${encodedPath}`
+      : `wiki/${encodedPath}#${encodeHrefComponent(anchorFragment(reading.anchor))}`;
   }
 
   renderSheet(
@@ -965,7 +968,10 @@ export class QuizService {
         !/^[0-9a-f]{64}$/u.test(reference) ||
         seen.has(reference) ||
         !validWikiPath(path) ||
-        !anchor.startsWith("#") ||
+        !(
+          (anchor === "" && heading === undefined) ||
+          (anchor.startsWith("#") && anchor.length > 1 && heading !== undefined)
+        ) ||
         !/^[0-9a-f]{64}$/u.test(pageDigest) ||
         !Number.isInteger(pageRevision) ||
         pageRevision < 1 ||
@@ -1027,7 +1033,7 @@ export class QuizService {
     if (createHash("sha256").update(bytes).digest("hex") !== pageDigest)
       throw new ValidationError(`Evidence page is stale: ${pageId}`);
     const content = bytes.toString("utf8");
-    const sections = parseWikiSections(content, pageId);
+    const sections = parseWikiDocumentSections(content, pageId);
     return sections.map((section) => {
       const sectionText = content.slice(section.startOffset, section.endOffset);
       if (!sectionText || createHash("sha256").update(sectionText).digest("hex") !== section.textDigest)

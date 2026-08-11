@@ -1,20 +1,23 @@
 import { type ComponentPropsWithoutRef, isValidElement, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { headingAnchor, imagePlaceholder } from "../../../../src/markdown";
 
-export function headingAnchor(value: string): string {
-  return value
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^\p{Letter}\p{Number}\s-]/gu, "")
-    .trim()
-    .replace(/[\s-]+/g, "-");
+export { headingAnchor };
+
+type MarkdownImageProps = { alt?: string; node?: unknown };
+
+function MarkdownImage({ alt }: MarkdownImageProps) {
+  return <span className="text-sm italic text-muted">{imagePlaceholder(alt)}</span>;
 }
 
 function textFrom(children: ReactNode): string {
   if (typeof children === "string" || typeof children === "number") return String(children);
   if (Array.isArray(children)) return children.map(textFrom).join("");
-  if (isValidElement<{ children?: ReactNode }>(children)) return textFrom(children.props.children);
+  if (isValidElement<MarkdownImageProps & { children?: ReactNode }>(children)) {
+    if (children.type === MarkdownImage) return imagePlaceholder(children.props.alt);
+    return textFrom(children.props.children);
+  }
   return "";
 }
 
@@ -91,9 +94,7 @@ export function Markdown({
             );
           },
           code: InertCode,
-          img: ({ alt, node: _node }) => (
-            <span className="text-sm italic text-muted">[Image: {alt || "illustration"}]</span>
-          ),
+          img: MarkdownImage,
           h1: ({ children, node: _node, ...props }) => (
             <h1 id={idFor(children)} {...props}>
               {children}
