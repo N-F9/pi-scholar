@@ -555,6 +555,42 @@ describe("Pi package lifecycle", () => {
       await invoke(fixture.tools, `scholar_finish_${kind}`, {}, fixture.root);
     }
   });
+  it("returns exact ingest and lint results without an apply-time workflow update", async () => {
+    for (const kind of ["ingest", "lint"] as const) {
+      const context = { marker: `${kind}-context` };
+      const result = { kind: "create-page" as const };
+      const fixture = fakeLifecycleApp(context, async () => ({}));
+      let operationCalls = 0;
+      if (kind === "ingest") {
+        fixture.app.getIngestContext = async () => context;
+        fixture.app.applyIngestChange = async () => {
+          operationCalls += 1;
+          return result;
+        };
+      } else {
+        fixture.app.getLintContext = async () => context;
+        fixture.app.applyWikiChange = async () => {
+          operationCalls += 1;
+          return result;
+        };
+      }
+
+      await invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root);
+      fixture.app.updateWorkflow = async () => {
+        throw new Error("unexpected apply progress write");
+      };
+      const applied = (await invoke(fixture.tools, `scholar_apply_${kind}`, {}, fixture.root)) as {
+        readonly details: unknown;
+      };
+      assert.strictEqual(applied.details, result);
+      assert.equal(operationCalls, 1);
+      await invoke(fixture.tools, `scholar_finish_${kind}`, {}, fixture.root);
+      assert.deepEqual(
+        fixture.app.finishes.map(({ status }) => status),
+        ["succeeded"],
+      );
+    }
+  });
 
   it("replays exact daily initialization context after applied and unapplied automatic finish failures", async () => {
     for (const applied of [false, true]) {
@@ -602,6 +638,35 @@ describe("Pi package lifecycle", () => {
         /context is required/u,
       );
     }
+  });
+
+  it("retries an applied extraction publication failure with the identical input", async () => {
+    const only = claim("claim-applied-publication", "prepared-applied-publication");
+    const publication = { sourceId: only.claimId, manifest: {}, removedInbox: true };
+    let publicationCalls = 0;
+    const fixture = fakeLifecycleApp({ claims: [only] }, async () => {
+      publicationCalls += 1;
+      if (publicationCalls === 1)
+        throw Object.assign(new Error("applied publication finalization failure"), { details: { applied: true } });
+      return publication;
+    });
+    const input = { ...only, endpoints: [1] };
+
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", input, fixture.root),
+      /applied publication finalization failure/u,
+    );
+    assert.deepEqual(fixture.app.finishes, []);
+    const retry = (await invoke(fixture.tools, "scholar_publish_extraction", input, fixture.root)) as {
+      readonly details: unknown;
+    };
+    assert.strictEqual(retry.details, publication);
+    assert.equal(publicationCalls, 2);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
   });
 
   it("retains a publication failure through later successful claims", async () => {

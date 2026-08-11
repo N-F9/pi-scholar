@@ -1916,6 +1916,8 @@ export class ScholarApplication {
     return withWriterLock(this.paths, async () => {
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz evidence is limited to the current local date");
+      if (await this.readSetting("initializationEnabled", true))
+        throw new ValidationError("Initialization maintenance is active; quiz evidence is blocked");
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date, false));
       const byId = new Map(duePages.map((page) => [page.pageId, page]));
       const selectedPages = pageIds.map((pageId) => {
@@ -1956,15 +1958,11 @@ export class ScholarApplication {
   async publishQuiz(input: QuizPublicationInput): Promise<QuizDetailRecord> {
     const proposal = decodeQuizPublication(input);
     const date = proposal.date;
-    let blocked = false;
-    const result = await this.durableDirect(async () => {
+    return this.durableDirect(async () => {
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz publication is limited to the current local date");
-      const settings = await this.getSettings();
-      if (settings.settings.initializationEnabled) {
-        blocked = true;
-        return undefined;
-      }
+      if (await this.readSetting("initializationEnabled", true))
+        throw new ValidationError("Initialization maintenance is active; quiz publication is blocked");
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       if (proposal.status === "skipped") {
         if (duePages.length) throw new ValidationError("A quiz may be skipped only when no pages are eligible");
@@ -1989,9 +1987,6 @@ export class ScholarApplication {
         }),
       );
     }, "quiz:publish");
-    if (blocked || !result)
-      throw new ValidationError("Initialization maintenance is active; quiz publication is blocked");
-    return result;
   }
   private async gradingContextFor(date: string, requestId: string, quiz: QuizRecord): Promise<GradingContext> {
     return {
