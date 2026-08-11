@@ -3,11 +3,13 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import type { WikiPageSection } from "./contracts.js";
+import { imagePlaceholder, headingAnchor as normalizeHeadingAnchor } from "./markdown.js";
 import { okfRenderedText, parseOkfConcept } from "./okf.js";
 
 type MarkdownNode = {
   readonly type: string;
   readonly value?: string;
+  readonly alt?: string;
   readonly children?: readonly MarkdownNode[];
   readonly position?: {
     readonly start?: { readonly offset?: number };
@@ -29,6 +31,10 @@ function renderedHeading(heading: MarkdownNode): string {
       if (node.value) text.push(node.value);
       return;
     }
+    if (node.type === "image" || node.type === "imageReference") {
+      text.push(imagePlaceholder(node.alt));
+      return;
+    }
     if (node.type === "break") {
       text.push("\n");
       return;
@@ -46,12 +52,7 @@ export function hasRenderedEmptyHeading(markdown: string): boolean {
 }
 
 function headingAnchor(heading: string, used: Set<string>): string {
-  const slug = heading
-    .normalize("NFKD")
-    .toLocaleLowerCase()
-    .replace(/[^\p{Letter}\p{Number}\s-]/gu, "")
-    .trim()
-    .replace(/[\s-]+/gu, "-");
+  const slug = normalizeHeadingAnchor(heading);
   if (!slug) return "";
   let candidate = slug;
   for (let suffix = 1; used.has(candidate); suffix += 1) candidate = `${slug}-${suffix}`;

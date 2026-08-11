@@ -1,4 +1,6 @@
 import { strict as assert } from "node:assert";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   api,
@@ -10,6 +12,7 @@ import {
   isWikiPageResult,
   isWorkflowListResult,
 } from "./api";
+import { Markdown } from "./components/Markdown";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -268,5 +271,17 @@ describe("api response boundary", () => {
       }),
       true,
     );
+  });
+});
+
+describe("Markdown heading rendering", () => {
+  it("uses the image placeholder when assigning image-only heading ids", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: "# ![Architecture](diagram.png)\n",
+        headings: [{ heading: "[Image: Architecture]", anchor: "#image-architecture" }],
+      }),
+    );
+    assert.match(rendered, /<h1 id="image-architecture">.*\[Image: Architecture\].*<\/h1>/u);
   });
 });

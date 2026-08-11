@@ -133,6 +133,51 @@ test("section parser recognizes Setext headings and keeps their boundaries", () 
     richAtxSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
     [{ anchor: "#atx-link-code", heading: "ATX link code" }],
   );
+  const imageAtxBody = "# ![Architecture](diagram.png)\n\nImage evidence.\n\n# Following\nFollowing evidence.\n";
+  const imageAtxSections = parseWikiBodySections(imageAtxBody, "image-atx");
+  assert.deepEqual(
+    imageAtxSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#image-architecture", heading: "[Image: Architecture]" },
+      { anchor: "#following", heading: "Following" },
+    ],
+  );
+  assert.equal(
+    imageAtxBody.slice(imageAtxSections[0]!.startOffset, imageAtxSections[0]!.endOffset),
+    "# ![Architecture](diagram.png)\n\nImage evidence.\n\n",
+  );
+
+  const imageSetextBody =
+    "![Architecture](diagram.png)\n===\nSetext image evidence.\n\nFollowing\n---\nFollowing evidence.\n";
+  const imageSetextSections = parseWikiBodySections(imageSetextBody, "image-setext");
+  assert.deepEqual(
+    imageSetextSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#image-architecture", heading: "[Image: Architecture]" },
+      { anchor: "#following", heading: "Following" },
+    ],
+  );
+  assert.equal(
+    imageSetextBody.slice(imageSetextSections[0]!.startOffset, imageSetextSections[0]!.endOffset),
+    "![Architecture](diagram.png)\n===\nSetext image evidence.\n\n",
+  );
+
+  const imageReferenceBody =
+    "# ![Architecture][architecture]\n\n[architecture]: diagram.png\n\nReference image evidence.\n";
+  assert.deepEqual(
+    parseWikiBodySections(imageReferenceBody, "image-reference").map((item) => ({
+      anchor: item.anchor,
+      heading: item.heading,
+    })),
+    [{ anchor: "#image-architecture", heading: "[Image: Architecture]" }],
+  );
+  assert.deepEqual(
+    parseWikiBodySections("# ![](diagram.png)\n\nFallback image evidence.\n", "image-fallback").map((item) => ({
+      anchor: item.anchor,
+      heading: item.heading,
+    })),
+    [{ anchor: "#image-illustration", heading: "[Image: illustration]" }],
+  );
 
   const hardBreakSetext = "One\\\nTwo\n===\nEvidence.\n";
   assert.deepEqual(
