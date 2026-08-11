@@ -140,7 +140,7 @@ Admission publishes packets; it does not invoke `ingest`. `ingest` does not invo
 
 Inputs include documents and images through Docling, Markdown/plain text/XML/JSON/pasted text through lossless extraction, code files, directories and repositories through native tree capture, and direct notes through the guarded wiki path. Direct notes are authored knowledge, not fake source packets.
 
-Capture snapshots a stable physical identity and complete digest, then streams or processes disk-backed data inside contained private work. There is no fixed product source-size limit. Free space, elapsed time, converter/process output, parser, and model-context bounds remain operational safety limits; they must not become an arbitrary whole-source cap.
+Capture snapshots a stable physical identity and complete digest, then streams or processes disk-backed data inside contained private work. There is no fixed product source-size limit. Available free space is handled during work, not by a predictive preflight; elapsed time, converter/process output, parser, and model-context bounds remain operational safety limits and must not become an arbitrary whole-source cap.
 
 For each admitted source:
 

@@ -294,9 +294,11 @@ sanitized and retained in the manifest.
 
 There is no fixed product source-size limit. Streaming, disk-backed staging and
 extraction are bounded by available space, operation/process time, external
-output limits, and the model context supplied for a particular decision.
-These operational bounds do not replace digest, containment, or revalidation
-checks.
+output limits, and the model context supplied for a particular decision. Pi
+Scholar does not promise predictive free-space preflight; an ENOSPC failure is
+handled by operation cleanup/rollback and the normal doctor-and-retry recovery
+path. These operational bounds do not replace digest, containment, or
+revalidation checks.
 
 ### Claim, prepare, and publish
 

@@ -148,7 +148,7 @@ Untrusted inputs:
 - user-authored Markdown, Mermaid, and HTML.
 
 Every untrusted value crosses a validating host boundary before it can choose a path, mutate durable state, update a schedule, enter semantic context, or appear in a public response.
-HTTP(S) URL admission accepts user-supplied local, private, loopback, link-local, metadata, and Tailscale destinations under local-user/model trust. The host does not maintain a destination classifier as an SSRF trust boundary. It still enforces HTTP(S), redirect-loop limits, finite request timeouts, streaming or disk-backed reads, and available-space checks. URL response bytes remain untrusted evidence.
+HTTP(S) URL admission accepts user-supplied local, private, loopback, link-local, metadata, and Tailscale destinations under local-user/model trust. The host does not maintain a destination classifier as an SSRF trust boundary. It still enforces HTTP(S), redirect-loop limits, finite request timeouts, and streaming or disk-backed reads. URL response bytes remain untrusted evidence.
 
 ## Canonical vault
 
@@ -371,13 +371,13 @@ Mechanics contains no prompts or semantic judgment. `node:sqlite` is hidden behi
 | Code file | Lossless textual extraction retaining language and path |
 | Directory or Git repository | Native file/Git walker retaining paths, file digests, revision, and repository structure |
 
-Repository extraction has no product-level source-size cap. It uses streaming or disk-backed reads with available-space, timeout, process-output, and model-context bounds, and excludes Git internals, ignored files unless explicitly requested, unsupported devices, symlinks, and binary content not deliberately retained. Code boundaries follow files, symbols, modules, and coherent subsystems rather than document headings.
+Repository extraction has no product-level source-size cap. It uses streaming or disk-backed reads with timeout, process-output, and model-context bounds, and excludes Git internals, ignored files unless explicitly requested, unsupported devices, symlinks, and binary content not deliberately retained. Code boundaries follow files, symbols, modules, and coherent subsystems rather than document headings.
 
 ### Extraction flow
 
 1. Discover a stable inbox entry or materialize a typed input there.
 2. Copy it through validated no-follow streaming or disk-backed reads into private work, compute its complete file/tree manifest and digest, and claim that snapshot.
-3. Validate the snapshot's type, containment, authorization, available space, and operational time bounds.
+3. Validate the snapshot's type, containment, authorization, and operational time bounds; writes remain subject to OS storage errors.
 4. Retain the original bytes or repository tree in a prepared packet.
 5. Convert document formats through Docling; preserve already-textual inputs natively.
 6. Reject empty, truncated, timed-out, malformed, or unsupported conversion without removing the pending input.
@@ -386,7 +386,7 @@ Repository extraction has no product-level source-size cap. It uses streaming or
 9. Validate complete coverage and publish the packet through a temporary directory and atomic rename.
 10. Remove the pending inbox entry only if publication succeeded and its current physical identity and digest still match the claim.
 
-No path takes only the first N characters and no fixed product-level source-size limit exists. Long sources use hierarchical planning over the complete atom stream, subject only to available-space, timeout, process-output, and model-context bounds. A coherent presentation may remain one chunk; a book may split at sustained conceptual, argumentative, procedural, chapter, or reference transitions.
+No path takes only the first N characters and no fixed product-level source-size limit exists. Long sources use hierarchical planning over the complete atom stream, subject only to timeout, process-output, and model-context bounds. A coherent presentation may remain one chunk; a book may split at sustained conceptual, argumentative, procedural, chapter, or reference transitions.
 
 ### Chunk contract
 
@@ -689,6 +689,7 @@ Recovery stays operation-specific and idempotent: source publication reuses its 
 - **Docling unavailable:** document conversion fails visibly; textual, code, note, and exact-read paths remain distinct.
 - **Unsupported or failed extraction:** retain that pending entry and its diagnostics, continue other independent stable entries in the current extract session, and publish no packet for the failed entry.
 - **Partial chunk plan:** reject unless every atom is covered exactly once and in order.
+- **OS `ENOSPC` during extraction or publication:** no predictive free-space preflight exists. Disposable-vault recovery checks must exercise the error while writing accepted bytes, provenance, and temporary data, verify private-work cleanup, and verify SQLite, Git, and doctor recovery before retry. A failed write retains pending input or rolls back uncommitted durable state; partial bytes and crash remnants never become authority.
 - **qmd unavailable or malformed:** semantic search fails visibly; native exact and lexical navigation remains available.
 - **No relevant evidence:** offer capture/discovery or cancel; never disguise generic model knowledge as grounded material.
 - **Page missing or duplicate stable ID:** exclude it from scheduling and report it through doctor, ingest, or lint.
