@@ -111,7 +111,7 @@ function escapeRegExp(value: string): string {
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly string[]): void {
   const tokens = [...new Set(hiddenTokens.map((token) => token.trim()).filter(Boolean))];
   if (!tokens.length) return;
-  const pattern = new RegExp(`(?<![\\p{L}\\p{N}_-])(?:${tokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_-])`, "u");
+  const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])(?:${tokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`, "iu");
   if (pattern.test(value)) throw new ValidationError("Quiz Markdown contains private metadata");
 }
 
