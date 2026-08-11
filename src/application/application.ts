@@ -226,6 +226,7 @@ function errorMessage(error: unknown): string {
 function extractionResultKey(input: Pick<ExtractPublicationInput, "claimId" | "preparedId" | "digest">): string {
   return `${input.claimId}\u0000${input.preparedId}\u0000${input.digest}`;
 }
+const DAILY_CANDIDATE_DESCRIPTION_BYTES = 1024;
 function boundedUtf8(value: string, maxBytes: number): string {
   let bytes = 0;
   let end = 0;
@@ -1870,7 +1871,7 @@ export class ScholarApplication {
           pageId: result.page.pageId,
           path: result.page.relativePath,
           title: result.page.title,
-          description,
+          description: boundedUtf8(description.trim(), DAILY_CANDIDATE_DESCRIPTION_BYTES),
           dueAt: learning.dueAt,
         };
       }),

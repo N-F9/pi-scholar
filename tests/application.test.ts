@@ -13,7 +13,7 @@ import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
-import { WikiService } from "../src/wiki.js";
+import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
 it("requires non-empty extraction line endpoints", () => {
   const base = { claimId: "claim", preparedId: "prepared", digest: "digest" };
@@ -800,6 +800,31 @@ describe("application quiz publication guards", () => {
       assert.equal(candidate.description, "A page for publication.");
       assert.equal(candidate.dueAt, app.scheduler.getPageLearning(pageId).dueAt);
       assert.equal("excerpt" in candidate, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("bounds daily descriptions without changing canonical OKF", async () => {
+    const { app, db } = fixture();
+    const date = localDate(new Date());
+    const description = `  ${"é".repeat(600)}  `;
+    const page = await app.createNote({
+      path: "bounded-description.md",
+      title: "Bounded description",
+      description,
+      body: "# Section\n\nSection text.\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ initializationEnabled: false });
+    try {
+      const candidate = (await app.getQuizContext({ date })).candidates.find((item) => item.pageId === pageId);
+      assert.equal(candidate?.description, "é".repeat(512));
+      assert.equal(Buffer.byteLength(candidate?.description ?? "", "utf8"), 1024);
+      const stored = parseWikiMarkdown((await app.wiki.get(pageId)).content);
+      assert.equal(stored.frontmatter.description, description);
     } finally {
       await app.close();
       db.close();
