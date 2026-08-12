@@ -1,4 +1,5 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { useEffect, useRef } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { cx } from "./ui";
 
 const primary = [
@@ -21,6 +22,27 @@ const linkClass = ({ isActive }: { isActive: boolean }) =>
   );
 
 export function AppShell() {
+  const location = useLocation();
+  const main = useRef<HTMLElement>(null);
+  const params = new URLSearchParams(location.search);
+  const contentPath = JSON.stringify([location.pathname, params.get("pageId"), params.get("path")]);
+  const previousContentPath = useRef(contentPath);
+  const previousPathname = useRef(location.pathname);
+
+  useEffect(() => {
+    const pathname = location.pathname.toLowerCase().replace(/\/+$/, "") || "/";
+    const routeTitle =
+      primary.find((item) => item.to === pathname)?.label ??
+      secondary.find((item) => item.to === pathname)?.label ??
+      (/^\/history\/[^/]+$/.test(pathname) ? "Quiz history" : "Page not found");
+    document.title = `${routeTitle} · Pi Scholar`;
+    if (previousContentPath.current !== contentPath) {
+      main.current?.focus({ preventScroll: previousPathname.current === location.pathname });
+      previousContentPath.current = contentPath;
+      previousPathname.current = location.pathname;
+    }
+  }, [contentPath, location.pathname]);
+
   return (
     <div className="min-h-screen">
       <aside
@@ -78,7 +100,12 @@ export function AppShell() {
           </details>
         </header>
 
-        <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 sm:py-12 lg:px-10" id="main-content">
+        <main
+          className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 sm:py-12 lg:px-10"
+          id="main-content"
+          ref={main}
+          tabIndex={-1}
+        >
           <Outlet />
         </main>
       </div>
