@@ -411,7 +411,7 @@ function workflowError(error: unknown): WorkflowFinishOptions {
   return {
     errorCode:
       error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "PI_WORKFLOW_FAILED",
-    errorMessage: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+    errorMessage: error instanceof Error ? error.message : String(error),
   };
 }
 

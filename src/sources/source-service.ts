@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { promises as fs, readFileSync, type Stats } from "node:fs";
+import { promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -21,7 +21,7 @@ import {
 } from "../okf.js";
 import { QuizService } from "../quiz.js";
 import { ValidationError } from "../scheduler.js";
-import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
+import { atomicWriteFile, readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
 import {
   atomizeExtraction,
   chunkEndpointNumber,
@@ -38,7 +38,6 @@ import {
   canonical,
   copyFileNoFollow,
   copyPathNoFollow,
-  copyRepositoryNoSecrets,
   deterministicUuid,
   digestBytes,
   ENVELOPE_NAME,
@@ -46,6 +45,7 @@ import {
   hashFile,
   inferKind,
   lstatNoFollow,
+  lstatNoFollowSync,
   measurePath,
   pathFor,
   provenanceUrl,
@@ -100,6 +100,9 @@ export interface SourceStageRequest {
   displayName?: string;
   mediaType?: string;
   originalName?: string;
+}
+export interface PreparedSourceStage {
+  readonly stageId: string;
 }
 export interface FileSnapshot {
   path: string;
@@ -252,6 +255,19 @@ export interface ChunkPlanEndpoint {
 
 const MAX_SOURCE_REDIRECTS = 5;
 const DEFAULT_SOURCE_TIMEOUT_MS = 300_000;
+const SOURCE_ERROR_MESSAGE_BYTES = 500;
+
+function boundedUtf8(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const character of value) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += character.length;
+  }
+  return value.slice(0, end);
+}
 export interface SourceHttpResponse {
   status: number;
   location?: string;
@@ -451,10 +467,18 @@ function assertManifestClaimProvenance(
   if (canonical(manifestProvenance(manifest)) !== canonical(claimProvenance(claim, publication)))
     throw new Error("source packet provenance mismatch");
 }
+const SOURCE_STAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+type RetainedSourceStage = {
+  readonly prepared: PreparedSourceStage;
+  readonly kind: SourceKind;
+  readonly metadata: StageMetadata;
+};
+
 export class SourceService {
   readonly db: ScholarDatabase;
   readonly paths: VaultPathsLike;
   readonly adapters: SourceAdapters;
+  private readonly retainedSourceStages = new Map<string, RetainedSourceStage>();
   private readonly retainedPrepared = new Map<string, { prepared: PreparedAdmission; seal: string }>();
   constructor(db: ScholarDatabase, paths: VaultPathsLike, adapters: SourceAdapters = {}) {
     this.db = db;
@@ -463,6 +487,14 @@ export class SourceService {
   }
   private inbox(): string {
     return pathFor(this.paths, "inbox");
+  }
+  private assertSourceOutsideInbox(source: string): void {
+    try {
+      ensureWithin(this.inbox(), source);
+    } catch {
+      return;
+    }
+    throw new ValidationError("source path must be outside inbox");
   }
   private readonly completedPrepared = new Map<string, { prepared: PreparedAdmission; result: AdmissionResult }>();
   private async ensureInbox(): Promise<void> {
@@ -477,6 +509,10 @@ export class SourceService {
       const stat = await lstatNoFollow(inbox);
       if (!stat.isDirectory()) throw new Error("inbox root must be a real directory");
     }
+  }
+  private sourceStageRoot(stageId: string): string {
+    if (!SOURCE_STAGE_ID.test(stageId)) throw new Error("invalid source stage id");
+    return safeRelativePath(this.work(), `.source-stage-${stageId}`);
   }
   private sources(): string {
     return pathFor(this.paths, "sources");
@@ -546,42 +582,77 @@ export class SourceService {
       return { mediaType: response.mediaType, name: basename(current.pathname) || undefined };
     }
   }
-  private async privateStageRoot(): Promise<string> {
+  private async privateStageRoot(): Promise<{ stageId: string; root: string }> {
     await fs.mkdir(this.work(), { recursive: true, mode: 0o700 });
     const stat = await lstatNoFollow(this.work());
     if (!stat.isDirectory()) throw new Error("work root must be a real directory");
-    return fs.mkdtemp(join(this.work(), ".source-stage-"));
+    const stageId = randomUUID();
+    const root = this.sourceStageRoot(stageId);
+    await fs.mkdir(root, { recursive: false, mode: 0o700 });
+    return { stageId, root };
   }
-  private async publishEnvelopeStage(
-    stageRoot: string,
+  private async retainSourceStage(
+    stageId: string,
+    kind: SourceKind,
     metadata: StageMetadata,
-  ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
-    const name = `${randomUUID()}.pi-scholar`;
-    const target = safeRelativePath(this.inbox(), name);
-    await fs.writeFile(join(stageRoot, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, {
-      flag: "wx",
-      mode: 0o600,
+  ): Promise<PreparedSourceStage> {
+    const prepared: PreparedSourceStage = { stageId };
+    this.retainedSourceStages.set(stageId, {
+      prepared: structuredClone(prepared),
+      kind,
+      metadata: structuredClone(metadata),
     });
-    await fs.rename(stageRoot, target);
-    return { relativePath: name, absolutePath: target, kind: metadata.kind, metadata };
+    return prepared;
   }
-  private async stageEnvelope(
-    metadata: StageMetadata,
-    bytes: Uint8Array,
-  ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata: StageMetadata }> {
-    const stageRoot = await this.privateStageRoot();
+  private loadSourceStage(stage: PreparedSourceStage): RetainedSourceStage {
+    const retained = this.retainedSourceStages.get(stage.stageId);
+    if (!retained || canonical(retained.prepared) !== canonical(stage))
+      throw new Error("source stage is not owned by this service");
+    return retained;
+  }
+  async publishPreparedStage(stage: PreparedSourceStage): Promise<InboxEntry> {
+    const retained = this.loadSourceStage(stage);
+    const root = this.sourceStageRoot(stage.stageId);
     try {
-      await fs.writeFile(join(stageRoot, metadata.payload), Buffer.from(bytes), { flag: "wx", mode: 0o600 });
-      return await this.publishEnvelopeStage(stageRoot, metadata);
+      const rootStat = await lstatNoFollow(root);
+      if (!rootStat.isDirectory()) throw new Error("source stage root must be a directory");
+      const metadata = await stagedMetadata(root);
+      if (!metadata || metadata.kind !== retained.kind || canonical(metadata) !== canonical(retained.metadata))
+        throw new Error("source stage metadata is invalid");
+      await this.ensureInbox();
+      const relativePath = `${randomUUID()}.pi-scholar`;
+      const target = join(this.inbox(), relativePath);
+      await fs.rename(root, target);
+      const result: InboxEntry = {
+        relativePath,
+        absolutePath: target,
+        kind: retained.kind,
+        identity: statIdentity(rootStat),
+        metadata,
+      };
+      await this.cleanupPreparedStage(stage).catch(() => undefined);
+      return result;
     } catch (error) {
-      await fs.rm(stageRoot, { recursive: true, force: true });
+      await this.cleanupPreparedStage(stage).catch(() => undefined);
       throw error;
     }
   }
-  async stage(
-    request: SourceStageRequest,
-  ): Promise<{ relativePath: string; absolutePath: string; kind: SourceKind; metadata?: StageMetadata }> {
-    await this.ensureInbox();
+  async cleanupPreparedStage(stage: PreparedSourceStage): Promise<void> {
+    this.retainedSourceStages.delete(stage.stageId);
+    await fs.rm(this.sourceStageRoot(stage.stageId), { recursive: true, force: true });
+  }
+  private async stageEnvelope(metadata: StageMetadata, bytes: Uint8Array): Promise<PreparedSourceStage> {
+    const { stageId, root } = await this.privateStageRoot();
+    try {
+      await fs.writeFile(join(root, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+      await fs.writeFile(join(root, metadata.payload), Buffer.from(bytes), { flag: "wx", mode: 0o600 });
+      return await this.retainSourceStage(stageId, metadata.kind, metadata);
+    } catch (error) {
+      await this.cleanupPreparedStage({ stageId }).catch(() => undefined);
+      throw error;
+    }
+  }
+  async prepareStage(request: SourceStageRequest): Promise<PreparedSourceStage> {
     const forms = [
       request.url !== undefined,
       request.text !== undefined,
@@ -600,45 +671,17 @@ export class SourceService {
         throw new ValidationError("source URL is invalid");
       }
       if (!["http:", "https:"].includes(parsed.protocol)) throw new ValidationError("only HTTP(S) URLs are accepted");
-      if (this.adapters.fetchUrl) {
-        const fetched = await this.adapters.fetchUrl(parsed.toString());
-        const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
-        const originalName = validRelativePath(request.originalName ?? rawName);
-        const displayName = request.displayName ?? originalName;
-        const mediaType = request.mediaType ?? fetched.mediaType;
-        if (
-          /[\u0000-\u001f\u007f]/u.test(displayName) ||
-          (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
-        )
-          throw new ValidationError("invalid staged source metadata");
-        return this.stageEnvelope(
-          {
-            version: 1,
-            requestedKind: request.kind ?? "url",
-            kind: "url",
-            displayName,
-            originalName,
-            sourceUri: provenanceUrl(parsed),
-            mediaType,
-            payload: "payload",
-          },
-          fetched.bytes,
+      const metadataFor = (fetchedName?: string): StageMetadata => {
+        const originalName = validRelativePath(
+          request.originalName ?? request.name ?? fetchedName ?? (basename(parsed.pathname) || "source.txt"),
         );
-      }
-      const stageRoot = await this.privateStageRoot();
-      const payloadPath = join(stageRoot, "payload");
-      try {
-        const fetched = await this.defaultFetch(parsed, payloadPath);
-        const rawName = request.name ?? fetched.name ?? (basename(parsed.pathname) || "source.txt");
-        const originalName = validRelativePath(request.originalName ?? rawName);
         const displayName = request.displayName ?? originalName;
-        const mediaType = request.mediaType ?? fetched.mediaType;
         if (
           /[\u0000-\u001f\u007f]/u.test(displayName) ||
           (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
         )
           throw new ValidationError("invalid staged source metadata");
-        const metadata: StageMetadata = {
+        return {
           version: 1,
           requestedKind: request.kind ?? "url",
           kind: "url",
@@ -648,42 +691,54 @@ export class SourceService {
           mediaType,
           payload: "payload",
         };
-        return await this.publishEnvelopeStage(stageRoot, metadata);
+      };
+      let bytes: Uint8Array;
+      let mediaType = request.mediaType;
+      if (this.adapters.fetchUrl) {
+        const fetched = await this.adapters.fetchUrl(parsed.toString());
+        bytes = fetched.bytes;
+        mediaType ??= fetched.mediaType;
+        return this.stageEnvelope(metadataFor(fetched.name), bytes);
+      }
+      const { stageId, root } = await this.privateStageRoot();
+      try {
+        const fetched = await this.defaultFetch(parsed, join(root, "payload"));
+        mediaType ??= fetched.mediaType;
+        const metadata = metadataFor(fetched.name);
+        await fs.writeFile(join(root, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+        return await this.retainSourceStage(stageId, "url", metadata);
       } catch (error) {
-        await fs.rm(stageRoot, { recursive: true, force: true });
+        await this.cleanupPreparedStage({ stageId }).catch(() => undefined);
         throw error;
       }
     }
     if (request.text !== undefined) {
       if (request.kind !== undefined && request.kind !== "text" && request.kind !== "pasted")
         throw new ValidationError("text source kind must be text or pasted");
-      const rawName = request.name ?? "source.txt";
-      const originalName = validRelativePath(request.originalName ?? rawName);
-      const requestedKind = request.kind ?? "pasted";
-      const bytes = Buffer.from(request.text, "utf8");
+      const originalName = validRelativePath(request.originalName ?? request.name ?? "source.txt");
       const displayName = request.displayName ?? originalName;
       if (
         /[\u0000-\u001f\u007f]/u.test(displayName) ||
         (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
       )
         throw new ValidationError("invalid staged source metadata");
-      const metadata: StageMetadata = {
-        version: 1,
-        requestedKind,
-        kind: "text",
-        displayName,
-        originalName,
-        mediaType: request.mediaType,
-        payload: "payload",
-      };
-      return this.stageEnvelope(metadata, bytes);
+      return this.stageEnvelope(
+        {
+          version: 1,
+          requestedKind: request.kind ?? "pasted",
+          kind: "text",
+          displayName,
+          originalName,
+          mediaType: request.mediaType,
+          payload: "payload",
+        },
+        Buffer.from(request.text, "utf8"),
+      );
     }
     if (request.bytes !== undefined) {
       if (request.kind !== "upload") throw new ValidationError("bytes source kind must be upload");
       if (!(request.bytes instanceof Uint8Array)) throw new ValidationError("source payload must be binary");
-      const rawName = request.name ?? "source.txt";
-      const originalName = validRelativePath(request.originalName ?? rawName);
-      const bytes = Buffer.from(request.bytes);
+      const originalName = validRelativePath(request.originalName ?? request.name ?? "source.txt");
       const kind = inferKind(originalName);
       const displayName = request.displayName ?? originalName;
       if (
@@ -691,24 +746,26 @@ export class SourceService {
         (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
       )
         throw new ValidationError("invalid staged source metadata");
-      const metadata: StageMetadata = {
-        version: 1,
-        requestedKind: "upload",
-        kind,
-        displayName,
-        originalName,
-        mediaType: request.mediaType,
-        payload: "payload",
-      };
-      return this.stageEnvelope(metadata, bytes);
+      return this.stageEnvelope(
+        {
+          version: 1,
+          requestedKind: "upload",
+          kind,
+          displayName,
+          originalName,
+          mediaType: request.mediaType,
+          payload: "payload",
+        },
+        request.bytes,
+      );
     }
     if (request.filePath !== undefined) {
       if (request.kind !== "upload") throw new ValidationError("filePath source kind must be upload");
       const source = resolve(request.filePath);
+      this.assertSourceOutsideInbox(source);
       const stat = await lstatNoFollow(source);
       if (!stat.isFile()) throw new ValidationError("upload filePath must be a regular file");
-      const rawName = request.name ?? basename(source);
-      const originalName = validRelativePath(request.originalName ?? rawName);
+      const originalName = validRelativePath(request.originalName ?? request.name ?? basename(source));
       const kind = inferKind(originalName);
       const displayName = request.displayName ?? originalName;
       if (
@@ -725,27 +782,22 @@ export class SourceService {
         mediaType: request.mediaType,
         payload: "payload",
       };
-      const stageRoot = await this.privateStageRoot();
+      const { stageId, root } = await this.privateStageRoot();
       try {
-        await fs.writeFile(join(stageRoot, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, {
-          flag: "wx",
-          mode: 0o600,
-        });
-        await copyFileNoFollow(source, join(stageRoot, metadata.payload));
-        const name = `${randomUUID()}.pi-scholar`;
-        const target = safeRelativePath(this.inbox(), name);
-        await fs.rename(stageRoot, target);
-        return { relativePath: name, absolutePath: target, kind, metadata };
+        await fs.writeFile(join(root, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+        await copyFileNoFollow(source, join(root, metadata.payload));
+        return await this.retainSourceStage(stageId, kind, metadata);
       } catch (error) {
-        await fs.rm(stageRoot, { recursive: true, force: true });
+        await this.cleanupPreparedStage({ stageId }).catch(() => undefined);
         throw error;
       }
     }
-    const input = request.path ?? request.filePath;
+    const input = request.path;
     if (!input) throw new ValidationError("source input is required");
     if (request.kind !== undefined && !SOURCE_KINDS.includes(request.kind as SourceKind))
       throw new ValidationError("invalid source kind");
     const source = resolve(input);
+    this.assertSourceOutsideInbox(source);
     const name = validRelativePath(request.name ?? basename(source));
     if (name.includes("/")) throw new ValidationError("staging name must be a single filename");
     const stat = await lstatNoFollow(source);
@@ -771,67 +823,54 @@ export class SourceService {
     if (request.kind !== undefined && request.kind !== kind)
       throw new ValidationError(`path source kind must be ${kind}`);
     const revision = repository ? initialRevision : undefined;
-    const metadata = repository
-      ? (() => {
-          const originalName = validRelativePath(request.originalName ?? name);
-          const displayName = request.displayName ?? originalName;
-          if (
-            /[\u0000-\u001f\u007f]/u.test(displayName) ||
-            (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
-          )
-            throw new ValidationError("invalid staged source metadata");
-          return {
-            version: 1 as const,
-            requestedKind: (request.kind ?? kind) as InputKind,
-            kind,
-            displayName,
-            originalName,
-            mediaType: request.mediaType,
-            repositoryRevision: revision,
-            payload: "payload" as const,
-          };
-        })()
-      : undefined;
-    const targetName = repository ? `${randomUUID()}.pi-scholar` : name;
-    const target = safeRelativePath(this.inbox(), targetName);
-    if (source !== target) {
-      let targetExisted = false;
-      try {
-        await lstatNoFollow(target);
-        targetExisted = true;
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"))
-          throw error;
-      }
-      if (targetExisted) throw new Error(`staging target already exists: ${target}`);
-      try {
-        if (repository) await copyRepositoryNoSecrets(target, files ?? [], metadata!);
-        else await copyPathNoFollow(source, target);
-        if (repository) {
-          const copiedFiles = await walkFiles(join(target, metadata!.payload), "", false);
-          if (!sameFileContents(files ?? [], copiedFiles)) throw new Error("repository copy digest mismatch");
-          const afterFiles = await repositoryFiles(source);
-          const afterRevision = await readRevision();
-          if (afterRevision !== initialRevision || !sameFileSnapshots(files ?? [], afterFiles))
-            throw new Error("repository changed during staging");
-        }
-      } catch (error) {
-        if (!targetExisted) {
-          try {
-            await fs.rm(target, { recursive: true, force: true });
-          } catch {
-            /* Preserve the original staging failure. */
-          }
-        }
-        throw error;
-      }
-    }
-    return {
-      relativePath: relative(this.inbox(), target).replaceAll("\\", "/"),
-      absolutePath: target,
+    const originalName = validRelativePath(request.originalName ?? name);
+    const displayName = request.displayName ?? originalName;
+    if (
+      /[\u0000-\u001f\u007f]/u.test(displayName) ||
+      (request.mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(request.mediaType))
+    )
+      throw new ValidationError("invalid staged source metadata");
+    const metadata: StageMetadata = {
+      version: 1,
+      requestedKind: (request.kind ?? kind) as InputKind,
       kind,
-      ...(metadata ? { metadata } : {}),
+      displayName,
+      originalName,
+      mediaType: request.mediaType,
+      repositoryRevision: revision,
+      payload: "payload",
     };
+    const { stageId, root } = await this.privateStageRoot();
+    try {
+      await fs.writeFile(join(root, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+      if (repository) {
+        await fs.mkdir(join(root, metadata.payload), { recursive: false, mode: 0o700 });
+        await writeTree(join(root, metadata.payload), files ?? []);
+      } else {
+        await copyPathNoFollow(source, join(root, metadata.payload));
+      }
+      if (repository) {
+        const copiedFiles = await walkFiles(join(root, metadata!.payload), "", false);
+        if (!sameFileContents(files ?? [], copiedFiles)) throw new Error("repository copy digest mismatch");
+        const afterFiles = await repositoryFiles(source);
+        const afterRevision = await readRevision();
+        if (afterRevision !== initialRevision || !sameFileSnapshots(files ?? [], afterFiles))
+          throw new Error("repository changed during staging");
+      }
+      return await this.retainSourceStage(stageId, kind, metadata);
+    } catch (error) {
+      await this.cleanupPreparedStage({ stageId }).catch(() => undefined);
+      throw error;
+    }
+  }
+  async stage(request: SourceStageRequest): Promise<InboxEntry> {
+    const prepared = await this.prepareStage(request);
+    try {
+      return await this.publishPreparedStage(prepared);
+    } catch (error) {
+      await this.cleanupPreparedStage(prepared).catch(() => undefined);
+      throw error;
+    }
   }
   async discover(): Promise<InboxEntry[]> {
     const inbox = this.inbox();
@@ -1399,7 +1438,8 @@ export class SourceService {
         kind: claim?.snapshot.kind ?? entry.kind,
       }),
     );
-    const message = error instanceof Error ? error.message : String(error);
+    const diagnostic = (error instanceof Error ? error.message : String(error)).trim();
+    const message = boundedUtf8(diagnostic || "Source extraction failed", SOURCE_ERROR_MESSAGE_BYTES);
     transaction(this.db, () => {
       const existing = dbGet<Row>(this.db, "SELECT source_id FROM sources WHERE source_id = ?", [sourceId]);
       if (existing)
@@ -1929,6 +1969,14 @@ export class SourceService {
     if (!originalPresent && !quarantinePresent) throw new Error("source packet is missing");
     return undefined;
   }
+  private quizSheetPath(sheetPath: string | undefined, date: string): string {
+    const root = pathFor(this.paths, "quizzes");
+    const fallback = join(root, date.slice(0, 4), date.slice(5, 7), `${date}.md`);
+    const candidate = sheetPath === undefined ? fallback : isAbsolute(sheetPath) ? sheetPath : join(root, sheetPath);
+    const relativePath = relative(resolve(root), resolve(candidate)).replaceAll("\\", "/");
+    return safeRelativePath(root, relativePath);
+  }
+
   removalPreview(sourceId: string): SourceRemovalPreview {
     const source = dbGet<Row>(this.db, "SELECT * FROM sources WHERE source_id = ?", [sourceId]);
     if (!source) throw new Error("source not found");
@@ -1962,16 +2010,15 @@ export class SourceService {
         `source removal conflict: submitted quizzes without page settlement: ${affectedSubmittedQuizIds.join(", ")}`,
       );
     const affectedQuizIds = this.affectedOpenQuizIds(sourceId);
-    const quizSheetSnapshots: Array<{ sheetPath: string; previous?: Buffer }> = affectedQuizIds.flatMap(
-      (quizId): Array<{ sheetPath: string; previous?: Buffer }> => {
+    const quizSheetSnapshots: Array<{ sheetPath: string; previous?: Buffer; mode?: number }> = affectedQuizIds.flatMap(
+      (quizId): Array<{ sheetPath: string; previous?: Buffer; mode?: number }> => {
         const row = dbGet<Row>(this.db, "SELECT date, sheet_path FROM quizzes WHERE quiz_id = ?", [quizId]);
         if (!row) return [];
         const date = String(row.date ?? "");
-        const sheetPath = String(
-          row.sheet_path ?? join(pathFor(this.paths, "quizzes"), date.slice(0, 4), date.slice(5, 7), `${date}.md`),
-        );
+        const sheetPath = this.quizSheetPath(row.sheet_path ? String(row.sheet_path) : undefined, date);
         try {
-          return [{ sheetPath, previous: readFileSync(sheetPath) }];
+          const stat = lstatNoFollowSync(sheetPath);
+          return [{ sheetPath, previous: readFileNoFollow(sheetPath), mode: stat.mode & 0o777 }];
         } catch (error) {
           if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
             return [{ sheetPath }];
@@ -2016,7 +2063,7 @@ export class SourceService {
       for (const sheet of quizSheetSnapshots) {
         try {
           if (sheet.previous === undefined) await fs.rm(sheet.sheetPath, { force: true });
-          else await fs.writeFile(sheet.sheetPath, sheet.previous, { mode: 0o600 });
+          else atomicWriteFile(sheet.sheetPath, sheet.previous, sheet.mode);
         } catch (restoreError) {
           restoreErrors.push(restoreError);
         }

@@ -209,11 +209,11 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
   const args = ["push", "--porcelain", remote];
   if (branch !== undefined) args.push(branch);
   const result = runGitSync(paths, args);
-  const output = `${result.stdout}${result.stderr}`.trim();
+  const diagnostic = `${result.stdout}${result.stderr}`.trim();
   if (result.code !== 0) {
     const noUpstream =
       /no configured push destination|has no upstream branch|src refspec .* does not match any|set the remote as upstream/iu.test(
-        output,
+        diagnostic,
       );
     let reconciled = false;
     try {
@@ -230,16 +230,15 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
       // Preserve the original push failure when reconciliation cannot run.
     }
     const reconciledStatus = gitStatus(paths);
-    if (reconciled)
-      return { ok: true, status: reconciledStatus, output: `${output}\nPush status reconciled after remote update` };
+    if (reconciled) return { ok: true, status: reconciledStatus, output: "Push status reconciled after remote update" };
     return {
       ok: false,
       status: reconciledStatus,
-      output,
+      output: "Git push failed",
       error: noUpstream ? "NO_UPSTREAM" : result.timedOut ? "TIMEOUT" : "PUSH_FAILED",
     };
   }
-  return { ok: true, status: gitStatus(paths), output };
+  return { ok: true, status: gitStatus(paths), output: "Git push completed" };
 }
 
 export function gitDependencyIdentity(paths: VaultPaths): {

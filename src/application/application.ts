@@ -21,6 +21,7 @@ import type {
   PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
+  PublicWorkflowRecord,
   QuizAnswerInput,
   QuizCandidateRecord,
   QuizContext,
@@ -34,6 +35,7 @@ import type {
   QuizQuestionResultRecord,
   QuizReadingRecord,
   QuizRecord,
+  QuizSubmissionResult,
   SettingsFacts,
   SettingsRecord,
   SettingsUpdateRequest,
@@ -49,6 +51,7 @@ import type {
   WikiIssueUpdateRequest,
   WikiPageLearningProjection,
   WikiPageResult,
+  WorkflowListResult,
   WorkflowRecord,
 } from "../contracts.js";
 import { openDatabase, type ScholarDatabase, transaction } from "../database.js";
@@ -70,7 +73,13 @@ import {
   removeOkfFootnoteDefinitions,
 } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
-import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
+import {
+  localDate,
+  persistedTimezone,
+  RevisionConflictError,
+  SchedulerService,
+  ValidationError,
+} from "../scheduler.js";
 import {
   type SourceStageRequest as MechanicsSourceStageRequest,
   type SourceAdapters,
@@ -101,6 +110,7 @@ import {
   type WorkflowFinishOptions,
   type WorkflowKind,
   type WorkflowUpdateInput,
+  workflowFailureMessage,
 } from "../workflows.js";
 import {
   asAnswers,
@@ -126,7 +136,6 @@ import {
 } from "./grader-binding.js";
 import {
   answersObject,
-  type PublicWorkflowRecord,
   pageRecord,
   publicQuiz,
   publicQuizDetail,
@@ -159,7 +168,7 @@ export interface ApplicationOptions {
 }
 export interface ApplicationStatus extends HealthResult {
   readonly settings: SettingsRecord;
-  readonly workflows: readonly WorkflowRecord[];
+  readonly workflows: readonly PublicWorkflowRecord[];
 }
 export interface SourceStageResult {
   readonly source: PublicSourceRecord;
@@ -425,6 +434,12 @@ export class ScholarApplication {
       }
     });
   }
+  private async readSetting<T>(key: string, fallback: T): Promise<T> {
+    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
+    if (!row) return fallback;
+    const value = jsonValue(row.value_json);
+    return (value === undefined ? fallback : value) as T;
+  }
   private async mutate<T>(
     context: ApplicationMutationContext | undefined,
     operation: () => T | PromiseLike<T>,
@@ -548,21 +563,10 @@ export class ScholarApplication {
       if (substantive(body, section)) requireSectionCitation(body, section);
     }
   }
-  private async readSetting<T>(key: string, fallback: T): Promise<T> {
-    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
-    if (!row) return fallback;
-    return jsonValue(row.value_json) as T;
-  }
   private async currentLocalDate(): Promise<string> {
-    const timezone = await this.readSetting("timezone", "local");
-    if (timezone === "local") return localDate(new Date());
+    const timezone = persistedTimezone(this.db);
     try {
-      return new Intl.DateTimeFormat("en-CA", {
-        timeZone: timezone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).format(new Date());
+      return localDate(new Date(), timezone);
     } catch {
       return localDate(new Date());
     }
@@ -622,7 +626,6 @@ export class ScholarApplication {
         failures.push({
           relativePath: entry.relativePath,
           errorCode: "EXTRACT_FAILED",
-          errorMessage: errorMessage(error).slice(0, 500),
         });
       }
     }
@@ -702,16 +705,19 @@ export class ScholarApplication {
     request: SourceRequest | MechanicsSourceStageRequest,
     context?: ApplicationMutationContext,
   ): Promise<SourceStageResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
-        const entry = (await this.sources.discover()).find(
-          (candidate) => candidate.relativePath === staged.relativePath,
-        );
-        if (!entry) throw new Error("staged source disappeared");
-        return { source: publicSource(this.pendingSource(entry)) };
-      }, "source:stage"),
-    );
+    return this.mutate(context, async () => {
+      const prepared = await this.sources.prepareStage(request as MechanicsSourceStageRequest);
+      try {
+        return await this.durableDirect(async () => {
+          const staged = await this.sources.publishPreparedStage(prepared);
+          return { source: publicSource(this.pendingSource(staged)) };
+        }, "source:stage");
+      } catch (error) {
+        if (!isAppliedFinalizationFailure(error))
+          await this.sources.cleanupPreparedStage(prepared).catch(() => undefined);
+        throw error;
+      }
+    });
   }
   async removalPreview(sourceId: string): Promise<{
     readonly source: PublicSourceRecord;
@@ -1043,13 +1049,7 @@ export class ScholarApplication {
     date: string,
     input: { readonly expectedRevision: number },
     context?: ApplicationMutationContext,
-  ): Promise<{
-    readonly status: "sealed";
-    readonly workflow: PublicWorkflowRecord;
-    readonly quiz: PublicQuizDetailRecord;
-    readonly grades: readonly QuizGradeRecord[];
-    readonly readings: readonly QuizReadingRecord[];
-  }> {
+  ): Promise<QuizSubmissionResult> {
     const requestId = randomUUID();
     return this.mutate(context, () =>
       this.durableDirect(async () => {
@@ -1149,7 +1149,7 @@ export class ScholarApplication {
     );
   }
 
-  async listWorkflows(): Promise<{ readonly workflows: readonly PublicWorkflowRecord[] }> {
+  async listWorkflows(): Promise<WorkflowListResult> {
     return { workflows: this.workflows.list().map(publicWorkflow) };
   }
   async getWorkflow(requestId: string): Promise<PublicWorkflowRecord> {
@@ -1179,12 +1179,7 @@ export class ScholarApplication {
       const status = String(workflow.status ?? "unknown");
       if (status === "failed") {
         const errorCode = workflow.error_code ? ` (${String(workflow.error_code)})` : "";
-        const detail = workflow.error_message
-          ? String(workflow.error_message)
-          : workflow.message
-            ? String(workflow.message)
-            : "Workflow failed";
-        return `failed${errorCode}: ${detail}`;
+        return `failed${errorCode}: Workflow failed`;
       }
       return workflow.message ? String(workflow.message) : status;
     };
@@ -2082,9 +2077,9 @@ export class ScholarApplication {
     });
   }
   private async failGradingWorkflow(requestId: string, error: unknown, ownerHash: string): Promise<void> {
-    const message = errorMessage(error).slice(0, 500);
     const code =
       error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "QUIZ_GRADING_FAILED";
+    const message = workflowFailureMessage(error);
     await this.durableDirect(() => {
       transaction(this.db, () => {
         const workflow = this.db.get<Record<string, unknown>>(

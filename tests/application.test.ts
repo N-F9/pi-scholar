@@ -7,6 +7,7 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
+import { publicSource, publicWorkflow } from "../src/application/projections.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
@@ -16,6 +17,28 @@ import { localDate, SchedulerService } from "../src/scheduler.js";
 import { acquireWriterLock, initVault, LockBusyError } from "../src/vault.js";
 import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
+it("redacts persisted source and workflow diagnostics from public projections", () => {
+  const source = publicSource({
+    sourceId: "source",
+    kind: "text",
+    status: "failed",
+    displayName: "source",
+    errorCode: "EXTRACT_FAILED",
+    errorMessage: "/home/alice/private",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const workflow = publicWorkflow({
+    requestId: "1c4a9f7f-6c19-4b86-9bf8-6d2af3a4e0c2",
+    kind: "ingest",
+    status: "failed",
+    progress: 0,
+    errorCode: "INGEST_FAILED",
+    errorMessage: "/home/alice/private",
+  });
+  assert.equal("errorMessage" in source, false);
+  assert.equal("errorMessage" in workflow, false);
+});
 it("requires non-empty extraction line endpoints", () => {
   const base = { claimId: "claim", preparedId: "prepared", digest: "digest" };
   for (const endpoints of [undefined, [], [0], ["1"]]) {
@@ -119,6 +142,31 @@ describe("durable application writes", () => {
       const result = await app.stageSource({ kind: "text", text: "staged\n", name: "staged.txt" });
       assert.equal(result.source.status, "pending");
       assert.deepEqual(calls, ["checkpoint", "doctor", "commit:source:stage"]);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("cleans private staging after lock contention and retries exactly once", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      const lock = acquireWriterLock(paths);
+      try {
+        await assert.rejects(
+          app.stageSource({ kind: "text", text: "blocked\n", name: "blocked.txt" }),
+          (error: unknown) => error instanceof LockBusyError,
+        );
+        assert.deepEqual(await fs.readdir(paths.inboxRoot), []);
+        assert.equal(
+          (await fs.readdir(paths.workRoot)).some((name) => name.startsWith(".source-stage-")),
+          false,
+        );
+      } finally {
+        lock.release();
+      }
+      const result = await app.stageSource({ kind: "text", text: "retry\n", name: "retry.txt" });
+      assert.equal(result.source.status, "pending");
+      assert.equal((await fs.readdir(paths.inboxRoot)).length, 1);
     } finally {
       await app.close();
       db.close();
@@ -993,6 +1041,56 @@ describe("application quiz date guards", () => {
       db.close();
     }
   });
+  it("refreshes timezone eligibility for live injected schedulers sharing a vault", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-timezone-"));
+    const paths = initVault(join(root, "vault"));
+    const dbA = openDatabase(paths);
+    const dbB = openDatabase(paths);
+    const schedulerA = new SchedulerService(dbA, paths);
+    const schedulerB = new SchedulerService(dbB, paths);
+    const quizB = new QuizService(dbB, paths, schedulerB);
+    const appA = new ScholarApplication({
+      paths,
+      db: dbA,
+      schedulerService: schedulerA,
+      quizService: new QuizService(dbA, paths, schedulerA),
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const appB = new ScholarApplication({
+      paths,
+      db: dbB,
+      schedulerService: schedulerB,
+      quizService: quizB,
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const pageId = "shared-timezone-page";
+    const now = new Date().toISOString();
+    dbA.run(
+      "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
+      [pageId, `${pageId}.md`, pageId, "digest", now, now],
+    );
+    schedulerA.ensurePageLearning(pageId, "2026-08-13T00:30:00.000Z");
+    dbA.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", ["2026-08-13T00:30:00.000Z", pageId]);
+    try {
+      await appA.updateSettings({ timezone: "America/Los_Angeles" });
+      assert.deepEqual(
+        schedulerB.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+        [pageId],
+      );
+      assert.deepEqual(
+        quizB.scheduler.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+        [pageId],
+      );
+    } finally {
+      await appA.close();
+      await appB.close();
+      dbA.close();
+      dbB.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("does not expire prior open quizzes when current publication is rejected", async () => {
     const { app, db, date, pageId } = await gradingFixture();
     const previous = new Date(`${date}T00:00:00.000Z`);
@@ -1557,6 +1655,11 @@ describe("quiz grading workflow lifecycle", () => {
       const firstWorkflow = first.requestId!;
       await assert.rejects(app.settleGrade(gradeFor(first, pageId, questionId, ["not-authorized"]), firstOwner));
       assert.equal((await app.getWorkflow(firstWorkflow)).status, "failed");
+      const failure = db.get<{ error_message: string }>("SELECT error_message FROM workflows WHERE request_id = ?", [
+        firstWorkflow,
+      ]);
+      assert.equal(failure?.error_message, `Page grade cites unauthorized evidence: ${pageId}`);
+      assert.ok(Buffer.byteLength(failure?.error_message ?? "", "utf8") <= 500);
       assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       const retry = await app.getGradingContext({ date }, retryOwner);
@@ -1582,18 +1685,22 @@ describe("quiz grading workflow lifecycle", () => {
       ])?.message;
       assert.match(queuedMessage ?? "", /submissionId/u);
       assert.equal("message" in sealed.workflow, false);
+      assert.equal("errorMessage" in sealed.workflow, false);
       const listedWorkflow = (await app.listWorkflows()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(listedWorkflow);
       assert.equal("message" in listedWorkflow, false);
+      assert.equal("errorMessage" in listedWorkflow, false);
       assert.equal(listedWorkflow.status, "queued");
       await app.getGradingContext({ date }, owner);
       const detail = await app.getWorkflow(requestId);
       assert.equal(detail.status, "running");
       assert.equal(detail.progress, 0);
       assert.equal("message" in detail, false);
+      assert.equal("errorMessage" in detail, false);
       const statusWorkflow = (await app.status()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(statusWorkflow);
       assert.equal("message" in statusWorkflow, false);
+      assert.equal("errorMessage" in statusWorkflow, false);
       const runningMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [
         requestId,
       ])?.message;
@@ -2227,11 +2334,13 @@ describe("application capability boundaries", () => {
           endpoints: [1],
         }),
       );
-      const failure = db.get<{ status: string; error_code: string | null }>(
-        "SELECT status, error_code FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
+      const failure = db.get<{ status: string; error_code: string | null; error_message: string | null }>(
+        "SELECT status, error_code, error_message FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
       );
       assert.equal(failure?.status, "failed");
       assert.equal(failure?.error_code, "EXTRACT_FAILED");
+      assert.equal(failure?.error_message, "prepared extraction digest mismatch");
+      assert.ok(Buffer.byteLength(failure.error_message, "utf8") <= 500);
     } finally {
       await app.close();
       db.close();
@@ -2279,7 +2388,7 @@ describe("application capability boundaries", () => {
 
       const facts = (await app.getSettings()).settings.facts;
       assert.equal(facts.lastIngestAt, failedIngestResult.workflow.finishedAt);
-      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): source packet unavailable");
+      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): Workflow failed");
       assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
       assert.equal(facts.lastLintResult, "lint complete");
     } finally {

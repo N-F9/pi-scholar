@@ -158,6 +158,153 @@ describe("source admission mechanics", () => {
     expect(staged.kind).toBe("directory");
     db.close();
   });
+  it("keeps prepared directory envelopes private until atomic publication", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "prepared-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    expect(Object.keys(prepared)).toEqual(["stageId"]);
+    expect(await sources.discover()).toEqual([]);
+    expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+
+    const published = await sources.publishPreparedStage(prepared);
+    expect(published).toMatchObject({
+      kind: "directory",
+      metadata: { displayName: "prepared-directory", originalName: "prepared-directory" },
+    });
+    expect(published.relativePath).toMatch(/^[0-9a-f-]{36}\.pi-scholar$/u);
+    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([published.relativePath]);
+    db.close();
+  });
+  it("keeps an envelope out of discovery while its atomic rename is pending", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "publishing-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const realRename = fs.rename.bind(fs);
+    const rename = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      entered.resolve();
+      await release.promise;
+      await realRename(from, to);
+    });
+    const publication = sources.publishPreparedStage(prepared);
+    await entered.promise;
+    try {
+      expect(await sources.discover()).toEqual([]);
+    } finally {
+      release.resolve();
+      rename.mockRestore();
+    }
+    expect((await publication).relativePath).toMatch(/\.pi-scholar$/u);
+    db.close();
+  });
+  it("publishes to generated envelopes without replacing same-name direct drops", async () => {
+    const { root, paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "race.txt"), "direct-file\n");
+    await fs.mkdir(join(paths.inboxRoot, "race-directory"));
+    await fs.writeFile(join(paths.inboxRoot, "race-directory", "direct.txt"), "direct-directory\n");
+
+    const file = join(root, "file.txt");
+    await fs.writeFile(file, "prepared-file\n");
+    const directory = join(root, "directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "prepared.txt"), "prepared-directory\n");
+    const publishedFile = await sources.stage({ path: file, name: "race.txt" });
+    const publishedDirectory = await sources.stage({ path: directory, name: "race-directory" });
+
+    expect(publishedFile.relativePath).not.toBe("race.txt");
+    expect(publishedDirectory.relativePath).not.toBe("race-directory");
+    expect(publishedFile.metadata?.originalName).toBe("race.txt");
+    expect(publishedDirectory.metadata?.originalName).toBe("race-directory");
+    expect(await fs.readFile(join(paths.inboxRoot, "race.txt"), "utf8")).toBe("direct-file\n");
+    expect(await fs.readFile(join(paths.inboxRoot, "race-directory", "direct.txt"), "utf8")).toBe("direct-directory\n");
+    expect(new Set((await sources.discover()).map((entry) => entry.relativePath))).toEqual(
+      new Set(["race.txt", "race-directory", publishedFile.relativePath, publishedDirectory.relativePath]),
+    );
+    db.close();
+  });
+  it("rejects staging an existing inbox file without cloning it", async () => {
+    const { paths, db, sources } = await fixture();
+    const original = join(paths.inboxRoot, "existing.txt");
+    await fs.writeFile(original, "original\n");
+
+    await expect(sources.prepareStage({ path: original })).rejects.toBeInstanceOf(ValidationError);
+    await expect(sources.stage({ filePath: original, kind: "upload" })).rejects.toBeInstanceOf(ValidationError);
+
+    expect(await fs.readdir(paths.inboxRoot)).toEqual(["existing.txt"]);
+    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual(["existing.txt"]);
+    db.close();
+  });
+  it("rejects mutated prepared handles before resolving an inbox path", async () => {
+    const { paths, db, sources } = await fixture();
+    const prepared = await sources.prepareStage({ text: "private\n" });
+    Object.assign(prepared, { relativePath: "../../outside.txt" });
+
+    await expect(sources.publishPreparedStage(prepared)).rejects.toThrow("source stage is not owned");
+    expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+    await sources.cleanupPreparedStage(prepared);
+    db.close();
+  });
+  it("discovers a complete envelope left by an interrupted atomic publication", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "atomic-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "directory\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    const relativePath = "interrupted.pi-scholar";
+    await fs.rename(join(paths.workRoot, `.source-stage-${prepared.stageId}`), join(paths.inboxRoot, relativePath));
+
+    const entries = await sources.discover();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      relativePath,
+      kind: "directory",
+      metadata: { originalName: "atomic-directory" },
+    });
+    expect((await sources.claim(entries[0]!)).snapshot.files.map((file) => file.path)).toEqual(["notes.txt"]);
+    db.close();
+  });
+  it("cannot expose a partial target when atomic publication and cleanup fail", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "failed-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const publicationFailure = Object.assign(new Error("publication blocked"), { code: "EIO" });
+    const cleanupFailure = Object.assign(new Error("cleanup blocked"), { code: "EACCES" });
+    const realRm = fs.rm.bind(fs);
+    const rename = vi.spyOn(fs, "rename").mockRejectedValue(publicationFailure);
+    const rm = vi.spyOn(fs, "rm").mockImplementation(async (path, options) => {
+      if (String(path).includes(".source-stage-")) throw cleanupFailure;
+      await realRm(path, options);
+    });
+    try {
+      await expect(sources.stage({ path: directory })).rejects.toThrow("publication blocked");
+      expect(await sources.discover()).toEqual([]);
+      expect((await fs.readdir(paths.workRoot)).some((name) => name.startsWith(".source-stage-"))).toBe(true);
+    } finally {
+      rename.mockRestore();
+      rm.mockRestore();
+    }
+    db.close();
+  });
+  it("retains extraction diagnostics within the local UTF-8 byte bound", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "broken.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    sources.recordExtractFailure(entry, new Error(`conversion failed: ${"é".repeat(400)}`));
+
+    const failure = db.get<{ error_message: string }>(
+      "SELECT error_message FROM sources WHERE status = 'failed' LIMIT 1",
+    );
+    expect(failure?.error_message.startsWith("conversion failed:")).toBe(true);
+    expect(Buffer.byteLength(failure?.error_message ?? "", "utf8")).toBeLessThanOrEqual(500);
+    db.close();
+  });
   it("resets Markdown fence normalization at native file boundaries", async () => {
     const { root, db, sources } = await fixture();
     const directory = join(root, "fence-boundaries");
@@ -307,6 +454,63 @@ describe("source admission mechanics", () => {
         ?.source_uri,
     ).toBe("https://example.com/path/remote.txt");
     db.close();
+  });
+  it("uses adapter URL names after fetch for metadata and textual extraction", async () => {
+    const { paths, db } = await fixture();
+    const sources = new SourceService(db, paths, {
+      fetchUrl: async () => ({ bytes: Buffer.from("# fetched\n"), name: "fetched.md" }),
+    });
+    const explicit = await sources.prepareStage({
+      url: "https://example.com/download",
+      name: "ignored.txt",
+      originalName: "requested.txt",
+      displayName: "Shown",
+    });
+    const explicitPublished = await sources.publishPreparedStage(explicit);
+    expect(explicitPublished.metadata).toMatchObject({ originalName: "requested.txt", displayName: "Shown" });
+    await fs.rm(explicitPublished.absolutePath, { recursive: true });
+    const staged = await sources.stage({ url: "https://example.com/download" });
+    expect(staged.metadata).toMatchObject({ originalName: "fetched.md", displayName: "fetched.md" });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("adapter URL entry was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    expect(result.manifest.originalName).toBe("fetched.md");
+    expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe("# fetched\n");
+    db.close();
+  });
+  it("uses the final redirect basename for textual URL extraction", async () => {
+    const server = createServer((request, response) => {
+      if (request.url === "/start") {
+        response.writeHead(302, { location: "/remote.md" });
+        response.end();
+        return;
+      }
+      response.end("# redirected\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string")
+        throw new Error("redirect test server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        const staged = await sources.stage({ url: `http://127.0.0.1:${address.port}/start` });
+        expect(staged.metadata).toMatchObject({ originalName: "remote.md", displayName: "remote.md" });
+        const [entry] = await sources.discover();
+        if (!entry) throw new Error("redirect URL entry was not discovered");
+        const result = await sources.admitClaim(await sources.claim(entry));
+        expect(result.manifest.originalName).toBe("remote.md");
+        expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe("# redirected\n");
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it("rejects control-character display names from default URL staging", async () => {
@@ -856,7 +1060,7 @@ describe("source admission mechanics", () => {
     db.close();
   });
   it("previews page and open-quiz dependents and restores the packet after a failed removal transaction", async () => {
-    const { paths, db, sources, wiki } = await fixture();
+    const { root, paths, db, sources, wiki } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
     const [entry] = await sources.discover();
     const result = await sources.admitClaim(await sources.claim(entry));
@@ -874,6 +1078,9 @@ describe("source admission mechanics", () => {
     await fs.mkdir(join(paths.quizzesRoot, "2099", "01"), { recursive: true });
     const sheetBefore = Buffer.from("# canonical quiz\n");
     await fs.writeFile(sheetPath, sheetBefore);
+    await fs.chmod(sheetPath, 0o640);
+    const sheetBeforeMode = (await fs.stat(sheetPath)).mode & 0o777;
+    expect(sheetBeforeMode).not.toBe(0o600);
     db.run(
       "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', ?, ?, NULL, NULL, NULL)",
       ["quiz-removal", "2099-01-01", sheetPath, now],
@@ -914,14 +1121,22 @@ describe("source admission mechanics", () => {
     await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(
       "forced removal failure",
     );
-    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).toString()).toBe("evidence\n");
     expect((await fs.readFile(sheetPath)).equals(sheetBefore)).toBe(true);
+    expect((await fs.stat(sheetPath)).mode & 0o777).toBe(sheetBeforeMode);
     expect(
       db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [result.sourceId])?.status,
     ).toBe("published");
     expect(db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", ["quiz-removal"])?.status).toBe(
       "open",
     );
+    const outsidePath = join(root, "outside.md");
+    const linkedSheetPath = join(paths.quizzesRoot, "linked-sheet.md");
+    await fs.writeFile(outsidePath, "outside sentinel\n");
+    await fs.symlink(outsidePath, linkedSheetPath);
+    originalRun("UPDATE quizzes SET sheet_path = ? WHERE quiz_id = ?", [linkedSheetPath, "quiz-removal"]);
+    await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(/path|symlink/u);
+    expect((await fs.readFile(outsidePath)).toString()).toBe("outside sentinel\n");
+    expect(await fs.stat(result.packetPath)).toBeDefined();
     db.close();
   });
   it("blocks removal while a cited page has an unsettled submitted quiz", async () => {
