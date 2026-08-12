@@ -171,6 +171,28 @@ describe("source admission mechanics", () => {
     expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([published.relativePath]);
     db.close();
   });
+  it("rejects preexisting prepared targets without replacing direct bytes", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const filePrepared = await sources.prepareStage({ kind: "text", text: "prepared\n", name: "race.txt" });
+    const fileTarget = join(paths.inboxRoot, filePrepared.relativePath);
+    await fs.writeFile(fileTarget, "direct-file\n");
+    await expect(sources.publishPreparedStage(filePrepared)).rejects.toMatchObject({ code: "EEXIST" });
+    expect(await fs.readFile(fileTarget, "utf8")).toBe("direct-file\n");
+
+    const directory = join(root, "race-directory-source");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "prepared.txt"), "prepared-directory\n");
+    const directoryPrepared = await sources.prepareStage({ path: directory, name: "race-directory" });
+    const directoryTarget = join(paths.inboxRoot, directoryPrepared.relativePath);
+    await fs.mkdir(directoryTarget);
+    await fs.writeFile(join(directoryTarget, "direct.txt"), "direct-directory\n");
+    await expect(sources.publishPreparedStage(directoryPrepared)).rejects.toMatchObject({ code: "EEXIST" });
+    expect(await fs.readFile(join(directoryTarget, "direct.txt"), "utf8")).toBe("direct-directory\n");
+    expect(new Set((await sources.discover()).map((entry) => entry.relativePath))).toEqual(
+      new Set([filePrepared.relativePath, directoryPrepared.relativePath]),
+    );
+    db.close();
+  });
   it("resets Markdown fence normalization at native file boundaries", async () => {
     const { root, db, sources } = await fixture();
     const directory = join(root, "fence-boundaries");
@@ -320,6 +342,62 @@ describe("source admission mechanics", () => {
         ?.source_uri,
     ).toBe("https://example.com/path/remote.txt");
     db.close();
+  });
+  it("uses adapter URL names after fetch for metadata and textual extraction", async () => {
+    const { paths, db } = await fixture();
+    const sources = new SourceService(db, paths, {
+      fetchUrl: async () => ({ bytes: Buffer.from("# fetched\n"), name: "fetched.md" }),
+    });
+    const explicit = await sources.prepareStage({
+      url: "https://example.com/download",
+      name: "ignored.txt",
+      originalName: "requested.txt",
+      displayName: "Shown",
+    });
+    expect(explicit.metadata).toMatchObject({ originalName: "requested.txt", displayName: "Shown" });
+    await sources.cleanupPreparedStage(explicit);
+    const staged = await sources.stage({ url: "https://example.com/download" });
+    expect(staged.metadata).toMatchObject({ originalName: "fetched.md", displayName: "fetched.md" });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("adapter URL entry was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    expect(result.manifest.originalName).toBe("fetched.md");
+    expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe("# fetched\n");
+    db.close();
+  });
+  it("uses the final redirect basename for textual URL extraction", async () => {
+    const server = createServer((request, response) => {
+      if (request.url === "/start") {
+        response.writeHead(302, { location: "/remote.md" });
+        response.end();
+        return;
+      }
+      response.end("# redirected\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string")
+        throw new Error("redirect test server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        const staged = await sources.stage({ url: `http://127.0.0.1:${address.port}/start` });
+        expect(staged.metadata).toMatchObject({ originalName: "remote.md", displayName: "remote.md" });
+        const [entry] = await sources.discover();
+        if (!entry) throw new Error("redirect URL entry was not discovered");
+        const result = await sources.admitClaim(await sources.claim(entry));
+        expect(result.manifest.originalName).toBe("remote.md");
+        expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe("# redirected\n");
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it("rejects control-character display names from default URL staging", async () => {

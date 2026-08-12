@@ -458,6 +458,118 @@ function assertManifestClaimProvenance(
   if (canonical(manifestProvenance(manifest)) !== canonical(claimProvenance(claim, publication)))
     throw new Error("source packet provenance mismatch");
 }
+type CreatedStagePath = {
+  path: string;
+  identity: PhysicalIdentity;
+  directory: boolean;
+};
+
+function sameCreatedStagePath(current: PhysicalIdentity, expected: PhysicalIdentity, directory: boolean): boolean {
+  return (
+    current.device === expected.device &&
+    current.inode === expected.inode &&
+    current.mode === expected.mode &&
+    (directory || (current.size === expected.size && current.mtimeNs === expected.mtimeNs))
+  );
+}
+
+async function linkStageTree(source: string, target: string, created: CreatedStagePath[]): Promise<void> {
+  const sourceStat = await lstatNoFollow(source);
+  if (sourceStat.isDirectory()) {
+    await fs.mkdir(target, { recursive: false, mode: 0o700 });
+    const targetStat = await lstatNoFollow(target);
+    created.push({ path: target, identity: statIdentity(targetStat), directory: true });
+    for (const name of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
+      validRelativePath(name);
+      await linkStageTree(join(source, name), join(target, name), created);
+    }
+    return;
+  }
+  if (!sourceStat.isFile()) throw new Error("source stage payload must be a regular file or directory");
+  await fs.link(source, target);
+  const targetStat = await lstatNoFollow(target);
+  created.push({ path: target, identity: statIdentity(targetStat), directory: false });
+}
+
+async function linkStageChildren(source: string, target: string, created: CreatedStagePath[]): Promise<void> {
+  const sourceStat = await lstatNoFollow(source);
+  if (!sourceStat.isDirectory()) throw new Error("source stage root must be a directory");
+  for (const name of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
+    validRelativePath(name);
+    await linkStageTree(join(source, name), join(target, name), created);
+  }
+}
+
+async function cleanupCreatedStagePaths(created: CreatedStagePath[]): Promise<void> {
+  for (const item of created.toReversed()) {
+    try {
+      const current = await lstatNoFollow(item.path);
+      if (!sameCreatedStagePath(statIdentity(current), item.identity, item.directory)) continue;
+      if (item.directory) {
+        await fs.rmdir(item.path).catch((error: unknown) => {
+          const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+          if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
+        });
+      } else {
+        await fs.unlink(item.path).catch((error: unknown) => {
+          const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+          if (code !== "ENOENT") throw error;
+        });
+      }
+    } catch {
+      // A concurrent replacement or write wins; never recursively remove it.
+    }
+  }
+}
+
+async function activeStageReservations(work: string, inbox: string): Promise<Set<string>> {
+  const reservations = new Set<string>();
+  let names: string[];
+  try {
+    names = await fs.readdir(work);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
+      return reservations;
+    throw error;
+  }
+  for (const name of names) {
+    const match =
+      /^\.source-stage-([0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/iu.exec(name);
+    if (!match) continue;
+    try {
+      const descriptorPath = safeRelativePath(work, name);
+      const descriptorStat = await lstatNoFollow(descriptorPath);
+      if (!descriptorStat.isFile()) continue;
+      const stageId = match[1];
+      if (!stageId) continue;
+      const stageRoot = safeRelativePath(work, `.source-stage-${stageId}`);
+      const stageRootStat = await lstatNoFollow(stageRoot);
+      if (!stageRootStat.isDirectory()) continue;
+      const descriptor = JSON.parse((await readNoFollow(descriptorPath)).toString("utf8")) as unknown;
+      if (
+        descriptor === null ||
+        typeof descriptor !== "object" ||
+        !("stageId" in descriptor) ||
+        descriptor.stageId !== stageId ||
+        !("relativePath" in descriptor) ||
+        typeof descriptor.relativePath !== "string" ||
+        !("kind" in descriptor) ||
+        typeof descriptor.kind !== "string" ||
+        !SOURCE_KINDS.includes(descriptor.kind as SourceKind) ||
+        !("artifact" in descriptor) ||
+        (descriptor.artifact !== "root" && descriptor.artifact !== "payload")
+      )
+        continue;
+      const relativePath = validRelativePath(descriptor.relativePath);
+      if (relativePath.includes("/")) continue;
+      safeRelativePath(inbox, relativePath);
+      reservations.add(relativePath);
+    } catch {
+      // Malformed or replaced descriptors do not reserve an inbox name.
+    }
+  }
+  return reservations;
+}
 export class SourceService {
   readonly db: ScholarDatabase;
   readonly paths: VaultPathsLike;
@@ -616,23 +728,41 @@ export class SourceService {
       throw new Error("source stage metadata is invalid");
     await this.ensureInbox();
     const target = safeRelativePath(this.inbox(), prepared.relativePath);
+    const descriptor = this.sourceStageDescriptor(prepared.stageId);
+    const created: CreatedStagePath[] = [];
     try {
-      await lstatNoFollow(target);
-      throw new Error(`staging target already exists: ${prepared.relativePath}`);
+      let targetStat: Stats;
+      if (sourceStat.isFile()) {
+        await fs.link(source, target);
+        targetStat = await lstatNoFollow(target);
+        created.push({ path: target, identity: statIdentity(targetStat), directory: false });
+      } else {
+        await fs.mkdir(target, { recursive: false, mode: 0o700 });
+        targetStat = await lstatNoFollow(target);
+        created.push({ path: target, identity: statIdentity(targetStat), directory: true });
+        await linkStageChildren(source, target, created);
+        if (prepared.artifact === "root") {
+          const publishedMetadata = await stagedMetadata(target);
+          if (!publishedMetadata || publishedMetadata.kind !== prepared.kind)
+            throw new Error("published source metadata is invalid");
+        }
+        targetStat = await lstatNoFollow(target);
+      }
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(descriptor, { force: true });
+      return {
+        relativePath: prepared.relativePath,
+        absolutePath: target,
+        kind: prepared.kind,
+        identity: statIdentity(targetStat),
+        ...(metadata ? { metadata } : {}),
+      };
     } catch (error) {
-      if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"))
-        throw error;
+      await cleanupCreatedStagePaths(created);
+      await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(descriptor, { force: true }).catch(() => undefined);
+      throw error;
     }
-    await fs.rename(source, target);
-    await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
-    await fs.rm(this.sourceStageDescriptor(prepared.stageId), { force: true }).catch(() => undefined);
-    return {
-      relativePath: prepared.relativePath,
-      absolutePath: target,
-      kind: prepared.kind,
-      identity: statIdentity(sourceStat),
-      ...(metadata ? { metadata } : {}),
-    };
   }
   async cleanupPreparedStage(stage: PreparedSourceStage): Promise<void> {
     const root = this.sourceStageRoot(stage.stageId);
@@ -671,51 +801,17 @@ export class SourceService {
         throw new ValidationError("source URL is invalid");
       }
       if (!["http:", "https:"].includes(parsed.protocol)) throw new ValidationError("only HTTP(S) URLs are accepted");
-      const rawName = request.name ?? (basename(parsed.pathname) || "source.txt");
-      const originalName = validRelativePath(request.originalName ?? rawName);
-      const displayName = request.displayName ?? originalName;
-      let bytes: Uint8Array;
-      let mediaType = request.mediaType;
-      if (this.adapters.fetchUrl) {
-        const fetched = await this.adapters.fetchUrl(parsed.toString());
-        bytes = fetched.bytes;
-        mediaType ??= fetched.mediaType;
-      } else {
-        const { stageId, root } = await this.privateStageRoot();
-        try {
-          const fetched = await this.defaultFetch(parsed, join(root, "payload"));
-          mediaType ??= fetched.mediaType;
-          if (
-            /[\u0000-\u001f\u007f]/u.test(displayName) ||
-            (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
-          )
-            throw new ValidationError("invalid staged source metadata");
-          const metadata: StageMetadata = {
-            version: 1,
-            requestedKind: request.kind ?? "url",
-            kind: "url",
-            displayName,
-            originalName,
-            sourceUri: provenanceUrl(parsed),
-            mediaType,
-            payload: "payload",
-          };
-          await fs.writeFile(join(root, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
-          return await this.retainSourceStage(stageId, `${randomUUID()}.pi-scholar`, "url", "root", metadata);
-        } catch (error) {
-          await this.cleanupPreparedStage({ stageId, relativePath: "", kind: "url", artifact: "root" }).catch(
-            () => undefined,
-          );
-          throw error;
-        }
-      }
-      if (
-        /[\u0000-\u001f\u007f]/u.test(displayName) ||
-        (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
-      )
-        throw new ValidationError("invalid staged source metadata");
-      return this.stageEnvelope(
-        {
+      const metadataFor = (fetchedName?: string): StageMetadata => {
+        const originalName = validRelativePath(
+          request.originalName ?? request.name ?? fetchedName ?? (basename(parsed.pathname) || "source.txt"),
+        );
+        const displayName = request.displayName ?? originalName;
+        if (
+          /[\u0000-\u001f\u007f]/u.test(displayName) ||
+          (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
+        )
+          throw new ValidationError("invalid staged source metadata");
+        return {
           version: 1,
           requestedKind: request.kind ?? "url",
           kind: "url",
@@ -724,9 +820,29 @@ export class SourceService {
           sourceUri: provenanceUrl(parsed),
           mediaType,
           payload: "payload",
-        },
-        bytes,
-      );
+        };
+      };
+      let bytes: Uint8Array;
+      let mediaType = request.mediaType;
+      if (this.adapters.fetchUrl) {
+        const fetched = await this.adapters.fetchUrl(parsed.toString());
+        bytes = fetched.bytes;
+        mediaType ??= fetched.mediaType;
+        return this.stageEnvelope(metadataFor(fetched.name), bytes);
+      }
+      const { stageId, root } = await this.privateStageRoot();
+      try {
+        const fetched = await this.defaultFetch(parsed, join(root, "payload"));
+        mediaType ??= fetched.mediaType;
+        const metadata = metadataFor(fetched.name);
+        await fs.writeFile(join(root, ENVELOPE_NAME), `${JSON.stringify(metadata)}\n`, { flag: "wx", mode: 0o600 });
+        return await this.retainSourceStage(stageId, `${randomUUID()}.pi-scholar`, "url", "root", metadata);
+      } catch (error) {
+        await this.cleanupPreparedStage({ stageId, relativePath: "", kind: "url", artifact: "root" }).catch(
+          () => undefined,
+        );
+        throw error;
+      }
     }
     if (request.text !== undefined) {
       if (request.kind !== undefined && request.kind !== "text" && request.kind !== "pasted")
@@ -900,7 +1016,9 @@ export class SourceService {
   async discover(): Promise<InboxEntry[]> {
     const inbox = this.inbox();
     const entries: InboxEntry[] = [];
+    const reservations = await activeStageReservations(this.work(), inbox);
     for (const name of (await fs.readdir(inbox)).sort((a, b) => a.localeCompare(b))) {
+      if (reservations.has(name)) continue;
       const path = join(inbox, name);
       try {
         const stat = await lstatNoFollow(path);

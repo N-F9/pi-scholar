@@ -292,6 +292,46 @@ describe("vault foundation", () => {
     symlinkSync(paths.sourcesRoot, join(paths.wikiRoot, "link"));
     assert.throws(() => safeRelativePath(paths.wikiRoot, "link/file.md"));
   });
+  it("honors requested atomic file modes despite a restrictive umask", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-umask-"));
+    const target = join(root, "atomic.txt");
+    const child = runChildSync(
+      process.execPath,
+      [
+        "--import",
+        "jiti/register",
+        "--input-type=module",
+        "-e",
+        `import { strict as assert } from "node:assert";
+import { statSync } from "node:fs";
+const modulePath = process.env.PI_VAULT_MODULE;
+const targetPath = process.env.PI_ATOMIC_PATH;
+if (!modulePath || !targetPath) throw new Error("atomic write child environment is incomplete");
+const loaded = await import(modulePath);
+const { atomicWriteFile } = loaded.default ?? loaded;
+const originalUmask = process.umask();
+try {
+  process.umask(0o077);
+  for (const mode of [0o644, 0o666]) {
+    atomicWriteFile(targetPath, "mode", mode);
+    assert.equal(statSync(targetPath).mode & 0o777, mode);
+  }
+} finally {
+  process.umask(originalUmask);
+}
+`,
+      ],
+      {
+        cwd: process.cwd(),
+        timeoutMs: 30_000,
+        env: {
+          PI_VAULT_MODULE: "./src/vault.ts",
+          PI_ATOMIC_PATH: target,
+        },
+      },
+    );
+    assert.equal(child.code, 0, child.stderr || child.stdout);
+  });
 
   it("rejects a gitignore symlink before existing-vault Git operations", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
