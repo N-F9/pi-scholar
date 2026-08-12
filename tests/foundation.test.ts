@@ -583,7 +583,7 @@ describe("vault foundation", () => {
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       questionId,
       pageId,
-      JSON.stringify("Explain the page"),
+      JSON.stringify("Identify the page's central idea"),
       1,
     ]);
     db.run("INSERT INTO quiz_answers (quiz_id, question_id, revision, answer_json, saved_at) VALUES (?, ?, 1, ?, ?)", [
@@ -606,7 +606,7 @@ describe("vault foundation", () => {
             ordinal: 0,
             kind: "free-response",
             prompt: "Explain the page",
-            pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
+            pages: [{ pageId, criterion: "Identify the page's central idea", weight: 1 }],
             sourceRefs: [],
           },
         ],
@@ -645,7 +645,7 @@ describe("vault foundation", () => {
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       questionId,
       pageId,
-      JSON.stringify("Explain the page"),
+      JSON.stringify("Identify the page's central idea"),
       1,
     ]);
     const quizService = new QuizService(db, paths);

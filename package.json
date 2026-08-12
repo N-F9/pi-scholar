@@ -14,9 +14,7 @@
   },
   "exports": {
     ".": "./dist/index.js",
-    "./contracts": "./dist/contracts.js",
-    "./vault": "./dist/vault.js",
-    "./database": "./dist/database.js"
+    "./contracts": "./dist/contracts.js"
   },
   "files": [
     "dist",

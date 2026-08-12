@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import type {
   PageLearningRecord,
   QuizEvidenceRecord,
@@ -67,6 +70,7 @@ export interface GradeSubmissionInput {
   readonly date: string | Date;
   readonly revision?: number;
   readonly submissionId?: string;
+  readonly requestId?: string;
   readonly questions: readonly QuestionGradeInput[];
   readonly pages: readonly PageGradeInput[];
 }
@@ -103,6 +107,84 @@ export class QuizConflictError extends Error {
 }
 
 const FORBIDDEN_SHEET_TEXT = /answer\s*key|correct\s+answer|grading\s+criteria|rubric/i;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+function normalizeSearchable(value: string): string {
+  return value
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+    .normalize("NFC")
+    .replace(/[ \t\n\f\r]+/gu, " ")
+    .trim();
+}
+function renderedMarkdownValues(value: string): string {
+  const properties: string[] = [];
+  const render = (node: unknown): string => {
+    if (!node || typeof node !== "object") return "";
+    const record = node as Record<string, unknown>;
+    if (record.type === "html") return "";
+    for (const key of ["url", "title"]) if (typeof record[key] === "string") properties.push(record[key]);
+    if (record.type === "image" || record.type === "imageReference")
+      return typeof record.alt === "string" ? record.alt : "";
+    if (record.type === "break") return "\n";
+    if (Array.isArray(record.children)) {
+      const separator = ["root", "blockquote", "list", "listItem", "table", "tableRow"].includes(String(record.type))
+        ? "\n"
+        : "";
+      return record.children.map(render).join(separator);
+    }
+    return typeof record.value === "string" ? record.value : "";
+  };
+  return [
+    render(
+      fromMarkdown(value, {
+        extensions: [gfm()],
+        mdastExtensions: [gfmFromMarkdown()],
+      }),
+    ),
+    ...properties,
+  ].join("\n");
+}
+
+export interface QuizVisibleTextToken {
+  readonly value: string;
+  readonly match: "boundary" | "substring";
+}
+function boundaryToken(value: string): QuizVisibleTextToken {
+  return { value, match: "boundary" };
+}
+
+function substringToken(value: string): QuizVisibleTextToken {
+  return { value, match: "substring" };
+}
+const UUID_PAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+function pageIdToken(value: string): QuizVisibleTextToken {
+  return UUID_PAGE_ID.test(value) ? substringToken(value) : boundaryToken(value);
+}
+
+export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
+  const tokens = new Map<string, QuizVisibleTextToken["match"]>();
+  for (const token of hiddenTokens) {
+    const normalized = normalizeSearchable(token.value);
+    if (!normalized) continue;
+    if (token.match === "substring" || !tokens.has(normalized)) tokens.set(normalized, token.match);
+  }
+  if (!tokens.size) return;
+  const searchable = normalizeSearchable(`${value}\n${renderedMarkdownValues(value)}`);
+  const substringTokens = [...tokens].filter(([, match]) => match === "substring").map(([token]) => token);
+  const boundaryTokens = [...tokens].filter(([, match]) => match === "boundary").map(([token]) => token);
+  if (
+    (substringTokens.length &&
+      new RegExp(`(?:${substringTokens.map(escapeRegExp).join("|")})`, "iu").test(searchable)) ||
+    (boundaryTokens.length &&
+      new RegExp(`(?<![\\p{L}\\p{N}_])(?:${boundaryTokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`, "iu").test(
+        searchable,
+      ))
+  ) {
+    throw new ValidationError("Quiz Markdown contains private metadata");
+  }
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -369,7 +451,7 @@ export class QuizService {
     const evidence = this.uniqueEvidence(selectedPages.flatMap((page) => this.evidenceForPage(page.pageId)));
     const preview: QuizRecord = { quizId, date, revision: 1, status: "open", questions };
     const rendered = this.renderSheet(preview);
-    this.validateRenderedSheet(rendered);
+    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview, evidence));
     try {
       this.replaceSheet(sheetPath, rendered, () =>
         transaction(this.source, () => {
@@ -462,12 +544,13 @@ export class QuizService {
     const questionIds = new Set(quiz.questions.map((question) => question.questionId));
     if (Object.keys(input.answers).some((questionId) => !questionIds.has(questionId)))
       throw new ValidationError("Draft contains an unknown question");
-    for (const answer of Object.values(input.answers)) this.validateAnswerText(answer);
+    const hiddenTokens = this.hiddenTokensForQuiz(quiz);
+    for (const answer of Object.values(input.answers)) this.validateAnswerText(answer, hiddenTokens);
     const nextRevision = quiz.revision + 1;
     const answers = { ...this.answerMap(quiz.quizId), ...input.answers };
     const preview: QuizRecord = { ...quiz, revision: nextRevision };
     const rendered = this.renderSheet(preview, answers);
-    this.validateRenderedSheet(rendered);
+    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview));
     const result = this.replaceSheet(preview.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
       transaction(this.source, () => {
         for (const [questionId, answer] of Object.entries(input.answers)) {
@@ -662,7 +745,7 @@ export class QuizService {
       readings: page.readings,
     }));
     const rendered = this.renderSheet(quiz, this.answerMap(quiz.quizId), previewResults, previewPages);
-    this.validateRenderedSheet(rendered);
+    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(quiz, undefined, input.requestId));
     const settled = this.replaceSheet(quiz.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
       let committed: SettledQuizResult | undefined;
       transaction(this.source, () => {
@@ -794,6 +877,7 @@ export class QuizService {
     const stored = this.get(date);
     if (!stored || stored.quizId !== quizId || stored.revision !== revision)
       throw new ValidationError("Quiz sheet identity does not match SQLite");
+    this.validateRenderedSheet(markdown, this.hiddenTokensForQuiz(stored));
     const answerRows = this.db.all<Record<string, unknown>>(
       "SELECT question_id, revision FROM quiz_answers WHERE quiz_id = ?",
       stored.quizId,
@@ -854,6 +938,46 @@ export class QuizService {
     if (!quiz) throw new ValidationError(`No quiz for ${date}`);
     return quiz;
   }
+  private hiddenTokensForQuiz(
+    quiz: QuizRecord,
+    evidence?: readonly QuizEvidenceRecord[],
+    requestId?: string,
+  ): readonly QuizVisibleTextToken[] {
+    const evidenceTokens = evidence
+      ? evidence.flatMap((item) => [
+          substringToken(item.reference),
+          pageIdToken(item.pageId),
+          substringToken(item.pageDigest),
+          substringToken(item.textDigest),
+        ])
+      : this.db
+          .all<Record<string, unknown>>(
+            "SELECT reference, page_id, page_digest, text_digest FROM quiz_evidence WHERE quiz_id = ?",
+            quiz.quizId,
+          )
+          .flatMap((row) =>
+            [
+              typeof row.reference === "string" ? substringToken(row.reference) : undefined,
+              typeof row.page_id === "string" ? pageIdToken(row.page_id) : undefined,
+              typeof row.page_digest === "string" ? substringToken(row.page_digest) : undefined,
+              typeof row.text_digest === "string" ? substringToken(row.text_digest) : undefined,
+            ].filter((token): token is QuizVisibleTextToken => Boolean(token)),
+          );
+    return [
+      substringToken(quiz.quizId),
+      ...quiz.questions.flatMap((question) => [
+        substringToken(question.questionId),
+        ...question.pages.flatMap((page) => [
+          pageIdToken(page.pageId),
+          substringToken(page.criterion),
+          substringToken(renderedMarkdownValues(page.criterion)),
+        ]),
+        ...(question.sourceRefs ?? []).map(boundaryToken),
+      ]),
+      ...evidenceTokens,
+      ...(requestId ? [substringToken(requestId)] : []),
+    ];
+  }
 
   private mapQuiz(row: Record<string, unknown>): QuizRecord {
     const quizId = String(row.quiz_id);
@@ -913,7 +1037,7 @@ export class QuizService {
     const submittedAt = nowIso();
     const preview: QuizRecord = { ...quiz, status: "submitted", submittedAt };
     const rendered = this.renderSheet(preview, answers);
-    this.validateRenderedSheet(rendered);
+    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview));
     return { date, quiz, answers, submittedAt, rendered, sheetPath: quiz.sheetPath ?? pathForSheet(this.paths, date) };
   }
 
@@ -1073,9 +1197,18 @@ export class QuizService {
     for (const question of specs) {
       if (!question || (question.kind !== "free-response" && question.kind !== "multiple-choice"))
         throw new ValidationError("Question kind is invalid");
+      const boundaryTokens = [
+        ...selectedPageIds.map(pageIdToken),
+        ...(Array.isArray(question.sourceRefs)
+          ? question.sourceRefs
+              .filter((reference): reference is string => typeof reference === "string")
+              .map(boundaryToken)
+          : []),
+      ];
       const prompt = question.prompt.trim();
       if (!prompt || FORBIDDEN_SHEET_TEXT.test(prompt))
         throw new ValidationError("Question prompts must be nonempty and answer-key-free");
+      validateQuizVisibleText(prompt, boundaryTokens);
       if (!Array.isArray(question.pages) || !question.pages.length)
         throw new ValidationError("Every question must cover at least one wiki page");
       const pageIds = question.pages.map((page) => (page && typeof page.pageId === "string" ? page.pageId.trim() : ""));
@@ -1108,8 +1241,11 @@ export class QuizService {
         (!question.choices || question.choices.length < 2 || new Set(question.choices).size !== question.choices.length)
       )
         throw new ValidationError("Multiple-choice questions require distinct options");
-      if (question.choices?.some((choice) => !choice.trim() || FORBIDDEN_SHEET_TEXT.test(choice)))
-        throw new ValidationError("Question options must be nonempty and answer-key-free");
+      for (const choice of question.choices ?? []) {
+        if (!choice.trim() || FORBIDDEN_SHEET_TEXT.test(choice))
+          throw new ValidationError("Question options must be nonempty and answer-key-free");
+        validateQuizVisibleText(choice, boundaryTokens);
+      }
     }
     if (covered.size !== selected.size || [...selected].some((pageId) => !covered.has(pageId)))
       throw new ValidationError("Every selected page must be referenced by a question");
@@ -1123,6 +1259,7 @@ export class QuizService {
     ) {
       throw new ValidationError("Grading must cover every displayed question exactly once");
     }
+    const hiddenTokens = this.hiddenTokensForQuiz(quiz, undefined, input.requestId);
     const expectedPageIds = new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)));
     if (input.pages.length !== expectedPageIds.size || input.pages.some((page) => !expectedPageIds.has(page.pageId))) {
       throw new ValidationError("Grading must cover every covered page exactly once");
@@ -1142,7 +1279,7 @@ export class QuizService {
       const question = questionById.get(questionGrade.questionId);
       if (!question) throw new ValidationError("Grading references an unknown question");
       const feedback = questionGrade.feedback?.trim() || "";
-      this.validateFeedback(feedback);
+      this.validateFeedback(feedback, hiddenTokens);
       questions.push({ input: questionGrade, question, feedback });
     }
 
@@ -1182,7 +1319,7 @@ export class QuizService {
         )
       )
         throw new ValidationError(`Page grade readings are not covered by cited evidence: ${pageGrade.pageId}`);
-      this.validateFeedback(feedback);
+      this.validateFeedback(feedback, hiddenTokens);
       pages.push({ input: pageGrade, evidence, evidenceRecords, readings, feedback });
     }
     return { questions, pages };
@@ -1216,13 +1353,18 @@ export class QuizService {
     }
   }
 
-  private validateAnswerText(answer: string | readonly string[]): void {
+  private validateAnswerText(
+    answer: string | readonly string[],
+    hiddenTokens: readonly QuizVisibleTextToken[] = [],
+  ): void {
     const text = answerText(answer);
+    validateQuizVisibleText(text, hiddenTokens);
     if (FORBIDDEN_SHEET_TEXT.test(text) || /^#{1,6}\s/mu.test(text))
       throw new ValidationError("Answers may not contain private grading material or structural Markdown");
   }
 
-  private validateFeedback(feedback: string): void {
+  private validateFeedback(feedback: string, hiddenTokens: readonly QuizVisibleTextToken[] = []): void {
+    validateQuizVisibleText(feedback, hiddenTokens);
     if (FORBIDDEN_SHEET_TEXT.test(feedback))
       throw new ValidationError("Feedback may not contain private grading material");
   }
@@ -1231,6 +1373,7 @@ export class QuizService {
     quiz: QuizRecord,
     answers: Readonly<Record<string, string | readonly string[]>>,
   ): void {
+    const hiddenTokens = this.hiddenTokensForQuiz(quiz);
     for (const question of quiz.questions) {
       const answer = answers[question.questionId];
       if (answer === undefined || answerText(answer).trim() === "")
@@ -1240,7 +1383,7 @@ export class QuizService {
         if (values.some((value) => !question.choices?.includes(value)))
           throw new ValidationError(`Invalid choice for ${question.questionId}`);
       }
-      this.validateAnswerText(answer);
+      this.validateAnswerText(answer, hiddenTokens);
     }
   }
 
@@ -1318,6 +1461,7 @@ export class QuizService {
       reviewRows.length !== pageRows.length
     )
       throw new ValidationError("Committed grade is incomplete");
+    const hiddenTokens = this.hiddenTokensForQuiz(quiz);
 
     const questionById = new Map<string, Record<string, unknown>>();
     for (const row of questionRows) {
@@ -1329,7 +1473,7 @@ export class QuizService {
       if (Number(row.answer_revision) !== quiz.revision)
         throw new ValidationError("Committed grade revision does not match the sealed submission");
       const feedback = String(row.feedback ?? "");
-      this.validateFeedback(feedback);
+      this.validateFeedback(feedback, hiddenTokens);
       questionById.set(questionId, row);
     }
     const questions: SettledQuestionResult[] = [];
@@ -1383,7 +1527,7 @@ export class QuizService {
       if (!RATINGS.includes(rating) || String(review.rating) !== rating)
         throw new ValidationError("Committed grade page rating is inconsistent");
       const feedback = String(row.feedback ?? "");
-      this.validateFeedback(feedback);
+      this.validateFeedback(feedback, hiddenTokens);
       resultByPage.set(pageId, row);
       pages.push({
         gradeId: reviewId,
@@ -1404,7 +1548,7 @@ export class QuizService {
     return { quiz, questions, pages };
   }
 
-  private validateRenderedSheet(markdown: string): void {
+  private validateRenderedSheet(markdown: string, hiddenTokens: readonly QuizVisibleTextToken[] = []): void {
     if (
       !markdown.trim() ||
       FORBIDDEN_SHEET_TEXT.test(markdown) ||
@@ -1431,6 +1575,11 @@ export class QuizService {
       comments.filter((comment) => /^<!--\s*pi-scholar:quiz\b/u.test(comment)).length !== 1
     )
       throw new ValidationError("Rendered quiz sheet comments are invalid");
+    const visibleMarkdown = markdown.replace(
+      /<!--\s*pi-scholar:(?:quiz format=1 id=[^\s]+ revision=\d+|question id=[^\s]+)\s*-->/gu,
+      "",
+    );
+    validateQuizVisibleText(visibleMarkdown, hiddenTokens);
   }
 
   private replaceSheet<T>(sheetPath: string | undefined, rendered: string, operation: () => T): T {
@@ -1460,7 +1609,7 @@ export class QuizService {
     const sheetPath = quiz.sheetPath ?? pathForSheet(this.paths, quiz.date);
     if (!sheetPath) return;
     const rendered = this.renderSheet(quiz, answers, results, pageResults);
-    this.validateRenderedSheet(rendered);
+    this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(quiz));
     this.replaceSheet(sheetPath, rendered, () => undefined);
   }
 }
