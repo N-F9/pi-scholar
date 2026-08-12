@@ -696,12 +696,28 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
     ValidationError,
   );
   assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)-/u, "$1-<em>$2</em>-"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(`![${opaqueId.replace("-", "\\-")}][img]\n\n[img]: image.png`, [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
     () => validateQuizVisibleText(`x${pageDigest}`, [{ value: pageDigest, match: "substring" }]),
     ValidationError,
   );
   assert.doesNotThrow(() => validateQuizVisibleText("xp1", [{ value: "p1", match: "boundary" }]));
-  const storedCriterion = "Stored grading crit\u00e9rion";
-  const decomposedCriterion = storedCriterion.normalize("NFD");
+  const storedCriterion = "Stored **grading crit\u00e9rion &amp; evidence**";
+  const renderedCriterion = "Stored grading crit\u00e9rion & evidence";
+  const softBreakCriterion = renderedCriterion.replace("grading ", "grading\n");
+  const decomposedCriterion = renderedCriterion.normalize("NFD");
   assert.throws(
     () =>
       quiz.createDailyQuiz({
@@ -820,6 +836,28 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
         requestId: randomUUID(),
         submissionId: "hidden-letter-adjacent-criterion-feedback",
         questions: [{ questionId, feedback: `x${storedCriterion}` }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-rendered-criterion-feedback",
+        questions: [{ questionId, feedback: renderedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-soft-break-criterion-feedback",
+        questions: [{ questionId, feedback: softBreakCriterion }],
         pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
       }),
     ValidationError,

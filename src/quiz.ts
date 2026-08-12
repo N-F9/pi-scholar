@@ -111,13 +111,22 @@ const FORBIDDEN_SHEET_TEXT = /answer\s*key|correct\s+answer|grading\s+criteria|r
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
+function normalizeSearchable(value: string): string {
+  return value
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+    .normalize("NFC")
+    .replace(/[ \t\n\f\r]+/gu, " ")
+    .trim();
+}
 function renderedMarkdownValues(value: string): string {
   const properties: string[] = [];
   const render = (node: unknown): string => {
     if (!node || typeof node !== "object") return "";
     const record = node as Record<string, unknown>;
+    if (record.type === "html") return "";
     for (const key of ["url", "title"]) if (typeof record[key] === "string") properties.push(record[key]);
-    if (record.type === "image") return typeof record.alt === "string" ? record.alt : "";
+    if (record.type === "image" || record.type === "imageReference")
+      return typeof record.alt === "string" ? record.alt : "";
     if (record.type === "break") return "\n";
     if (Array.isArray(record.children)) {
       const separator = ["root", "blockquote", "list", "listItem", "table", "tableRow"].includes(String(record.type))
@@ -157,17 +166,12 @@ function pageIdToken(value: string): QuizVisibleTextToken {
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
   const tokens = new Map<string, QuizVisibleTextToken["match"]>();
   for (const token of hiddenTokens) {
-    const normalized = token.value
-      .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
-      .trim()
-      .normalize("NFC");
+    const normalized = normalizeSearchable(token.value);
     if (!normalized) continue;
     if (token.match === "substring" || !tokens.has(normalized)) tokens.set(normalized, token.match);
   }
   if (!tokens.size) return;
-  const searchable = `${value}\n${renderedMarkdownValues(value)}`
-    .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
-    .normalize("NFC");
+  const searchable = normalizeSearchable(`${value}\n${renderedMarkdownValues(value)}`);
   const substringTokens = [...tokens].filter(([, match]) => match === "substring").map(([token]) => token);
   const boundaryTokens = [...tokens].filter(([, match]) => match === "boundary").map(([token]) => token);
   if (
@@ -963,7 +967,11 @@ export class QuizService {
       substringToken(quiz.quizId),
       ...quiz.questions.flatMap((question) => [
         substringToken(question.questionId),
-        ...question.pages.flatMap((page) => [pageIdToken(page.pageId), substringToken(page.criterion)]),
+        ...question.pages.flatMap((page) => [
+          pageIdToken(page.pageId),
+          substringToken(page.criterion),
+          substringToken(renderedMarkdownValues(page.criterion)),
+        ]),
         ...(question.sourceRefs ?? []).map(boundaryToken),
       ]),
       ...evidenceTokens,
