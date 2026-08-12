@@ -664,9 +664,13 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
   const pageDigest = db.get<{ digest: string }>("SELECT digest FROM pages WHERE page_id = ?", ["p1"])!.digest;
   const opaqueId = randomUUID();
+  const sourceReference = `${randomUUID()}:0`;
   assert.throws(() => validateQuizVisibleText(`x${opaqueId}`, [opaqueId]), ValidationError);
+  assert.throws(() => validateQuizVisibleText(`x${sourceReference}`, [sourceReference]), ValidationError);
+  assert.throws(() => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [opaqueId]), ValidationError);
   assert.throws(() => validateQuizVisibleText(`x${pageDigest}`, [pageDigest]), ValidationError);
   assert.doesNotThrow(() => validateQuizVisibleText("xp1", ["p1"]));
+  const storedCriterion = "Stored grading criterion";
   assert.throws(
     () =>
       quiz.createDailyQuiz({
@@ -715,6 +719,7 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
     questionSpecs: [
       {
         ...question("p1"),
+        pages: [{ pageId: "p1", criterion: storedCriterion, weight: 1 }],
         sourceRefs: ["evidence-reference"],
       },
     ],
@@ -766,6 +771,19 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
       }),
     ValidationError,
   );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-criterion-feedback",
+        questions: [{ questionId, feedback: storedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   db.close();
 });

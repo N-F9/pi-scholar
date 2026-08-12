@@ -1134,7 +1134,7 @@ describe("application quiz publication guards", () => {
           {
             kind: "free-response",
             prompt: "Explain the page",
-            pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
+            pages: [{ pageId, criterion: "Connect the explanation to the source", weight: 1 }],
             sourceRefs: evidence.map((item) => item.reference),
           },
         ],
@@ -1388,7 +1388,7 @@ async function gradingFixture() {
       {
         kind: "free-response",
         prompt: "Explain the section",
-        pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
+        pages: [{ pageId, criterion: "Identify the section's central idea", weight: 1 }],
         sourceRefs: [],
       },
     ],

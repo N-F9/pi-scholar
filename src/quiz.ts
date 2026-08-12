@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { fromMarkdown } from "mdast-util-from-markdown";
 import type {
   PageLearningRecord,
   QuizEvidenceRecord,
@@ -108,25 +109,38 @@ const FORBIDDEN_SHEET_TEXT = /answer\s*key|correct\s+answer|grading\s+criteria|r
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
+function renderedMarkdownValues(value: string): string {
+  const values: string[] = [];
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const record = node as Record<string, unknown>;
+    for (const key of ["value", "url", "title", "alt"]) if (typeof record[key] === "string") values.push(record[key]);
+    if (Array.isArray(record.children)) for (const child of record.children) visit(child);
+  };
+  visit(fromMarkdown(value));
+  return values.join("\n");
+}
 
 function isOpaqueIdentifier(value: string): boolean {
   return (
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value) || /^[0-9a-f]{64}$/iu.test(value)
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::\d+)?$/iu.test(value) ||
+    /^[0-9a-f]{64}$/iu.test(value)
   );
 }
 
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly string[]): void {
   const tokens = [...new Set(hiddenTokens.map((token) => token.trim()).filter(Boolean))];
   if (!tokens.length) return;
+  const searchable = `${value}\n${renderedMarkdownValues(value)}`;
   const opaqueTokens = tokens.filter(isOpaqueIdentifier);
   const ambiguousTokens = tokens.filter((token) => !isOpaqueIdentifier(token));
   if (
-    (opaqueTokens.length && new RegExp(`(?:${opaqueTokens.map(escapeRegExp).join("|")})`, "iu").test(value)) ||
+    (opaqueTokens.length && new RegExp(`(?:${opaqueTokens.map(escapeRegExp).join("|")})`, "iu").test(searchable)) ||
     (ambiguousTokens.length &&
       new RegExp(
         `(?<![\\p{L}\\p{N}_])(?:${ambiguousTokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`,
         "iu",
-      ).test(value))
+      ).test(searchable))
   ) {
     throw new ValidationError("Quiz Markdown contains private metadata");
   }
@@ -906,7 +920,7 @@ export class QuizService {
         quiz.quizId,
         ...quiz.questions.flatMap((question) => [
           question.questionId,
-          ...question.pages.map((page) => page.pageId),
+          ...question.pages.flatMap((page) => [page.pageId, page.criterion]),
           ...(question.sourceRefs ?? []),
         ]),
         ...evidenceTokens,
