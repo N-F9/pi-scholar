@@ -57,167 +57,6 @@ export const REQUIRED_TABLES = [
   "settings",
 ] as const;
 
-const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
-  schema_meta: ["schema_version", "applied_at"],
-  sources: [
-    "source_id",
-    "kind",
-    "status",
-    "display_name",
-    "original_name",
-    "source_uri",
-    "media_type",
-    "repository_revision",
-    "captured_at",
-    "digest",
-    "manifest_digest",
-    "manifest_path",
-    "error_code",
-    "error_message",
-    "created_at",
-    "updated_at",
-  ],
-  source_files: ["source_id", "relative_path", "byte_length", "digest", "media_type"],
-  source_chunks: [
-    "chunk_id",
-    "source_id",
-    "ordinal",
-    "relative_path",
-    "byte_length",
-    "digest",
-    "atom_start",
-    "atom_end",
-  ],
-  source_dependencies: ["source_id", "page_id", "chunk_id", "relation"],
-  pages: [
-    "page_id",
-    "relative_path",
-    "title",
-    "digest",
-    "revision",
-    "status",
-    "quiz_worthiness",
-    "created_at",
-    "updated_at",
-  ],
-  wiki_issues: [
-    "issue_id",
-    "page_id",
-    "heading",
-    "page_digest",
-    "kind",
-    "description",
-    "status",
-    "resolution",
-    "created_at",
-    "updated_at",
-  ],
-  authored_snapshots: ["relative_path", "digest", "revision", "captured_at", "commit_id"],
-  page_learning: [
-    "page_id",
-    "initial_due_at",
-    "due_at",
-    "fsrs_state",
-    "stability",
-    "difficulty",
-    "reps",
-    "lapses",
-    "scheduled_days",
-    "last_review_at",
-    "revision",
-    "created_at",
-    "updated_at",
-  ],
-  page_prerequisites: ["page_id", "prerequisite_page_id"],
-  quizzes: [
-    "quiz_id",
-    "date",
-    "revision",
-    "status",
-    "sheet_path",
-    "generated_at",
-    "submitted_at",
-    "error_code",
-    "error_message",
-  ],
-  quiz_questions: [
-    "question_id",
-    "quiz_id",
-    "ordinal",
-    "kind",
-    "prompt",
-    "choices_json",
-    "answer_key_json",
-    "source_refs_json",
-  ],
-  page_reviews: [
-    "review_id",
-    "page_id",
-    "quiz_id",
-    "submission_id",
-    "revision",
-    "rating",
-    "reviewed_at",
-    "state_before_json",
-    "state_after_json",
-    "settlement_id",
-  ],
-  question_pages: ["question_id", "page_id", "criterion_json", "weight"],
-  quiz_answers: ["quiz_id", "question_id", "revision", "answer_json", "saved_at"],
-  question_results: ["result_id", "quiz_id", "question_id", "answer_revision", "feedback", "graded_at"],
-  page_results: [
-    "result_id",
-    "quiz_id",
-    "page_id",
-    "rating",
-    "feedback",
-    "evidence_json",
-    "readings_json",
-    "review_id",
-  ],
-  quiz_evidence: [
-    "quiz_id",
-    "reference",
-    "page_id",
-    "relative_path",
-    "anchor",
-    "heading",
-    "page_digest",
-    "page_revision",
-    "text_digest",
-    "excerpt",
-    "excerpt_digest",
-  ],
-  workflows: [
-    "request_id",
-    "kind",
-    "status",
-    "started_at",
-    "finished_at",
-    "progress",
-    "message",
-    "error_code",
-    "error_message",
-    "idempotency_key",
-  ],
-  settings: ["key", "value_json", "updated_at"],
-};
-
-const REQUIRED_SCHEMA_FRAGMENTS: Readonly<Record<string, readonly string[]>> = {
-  source_chunks: ["unique (source_id, chunk_id)"],
-  source_dependencies: [
-    "check (page_id is not null or chunk_id is not null)",
-    "foreign key (source_id, chunk_id) references source_chunks(source_id, chunk_id)",
-  ],
-  page_prerequisites: ["check (page_id <> prerequisite_page_id)"],
-  quiz_questions: ["check (kind in ('free-response','multiple-choice'))"],
-  page_reviews: ["unique (quiz_id, page_id, revision)", "unique (settlement_id, page_id)"],
-  question_pages: ["criterion_json text not null", "weight real not null"],
-  page_results: ["unique (quiz_id, page_id)", "unique (review_id)"],
-  quiz_evidence: ["primary key (quiz_id, reference)"],
-  workflows: ["check (kind in ('extract','ingest','lint','daily','quiz-grader','sync'))"],
-};
-
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
 
@@ -484,7 +323,11 @@ export class ScholarDatabase {
   }
 
   checkpoint(): void {
-    this.#database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    const row = this.get<{ busy: number | bigint; log: number | bigint; checkpointed: number | bigint }>(
+      "PRAGMA wal_checkpoint(TRUNCATE)",
+    );
+    if (!row || Number(row.busy) !== 0 || Number(row.log) !== Number(row.checkpointed))
+      throw new Error("SQLite WAL checkpoint incomplete");
   }
 
   integrityCheck(): string[] {
@@ -540,8 +383,17 @@ export class ScholarDatabase {
 }
 
 function normalizedSql(sql: string): string {
-  return sql.toLowerCase().replace(/\s+/gu, " ").trim();
+  return sql.replace(/\s+/gu, " ").trim();
 }
+const CANONICAL_TABLE_DEFINITIONS: Readonly<Record<string, string>> = (() => {
+  const definitions: Record<string, string> = {};
+  for (const statement of SCHEMA_SQL.split(";")) {
+    const normalized = normalizedSql(statement);
+    const name = /^CREATE TABLE IF NOT EXISTS ([a-z_][a-z0-9_]*) /u.exec(normalized)?.[1];
+    if (name) definitions[name] = normalized.replace(/^CREATE TABLE IF NOT EXISTS /u, "CREATE TABLE ");
+  }
+  return definitions;
+})();
 
 export function validateSchema(db: ScholarDatabase): void {
   const current = Number(db.get<{ user_version: number | bigint }>("PRAGMA user_version")?.user_version ?? 0);
@@ -560,20 +412,13 @@ export function validateSchema(db: ScholarDatabase): void {
   const metadata = db.all<{ schema_version: number | bigint }>("SELECT schema_version FROM schema_meta");
   if (metadata.length !== 1 || Number(metadata[0]?.schema_version) !== SCHEMA_VERSION)
     throw new Error("Pi Scholar database schema_meta does not match the schema version");
-  for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
-    const actual = new Set(db.all<{ name: string }>(`PRAGMA table_info('${table}')`).map((row) => row.name));
-    const missingColumns = columns.filter((column) => !actual.has(column));
-    if (missingColumns.length)
-      throw new Error(`Pi Scholar database table ${table} is missing columns: ${missingColumns.join(", ")}`);
-  }
-  for (const [table, fragments] of Object.entries(REQUIRED_SCHEMA_FRAGMENTS)) {
-    const definition = db.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", [
+  for (const table of REQUIRED_TABLES) {
+    const expected = CANONICAL_TABLE_DEFINITIONS[table];
+    const actual = db.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", [
       table,
     ])?.sql;
-    const normalized = normalizedSql(definition ?? "");
-    const missingFragments = fragments.filter((fragment) => !normalized.includes(normalizedSql(fragment)));
-    if (missingFragments.length)
-      throw new Error(`Pi Scholar database table ${table} is missing constraints: ${missingFragments.join("; ")}`);
+    if (!expected || normalizedSql(actual ?? "") !== expected)
+      throw new Error(`Pi Scholar database table ${table} does not match canonical schema v${SCHEMA_VERSION}`);
   }
 }
 
@@ -588,13 +433,15 @@ function ensureSchema(db: ScholarDatabase): void {
     return;
   }
   if (existing.length > 0) throw new Error("Pi Scholar database has an unknown unversioned schema");
-  db.exec(SCHEMA_SQL);
-  db.run("INSERT INTO schema_meta (schema_version, applied_at) VALUES (?, ?)", [
-    SCHEMA_VERSION,
-    new Date().toISOString(),
-  ]);
-  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  validateSchema(db);
+  transaction(db, () => {
+    db.exec(SCHEMA_SQL);
+    db.run("INSERT INTO schema_meta (schema_version, applied_at) VALUES (?, ?)", [
+      SCHEMA_VERSION,
+      new Date().toISOString(),
+    ]);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    validateSchema(db);
+  });
 }
 
 function validateDatabaseSidecars(path: string): void {

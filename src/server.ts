@@ -21,6 +21,11 @@ import { localDate, RevisionConflictError, ValidationError } from "./scheduler.j
 import { DEFAULT_VAULT_HOST, DEFAULT_VAULT_PORT, LockBusyError, resolveVault, type VaultPaths } from "./vault.js";
 
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
+const INTERNAL_ERROR_CODE = "INTERNAL_ERROR";
+const INTERNAL_ERROR_MESSAGE = "Internal server error";
+const APPLIED_FINALIZATION_CODE = "MUTATION_APPLIED_FINALIZATION_FAILED";
+const FINALIZATION_STAGES = ["checkpoint", "doctor", "commit", "projection", "qmd", "rollback"] as const;
+type FinalizationStage = (typeof FINALIZATION_STAGES)[number];
 const MULTIPART_FIELD_BYTES = 64 * 1024;
 const MULTIPART_FIELD_NAMES: Record<string, true> = {
   kind: true,
@@ -149,7 +154,24 @@ function errorCode(error: unknown): string {
   if (error instanceof Error && "code" in error && typeof error.code === "string") return error.code;
   return "REQUEST_FAILED";
 }
+function safeFinalizationDetails(
+  error: unknown,
+): { readonly applied: true; readonly retryable: boolean; readonly stage: FinalizationStage } | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const candidate = error as Error & { code?: unknown; details?: unknown };
+  if (
+    candidate.code !== APPLIED_FINALIZATION_CODE ||
+    !isRecord(candidate.details) ||
+    candidate.details.applied !== true ||
+    typeof candidate.details.retryable !== "boolean"
+  )
+    return undefined;
+  const stage = candidate.details.stage;
+  if (typeof stage !== "string" || !(FINALIZATION_STAGES as readonly string[]).includes(stage)) return undefined;
+  return { applied: true, retryable: candidate.details.retryable, stage: stage as FinalizationStage };
+}
 function errorStatus(error: unknown): number {
+  if (errorCode(error) === APPLIED_FINALIZATION_CODE) return 500;
   if (
     error instanceof LockBusyError ||
     error instanceof RevisionConflictError ||
@@ -158,7 +180,8 @@ function errorStatus(error: unknown): number {
   )
     return 409;
   if (/not found|unknown page|no quiz for/iu.test(errorText(error))) return 404;
-  return 400;
+  if (error instanceof ValidationError) return 400;
+  return 500;
 }
 function jsonSafe(value: unknown): JsonValue {
   if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean")
@@ -186,14 +209,22 @@ function sendJson<T>(res: ServerResponse, status: number, data: T, requestId: st
   res.end(body);
 }
 function sendError(res: ServerResponse, status: number, error: unknown, requestId: string): void {
+  const internal = status >= 500;
+  const finalizationDetails = internal ? safeFinalizationDetails(error) : undefined;
   const body: ApiEnvelope<never> = {
     ok: false,
     error: {
-      code: errorCode(error),
-      message: error instanceof LockBusyError ? "Pi Scholar is busy; try again later." : errorText(error),
-      ...(error instanceof Error && "details" in error && isRecord(error.details)
-        ? { details: jsonSafe(error.details) }
-        : {}),
+      code: finalizationDetails ? APPLIED_FINALIZATION_CODE : internal ? INTERNAL_ERROR_CODE : errorCode(error),
+      message: internal
+        ? INTERNAL_ERROR_MESSAGE
+        : error instanceof LockBusyError
+          ? "Pi Scholar is busy; try again later."
+          : errorText(error),
+      ...(finalizationDetails
+        ? { details: finalizationDetails }
+        : !internal && error instanceof Error && "details" in error && isRecord(error.details)
+          ? { details: jsonSafe(error.details) }
+          : {}),
       requestId,
     },
   };
@@ -251,8 +282,9 @@ async function receiveMultipartUpload(
     let writePromise: Promise<void> | undefined;
     let failure: unknown;
 
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      const parser = busboy({
+    let parser: ReturnType<typeof busboy>;
+    try {
+      parser = busboy({
         headers: req.headers,
         defParamCharset: "utf8",
         limits: {
@@ -262,6 +294,10 @@ async function receiveMultipartUpload(
           parts: Object.keys(MULTIPART_FIELD_NAMES).length + 2,
         },
       });
+    } catch (error) {
+      throw new ValidationError(errorText(error));
+    }
+    await new Promise<void>((resolvePromise, rejectPromise) => {
       const fail = (error: unknown): void => {
         failure ??= error;
       };
@@ -326,7 +362,7 @@ async function receiveMultipartUpload(
       parser.on("filesLimit", () => fail(new ValidationError("multipart request contains multiple files")));
       parser.on("fieldsLimit", () => fail(new ValidationError("multipart request contains too many fields")));
       parser.on("partsLimit", () => fail(new ValidationError("multipart request contains too many parts")));
-      parser.on("error", fail);
+      parser.on("error", (error) => fail(new ValidationError(errorText(error))));
       parser.on("close", () => {
         req.off("error", requestError);
         void (async () => {
@@ -663,6 +699,7 @@ async function apiRoute(
   if (path === "/api/v1/wiki/search") {
     queryOnly(url, ["q", "mode", "limit"]);
     const q = queryOne(url, "q")!;
+    if (!q.trim()) throw new ValidationError("q query parameter must be nonempty");
     const mode = queryOne(url, "mode", false) as "semantic" | "lexical" | "exact" | undefined;
     if (mode !== undefined && mode !== "semantic" && mode !== "lexical" && mode !== "exact")
       throw new ValidationError("mode is invalid");

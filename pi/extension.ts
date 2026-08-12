@@ -497,6 +497,7 @@ async function lifecycleContext<T>(
   cancelled(signal);
   progress(onUpdate, message);
   const app = await applicationFor(ctx);
+  cancelled(signal);
   const key = workflowKey(app, kind);
   const existingState = workflowStates.get(key);
   if (existingState && "replayContext" in existingState && existingState.replayContext !== undefined) {
@@ -630,6 +631,7 @@ async function lifecycleFinal<T>(
   cancelled(signal);
   progress(onUpdate, message);
   const app = await applicationFor(ctx);
+  cancelled(signal);
   const key = workflowKey(app, kind);
   const state = workflowStates.get(key);
   if (!state) throw new Error(`${kind} context is required before the final tool`);
@@ -715,6 +717,7 @@ async function lifecycleFinish<T>(
   cancelled(signal);
   progress(onUpdate, message);
   const app = await applicationFor(ctx);
+  cancelled(signal);
   const key = workflowKey(app, kind);
   const state = workflowStates.get(key);
   if (!state) throw new Error(`${kind} context is required before finishing`);
