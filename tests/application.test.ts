@@ -147,6 +147,31 @@ describe("durable application writes", () => {
       db.close();
     }
   });
+  it("cleans private staging after lock contention and retries exactly once", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      const lock = acquireWriterLock(paths);
+      try {
+        await assert.rejects(
+          app.stageSource({ kind: "text", text: "blocked\n", name: "blocked.txt" }),
+          (error: unknown) => error instanceof LockBusyError,
+        );
+        assert.deepEqual(await fs.readdir(paths.inboxRoot), []);
+        assert.equal(
+          (await fs.readdir(paths.workRoot)).some((name) => name.startsWith(".source-stage-")),
+          false,
+        );
+      } finally {
+        lock.release();
+      }
+      const result = await app.stageSource({ kind: "text", text: "retry\n", name: "retry.txt" });
+      assert.equal(result.source.status, "pending");
+      assert.equal((await fs.readdir(paths.inboxRoot)).length, 1);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 
   it("reports applied, non-retryable finalization failures and never commits degraded state", async () => {
     for (const stage of ["checkpoint", "doctor", "commit"] as const) {
@@ -1016,6 +1041,56 @@ describe("application quiz date guards", () => {
       db.close();
     }
   });
+  it("refreshes timezone eligibility for live injected schedulers sharing a vault", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-timezone-"));
+    const paths = initVault(join(root, "vault"));
+    const dbA = openDatabase(paths);
+    const dbB = openDatabase(paths);
+    const schedulerA = new SchedulerService(dbA, paths);
+    const schedulerB = new SchedulerService(dbB, paths);
+    const quizB = new QuizService(dbB, paths, schedulerB);
+    const appA = new ScholarApplication({
+      paths,
+      db: dbA,
+      schedulerService: schedulerA,
+      quizService: new QuizService(dbA, paths, schedulerA),
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const appB = new ScholarApplication({
+      paths,
+      db: dbB,
+      schedulerService: schedulerB,
+      quizService: quizB,
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const pageId = "shared-timezone-page";
+    const now = new Date().toISOString();
+    dbA.run(
+      "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
+      [pageId, `${pageId}.md`, pageId, "digest", now, now],
+    );
+    schedulerA.ensurePageLearning(pageId, "2026-08-13T00:30:00.000Z");
+    dbA.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", ["2026-08-13T00:30:00.000Z", pageId]);
+    try {
+      await appA.updateSettings({ timezone: "America/Los_Angeles" });
+      assert.deepEqual(
+        schedulerB.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+        [pageId],
+      );
+      assert.deepEqual(
+        quizB.scheduler.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+        [pageId],
+      );
+    } finally {
+      await appA.close();
+      await appB.close();
+      dbA.close();
+      dbB.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("does not expire prior open quizzes when current publication is rejected", async () => {
     const { app, db, date, pageId } = await gradingFixture();
     const previous = new Date(`${date}T00:00:00.000Z`);
@@ -1605,18 +1680,22 @@ describe("quiz grading workflow lifecycle", () => {
       ])?.message;
       assert.match(queuedMessage ?? "", /submissionId/u);
       assert.equal("message" in sealed.workflow, false);
+      assert.equal("errorMessage" in sealed.workflow, false);
       const listedWorkflow = (await app.listWorkflows()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(listedWorkflow);
       assert.equal("message" in listedWorkflow, false);
+      assert.equal("errorMessage" in listedWorkflow, false);
       assert.equal(listedWorkflow.status, "queued");
       await app.getGradingContext({ date }, owner);
       const detail = await app.getWorkflow(requestId);
       assert.equal(detail.status, "running");
       assert.equal(detail.progress, 0);
       assert.equal("message" in detail, false);
+      assert.equal("errorMessage" in detail, false);
       const statusWorkflow = (await app.status()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(statusWorkflow);
       assert.equal("message" in statusWorkflow, false);
+      assert.equal("errorMessage" in statusWorkflow, false);
       const runningMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [
         requestId,
       ])?.message;

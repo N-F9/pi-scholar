@@ -124,7 +124,6 @@ export interface ExtractClaimRecord extends PreparedAdmission {
 export interface ExtractFailureRecord {
   readonly relativePath: string;
   readonly errorCode: string;
-  readonly errorMessage: string;
 }
 export interface ExtractContext {
   readonly claims: readonly PreparedAdmission[];
@@ -521,6 +520,7 @@ export interface WorkflowRecord {
   readonly errorCode?: string;
   readonly errorMessage?: string;
 }
+export type PublicWorkflowRecord = Omit<WorkflowRecord, "errorMessage">;
 
 export interface GitStateFacts {
   readonly branch?: string;
@@ -691,14 +691,14 @@ export interface QuizSubmissionRequest {
 
 export interface QuizSubmissionResult {
   readonly status: "sealed";
-  readonly workflow: WorkflowRecord;
+  readonly workflow: PublicWorkflowRecord;
   readonly quiz: PublicQuizDetailRecord;
   readonly grades: readonly QuizGradeRecord[];
   readonly readings: readonly QuizReadingRecord[];
 }
 
 export interface WorkflowListResult {
-  readonly workflows: readonly WorkflowRecord[];
+  readonly workflows: readonly PublicWorkflowRecord[];
 }
 
 export interface SettingsResult {

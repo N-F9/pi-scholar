@@ -1031,6 +1031,59 @@ describe("vault foundation", () => {
     await assert.rejects(runGit(paths, assignment), /Git options must use separate argv values/u);
     assert.equal(runGitSync(paths, ["status", "--porcelain=v2", "--branch", "--ahead-behind"]).code, 0);
   });
+  it("redacts Git push diagnostics from the public result", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-git-push-"));
+    const paths = initVault(join(root, "vault"));
+    const realGit = runChildSync("git", ["--version"], { cwd: paths.vaultRoot, timeoutMs: 5_000 }).executable;
+    const wrapperDirectory = join(root, "bin");
+    mkdirSync(wrapperDirectory);
+    writeFileSync(
+      join(wrapperDirectory, "git"),
+      `#!/bin/sh
+for arg
+do
+  if [ "$arg" = "push" ]; then
+    printf '%s\n' "remote=https://alice:secret@example.invalid/repo.git path=${paths.vaultRoot} ref=refs/heads/main"
+    printf '%s\n' "fatal: credential=top-secret subprocess=/private/git-helper" >&2
+    exit 73
+  fi
+done
+exec ${JSON.stringify(realGit)} "$@"
+`,
+      { mode: 0o700 },
+    );
+    const child = runChildSync(
+      process.execPath,
+      [
+        "--import",
+        "jiti/register",
+        "--input-type=module",
+        "-e",
+        `const modulePath = process.env.PI_GIT_MODULE;
+const vaultRoot = process.env.PI_VAULT_ROOT;
+if (!modulePath || !vaultRoot) throw new Error("push child environment is incomplete");
+const loaded = await import(modulePath);
+const { safePush } = loaded.default ?? loaded;
+const result = safePush({ vaultRoot });
+process.stdout.write(JSON.stringify({ output: result.output, error: result.error }));
+`,
+      ],
+      {
+        cwd: process.cwd(),
+        timeoutMs: 30_000,
+        env: {
+          PATH: `${wrapperDirectory}${delimiter}${process.env.PATH ?? ""}`,
+          PI_GIT_MODULE: "./src/external/git.ts",
+          PI_VAULT_ROOT: paths.vaultRoot,
+        },
+      },
+    );
+    assert.equal(child.code, 0, child.stderr || child.stdout);
+    assert.deepEqual(JSON.parse(child.stdout), {
+      output: "Git push failed",
+      error: "PUSH_FAILED",
+    });
+  });
   it("treats Git checkpoint exclusions as literal path names", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = initVault(join(root, "vault"));

@@ -21,6 +21,7 @@ import type {
   PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
+  PublicWorkflowRecord,
   QuizAnswerInput,
   QuizCandidateRecord,
   QuizContext,
@@ -34,6 +35,7 @@ import type {
   QuizQuestionResultRecord,
   QuizReadingRecord,
   QuizRecord,
+  QuizSubmissionResult,
   SettingsFacts,
   SettingsRecord,
   SettingsUpdateRequest,
@@ -49,6 +51,7 @@ import type {
   WikiIssueUpdateRequest,
   WikiPageLearningProjection,
   WikiPageResult,
+  WorkflowListResult,
   WorkflowRecord,
 } from "../contracts.js";
 import { openDatabase, type ScholarDatabase, transaction } from "../database.js";
@@ -70,7 +73,13 @@ import {
   removeOkfFootnoteDefinitions,
 } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
-import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
+import {
+  localDate,
+  persistedTimezone,
+  RevisionConflictError,
+  SchedulerService,
+  ValidationError,
+} from "../scheduler.js";
 import {
   type SourceStageRequest as MechanicsSourceStageRequest,
   type SourceAdapters,
@@ -126,7 +135,6 @@ import {
 } from "./grader-binding.js";
 import {
   answersObject,
-  type PublicWorkflowRecord,
   pageRecord,
   publicQuiz,
   publicQuizDetail,
@@ -159,7 +167,7 @@ export interface ApplicationOptions {
 }
 export interface ApplicationStatus extends HealthResult {
   readonly settings: SettingsRecord;
-  readonly workflows: readonly WorkflowRecord[];
+  readonly workflows: readonly PublicWorkflowRecord[];
 }
 export interface SourceStageResult {
   readonly source: PublicSourceRecord;
@@ -348,12 +356,7 @@ export class ScholarApplication {
       new SourceService(this.db, this.paths, defaultSourceAdapters(this.paths, input.adapters?.sources));
     this.wiki =
       input.wikiService ?? new WikiService(this.db, this.paths, defaultWikiAdapters(this.paths, input.adapters?.wiki));
-    const timezoneRow = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [
-      "timezone",
-    ]);
-    const timezone = timezoneRow ? String(jsonValue(timezoneRow.value_json)) : "local";
-    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths, timezone);
-    this.scheduler.setTimezone(timezone);
+    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths);
     this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
     this.worker = new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
@@ -560,7 +563,7 @@ export class ScholarApplication {
     }
   }
   private async currentLocalDate(): Promise<string> {
-    const timezone = String(await this.readSetting("timezone", "local"));
+    const timezone = persistedTimezone(this.db);
     try {
       return localDate(new Date(), timezone);
     } catch {
@@ -622,7 +625,6 @@ export class ScholarApplication {
         failures.push({
           relativePath: entry.relativePath,
           errorCode: "EXTRACT_FAILED",
-          errorMessage: "Source extraction failed",
         });
       }
     }
@@ -703,14 +705,17 @@ export class ScholarApplication {
     context?: ApplicationMutationContext,
   ): Promise<SourceStageResult> {
     return this.mutate(context, async () => {
-      const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
-      return this.durableDirect(async () => {
-        const entry = (await this.sources.discover()).find(
-          (candidate) => candidate.relativePath === staged.relativePath,
-        );
-        if (!entry) throw new Error("staged source disappeared");
-        return { source: publicSource(this.pendingSource(entry)) };
-      }, "source:stage");
+      const prepared = await this.sources.prepareStage(request as MechanicsSourceStageRequest);
+      try {
+        return await this.durableDirect(async () => {
+          const staged = await this.sources.publishPreparedStage(prepared);
+          return { source: publicSource(this.pendingSource(staged)) };
+        }, "source:stage");
+      } catch (error) {
+        if (!isAppliedFinalizationFailure(error))
+          await this.sources.cleanupPreparedStage(prepared).catch(() => undefined);
+        throw error;
+      }
     });
   }
   async removalPreview(sourceId: string): Promise<{
@@ -1043,13 +1048,7 @@ export class ScholarApplication {
     date: string,
     input: { readonly expectedRevision: number },
     context?: ApplicationMutationContext,
-  ): Promise<{
-    readonly status: "sealed";
-    readonly workflow: PublicWorkflowRecord;
-    readonly quiz: PublicQuizDetailRecord;
-    readonly grades: readonly QuizGradeRecord[];
-    readonly readings: readonly QuizReadingRecord[];
-  }> {
+  ): Promise<QuizSubmissionResult> {
     const requestId = randomUUID();
     return this.mutate(context, () =>
       this.durableDirect(async () => {
@@ -1149,7 +1148,7 @@ export class ScholarApplication {
     );
   }
 
-  async listWorkflows(): Promise<{ readonly workflows: readonly PublicWorkflowRecord[] }> {
+  async listWorkflows(): Promise<WorkflowListResult> {
     return { workflows: this.workflows.list().map(publicWorkflow) };
   }
   async getWorkflow(requestId: string): Promise<PublicWorkflowRecord> {
@@ -1270,7 +1269,6 @@ export class ScholarApplication {
               [key, JSON.stringify(value), now],
             );
         });
-        if (input.timezone !== undefined) this.scheduler.setTimezone(input.timezone);
         return this.getSettings();
       }, "settings:update"),
     );

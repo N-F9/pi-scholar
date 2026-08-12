@@ -3,6 +3,7 @@ import type {
   PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
+  PublicWorkflowRecord,
   QuizAnswerInput,
   QuizDetailRecord,
   QuizRecord,
@@ -44,8 +45,6 @@ export function publicSource(source: SourceRecord): PublicSourceRecord {
   const { manifestPath: _manifestPath, errorMessage: _errorMessage, ...record } = source;
   return record;
 }
-
-export type PublicWorkflowRecord = Omit<WorkflowRecord, "message" | "errorMessage"> & { readonly message?: string };
 
 export function publicWorkflow(workflow: WorkflowRecord): PublicWorkflowRecord {
   const { errorMessage: _errorMessage, ...withoutErrorMessage } = workflow;

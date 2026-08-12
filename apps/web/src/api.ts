@@ -5,6 +5,7 @@ import type {
   PublicQuizQuestionRecord,
   PublicQuizRecord,
   PublicSourceRecord,
+  PublicWorkflowRecord,
   QuizAnswersResult,
   QuizListResult,
   QuizResult,
@@ -19,7 +20,6 @@ import type {
   WikiPageResult,
   WorkflowListResult,
 } from "../../../src/contracts";
-
 export class ApiRequestError extends Error {
   readonly code: string;
   readonly details?: JsonValue;
@@ -275,13 +275,20 @@ function isQuizDetail(value: unknown): value is PublicQuizDetailRecord {
   );
 }
 
-function isWorkflow(value: unknown): boolean {
+function isWorkflow(value: unknown): value is PublicWorkflowRecord {
   return (
     isRecord(value) &&
+    Object.keys(value).every((field) =>
+      ["requestId", "kind", "status", "startedAt", "finishedAt", "progress", "message", "errorCode"].includes(field),
+    ) &&
     hasStrings(value, ["requestId", "kind", "status"]) &&
     isEnum(value.kind, WORKFLOW_KINDS) &&
     isEnum(value.status, WORKFLOW_STATUSES) &&
-    typeof value.progress === "number"
+    typeof value.progress === "number" &&
+    (value.startedAt === undefined || typeof value.startedAt === "string") &&
+    (value.finishedAt === undefined || typeof value.finishedAt === "string") &&
+    (value.message === undefined || typeof value.message === "string") &&
+    (value.errorCode === undefined || typeof value.errorCode === "string")
   );
 }
 

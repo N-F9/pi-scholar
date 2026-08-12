@@ -252,9 +252,11 @@ describe("server browser boundary", () => {
           {
             sourceId: "source-1",
             kind: "upload",
-            status: "pending",
+            status: "failed",
             displayName: "notes",
             manifestPath: "/private/manifest.json",
+            errorCode: "EXTRACT_FAILED",
+            errorMessage: "/private/diagnostic",
             createdAt: new Date(0).toISOString(),
             updatedAt: new Date(0).toISOString(),
           },
@@ -292,8 +294,8 @@ describe("server browser boundary", () => {
         const sourceListEnvelope = (await sourceListResponse.json()) as {
           data: { sources: Array<Record<string, unknown>> };
         };
-        assert.equal(sourceListResponse.status, 200);
         assert.equal("manifestPath" in sourceListEnvelope.data.sources[0]!, false);
+        assert.equal("errorMessage" in sourceListEnvelope.data.sources[0]!, false);
 
         const form = new FormData();
         form.set("kind", "upload");
@@ -330,6 +332,48 @@ describe("server browser boundary", () => {
     } finally {
       rmSync(workRoot, { recursive: true, force: true });
     }
+  });
+  it("redacts workflow diagnostics at every exposed workflow boundary", async () => {
+    const workflow = {
+      requestId: "11111111-1111-4111-8111-111111111111",
+      kind: "ingest",
+      status: "failed",
+      progress: 0,
+      errorCode: "INGEST_FAILED",
+      errorMessage: "/private/workflow",
+      error_message: "/private/legacy-workflow",
+    };
+    const application = {
+      listWorkflows: async () => ({ workflows: [workflow] }),
+      getWorkflow: async () => workflow,
+      sealSubmission: async () => ({ status: "sealed", workflow }),
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const responses = [
+        await fetch(`${base}/api/v1/workflows`),
+        await fetch(`${base}/api/v1/workflows/${workflow.requestId}`),
+        await fetch(`${base}/api/v1/quizzes/2026-08-09/submission`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+          body: JSON.stringify({ expectedRevision: 1 }),
+        }),
+      ];
+      for (const response of responses) {
+        assert.equal(response.status, 200);
+        const payload = await response.text();
+        assert.equal(payload.includes("/private/workflow"), false);
+        assert.equal(payload.includes("/private/legacy-workflow"), false);
+        const envelope = JSON.parse(payload) as {
+          data: { workflow?: Record<string, unknown>; workflows?: Array<Record<string, unknown>> };
+        };
+        const records = envelope.data.workflows ?? (envelope.data.workflow ? [envelope.data.workflow] : []);
+        assert.equal(records.length, 1);
+        assert.equal("errorMessage" in records[0]!, false);
+        assert.equal("error_message" in records[0]!, false);
+      }
+    });
   });
   it("decodes quoted multipart filenames as UTF-8", async () => {
     const workRoot = mkdtempSync(join(tmpdir(), "pi-scholar-server-"));

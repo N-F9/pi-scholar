@@ -158,6 +158,19 @@ describe("source admission mechanics", () => {
     expect(staged.kind).toBe("directory");
     db.close();
   });
+  it("keeps prepared directory payloads out of the inbox until publication", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "prepared-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    expect(await sources.discover()).toEqual([]);
+    expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+    const published = await sources.publishPreparedStage(prepared);
+    expect(published.kind).toBe("directory");
+    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([published.relativePath]);
+    db.close();
+  });
   it("resets Markdown fence normalization at native file boundaries", async () => {
     const { root, db, sources } = await fixture();
     const directory = join(root, "fence-boundaries");
@@ -874,6 +887,9 @@ describe("source admission mechanics", () => {
     await fs.mkdir(join(paths.quizzesRoot, "2099", "01"), { recursive: true });
     const sheetBefore = Buffer.from("# canonical quiz\n");
     await fs.writeFile(sheetPath, sheetBefore);
+    await fs.chmod(sheetPath, 0o640);
+    const sheetBeforeMode = (await fs.stat(sheetPath)).mode & 0o777;
+    expect(sheetBeforeMode).not.toBe(0o600);
     db.run(
       "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', ?, ?, NULL, NULL, NULL)",
       ["quiz-removal", "2099-01-01", sheetPath, now],
@@ -914,8 +930,8 @@ describe("source admission mechanics", () => {
     await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(
       "forced removal failure",
     );
-    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).toString()).toBe("evidence\n");
     expect((await fs.readFile(sheetPath)).equals(sheetBefore)).toBe(true);
+    expect((await fs.stat(sheetPath)).mode & 0o777).toBe(sheetBeforeMode);
     expect(
       db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [result.sourceId])?.status,
     ).toBe("published");

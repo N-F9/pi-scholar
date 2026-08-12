@@ -430,7 +430,12 @@ function queryOne(url: URL, key: string, required = true): string | undefined {
 }
 function publicSourceRecord(value: unknown): unknown {
   if (!isRecord(value)) return value;
-  return Object.fromEntries(Object.entries(value).filter(([key]) => !key.toLocaleLowerCase().endsWith("path")));
+  return Object.fromEntries(
+    Object.entries(value).filter(([key]) => {
+      const normalized = key.toLocaleLowerCase();
+      return !normalized.endsWith("path") && normalized !== "errormessage" && normalized !== "error_message";
+    }),
+  );
 }
 function publicSourceResponse(value: unknown): unknown {
   if (!isRecord(value)) return value;
@@ -438,6 +443,18 @@ function publicSourceResponse(value: unknown): unknown {
     ...value,
     ...(Array.isArray(value.sources) ? { sources: value.sources.map(publicSourceRecord) } : {}),
     ...(isRecord(value.source) ? { source: publicSourceRecord(value.source) } : {}),
+  };
+}
+function publicWorkflowRecord(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "errorMessage" && key !== "error_message"));
+}
+function publicWorkflowResponse(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  return {
+    ...value,
+    ...(Array.isArray(value.workflows) ? { workflows: value.workflows.map(publicWorkflowRecord) } : {}),
+    ...(isRecord(value.workflow) ? { workflow: publicWorkflowRecord(value.workflow) } : {}),
   };
 }
 function sourceRequest(value: Record<string, unknown>): SourceRequest {
@@ -786,10 +803,12 @@ async function apiRoute(
     sendJson(
       res,
       200,
-      await app.sealSubmission(
-        date,
-        { expectedRevision: integerField(value, "expectedRevision") },
-        { origin: "browser" },
+      publicWorkflowResponse(
+        await app.sealSubmission(
+          date,
+          { expectedRevision: integerField(value, "expectedRevision") },
+          { origin: "browser" },
+        ),
       ),
       requestId,
     );
@@ -797,14 +816,14 @@ async function apiRoute(
   }
   if (path === "/api/v1/workflows") {
     queryOnly(url, []);
-    sendJson(res, 200, await app.listWorkflows(), requestId);
+    sendJson(res, 200, publicWorkflowResponse(await app.listWorkflows()), requestId);
     return;
   }
   const workflowMatch = /^\/api\/v1\/workflows\/([^/]+)$/u.exec(path);
   if (workflowMatch) {
     const requestIdValue = pathSegment(workflowMatch[1]!, "workflow");
     if (!UUID.test(requestIdValue)) throw new ValidationError("workflow ID is malformed");
-    sendJson(res, 200, { workflow: await app.getWorkflow(requestIdValue) }, requestId);
+    sendJson(res, 200, publicWorkflowResponse({ workflow: await app.getWorkflow(requestIdValue) }), requestId);
     return;
   }
   if (path === "/api/v1/settings") {

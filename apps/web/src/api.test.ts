@@ -7,6 +7,7 @@ import {
   isHealthResult,
   isQuizListResult,
   isQuizResult,
+  isQuizSubmissionResult,
   isSourceListResult,
   isSourceRemovalPreviewResult,
   isWikiPageResult,
@@ -270,6 +271,38 @@ describe("api response boundary", () => {
         })),
       }),
       true,
+    );
+  });
+  it("rejects workflow diagnostics in public guards", () => {
+    const workflow = {
+      requestId: "workflow-1",
+      kind: "ingest",
+      status: "failed",
+      progress: 0,
+      errorMessage: "private diagnostic",
+    };
+    assert.equal(isWorkflowListResult({ workflows: [workflow] }), false);
+    const quiz = {
+      quizId: "quiz-1",
+      date: "2026-08-09",
+      revision: 1,
+      status: "submitted",
+      questions: [],
+      answers: [],
+      questionResults: [],
+      pageResults: [],
+      grades: [],
+      readings: [],
+    };
+    assert.equal(
+      isQuizSubmissionResult({
+        status: "sealed",
+        workflow,
+        quiz,
+        grades: [],
+        readings: [],
+      }),
+      false,
     );
   });
 });

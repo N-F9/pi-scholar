@@ -59,10 +59,15 @@ function question(pageId: string, prompt = "Explain the page") {
     sourceRefs: [],
   };
 }
-test("due eligibility uses the configured timezone for both day and due timestamps", () => {
+test("due eligibility uses the persisted timezone for both day and due timestamps", () => {
   const db = openDatabase(":memory:");
   addPage(db, "timezone-page");
-  const scheduler = new SchedulerService(db, undefined, "America/Los_Angeles");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("America/Los_Angeles"),
+    new Date().toISOString(),
+  ]);
+  const scheduler = new SchedulerService(db);
   scheduler.ensurePageLearning("timezone-page");
   db.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", ["2026-08-13T00:30:00.000Z", "timezone-page"]);
   assert.deepEqual(
