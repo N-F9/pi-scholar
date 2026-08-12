@@ -488,6 +488,14 @@ export class SourceService {
   private inbox(): string {
     return pathFor(this.paths, "inbox");
   }
+  private assertSourceOutsideInbox(source: string): void {
+    try {
+      ensureWithin(this.inbox(), source);
+    } catch {
+      return;
+    }
+    throw new ValidationError("source path must be outside inbox");
+  }
   private readonly completedPrepared = new Map<string, { prepared: PreparedAdmission; result: AdmissionResult }>();
   private async ensureInbox(): Promise<void> {
     const inbox = this.inbox();
@@ -754,6 +762,7 @@ export class SourceService {
     if (request.filePath !== undefined) {
       if (request.kind !== "upload") throw new ValidationError("filePath source kind must be upload");
       const source = resolve(request.filePath);
+      this.assertSourceOutsideInbox(source);
       const stat = await lstatNoFollow(source);
       if (!stat.isFile()) throw new ValidationError("upload filePath must be a regular file");
       const originalName = validRelativePath(request.originalName ?? request.name ?? basename(source));
@@ -788,6 +797,7 @@ export class SourceService {
     if (request.kind !== undefined && !SOURCE_KINDS.includes(request.kind as SourceKind))
       throw new ValidationError("invalid source kind");
     const source = resolve(input);
+    this.assertSourceOutsideInbox(source);
     const name = validRelativePath(request.name ?? basename(source));
     if (name.includes("/")) throw new ValidationError("staging name must be a single filename");
     const stat = await lstatNoFollow(source);

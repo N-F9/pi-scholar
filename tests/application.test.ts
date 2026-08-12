@@ -1655,6 +1655,11 @@ describe("quiz grading workflow lifecycle", () => {
       const firstWorkflow = first.requestId!;
       await assert.rejects(app.settleGrade(gradeFor(first, pageId, questionId, ["not-authorized"]), firstOwner));
       assert.equal((await app.getWorkflow(firstWorkflow)).status, "failed");
+      const failure = db.get<{ error_message: string }>("SELECT error_message FROM workflows WHERE request_id = ?", [
+        firstWorkflow,
+      ]);
+      assert.equal(failure?.error_message, `Page grade cites unauthorized evidence: ${pageId}`);
+      assert.ok(Buffer.byteLength(failure?.error_message ?? "", "utf8") <= 500);
       assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       const retry = await app.getGradingContext({ date }, retryOwner);

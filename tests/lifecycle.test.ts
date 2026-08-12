@@ -447,19 +447,22 @@ describe("Pi package lifecycle", () => {
     );
   });
 
-  it("finishes extraction failed when every preparation fails", async () => {
-    const fixture = fakeLifecycleApp(
+  it("passes thrown extraction diagnostics to workflow finalization", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({ sourceId: "unused", manifest: {}, removedInbox: false }));
+    fixture.app.getExtractContext = async () => {
+      throw new Error("local extraction diagnostic");
+    };
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root),
+      /local extraction diagnostic/u,
+    );
+    assert.deepEqual(fixture.app.finishes, [
       {
-        claims: [],
-        failures: [{ relativePath: "broken.txt", errorCode: "EXTRACT_FAILED", errorMessage: "cannot prepare" }],
+        requestId: `extract-${fixture.root}`,
+        status: "failed",
+        options: { errorCode: "PI_WORKFLOW_FAILED", errorMessage: "local extraction diagnostic" },
       },
-      async () => ({ sourceId: "unused", manifest: {}, removedInbox: false }),
-    );
-    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
-    assert.deepEqual(
-      fixture.app.finishes.map(({ status }) => status),
-      ["failed"],
-    );
+    ]);
   });
   it("replays extraction after applied and unapplied initial progress failures", async () => {
     for (const applied of [false, true]) {
@@ -900,14 +903,16 @@ describe("Pi package lifecycle", () => {
       assert.ok(succeeded.finishedAt);
       assert.throws(() => workflows.updateWorkflow(started.requestId, { progress: 0.75 }), /not running/u);
 
+      const diagnostic = `SQLite busy while committing workflow: ${"é".repeat(400)}`;
       const failed = workflows.beginWorkflow("lint");
       const failure = workflows.finishWorkflow(failed.requestId, "failed", {
         errorCode: "E".repeat(120),
-        errorMessage: "é".repeat(400),
+        errorMessage: diagnostic,
       });
       assert.equal(failure.status, "failed");
       assert.ok(Buffer.byteLength(failure.errorCode ?? "", "utf8") <= 100);
-      assert.equal(failure.errorMessage, "é".repeat(250));
+      assert.equal(failure.errorMessage, `SQLite busy while committing workflow: ${"é".repeat(230)}`);
+      assert.ok(Buffer.byteLength(failure.errorMessage ?? "", "utf8") <= 500);
     } finally {
       db.close();
       rmSync(root, { recursive: true, force: true });

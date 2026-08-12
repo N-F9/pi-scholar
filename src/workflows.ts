@@ -85,10 +85,9 @@ function boundedText(value: string | undefined, maxBytes: number, label: string)
   return boundedUtf8(value, maxBytes);
 }
 
-function workflowErrorMessage(value: string | undefined): string {
-  if (value === undefined) return WORKFLOW_ERROR_FALLBACK;
-  if (typeof value !== "string") throw new Error("workflow error message must be a string");
-  return boundedUtf8(value.trim(), WORKFLOW_ERROR_MESSAGE_BYTES) || WORKFLOW_ERROR_FALLBACK;
+export function workflowFailureMessage(value: unknown): string {
+  const diagnostic = value === undefined ? "" : value instanceof Error ? value.message : String(value);
+  return boundedUtf8(diagnostic.trim(), WORKFLOW_ERROR_MESSAGE_BYTES) || WORKFLOW_ERROR_FALLBACK;
 }
 
 function workflowProgress(value: number | undefined): number | undefined {
@@ -200,7 +199,7 @@ export class WorkflowCoordinator {
   failRunningWorkflows(options: WorkflowFinishOptions): WorkflowRecord[] {
     const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
     const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
-    const errorMessage = workflowErrorMessage(options.errorMessage);
+    const errorMessage = workflowFailureMessage(options.errorMessage);
     return transaction(this.db, () => {
       const requestIds = this.db
         .all<Record<string, unknown>>(
@@ -250,7 +249,7 @@ export class WorkflowCoordinator {
     const progress = workflowProgress(options.progress);
     const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
     const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
-    const errorMessage = workflowErrorMessage(options.errorMessage);
+    const errorMessage = workflowFailureMessage(options.errorMessage);
     return transaction(this.db, () => {
       const current = this.get(requestId);
       if (!current) throw new Error("workflow not found");

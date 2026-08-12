@@ -110,6 +110,7 @@ import {
   type WorkflowFinishOptions,
   type WorkflowKind,
   type WorkflowUpdateInput,
+  workflowFailureMessage,
 } from "../workflows.js";
 import {
   asAnswers,
@@ -2078,6 +2079,7 @@ export class ScholarApplication {
   private async failGradingWorkflow(requestId: string, error: unknown, ownerHash: string): Promise<void> {
     const code =
       error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "QUIZ_GRADING_FAILED";
+    const message = workflowFailureMessage(error);
     await this.durableDirect(() => {
       transaction(this.db, () => {
         const workflow = this.db.get<Record<string, unknown>>(
@@ -2088,13 +2090,7 @@ export class ScholarApplication {
         if (!binding || binding.ownerHash !== ownerHash) return;
         this.db.run(
           "UPDATE workflows SET status = 'failed', finished_at = ?, progress = 0, message = NULL, error_code = ?, error_message = ? WHERE request_id = ? AND kind = 'quiz-grader' AND status = 'running' AND message = ?",
-          [
-            new Date().toISOString(),
-            code,
-            "Quiz grading failed",
-            requestId,
-            quizGraderBindingText(binding.quizId, ownerHash),
-          ],
+          [new Date().toISOString(), code, message, requestId, quizGraderBindingText(binding.quizId, ownerHash)],
         );
       });
     }, "quiz:grade-failure");

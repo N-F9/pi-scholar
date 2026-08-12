@@ -227,6 +227,18 @@ describe("source admission mechanics", () => {
     );
     db.close();
   });
+  it("rejects staging an existing inbox file without cloning it", async () => {
+    const { paths, db, sources } = await fixture();
+    const original = join(paths.inboxRoot, "existing.txt");
+    await fs.writeFile(original, "original\n");
+
+    await expect(sources.prepareStage({ path: original })).rejects.toBeInstanceOf(ValidationError);
+    await expect(sources.stage({ filePath: original, kind: "upload" })).rejects.toBeInstanceOf(ValidationError);
+
+    expect(await fs.readdir(paths.inboxRoot)).toEqual(["existing.txt"]);
+    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual(["existing.txt"]);
+    db.close();
+  });
   it("rejects mutated prepared handles before resolving an inbox path", async () => {
     const { paths, db, sources } = await fixture();
     const prepared = await sources.prepareStage({ text: "private\n" });
