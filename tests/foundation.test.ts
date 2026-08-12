@@ -442,6 +442,20 @@ describe("vault foundation", () => {
     assert.throws(() => validateSchema(db), /canonical schema v5/u);
     db.close();
   });
+  it("rejects case-changed quoted CHECK literals in canonical schema", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const canonicalSourcesSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'",
+    )?.sql;
+    assert.ok(canonicalSourcesSql);
+    db.exec("DROP TABLE sources");
+    db.exec(canonicalSourcesSql.replace("'url'", "'URL'"));
+    assert.equal(Number(db.get<{ user_version: number }>("PRAGMA user_version")?.user_version ?? 0), 5);
+    assert.throws(() => validateSchema(db), /canonical schema v5/u);
+    db.close();
+  });
 
   it("rolls back failed first-time schema creation atomically", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));

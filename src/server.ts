@@ -171,6 +171,7 @@ function safeFinalizationDetails(
   return { applied: true, retryable: candidate.details.retryable, stage: stage as FinalizationStage };
 }
 function errorStatus(error: unknown): number {
+  if (errorCode(error) === APPLIED_FINALIZATION_CODE) return 500;
   if (
     error instanceof LockBusyError ||
     error instanceof RevisionConflictError ||
@@ -698,6 +699,7 @@ async function apiRoute(
   if (path === "/api/v1/wiki/search") {
     queryOnly(url, ["q", "mode", "limit"]);
     const q = queryOne(url, "q")!;
+    if (!q.trim()) throw new ValidationError("q query parameter must be nonempty");
     const mode = queryOne(url, "mode", false) as "semantic" | "lexical" | "exact" | undefined;
     if (mode !== undefined && mode !== "semantic" && mode !== "lexical" && mode !== "exact")
       throw new ValidationError("mode is invalid");

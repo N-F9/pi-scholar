@@ -742,7 +742,7 @@ describe("server browser boundary", () => {
   });
 
   it("retains only safe metadata for applied finalization failures", async () => {
-    const secretCause = "SQLITE_ERROR: unable to open /private/vault/.pi-scholar/vault.sqlite";
+    const secretCause = "projection not found: SQLITE_ERROR: unable to open /private/vault/.pi-scholar/vault.sqlite";
     const application = {
       listSources: async () => {
         throw Object.assign(new Error(`mutation applied but projection failed: ${secretCause}`), {
@@ -815,6 +815,23 @@ describe("server browser boundary", () => {
 
     await withServer(application, async (base) => {
       const response = await fetch(`${base}/api/v1/wiki/search?q=term&mode=bogus`);
+      assert.equal(response.status, 400);
+      assert.equal(calls, 0);
+    });
+  });
+
+  it("rejects blank wiki searches before application dispatch", async () => {
+    let calls = 0;
+    const application = {
+      searchWiki: async () => {
+        calls += 1;
+        return { results: [] };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/wiki/search?q=`);
       assert.equal(response.status, 400);
       assert.equal(calls, 0);
     });

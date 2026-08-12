@@ -383,14 +383,14 @@ export class ScholarDatabase {
 }
 
 function normalizedSql(sql: string): string {
-  return sql.toLowerCase().replace(/\s+/gu, " ").trim();
+  return sql.replace(/\s+/gu, " ").trim();
 }
 const CANONICAL_TABLE_DEFINITIONS: Readonly<Record<string, string>> = (() => {
   const definitions: Record<string, string> = {};
   for (const statement of SCHEMA_SQL.split(";")) {
     const normalized = normalizedSql(statement);
-    const name = /^create table if not exists ([a-z_][a-z0-9_]*) /u.exec(normalized)?.[1];
-    if (name) definitions[name] = normalized.replace(/^create table if not exists /u, "create table ");
+    const name = /^CREATE TABLE IF NOT EXISTS ([a-z_][a-z0-9_]*) /u.exec(normalized)?.[1];
+    if (name) definitions[name] = normalized.replace(/^CREATE TABLE IF NOT EXISTS /u, "CREATE TABLE ");
   }
   return definitions;
 })();

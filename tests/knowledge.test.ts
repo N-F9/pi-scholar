@@ -13,7 +13,7 @@ import {
   validateOkfIndex,
   validateOkfLog,
 } from "../src/okf.js";
-import { SchedulerService } from "../src/scheduler.js";
+import { SchedulerService, ValidationError } from "../src/scheduler.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { requestSourceToFile, SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -307,6 +307,35 @@ describe("source admission mechanics", () => {
         ?.source_uri,
     ).toBe("https://example.com/path/remote.txt");
     db.close();
+  });
+
+  it("rejects control-character display names from default URL staging", async () => {
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.end("remote\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("URL test server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        await expect(
+          sources.stage({
+            url: `http://127.0.0.1:${address.port}/remote.txt`,
+            displayName: `remote${String.fromCharCode(10)}name`,
+          }),
+        ).rejects.toBeInstanceOf(ValidationError);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
   it("keeps streamed URL envelopes private until the payload is complete", async () => {
     const firstChunk = Promise.withResolvers<void>();

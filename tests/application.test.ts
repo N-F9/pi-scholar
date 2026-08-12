@@ -489,6 +489,149 @@ describe("durable application writes", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+  it("refreshes qmd after direct create rollback", async () => {
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
+    const pagePath = join(paths.wikiRoot, "direct-create-rollback.md");
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const beforeIndex = await fs.readFile(indexPath);
+    const beforeLog = await fs.readFile(logPath);
+    const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
+    const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
+    const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
+    let qmdIndexes = 0;
+    qmd.index = async () => {
+      qmdIndexes += 1;
+      if (qmdIndexes === 1) {
+        assert.match(await fs.readFile(pagePath, "utf8"), /Inside mutation/u);
+        assert.ok(db.get("SELECT page_id FROM pages WHERE relative_path = ?", ["direct-create-rollback.md"]));
+        throw new Error("injected create qmd failure");
+      }
+      assert.equal((await fs.readdir(paths.wikiRoot)).includes("direct-create-rollback.md"), false);
+      assert.equal(
+        db.get("SELECT page_id FROM pages WHERE relative_path = ?", ["direct-create-rollback.md"]),
+        undefined,
+      );
+    };
+    try {
+      await assert.rejects(
+        app.createNote({
+          path: "direct-create-rollback.md",
+          body: "# Inside mutation\n\nCreated.\n",
+          quizWorthiness: "skip",
+        }),
+        /injected create qmd failure/u,
+      );
+      assert.equal(qmdIndexes, 2);
+      assert.equal((await fs.readdir(paths.wikiRoot)).includes("direct-create-rollback.md"), false);
+      assert.equal((await fs.readFile(indexPath)).equals(beforeIndex), true);
+      assert.equal((await fs.readFile(logPath)).equals(beforeLog), true);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("refreshes qmd after direct update rollback", async () => {
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
+    try {
+      const original = await app.createNote({
+        path: "direct-update-rollback.md",
+        body: "# Before\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const pagePath = join(paths.wikiRoot, original.page.relativePath);
+      const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${original.page.pageId}.md`);
+      const destinations = [pagePath, snapshotPath, join(paths.wikiRoot, "index.md"), join(paths.wikiRoot, "log.md")];
+      const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
+      const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
+      const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
+      const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
+      let qmdIndexes = 0;
+      qmd.index = async () => {
+        qmdIndexes += 1;
+        if (qmdIndexes === 1) {
+          assert.match(await fs.readFile(pagePath, "utf8"), /Changed by mutation/u);
+          assert.equal(
+            db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+              ?.revision,
+            original.page.revision + 1,
+          );
+          throw new Error("injected update qmd failure");
+        }
+        assert.equal((await fs.readFile(pagePath)).equals(beforeFiles[0]!), true);
+        assert.equal(
+          db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+            ?.revision,
+          original.page.revision,
+        );
+      };
+      await assert.rejects(
+        app.updateNote(original.page.pageId, { body: "# Before\n\nChanged by mutation.\n" }),
+        /injected update qmd failure/u,
+      );
+      assert.equal(qmdIndexes, 2);
+      for (const [index, path] of destinations.entries())
+        assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("refreshes qmd after direct drift resolution rollback", async () => {
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
+    try {
+      const original = await app.createNote({
+        path: "direct-drift-rollback.md",
+        body: "# Drift\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const pagePath = join(paths.wikiRoot, original.page.relativePath);
+      await fs.appendFile(pagePath, "\nExternal edit.\n");
+      const drift = await wiki.inspectDrift(original.page.pageId);
+      const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${original.page.pageId}.md`);
+      const destinations = [pagePath, snapshotPath, join(paths.wikiRoot, "index.md"), join(paths.wikiRoot, "log.md")];
+      const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
+      const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
+      const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
+      const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
+      let qmdIndexes = 0;
+      qmd.index = async () => {
+        qmdIndexes += 1;
+        if (qmdIndexes === 1) {
+          assert.equal((await fs.readFile(pagePath, "utf8")).includes("External edit."), false);
+          assert.equal(
+            db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+              ?.revision,
+            original.page.revision + 1,
+          );
+          throw new Error("injected drift qmd failure");
+        }
+        assert.equal((await fs.readFile(pagePath)).equals(beforeFiles[0]!), true);
+        assert.equal(
+          db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+            ?.revision,
+          original.page.revision,
+        );
+      };
+      await assert.rejects(
+        app.resolveDrift(original.page.pageId, { action: "restore", expectedDigest: drift.currentDigest }),
+        /injected drift qmd failure/u,
+      );
+      assert.equal(qmdIndexes, 2);
+      for (const [index, path] of destinations.entries())
+        assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
+      assert.equal((await wiki.inspectDrift(original.page.pageId)).drifted, true);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("rejects rollback restoration through a symlink", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-symlink-"));
     const paths = initVault(join(root, "vault"));

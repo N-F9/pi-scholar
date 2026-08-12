@@ -637,7 +637,7 @@ export class SourceService {
           /[\u0000-\u001f\u007f]/u.test(displayName) ||
           (mediaType !== undefined && /[\u0000-\u001f\u007f]/u.test(mediaType))
         )
-          throw new Error("invalid staged source metadata");
+          throw new ValidationError("invalid staged source metadata");
         const metadata: StageMetadata = {
           version: 1,
           requestedKind: request.kind ?? "url",

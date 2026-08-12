@@ -981,19 +981,6 @@ export class ScholarApplication {
       }, "wiki:update"),
     );
   }
-  async renameNote(
-    pageId: string,
-    requestedPath: string,
-    context?: ApplicationMutationContext,
-  ): Promise<WikiPageResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        this.assertPageMutationAllowed(pageId);
-        const updated = await this.wiki.rename(pageId, requestedPath);
-        return this.wikiResult(updated.pageId);
-      }, "wiki:rename"),
-    );
-  }
 
   async listQuizzes(): Promise<{ readonly quizzes: readonly PublicQuizRecord[] }> {
     return { quizzes: this.quiz.list().map(publicQuiz) };
