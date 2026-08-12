@@ -89,13 +89,25 @@ function asDate(value: string | Date | undefined, field: string): Date {
   return date;
 }
 
-export function localDate(value: string | Date): string {
+export function localDate(value: string | Date, timezone = "local"): string {
   if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value)) {
     const date = new Date(`${value}T00:00:00.000Z`);
     if (!Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value) return value;
     throw new ValidationError("date must be a valid calendar date");
   }
   const date = asDate(value, "date");
+  if (timezone !== "local") {
+    try {
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(date);
+    } catch {
+      throw new ValidationError("timezone is invalid");
+    }
+  }
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
@@ -240,11 +252,17 @@ export class SchedulerService {
   readonly paths?: VaultPathsLike;
   private readonly source: SqlDatabaseSource;
   private readonly engine = fsrs();
+  private timezone: string;
 
-  constructor(source: SqlDatabaseSource, paths?: VaultPathsLike) {
+  constructor(source: SqlDatabaseSource, paths?: VaultPathsLike, timezone = "local") {
     this.source = source;
     this.db = adaptDatabase(source);
     this.paths = paths;
+    this.timezone = timezone;
+  }
+
+  setTimezone(timezone: string): void {
+    this.timezone = timezone;
   }
 
   ensurePageLearning(pageId: string, initialDueAt?: string | Date): PageLearningRecord {
@@ -380,7 +398,7 @@ export class SchedulerService {
   }
 
   eligiblePages(date: string | Date, initializeMissing = true): PageLearningRecord[] {
-    const day = localDate(date);
+    const day = localDate(date, this.timezone);
     if (initializeMissing) {
       const eligible = this.db.all<{ page_id: string }>(
         "SELECT page_id FROM pages WHERE status = 'active' AND quiz_worthiness = 'eligible' ORDER BY page_id",
@@ -390,7 +408,7 @@ export class SchedulerService {
           this.ensurePageLearning(page.page_id);
       }
     }
-    const learning = this.listPageLearning(true).filter((entry) => localDate(entry.dueAt) <= day);
+    const learning = this.listPageLearning(true).filter((entry) => localDate(entry.dueAt, this.timezone) <= day);
     const prerequisites = this.db.all<Record<string, unknown>>(
       "SELECT page_id, prerequisite_page_id FROM page_prerequisites",
     );

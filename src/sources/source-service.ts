@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { promises as fs, readFileSync, type Stats } from "node:fs";
+import { promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -20,7 +20,8 @@ import {
   parseOkfConcept,
 } from "../okf.js";
 import { QuizService } from "../quiz.js";
-import { readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
+import type { VaultPaths } from "../vault.js";
+import { atomicWriteFile, readFileNoFollow, safeRelativePath } from "../vault.js";
 import {
   atomizeExtraction,
   chunkEndpointNumber,
@@ -1380,7 +1381,7 @@ export class SourceService {
       endpoints,
     });
   }
-  private recordFailure(entry: InboxEntry, error: unknown, claim?: SourceClaim): void {
+  private recordFailure(entry: InboxEntry, _error: unknown, claim?: SourceClaim): void {
     const now = new Date().toISOString();
     const sourceId = deterministicUuid(
       canonical({
@@ -1391,7 +1392,7 @@ export class SourceService {
         kind: claim?.snapshot.kind ?? entry.kind,
       }),
     );
-    const message = error instanceof Error ? error.message : String(error);
+    const message = "Source extraction failed";
     transaction(this.db, () => {
       const existing = dbGet<Row>(this.db, "SELECT source_id FROM sources WHERE source_id = ?", [sourceId]);
       if (existing)
@@ -1921,6 +1922,14 @@ export class SourceService {
     if (!originalPresent && !quarantinePresent) throw new Error("source packet is missing");
     return undefined;
   }
+  private quizSheetPath(sheetPath: string | undefined, date: string): string {
+    const root = pathFor(this.paths, "quizzes");
+    const fallback = join(root, date.slice(0, 4), date.slice(5, 7), `${date}.md`);
+    const candidate = sheetPath === undefined ? fallback : isAbsolute(sheetPath) ? sheetPath : join(root, sheetPath);
+    const relativePath = relative(resolve(root), resolve(candidate)).replaceAll("\\", "/");
+    return safeRelativePath(root, relativePath);
+  }
+
   removalPreview(sourceId: string): SourceRemovalPreview {
     const source = dbGet<Row>(this.db, "SELECT * FROM sources WHERE source_id = ?", [sourceId]);
     if (!source) throw new Error("source not found");
@@ -1959,11 +1968,9 @@ export class SourceService {
         const row = dbGet<Row>(this.db, "SELECT date, sheet_path FROM quizzes WHERE quiz_id = ?", [quizId]);
         if (!row) return [];
         const date = String(row.date ?? "");
-        const sheetPath = String(
-          row.sheet_path ?? join(pathFor(this.paths, "quizzes"), date.slice(0, 4), date.slice(5, 7), `${date}.md`),
-        );
+        const sheetPath = this.quizSheetPath(row.sheet_path ? String(row.sheet_path) : undefined, date);
         try {
-          return [{ sheetPath, previous: readFileSync(sheetPath) }];
+          return [{ sheetPath, previous: readFileNoFollow(sheetPath) }];
         } catch (error) {
           if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
             return [{ sheetPath }];
@@ -2008,7 +2015,7 @@ export class SourceService {
       for (const sheet of quizSheetSnapshots) {
         try {
           if (sheet.previous === undefined) await fs.rm(sheet.sheetPath, { force: true });
-          else await fs.writeFile(sheet.sheetPath, sheet.previous, { mode: 0o600 });
+          else atomicWriteFile(sheet.sheetPath, sheet.previous);
         } catch (restoreError) {
           restoreErrors.push(restoreError);
         }

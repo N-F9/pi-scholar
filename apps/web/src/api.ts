@@ -193,7 +193,6 @@ function isSource(value: unknown): value is PublicSourceRecord {
         "capturedAt",
         "digest",
         "errorCode",
-        "errorMessage",
         "createdAt",
         "updatedAt",
       ].includes(field),

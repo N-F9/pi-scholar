@@ -285,11 +285,6 @@ export function AddPage() {
                   <p className="mt-1 text-sm text-muted">
                     {source.kind} · Updated {formatDate(source.updatedAt, { dateStyle: "medium", timeStyle: "short" })}
                   </p>
-                  {source.errorMessage ? (
-                    <p className="mt-2 text-sm text-danger" role="alert">
-                      {source.errorMessage}
-                    </p>
-                  ) : null}
                 </div>
                 {source.status === "published" ? (
                   <Button

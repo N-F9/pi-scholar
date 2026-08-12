@@ -41,15 +41,16 @@ export function sourceRecord(value: Record<string, unknown>): SourceRecord {
 }
 
 export function publicSource(source: SourceRecord): PublicSourceRecord {
-  const { manifestPath: _manifestPath, ...record } = source;
+  const { manifestPath: _manifestPath, errorMessage: _errorMessage, ...record } = source;
   return record;
 }
 
-export type PublicWorkflowRecord = Omit<WorkflowRecord, "message"> & { readonly message?: string };
+export type PublicWorkflowRecord = Omit<WorkflowRecord, "message" | "errorMessage"> & { readonly message?: string };
 
 export function publicWorkflow(workflow: WorkflowRecord): PublicWorkflowRecord {
-  if (workflow.kind !== "quiz-grader") return workflow;
-  const { message: _message, ...record } = workflow;
+  const { errorMessage: _errorMessage, ...withoutErrorMessage } = workflow;
+  if (workflow.kind !== "quiz-grader") return withoutErrorMessage;
+  const { message: _message, ...record } = withoutErrorMessage;
   return record;
 }
 

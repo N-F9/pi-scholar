@@ -348,7 +348,12 @@ export class ScholarApplication {
       new SourceService(this.db, this.paths, defaultSourceAdapters(this.paths, input.adapters?.sources));
     this.wiki =
       input.wikiService ?? new WikiService(this.db, this.paths, defaultWikiAdapters(this.paths, input.adapters?.wiki));
-    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths);
+    const timezoneRow = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [
+      "timezone",
+    ]);
+    const timezone = timezoneRow ? String(jsonValue(timezoneRow.value_json)) : "local";
+    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths, timezone);
+    this.scheduler.setTimezone(timezone);
     this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
     this.worker = new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
@@ -422,6 +427,12 @@ export class ScholarApplication {
         throw error;
       }
     });
+  }
+  private async readSetting<T>(key: string, fallback: T): Promise<T> {
+    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
+    if (!row) return fallback;
+    const value = jsonValue(row.value_json);
+    return (value === undefined ? fallback : value) as T;
   }
   private async mutate<T>(
     context: ApplicationMutationContext | undefined,
@@ -546,21 +557,10 @@ export class ScholarApplication {
       if (substantive(body, section)) requireSectionCitation(body, section);
     }
   }
-  private async readSetting<T>(key: string, fallback: T): Promise<T> {
-    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
-    if (!row) return fallback;
-    return jsonValue(row.value_json) as T;
-  }
   private async currentLocalDate(): Promise<string> {
-    const timezone = await this.readSetting("timezone", "local");
-    if (timezone === "local") return localDate(new Date());
+    const timezone = String(await this.readSetting("timezone", "local"));
     try {
-      return new Intl.DateTimeFormat("en-CA", {
-        timeZone: timezone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).format(new Date());
+      return localDate(new Date(), timezone);
     } catch {
       return localDate(new Date());
     }
@@ -620,7 +620,7 @@ export class ScholarApplication {
         failures.push({
           relativePath: entry.relativePath,
           errorCode: "EXTRACT_FAILED",
-          errorMessage: errorMessage(error).slice(0, 500),
+          errorMessage: "Source extraction failed",
         });
       }
     }
@@ -700,16 +700,16 @@ export class ScholarApplication {
     request: SourceRequest | MechanicsSourceStageRequest,
     context?: ApplicationMutationContext,
   ): Promise<SourceStageResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
+    return this.mutate(context, async () => {
+      const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
+      return this.durableDirect(async () => {
         const entry = (await this.sources.discover()).find(
           (candidate) => candidate.relativePath === staged.relativePath,
         );
         if (!entry) throw new Error("staged source disappeared");
         return { source: publicSource(this.pendingSource(entry)) };
-      }, "source:stage"),
-    );
+      }, "source:stage");
+    });
   }
   async removalPreview(sourceId: string): Promise<{
     readonly source: PublicSourceRecord;
@@ -1180,12 +1180,7 @@ export class ScholarApplication {
       const status = String(workflow.status ?? "unknown");
       if (status === "failed") {
         const errorCode = workflow.error_code ? ` (${String(workflow.error_code)})` : "";
-        const detail = workflow.error_message
-          ? String(workflow.error_message)
-          : workflow.message
-            ? String(workflow.message)
-            : "Workflow failed";
-        return `failed${errorCode}: ${detail}`;
+        return `failed${errorCode}: Workflow failed`;
       }
       return workflow.message ? String(workflow.message) : status;
     };
@@ -1276,6 +1271,7 @@ export class ScholarApplication {
               [key, JSON.stringify(value), now],
             );
         });
+        if (input.timezone !== undefined) this.scheduler.setTimezone(input.timezone);
         return this.getSettings();
       }, "settings:update"),
     );
@@ -2083,7 +2079,6 @@ export class ScholarApplication {
     });
   }
   private async failGradingWorkflow(requestId: string, error: unknown, ownerHash: string): Promise<void> {
-    const message = errorMessage(error).slice(0, 500);
     const code =
       error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "QUIZ_GRADING_FAILED";
     await this.durableDirect(() => {
@@ -2096,7 +2091,13 @@ export class ScholarApplication {
         if (!binding || binding.ownerHash !== ownerHash) return;
         this.db.run(
           "UPDATE workflows SET status = 'failed', finished_at = ?, progress = 0, message = NULL, error_code = ?, error_message = ? WHERE request_id = ? AND kind = 'quiz-grader' AND status = 'running' AND message = ?",
-          [new Date().toISOString(), code, message, requestId, quizGraderBindingText(binding.quizId, ownerHash)],
+          [
+            new Date().toISOString(),
+            code,
+            "Quiz grading failed",
+            requestId,
+            quizGraderBindingText(binding.quizId, ownerHash),
+          ],
         );
       });
     }, "quiz:grade-failure");

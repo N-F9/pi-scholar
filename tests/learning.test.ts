@@ -56,6 +56,19 @@ function question(pageId: string, prompt = "Explain the page") {
     sourceRefs: [],
   };
 }
+test("due eligibility uses the configured timezone for both day and due timestamps", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "timezone-page");
+  const scheduler = new SchedulerService(db, undefined, "America/Los_Angeles");
+  scheduler.ensurePageLearning("timezone-page");
+  db.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", ["2026-08-13T00:30:00.000Z", "timezone-page"]);
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+    ["timezone-page"],
+  );
+  assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
+  db.close();
+});
 test("section parsers keep headed preambles and exclude OKF frontmatter", () => {
   const body = "Meaningful preamble.\n\n# Heading\n\nHeading text.\n";
   const document = pageDocument("parser", body);

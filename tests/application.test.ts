@@ -7,6 +7,7 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
+import { publicSource, publicWorkflow } from "../src/application/projections.js";
 import type { GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
@@ -15,6 +16,28 @@ import { localDate } from "../src/scheduler.js";
 import { initVault } from "../src/vault.js";
 import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
+it("redacts persisted source and workflow diagnostics from public projections", () => {
+  const source = publicSource({
+    sourceId: "source",
+    kind: "text",
+    status: "failed",
+    displayName: "source",
+    errorCode: "EXTRACT_FAILED",
+    errorMessage: "/home/alice/private",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const workflow = publicWorkflow({
+    requestId: "1c4a9f7f-6c19-4b86-9bf8-6d2af3a4e0c2",
+    kind: "ingest",
+    status: "failed",
+    progress: 0,
+    errorCode: "INGEST_FAILED",
+    errorMessage: "/home/alice/private",
+  });
+  assert.equal("errorMessage" in source, false);
+  assert.equal("errorMessage" in workflow, false);
+});
 it("requires non-empty extraction line endpoints", () => {
   const base = { claimId: "claim", preparedId: "prepared", digest: "digest" };
   for (const endpoints of [undefined, [], [0], ["1"]]) {
@@ -1926,11 +1949,12 @@ describe("application capability boundaries", () => {
           endpoints: [1],
         }),
       );
-      const failure = db.get<{ status: string; error_code: string | null }>(
-        "SELECT status, error_code FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
+      const failure = db.get<{ status: string; error_code: string | null; error_message: string | null }>(
+        "SELECT status, error_code, error_message FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
       );
       assert.equal(failure?.status, "failed");
       assert.equal(failure?.error_code, "EXTRACT_FAILED");
+      assert.equal(failure?.error_message, "Source extraction failed");
     } finally {
       await app.close();
       db.close();
@@ -1948,10 +1972,7 @@ describe("application capability boundaries", () => {
       assert.equal(recovered.workflows[0]?.requestId, running.workflow.requestId);
       assert.equal(recovered.workflows[0]?.status, "failed");
       assert.equal(recovered.workflows[0]?.errorCode, "PI_SESSION_INTERRUPTED");
-      assert.equal(
-        recovered.workflows[0]?.errorMessage,
-        "The previous Pi session ended before completing this workflow.",
-      );
+      assert.equal(recovered.workflows[0]?.errorMessage, "Workflow failed");
     } finally {
       await app.close();
       db.close();
@@ -1978,7 +1999,7 @@ describe("application capability boundaries", () => {
 
       const facts = (await app.getSettings()).settings.facts;
       assert.equal(facts.lastIngestAt, failedIngestResult.workflow.finishedAt);
-      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): source packet unavailable");
+      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): Workflow failed");
       assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
       assert.equal(facts.lastLintResult, "lint complete");
     } finally {

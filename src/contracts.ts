@@ -78,7 +78,7 @@ export interface SourceRecord {
   readonly createdAt: IsoDateTime;
   readonly updatedAt: IsoDateTime;
 }
-export type PublicSourceRecord = Omit<SourceRecord, "manifestPath">;
+export type PublicSourceRecord = Omit<SourceRecord, "manifestPath" | "errorMessage">;
 export interface PreparedAdmissionFile {
   readonly relativePath: string;
   readonly byteLength: number;

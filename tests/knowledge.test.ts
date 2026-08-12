@@ -826,7 +826,7 @@ describe("source admission mechanics", () => {
     db.close();
   });
   it("previews page and open-quiz dependents and restores the packet after a failed removal transaction", async () => {
-    const { paths, db, sources, wiki } = await fixture();
+    const { root, paths, db, sources, wiki } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
     const [entry] = await sources.discover();
     const result = await sources.admitClaim(await sources.claim(entry));
@@ -892,6 +892,14 @@ describe("source admission mechanics", () => {
     expect(db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", ["quiz-removal"])?.status).toBe(
       "open",
     );
+    const outsidePath = join(root, "outside.md");
+    const linkedSheetPath = join(paths.quizzesRoot, "linked-sheet.md");
+    await fs.writeFile(outsidePath, "outside sentinel\n");
+    await fs.symlink(outsidePath, linkedSheetPath);
+    originalRun("UPDATE quizzes SET sheet_path = ? WHERE quiz_id = ?", [linkedSheetPath, "quiz-removal"]);
+    await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(/path|symlink/u);
+    expect((await fs.readFile(outsidePath)).toString()).toBe("outside sentinel\n");
+    expect(await fs.stat(result.packetPath)).toBeDefined();
     db.close();
   });
   it("blocks removal while a cited page has an unsettled submitted quiz", async () => {
