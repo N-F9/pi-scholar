@@ -668,6 +668,7 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   assert.throws(() => validateQuizVisibleText(`x${opaqueId}`, [opaqueId]), ValidationError);
   assert.throws(() => validateQuizVisibleText(`x${sourceReference}`, [sourceReference]), ValidationError);
   assert.throws(() => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [opaqueId]), ValidationError);
+  assert.throws(() => validateQuizVisibleText(opaqueId.replace("-", "-\u200b"), [opaqueId]), ValidationError);
   assert.throws(
     () => validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-**$2**"), [opaqueId]),
     ValidationError,

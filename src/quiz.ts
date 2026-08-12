@@ -136,9 +136,13 @@ function isOpaqueIdentifier(value: string): boolean {
 }
 
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly string[]): void {
-  const tokens = [...new Set(hiddenTokens.map((token) => token.trim()).filter(Boolean))];
+  const tokens = [
+    ...new Set(
+      hiddenTokens.map((token) => token.replace(/\p{Default_Ignorable_Code_Point}/gu, "").trim()).filter(Boolean),
+    ),
+  ];
   if (!tokens.length) return;
-  const searchable = `${value}\n${renderedMarkdownValues(value)}`;
+  const searchable = `${value}\n${renderedMarkdownValues(value)}`.replace(/\p{Default_Ignorable_Code_Point}/gu, "");
   const opaqueTokens = tokens.filter(isOpaqueIdentifier);
   const ambiguousTokens = tokens.filter((token) => !isOpaqueIdentifier(token));
   if (
