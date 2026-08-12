@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { promises as fs, type Stats } from "node:fs";
+import { constants, promises as fs, readFileSync, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { type ClientRequest, request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -458,114 +458,238 @@ function assertManifestClaimProvenance(
   if (canonical(manifestProvenance(manifest)) !== canonical(claimProvenance(claim, publication)))
     throw new Error("source packet provenance mismatch");
 }
-type CreatedStagePath = {
-  path: string;
-  identity: PhysicalIdentity;
-  directory: boolean;
+type SourceStageState = "prepared" | "publishing" | "recovery" | "committed";
+type PersistedSourceStage = PreparedSourceStage & {
+  readonly ownerPid?: number;
+  readonly ownerToken?: string;
+  readonly ownerStartedAt?: string;
+  readonly state?: SourceStageState;
+  readonly targetCreated?: boolean;
 };
+const sourceStageOwnerToken = randomUUID();
+const sourceStageOwnerStartedAt = processStartTime(process.pid);
+const failedSourceStagePublications = new Map<string, boolean>();
 
-function sameCreatedStagePath(current: PhysicalIdentity, expected: PhysicalIdentity, directory: boolean): boolean {
-  return (
-    current.device === expected.device &&
-    current.inode === expected.inode &&
-    current.mode === expected.mode &&
-    (directory || (current.size === expected.size && current.mtimeNs === expected.mtimeNs))
-  );
+function errno(error: unknown, ...codes: string[]): boolean {
+  return error instanceof Error && "code" in error && codes.includes((error as NodeJS.ErrnoException).code ?? "");
+}
+function processStartTime(pid: number): string | undefined {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return raw.slice(raw.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
 }
 
-async function linkStageTree(source: string, target: string, created: CreatedStagePath[]): Promise<void> {
+function parseSourceStageDescriptor(value: unknown, stageId: string): PersistedSourceStage {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !("stageId" in value) ||
+    value.stageId !== stageId ||
+    !("relativePath" in value) ||
+    typeof value.relativePath !== "string" ||
+    !("kind" in value) ||
+    typeof value.kind !== "string" ||
+    !SOURCE_KINDS.includes(value.kind as SourceKind) ||
+    !("artifact" in value) ||
+    (value.artifact !== "root" && value.artifact !== "payload")
+  )
+    throw new Error("source stage descriptor is invalid");
+  const relativePath = validRelativePath(value.relativePath);
+  if (relativePath.includes("/")) throw new Error("source stage path is invalid");
+  if (
+    "ownerPid" in value &&
+    value.ownerPid !== undefined &&
+    (typeof value.ownerPid !== "number" || !Number.isInteger(value.ownerPid) || value.ownerPid <= 0)
+  )
+    throw new Error("source stage owner is invalid");
+  if (
+    ("ownerToken" in value &&
+      value.ownerToken !== undefined &&
+      (typeof value.ownerToken !== "string" || value.ownerToken.length === 0)) ||
+    ("ownerStartedAt" in value &&
+      value.ownerStartedAt !== undefined &&
+      (typeof value.ownerStartedAt !== "string" || value.ownerStartedAt.length === 0))
+  )
+    throw new Error("source stage owner identity is invalid");
+  if (
+    "state" in value &&
+    value.state !== undefined &&
+    value.state !== "prepared" &&
+    value.state !== "publishing" &&
+    value.state !== "recovery" &&
+    value.state !== "committed"
+  )
+    throw new Error("source stage state is invalid");
+  const state = "state" in value ? value.state : undefined;
+  const targetCreated = "targetCreated" in value ? value.targetCreated : undefined;
+  if (
+    targetCreated !== undefined &&
+    (typeof targetCreated !== "boolean" || (state !== "recovery" && state !== "committed"))
+  )
+    throw new Error("source stage target state is invalid");
+  return value as PersistedSourceStage;
+}
+
+function stageOwnerAlive(stage: PersistedSourceStage): boolean {
+  if (stage.ownerPid === process.pid) return stage.ownerToken === sourceStageOwnerToken;
+  if (stage.ownerPid === undefined || stage.ownerToken === undefined || stage.ownerStartedAt === undefined)
+    return false;
+  try {
+    process.kill(stage.ownerPid, 0);
+    return processStartTime(stage.ownerPid) === stage.ownerStartedAt;
+  } catch (error) {
+    return errno(error, "EPERM");
+  }
+}
+
+async function withDirectoryHandle(path: string, callback: (directory: string) => Promise<void>): Promise<void> {
+  const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    await callback(`/proc/self/fd/${handle.fd}`);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function linkStageTree(source: string, directory: string, name: string): Promise<void> {
   const sourceStat = await lstatNoFollow(source);
+  const target = join(directory, name);
   if (sourceStat.isDirectory()) {
     await fs.mkdir(target, { recursive: false, mode: 0o700 });
-    const targetStat = await lstatNoFollow(target);
-    created.push({ path: target, identity: statIdentity(targetStat), directory: true });
-    for (const name of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
-      validRelativePath(name);
-      await linkStageTree(join(source, name), join(target, name), created);
-    }
+    await withDirectoryHandle(target, async (child) => {
+      for (const childName of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
+        validRelativePath(childName);
+        await linkStageTree(join(source, childName), child, childName);
+      }
+    });
     return;
   }
   if (!sourceStat.isFile()) throw new Error("source stage payload must be a regular file or directory");
   await fs.link(source, target);
-  const targetStat = await lstatNoFollow(target);
-  created.push({ path: target, identity: statIdentity(targetStat), directory: false });
 }
 
-async function linkStageChildren(source: string, target: string, created: CreatedStagePath[]): Promise<void> {
+async function linkStageChildren(source: string, target: string): Promise<void> {
   const sourceStat = await lstatNoFollow(source);
   if (!sourceStat.isDirectory()) throw new Error("source stage root must be a directory");
-  for (const name of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
-    validRelativePath(name);
-    await linkStageTree(join(source, name), join(target, name), created);
-  }
-}
-
-async function cleanupCreatedStagePaths(created: CreatedStagePath[]): Promise<void> {
-  for (const item of created.toReversed()) {
-    try {
-      const current = await lstatNoFollow(item.path);
-      if (!sameCreatedStagePath(statIdentity(current), item.identity, item.directory)) continue;
-      if (item.directory) {
-        await fs.rmdir(item.path).catch((error: unknown) => {
-          const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
-          if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
-        });
-      } else {
-        await fs.unlink(item.path).catch((error: unknown) => {
-          const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
-          if (code !== "ENOENT") throw error;
-        });
-      }
-    } catch {
-      // A concurrent replacement or write wins; never recursively remove it.
+  await withDirectoryHandle(target, async (directory) => {
+    for (const name of (await fs.readdir(source)).sort((left, right) => left.localeCompare(right))) {
+      validRelativePath(name);
+      await linkStageTree(join(source, name), directory, name);
     }
+  });
+}
+
+async function stageTargetExists(inbox: string, relativePath: string): Promise<boolean> {
+  try {
+    await fs.lstat(join(inbox, relativePath));
+    return true;
+  } catch (error) {
+    if (errno(error, "ENOENT")) return false;
+    throw error;
   }
 }
 
-async function activeStageReservations(work: string, inbox: string): Promise<Set<string>> {
-  const reservations = new Set<string>();
+async function removePrivateStage(work: string, stageId: string): Promise<void> {
+  await fs.rm(safeRelativePath(work, `.source-stage-${stageId}`), { recursive: true, force: true });
+  await fs.rm(safeRelativePath(work, `.source-stage-${stageId}.json`), { force: true });
+}
+
+type StageRecoveryResult = "clear" | "blocked" | "committed";
+async function reconcileStageReservation(
+  work: string,
+  inbox: string,
+  stage: PersistedSourceStage,
+): Promise<StageRecoveryResult> {
+  const state = stage.state ?? "prepared";
+  if (state === "committed") {
+    await removePrivateStage(work, stage.stageId).catch(() => undefined);
+    return "committed";
+  }
+  if (state === "prepared" || (state === "recovery" && stage.targetCreated === false)) {
+    await removePrivateStage(work, stage.stageId);
+    return "clear";
+  }
+  if (!(await stageTargetExists(inbox, stage.relativePath))) {
+    await removePrivateStage(work, stage.stageId);
+    return "clear";
+  }
+  return "blocked";
+}
+
+type StageReservations = {
+  hidden: Set<string>;
+  errors: Map<string, string>;
+};
+async function activeStageReservations(work: string, inbox: string): Promise<StageReservations> {
+  const reservations: StageReservations = { hidden: new Set(), errors: new Map() };
   let names: string[];
   try {
     names = await fs.readdir(work);
   } catch (error) {
-    if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
-      return reservations;
+    if (errno(error, "ENOENT")) return reservations;
     throw error;
   }
   for (const name of names) {
     const match =
       /^\.source-stage-([0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/iu.exec(name);
-    if (!match) continue;
+    if (!match?.[1]) continue;
+    const stageId = match[1];
+    let stage: PersistedSourceStage;
     try {
-      const descriptorPath = safeRelativePath(work, name);
-      const descriptorStat = await lstatNoFollow(descriptorPath);
-      if (!descriptorStat.isFile()) continue;
-      const stageId = match[1];
-      if (!stageId) continue;
-      const stageRoot = safeRelativePath(work, `.source-stage-${stageId}`);
-      const stageRootStat = await lstatNoFollow(stageRoot);
-      if (!stageRootStat.isDirectory()) continue;
-      const descriptor = JSON.parse((await readNoFollow(descriptorPath)).toString("utf8")) as unknown;
-      if (
-        descriptor === null ||
-        typeof descriptor !== "object" ||
-        !("stageId" in descriptor) ||
-        descriptor.stageId !== stageId ||
-        !("relativePath" in descriptor) ||
-        typeof descriptor.relativePath !== "string" ||
-        !("kind" in descriptor) ||
-        typeof descriptor.kind !== "string" ||
-        !SOURCE_KINDS.includes(descriptor.kind as SourceKind) ||
-        !("artifact" in descriptor) ||
-        (descriptor.artifact !== "root" && descriptor.artifact !== "payload")
-      )
+      const descriptor = safeRelativePath(work, name);
+      const descriptorStat = await lstatNoFollow(descriptor);
+      if (!descriptorStat.isFile()) throw new Error("source stage descriptor must be a file");
+      stage = parseSourceStageDescriptor(
+        JSON.parse((await readNoFollow(descriptor)).toString("utf8")) as unknown,
+        stageId,
+      );
+    } catch (error) {
+      if (errno(error, "ENOENT")) continue;
+      throw new Error("source stage reservation is invalid", { cause: error });
+    }
+    const state = stage.state ?? "prepared";
+    let rootPresent = true;
+    try {
+      const rootStat = await lstatNoFollow(safeRelativePath(work, `.source-stage-${stageId}`));
+      if (!rootStat.isDirectory()) throw new Error("source stage root must be a directory");
+    } catch (error) {
+      if (!errno(error, "ENOENT")) {
+        reservations.hidden.add(stage.relativePath);
+        reservations.errors.set(stage.relativePath, "source stage recovery failed");
         continue;
-      const relativePath = validRelativePath(descriptor.relativePath);
-      if (relativePath.includes("/")) continue;
-      safeRelativePath(inbox, relativePath);
-      reservations.add(relativePath);
+      }
+      rootPresent = false;
+    }
+    const ownerAlive = stageOwnerAlive(stage);
+    if (
+      (state === "prepared" && ownerAlive && rootPresent) ||
+      (state === "publishing" &&
+        ownerAlive &&
+        rootPresent &&
+        (stage.ownerPid !== process.pid || !failedSourceStagePublications.has(stageId)))
+    ) {
+      reservations.hidden.add(stage.relativePath);
+      continue;
+    }
+    const failedTarget = failedSourceStagePublications.get(stageId);
+    const recoverable =
+      state === "publishing" && failedTarget !== undefined
+        ? { ...stage, state: "recovery" as const, targetCreated: failedTarget }
+        : stage;
+    try {
+      const result = await reconcileStageReservation(work, inbox, recoverable);
+      if (result === "blocked") {
+        reservations.hidden.add(stage.relativePath);
+        reservations.errors.set(stage.relativePath, "source stage publication requires recovery");
+      } else {
+        failedSourceStagePublications.delete(stageId);
+      }
     } catch {
-      // Malformed or replaced descriptors do not reserve an inbox name.
+      reservations.hidden.add(stage.relativePath);
+      reservations.errors.set(stage.relativePath, "source stage recovery failed");
     }
   }
   return reservations;
@@ -690,84 +814,133 @@ export class SourceService {
     metadata?: StageMetadata,
   ): Promise<PreparedSourceStage> {
     const prepared: PreparedSourceStage = { stageId, relativePath, kind, artifact, ...(metadata ? { metadata } : {}) };
-    await fs.writeFile(this.sourceStageDescriptor(stageId), `${JSON.stringify(prepared)}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    });
+    const descriptor: PersistedSourceStage = {
+      ...prepared,
+      ownerPid: process.pid,
+      ownerToken: sourceStageOwnerToken,
+      ownerStartedAt: sourceStageOwnerStartedAt,
+      state: "prepared",
+    };
+    atomicWriteFile(this.sourceStageDescriptor(stageId), `${JSON.stringify(descriptor)}\n`);
     return prepared;
   }
-  private async loadSourceStage(stageId: string): Promise<PreparedSourceStage> {
-    const descriptor = JSON.parse(
-      (await readNoFollow(this.sourceStageDescriptor(stageId))).toString("utf8"),
-    ) as unknown;
-    if (!descriptor || typeof descriptor !== "object") throw new Error("source stage descriptor is invalid");
-    if (!("stageId" in descriptor) || descriptor.stageId !== stageId) throw new Error("source stage id mismatch");
-    if (!("relativePath" in descriptor) || typeof descriptor.relativePath !== "string")
-      throw new Error("source stage path is invalid");
+  private async readSourceStage(stageId: string): Promise<PersistedSourceStage> {
+    return parseSourceStageDescriptor(
+      JSON.parse((await readNoFollow(this.sourceStageDescriptor(stageId))).toString("utf8")) as unknown,
+      stageId,
+    );
+  }
+  private async loadSourceStage(stageId: string): Promise<PersistedSourceStage> {
+    const descriptor = await this.readSourceStage(stageId);
     if (
-      !("kind" in descriptor) ||
-      typeof descriptor.kind !== "string" ||
-      !SOURCE_KINDS.includes(descriptor.kind as SourceKind)
+      descriptor.ownerPid !== process.pid ||
+      descriptor.ownerToken !== sourceStageOwnerToken ||
+      descriptor.state !== "prepared" ||
+      !stageOwnerAlive(descriptor)
     )
-      throw new Error("source stage kind is invalid");
-    if (!("artifact" in descriptor) || (descriptor.artifact !== "root" && descriptor.artifact !== "payload"))
-      throw new Error("source stage artifact is invalid");
-    return descriptor as PreparedSourceStage;
+      throw new Error("source stage is not owned by this process");
+    return descriptor;
   }
   async publishPreparedStage(stage: PreparedSourceStage): Promise<InboxEntry> {
     const prepared = await this.loadSourceStage(stage.stageId);
-    const root = this.sourceStageRoot(prepared.stageId);
-    const rootStat = await lstatNoFollow(root);
-    if (!rootStat.isDirectory()) throw new Error("source stage root must be a directory");
-    const source = prepared.artifact === "root" ? root : join(root, "payload");
-    const sourceStat = await lstatNoFollow(source);
-    if (!sourceStat.isFile() && !sourceStat.isDirectory())
-      throw new Error("source stage payload must be a regular file or directory");
-    const metadata = prepared.artifact === "root" ? await stagedMetadata(source) : undefined;
-    if (prepared.artifact === "root" && (!metadata || metadata.kind !== prepared.kind))
-      throw new Error("source stage metadata is invalid");
-    await this.ensureInbox();
-    const target = safeRelativePath(this.inbox(), prepared.relativePath);
-    const descriptor = this.sourceStageDescriptor(prepared.stageId);
-    const created: CreatedStagePath[] = [];
+    const descriptorPath = this.sourceStageDescriptor(prepared.stageId);
+    const publishing: PersistedSourceStage = {
+      ...prepared,
+      ownerPid: process.pid,
+      ownerToken: sourceStageOwnerToken,
+      ownerStartedAt: sourceStageOwnerStartedAt,
+      state: "publishing",
+    };
+    let targetCreated = false;
     try {
+      const root = this.sourceStageRoot(prepared.stageId);
+      const rootStat = await lstatNoFollow(root);
+      if (!rootStat.isDirectory()) throw new Error("source stage root must be a directory");
+      const source = prepared.artifact === "root" ? root : join(root, "payload");
+      const sourceStat = await lstatNoFollow(source);
+      if (!sourceStat.isFile() && !sourceStat.isDirectory())
+        throw new Error("source stage payload must be a regular file or directory");
+      const metadata = prepared.artifact === "root" ? await stagedMetadata(source) : undefined;
+      if (prepared.artifact === "root" && (!metadata || metadata.kind !== prepared.kind))
+        throw new Error("source stage metadata is invalid");
+      await this.ensureInbox();
+      const target = join(this.inbox(), prepared.relativePath);
+      atomicWriteFile(descriptorPath, `${JSON.stringify(publishing)}\n`);
       let targetStat: Stats;
       if (sourceStat.isFile()) {
         await fs.link(source, target);
+        targetCreated = true;
         targetStat = await lstatNoFollow(target);
-        created.push({ path: target, identity: statIdentity(targetStat), directory: false });
       } else {
         await fs.mkdir(target, { recursive: false, mode: 0o700 });
+        targetCreated = true;
+        const initialTarget = statIdentity(await lstatNoFollow(target));
+        await linkStageChildren(source, target);
         targetStat = await lstatNoFollow(target);
-        created.push({ path: target, identity: statIdentity(targetStat), directory: true });
-        await linkStageChildren(source, target, created);
+        if (
+          statIdentity(targetStat).device !== initialTarget.device ||
+          statIdentity(targetStat).inode !== initialTarget.inode
+        )
+          throw new Error("source stage target changed during publication");
         if (prepared.artifact === "root") {
           const publishedMetadata = await stagedMetadata(target);
           if (!publishedMetadata || publishedMetadata.kind !== prepared.kind)
             throw new Error("published source metadata is invalid");
         }
-        targetStat = await lstatNoFollow(target);
       }
-      await fs.rm(root, { recursive: true, force: true });
-      await fs.rm(descriptor, { force: true });
-      return {
+      const result: InboxEntry = {
         relativePath: prepared.relativePath,
         absolutePath: target,
         kind: prepared.kind,
         identity: statIdentity(targetStat),
         ...(metadata ? { metadata } : {}),
       };
+      const committed: PersistedSourceStage = { ...publishing, state: "committed", targetCreated: true };
+      atomicWriteFile(descriptorPath, `${JSON.stringify(committed)}\n`);
+      failedSourceStagePublications.delete(prepared.stageId);
+      await removePrivateStage(this.work(), prepared.stageId).catch(() => undefined);
+      return result;
     } catch (error) {
-      await cleanupCreatedStagePaths(created);
-      await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
-      await fs.rm(descriptor, { force: true }).catch(() => undefined);
+      failedSourceStagePublications.set(prepared.stageId, targetCreated);
+      const recovery: PersistedSourceStage = { ...publishing, state: "recovery", targetCreated };
+      if (!targetCreated) {
+        try {
+          await removePrivateStage(this.work(), prepared.stageId);
+          failedSourceStagePublications.delete(prepared.stageId);
+        } catch (cleanupError) {
+          try {
+            atomicWriteFile(descriptorPath, `${JSON.stringify(recovery)}\n`);
+          } catch {
+            // The publishing descriptor and local failure record remain fail-closed.
+          }
+          throw new AggregateError([error, cleanupError], "source stage publication cleanup failed", { cause: error });
+        }
+        throw error;
+      }
+      try {
+        atomicWriteFile(descriptorPath, `${JSON.stringify(recovery)}\n`);
+      } catch {
+        // The publishing descriptor and local failure record remain fail-closed.
+      }
       throw error;
     }
   }
   async cleanupPreparedStage(stage: PreparedSourceStage): Promise<void> {
-    const root = this.sourceStageRoot(stage.stageId);
-    await fs.rm(root, { recursive: true, force: true });
-    await fs.rm(this.sourceStageDescriptor(stage.stageId), { force: true });
+    try {
+      const persisted = await this.readSourceStage(stage.stageId);
+      const failedTarget = failedSourceStagePublications.get(stage.stageId);
+      const recoverable =
+        persisted.state === "publishing" && failedTarget !== undefined
+          ? { ...persisted, state: "recovery" as const, targetCreated: failedTarget }
+          : persisted;
+      if ((await reconcileStageReservation(this.work(), this.inbox(), recoverable)) === "blocked")
+        throw new Error("source stage publication requires recovery");
+      failedSourceStagePublications.delete(stage.stageId);
+    } catch (error) {
+      if (!errno(error, "ENOENT")) throw error;
+      await removePrivateStage(this.work(), stage.stageId);
+      failedSourceStagePublications.delete(stage.stageId);
+    }
   }
   private async stageEnvelope(metadata: StageMetadata, bytes: Uint8Array): Promise<PreparedSourceStage> {
     const { stageId, root } = await this.privateStageRoot();
@@ -1017,8 +1190,18 @@ export class SourceService {
     const inbox = this.inbox();
     const entries: InboxEntry[] = [];
     const reservations = await activeStageReservations(this.work(), inbox);
+    for (const [name, error] of reservations.errors) {
+      entries.push({
+        relativePath: name,
+        absolutePath: join(inbox, name),
+        kind: "text",
+        identity: { device: "", inode: "", mode: 0, size: 0, mtimeNs: "" },
+        digest: `error:${error}`,
+        error,
+      });
+    }
     for (const name of (await fs.readdir(inbox)).sort((a, b) => a.localeCompare(b))) {
-      if (reservations.has(name)) continue;
+      if (reservations.hidden.has(name)) continue;
       const path = join(inbox, name);
       try {
         const stat = await lstatNoFollow(path);
