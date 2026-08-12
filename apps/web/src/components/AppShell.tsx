@@ -27,7 +27,7 @@ export function AppShell() {
   const previousPath = useRef(location.pathname);
 
   useEffect(() => {
-    const pathname = location.pathname.replace(/\/+$/, "") || "/";
+    const pathname = location.pathname.toLowerCase().replace(/\/+$/, "") || "/";
     const routeTitle =
       primary.find((item) => item.to === pathname)?.label ??
       secondary.find((item) => item.to === pathname)?.label ??
