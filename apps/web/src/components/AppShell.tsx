@@ -27,6 +27,7 @@ export function AppShell() {
   const params = new URLSearchParams(location.search);
   const contentPath = JSON.stringify([location.pathname, params.get("pageId"), params.get("path")]);
   const previousContentPath = useRef(contentPath);
+  const previousPathname = useRef(location.pathname);
 
   useEffect(() => {
     const pathname = location.pathname.toLowerCase().replace(/\/+$/, "") || "/";
@@ -36,8 +37,9 @@ export function AppShell() {
       (/^\/history\/[^/]+$/.test(pathname) ? "Quiz history" : "Page not found");
     document.title = `${routeTitle} · Pi Scholar`;
     if (previousContentPath.current !== contentPath) {
-      main.current?.focus({ preventScroll: true });
+      main.current?.focus({ preventScroll: previousPathname.current === location.pathname });
       previousContentPath.current = contentPath;
+      previousPathname.current = location.pathname;
     }
   }, [contentPath, location.pathname]);
 
