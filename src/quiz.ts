@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import type {
   PageLearningRecord,
   QuizEvidenceRecord,
@@ -125,33 +127,47 @@ function renderedMarkdownValues(value: string): string {
     }
     return typeof record.value === "string" ? record.value : "";
   };
-  return [render(fromMarkdown(value)), ...properties].join("\n");
-}
-
-function isOpaqueIdentifier(value: string): boolean {
-  return (
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::\d+)?$/iu.test(value) ||
-    /^[0-9a-f]{64}$/iu.test(value)
-  );
-}
-
-export function validateQuizVisibleText(value: string, hiddenTokens: readonly string[]): void {
-  const tokens = [
-    ...new Set(
-      hiddenTokens.map((token) => token.replace(/\p{Default_Ignorable_Code_Point}/gu, "").trim()).filter(Boolean),
+  return [
+    render(
+      fromMarkdown(value, {
+        extensions: [gfm()],
+        mdastExtensions: [gfmFromMarkdown()],
+      }),
     ),
-  ];
-  if (!tokens.length) return;
+    ...properties,
+  ].join("\n");
+}
+
+export interface QuizVisibleTextToken {
+  readonly value: string;
+  readonly match: "boundary" | "substring";
+}
+function boundaryToken(value: string): QuizVisibleTextToken {
+  return { value, match: "boundary" };
+}
+
+function substringToken(value: string): QuizVisibleTextToken {
+  return { value, match: "substring" };
+}
+
+export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
+  const tokens = new Map<string, QuizVisibleTextToken["match"]>();
+  for (const token of hiddenTokens) {
+    const normalized = token.value.replace(/\p{Default_Ignorable_Code_Point}/gu, "").trim();
+    if (!normalized) continue;
+    if (token.match === "substring" || !tokens.has(normalized)) tokens.set(normalized, token.match);
+  }
+  if (!tokens.size) return;
   const searchable = `${value}\n${renderedMarkdownValues(value)}`.replace(/\p{Default_Ignorable_Code_Point}/gu, "");
-  const opaqueTokens = tokens.filter(isOpaqueIdentifier);
-  const ambiguousTokens = tokens.filter((token) => !isOpaqueIdentifier(token));
+  const substringTokens = [...tokens].filter(([, match]) => match === "substring").map(([token]) => token);
+  const boundaryTokens = [...tokens].filter(([, match]) => match === "boundary").map(([token]) => token);
   if (
-    (opaqueTokens.length && new RegExp(`(?:${opaqueTokens.map(escapeRegExp).join("|")})`, "iu").test(searchable)) ||
-    (ambiguousTokens.length &&
-      new RegExp(
-        `(?<![\\p{L}\\p{N}_])(?:${ambiguousTokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`,
-        "iu",
-      ).test(searchable))
+    (substringTokens.length &&
+      new RegExp(`(?:${substringTokens.map(escapeRegExp).join("|")})`, "iu").test(searchable)) ||
+    (boundaryTokens.length &&
+      new RegExp(`(?<![\\p{L}\\p{N}_])(?:${boundaryTokens.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`, "iu").test(
+        searchable,
+      ))
   ) {
     throw new ValidationError("Quiz Markdown contains private metadata");
   }
@@ -913,31 +929,37 @@ export class QuizService {
     quiz: QuizRecord,
     evidence?: readonly QuizEvidenceRecord[],
     requestId?: string,
-  ): readonly string[] {
+  ): readonly QuizVisibleTextToken[] {
     const evidenceTokens = evidence
-      ? evidence.flatMap((item) => [item.reference, item.pageId, item.pageDigest, item.textDigest])
+      ? evidence.flatMap((item) => [
+          substringToken(item.reference),
+          boundaryToken(item.pageId),
+          substringToken(item.pageDigest),
+          substringToken(item.textDigest),
+        ])
       : this.db
           .all<Record<string, unknown>>(
             "SELECT reference, page_id, page_digest, text_digest FROM quiz_evidence WHERE quiz_id = ?",
             quiz.quizId,
           )
           .flatMap((row) =>
-            [row.reference, row.page_id, row.page_digest, row.text_digest].filter(
-              (value): value is string => typeof value === "string",
-            ),
+            [
+              typeof row.reference === "string" ? substringToken(row.reference) : undefined,
+              typeof row.page_id === "string" ? boundaryToken(row.page_id) : undefined,
+              typeof row.page_digest === "string" ? substringToken(row.page_digest) : undefined,
+              typeof row.text_digest === "string" ? substringToken(row.text_digest) : undefined,
+            ].filter((token): token is QuizVisibleTextToken => Boolean(token)),
           );
     return [
-      ...new Set([
-        quiz.quizId,
-        ...quiz.questions.flatMap((question) => [
-          question.questionId,
-          ...question.pages.flatMap((page) => [page.pageId, page.criterion]),
-          ...(question.sourceRefs ?? []),
-        ]),
-        ...evidenceTokens,
-        ...(requestId ? [requestId] : []),
+      substringToken(quiz.quizId),
+      ...quiz.questions.flatMap((question) => [
+        substringToken(question.questionId),
+        ...question.pages.flatMap((page) => [boundaryToken(page.pageId), substringToken(page.criterion)]),
+        ...(question.sourceRefs ?? []).map(boundaryToken),
       ]),
-    ].filter(Boolean);
+      ...evidenceTokens,
+      ...(requestId ? [substringToken(requestId)] : []),
+    ];
   }
 
   private mapQuiz(row: Record<string, unknown>): QuizRecord {
@@ -1158,16 +1180,18 @@ export class QuizService {
     for (const question of specs) {
       if (!question || (question.kind !== "free-response" && question.kind !== "multiple-choice"))
         throw new ValidationError("Question kind is invalid");
-      const opaqueTokens = [
-        ...selectedPageIds,
+      const boundaryTokens = [
+        ...selectedPageIds.map(boundaryToken),
         ...(Array.isArray(question.sourceRefs)
-          ? question.sourceRefs.filter((reference): reference is string => typeof reference === "string")
+          ? question.sourceRefs
+              .filter((reference): reference is string => typeof reference === "string")
+              .map(boundaryToken)
           : []),
       ];
       const prompt = question.prompt.trim();
       if (!prompt || FORBIDDEN_SHEET_TEXT.test(prompt))
         throw new ValidationError("Question prompts must be nonempty and answer-key-free");
-      validateQuizVisibleText(prompt, opaqueTokens);
+      validateQuizVisibleText(prompt, boundaryTokens);
       if (!Array.isArray(question.pages) || !question.pages.length)
         throw new ValidationError("Every question must cover at least one wiki page");
       const pageIds = question.pages.map((page) => (page && typeof page.pageId === "string" ? page.pageId.trim() : ""));
@@ -1203,7 +1227,7 @@ export class QuizService {
       for (const choice of question.choices ?? []) {
         if (!choice.trim() || FORBIDDEN_SHEET_TEXT.test(choice))
           throw new ValidationError("Question options must be nonempty and answer-key-free");
-        validateQuizVisibleText(choice, opaqueTokens);
+        validateQuizVisibleText(choice, boundaryTokens);
       }
     }
     if (covered.size !== selected.size || [...selected].some((pageId) => !covered.has(pageId)))
@@ -1312,14 +1336,17 @@ export class QuizService {
     }
   }
 
-  private validateAnswerText(answer: string | readonly string[], hiddenTokens: readonly string[] = []): void {
+  private validateAnswerText(
+    answer: string | readonly string[],
+    hiddenTokens: readonly QuizVisibleTextToken[] = [],
+  ): void {
     const text = answerText(answer);
     validateQuizVisibleText(text, hiddenTokens);
     if (FORBIDDEN_SHEET_TEXT.test(text) || /^#{1,6}\s/mu.test(text))
       throw new ValidationError("Answers may not contain private grading material or structural Markdown");
   }
 
-  private validateFeedback(feedback: string, hiddenTokens: readonly string[] = []): void {
+  private validateFeedback(feedback: string, hiddenTokens: readonly QuizVisibleTextToken[] = []): void {
     validateQuizVisibleText(feedback, hiddenTokens);
     if (FORBIDDEN_SHEET_TEXT.test(feedback))
       throw new ValidationError("Feedback may not contain private grading material");
@@ -1504,7 +1531,7 @@ export class QuizService {
     return { quiz, questions, pages };
   }
 
-  private validateRenderedSheet(markdown: string, hiddenTokens: readonly string[] = []): void {
+  private validateRenderedSheet(markdown: string, hiddenTokens: readonly QuizVisibleTextToken[] = []): void {
     if (
       !markdown.trim() ||
       FORBIDDEN_SHEET_TEXT.test(markdown) ||

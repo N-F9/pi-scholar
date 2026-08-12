@@ -665,16 +665,41 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   const pageDigest = db.get<{ digest: string }>("SELECT digest FROM pages WHERE page_id = ?", ["p1"])!.digest;
   const opaqueId = randomUUID();
   const sourceReference = `${randomUUID()}:0`;
-  assert.throws(() => validateQuizVisibleText(`x${opaqueId}`, [opaqueId]), ValidationError);
-  assert.throws(() => validateQuizVisibleText(`x${sourceReference}`, [sourceReference]), ValidationError);
-  assert.throws(() => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [opaqueId]), ValidationError);
-  assert.throws(() => validateQuizVisibleText(opaqueId.replace("-", "-\u200b"), [opaqueId]), ValidationError);
   assert.throws(
-    () => validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-**$2**"), [opaqueId]),
+    () => validateQuizVisibleText(`x${opaqueId}`, [{ value: opaqueId, match: "substring" }]),
     ValidationError,
   );
-  assert.throws(() => validateQuizVisibleText(`x${pageDigest}`, [pageDigest]), ValidationError);
-  assert.doesNotThrow(() => validateQuizVisibleText("xp1", ["p1"]));
+  assert.throws(
+    () => validateQuizVisibleText(`x${sourceReference}`, [{ value: sourceReference, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace("-", "-\u200b"), [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-**$2**"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-~~$2~~"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x${pageDigest}`, [{ value: pageDigest, match: "substring" }]),
+    ValidationError,
+  );
+  assert.doesNotThrow(() => validateQuizVisibleText("xp1", [{ value: "p1", match: "boundary" }]));
   const storedCriterion = "Stored grading criterion";
   assert.throws(
     () =>
@@ -783,6 +808,17 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
         requestId: randomUUID(),
         submissionId: "hidden-criterion-feedback",
         questions: [{ questionId, feedback: storedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-letter-adjacent-criterion-feedback",
+        questions: [{ questionId, feedback: `x${storedCriterion}` }],
         pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
       }),
     ValidationError,
