@@ -2334,7 +2334,8 @@ describe("application capability boundaries", () => {
       );
       assert.equal(failure?.status, "failed");
       assert.equal(failure?.error_code, "EXTRACT_FAILED");
-      assert.equal(failure?.error_message, "Source extraction failed");
+      assert.equal(failure?.error_message, "prepared extraction digest mismatch");
+      assert.ok(Buffer.byteLength(failure.error_message, "utf8") <= 500);
     } finally {
       await app.close();
       db.close();

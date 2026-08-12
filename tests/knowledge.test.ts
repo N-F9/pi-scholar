@@ -158,20 +158,26 @@ describe("source admission mechanics", () => {
     expect(staged.kind).toBe("directory");
     db.close();
   });
-  it("keeps prepared directory payloads out of the inbox until publication", async () => {
+  it("keeps prepared directory envelopes private until atomic publication", async () => {
     const { root, paths, db, sources } = await fixture();
     const directory = join(root, "prepared-directory");
     await fs.mkdir(directory);
     await fs.writeFile(join(directory, "notes.txt"), "private\n");
     const prepared = await sources.prepareStage({ path: directory });
+    expect(Object.keys(prepared)).toEqual(["stageId"]);
     expect(await sources.discover()).toEqual([]);
     expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+
     const published = await sources.publishPreparedStage(prepared);
-    expect(published.kind).toBe("directory");
+    expect(published).toMatchObject({
+      kind: "directory",
+      metadata: { displayName: "prepared-directory", originalName: "prepared-directory" },
+    });
+    expect(published.relativePath).toMatch(/^[0-9a-f-]{36}\.pi-scholar$/u);
     expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([published.relativePath]);
     db.close();
   });
-  it("keeps in-progress directory publications out of discovery", async () => {
+  it("keeps an envelope out of discovery while its atomic rename is pending", async () => {
     const { root, db, sources } = await fixture();
     const directory = join(root, "publishing-directory");
     await fs.mkdir(directory);
@@ -179,11 +185,11 @@ describe("source admission mechanics", () => {
     const prepared = await sources.prepareStage({ path: directory });
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const realLink = fs.link.bind(fs);
-    const link = vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
+    const realRename = fs.rename.bind(fs);
+    const rename = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
       entered.resolve();
       await release.promise;
-      await realLink(from, to);
+      await realRename(from, to);
     });
     const publication = sources.publishPreparedStage(prepared);
     await entered.promise;
@@ -191,205 +197,100 @@ describe("source admission mechanics", () => {
       expect(await sources.discover()).toEqual([]);
     } finally {
       release.resolve();
-      link.mockRestore();
+      rename.mockRestore();
     }
-    expect((await publication).relativePath).toBe(prepared.relativePath);
+    expect((await publication).relativePath).toMatch(/\.pi-scholar$/u);
     db.close();
   });
-  it("rejects preexisting prepared targets without replacing direct bytes", async () => {
+  it("publishes to generated envelopes without replacing same-name direct drops", async () => {
     const { root, paths, db, sources } = await fixture();
-    const filePrepared = await sources.prepareStage({ kind: "text", text: "prepared\n", name: "race.txt" });
-    const fileTarget = join(paths.inboxRoot, filePrepared.relativePath);
-    await fs.writeFile(fileTarget, "direct-file\n");
-    await expect(sources.publishPreparedStage(filePrepared)).rejects.toMatchObject({ code: "EEXIST" });
-    expect(await fs.readFile(fileTarget, "utf8")).toBe("direct-file\n");
+    await fs.writeFile(join(paths.inboxRoot, "race.txt"), "direct-file\n");
+    await fs.mkdir(join(paths.inboxRoot, "race-directory"));
+    await fs.writeFile(join(paths.inboxRoot, "race-directory", "direct.txt"), "direct-directory\n");
 
-    const directory = join(root, "race-directory-source");
+    const file = join(root, "file.txt");
+    await fs.writeFile(file, "prepared-file\n");
+    const directory = join(root, "directory");
     await fs.mkdir(directory);
     await fs.writeFile(join(directory, "prepared.txt"), "prepared-directory\n");
-    const directoryPrepared = await sources.prepareStage({ path: directory, name: "race-directory" });
-    const directoryTarget = join(paths.inboxRoot, directoryPrepared.relativePath);
-    await fs.mkdir(directoryTarget);
-    await fs.writeFile(join(directoryTarget, "direct.txt"), "direct-directory\n");
-    await expect(sources.publishPreparedStage(directoryPrepared)).rejects.toMatchObject({ code: "EEXIST" });
-    expect(await fs.readFile(join(directoryTarget, "direct.txt"), "utf8")).toBe("direct-directory\n");
+    const publishedFile = await sources.stage({ path: file, name: "race.txt" });
+    const publishedDirectory = await sources.stage({ path: directory, name: "race-directory" });
+
+    expect(publishedFile.relativePath).not.toBe("race.txt");
+    expect(publishedDirectory.relativePath).not.toBe("race-directory");
+    expect(publishedFile.metadata?.originalName).toBe("race.txt");
+    expect(publishedDirectory.metadata?.originalName).toBe("race-directory");
+    expect(await fs.readFile(join(paths.inboxRoot, "race.txt"), "utf8")).toBe("direct-file\n");
+    expect(await fs.readFile(join(paths.inboxRoot, "race-directory", "direct.txt"), "utf8")).toBe("direct-directory\n");
     expect(new Set((await sources.discover()).map((entry) => entry.relativePath))).toEqual(
-      new Set([filePrepared.relativePath, directoryPrepared.relativePath]),
+      new Set(["race.txt", "race-directory", publishedFile.relativePath, publishedDirectory.relativePath]),
     );
     db.close();
   });
-  it("rejects symlink targets without retaining a prepared reservation", async () => {
-    const { root, paths, db, sources } = await fixture();
-    const outside = join(root, "outside.txt");
-    await fs.writeFile(outside, "outside\n");
-    const prepared = await sources.prepareStage({ kind: "text", text: "prepared\n", name: "symlink.txt" });
-    const target = join(paths.inboxRoot, prepared.relativePath);
-    await fs.symlink(outside, target);
+  it("rejects mutated prepared handles before resolving an inbox path", async () => {
+    const { paths, db, sources } = await fixture();
+    const prepared = await sources.prepareStage({ text: "private\n" });
+    Object.assign(prepared, { relativePath: "../../outside.txt" });
 
-    await expect(sources.publishPreparedStage(prepared)).rejects.toMatchObject({ code: "EEXIST" });
-    const [entry] = await sources.discover();
-    expect(entry).toMatchObject({ relativePath: prepared.relativePath });
-    expect(entry?.error).toContain("symlink");
-    expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toEqual([]);
+    await expect(sources.publishPreparedStage(prepared)).rejects.toThrow("source stage is not owned");
+    expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+    await sources.cleanupPreparedStage(prepared);
     db.close();
   });
-  it("reclaims abandoned prepared stages without hiding later inbox entries", async () => {
+  it("discovers a complete envelope left by an interrupted atomic publication", async () => {
     const { root, paths, db, sources } = await fixture();
-    const source = join(root, "stale.txt");
-    await fs.writeFile(source, "prepared\n");
-    const prepared = await sources.prepareStage({ path: source });
-    const descriptor = join(paths.workRoot, `.source-stage-${prepared.stageId}.json`);
-    const stale = JSON.parse(await fs.readFile(descriptor, "utf8")) as Record<string, unknown>;
-    stale.ownerToken = "stale-process";
-    await fs.writeFile(descriptor, `${JSON.stringify(stale)}\n`);
-    const target = join(paths.inboxRoot, prepared.relativePath);
-    await fs.writeFile(target, "direct\n");
-
-    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([prepared.relativePath]);
-    expect(await fs.readFile(target, "utf8")).toBe("direct\n");
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toEqual([]);
-    db.close();
-  });
-  it("clears stale prepared stages without hiding direct symlink errors", async () => {
-    const { root, paths, db, sources } = await fixture();
-    const source = join(root, "stale-symlink.txt");
-    await fs.writeFile(source, "prepared\n");
-    const prepared = await sources.prepareStage({ path: source });
-    const descriptor = join(paths.workRoot, `.source-stage-${prepared.stageId}.json`);
-    const stale = JSON.parse(await fs.readFile(descriptor, "utf8")) as Record<string, unknown>;
-    stale.ownerToken = "stale-process";
-    await fs.writeFile(descriptor, `${JSON.stringify(stale)}\n`);
-    await fs.symlink(source, join(paths.inboxRoot, prepared.relativePath));
-    await fs.writeFile(join(paths.inboxRoot, "visible.txt"), "visible\n");
+    const directory = join(root, "atomic-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "directory\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    const relativePath = "interrupted.pi-scholar";
+    await fs.rename(join(paths.workRoot, `.source-stage-${prepared.stageId}`), join(paths.inboxRoot, relativePath));
 
     const entries = await sources.discover();
-    expect(entries.map((entry) => entry.relativePath)).toEqual(["visible.txt", prepared.relativePath]);
-    expect(entries[1]?.error).toContain("symlink");
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toEqual([]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      relativePath,
+      kind: "directory",
+      metadata: { originalName: "atomic-directory" },
+    });
+    expect((await sources.claim(entries[0]!)).snapshot.files.map((file) => file.path)).toEqual(["notes.txt"]);
     db.close();
   });
-  it("releases live prepared reservations whose private root is gone", async () => {
+  it("cannot expose a partial target when atomic publication and cleanup fail", async () => {
     const { root, paths, db, sources } = await fixture();
-    const source = join(root, "rootless-prepared.txt");
-    await fs.writeFile(source, "prepared\n");
-    const prepared = await sources.prepareStage({ path: source });
-    await fs.rm(join(paths.workRoot, `.source-stage-${prepared.stageId}`), { recursive: true });
-    const target = join(paths.inboxRoot, prepared.relativePath);
-    await fs.writeFile(target, "direct\n");
-
-    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([prepared.relativePath]);
-    expect(await fs.readFile(target, "utf8")).toBe("direct\n");
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toEqual([]);
-    db.close();
-  });
-  it("preserves unowned targets left beside abandoned publications", async () => {
-    const { root, paths, db, sources } = await fixture();
-    const source = join(root, "staged-directory");
-    await fs.mkdir(source);
-    await fs.writeFile(join(source, "notes.txt"), "prepared\n");
-    const prepared = await sources.prepareStage({ path: source, name: "direct-directory" });
-    const descriptor = join(paths.workRoot, `.source-stage-${prepared.stageId}.json`);
-    const abandoned = JSON.parse(await fs.readFile(descriptor, "utf8")) as Record<string, unknown>;
-    abandoned.ownerToken = "stale-process";
-    abandoned.state = "publishing";
-    await fs.writeFile(descriptor, `${JSON.stringify(abandoned)}\n`);
-    const target = join(paths.inboxRoot, prepared.relativePath);
-    await fs.mkdir(target);
-
-    expect(await sources.discover()).toEqual([
-      expect.objectContaining({
-        relativePath: prepared.relativePath,
-        error: "source stage publication requires recovery",
-      }),
-    ]);
-    expect((await fs.lstat(target)).isDirectory()).toBe(true);
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toHaveLength(2);
-    db.close();
-  });
-  it("preserves inbox bytes changed after an abandoned hard-link publication", async () => {
-    const { root, paths, db, sources } = await fixture();
-    const source = join(root, "hard-link.txt");
-    await fs.writeFile(source, "prepared\n");
-    const prepared = await sources.prepareStage({ path: source });
-    const stageRoot = join(paths.workRoot, `.source-stage-${prepared.stageId}`);
-    const stagedPayload = join(stageRoot, "payload");
-    const descriptor = join(paths.workRoot, `.source-stage-${prepared.stageId}.json`);
-    const abandoned = JSON.parse(await fs.readFile(descriptor, "utf8")) as Record<string, unknown>;
-    abandoned.ownerToken = "stale-process";
-    abandoned.state = "publishing";
-    await fs.writeFile(descriptor, `${JSON.stringify(abandoned)}\n`);
-    const target = join(paths.inboxRoot, prepared.relativePath);
-    await fs.link(stagedPayload, target);
-    await fs.writeFile(target, "direct bytes changed through inbox\n");
-
-    expect(await sources.discover()).toEqual([
-      expect.objectContaining({
-        relativePath: prepared.relativePath,
-        error: "source stage publication requires recovery",
-      }),
-    ]);
-    expect(await fs.readFile(target, "utf8")).toBe("direct bytes changed through inbox\n");
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toHaveLength(2);
-    db.close();
-  });
-  it("retains recovery state until partial publication cleanup succeeds", async () => {
-    const { root, paths, db, sources } = await fixture();
-    const source = join(root, "partial-source");
-    await fs.mkdir(source);
-    await fs.mkdir(join(source, "a-empty"));
-    await fs.writeFile(join(source, "b.txt"), "b\n");
-    await fs.writeFile(join(source, "c.txt"), "c\n");
-    const prepared = await sources.prepareStage({ path: source, name: "partial-target" });
-    const realLink = fs.link.bind(fs);
-    let links = 0;
+    const directory = join(root, "failed-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
     const publicationFailure = Object.assign(new Error("publication blocked"), { code: "EIO" });
-    const link = vi.spyOn(fs, "link").mockImplementation(async (from, to) => {
-      if (++links === 2) throw publicationFailure;
-      await realLink(from, to);
+    const cleanupFailure = Object.assign(new Error("cleanup blocked"), { code: "EACCES" });
+    const realRm = fs.rm.bind(fs);
+    const rename = vi.spyOn(fs, "rename").mockRejectedValue(publicationFailure);
+    const rm = vi.spyOn(fs, "rm").mockImplementation(async (path, options) => {
+      if (String(path).includes(".source-stage-")) throw cleanupFailure;
+      await realRm(path, options);
     });
     try {
-      await expect(sources.publishPreparedStage(prepared)).rejects.toThrow("publication blocked");
-      expect(
-        JSON.parse(await fs.readFile(join(paths.workRoot, `.source-stage-${prepared.stageId}.json`), "utf8")) as Record<
-          string,
-          unknown
-        >,
-      ).toMatchObject({ state: "recovery", targetCreated: true });
-      expect(await fs.readFile(join(paths.inboxRoot, prepared.relativePath, "b.txt"), "utf8")).toBe("b\n");
+      await expect(sources.stage({ path: directory })).rejects.toThrow("publication blocked");
+      expect(await sources.discover()).toEqual([]);
+      expect((await fs.readdir(paths.workRoot)).some((name) => name.startsWith(".source-stage-"))).toBe(true);
     } finally {
-      link.mockRestore();
+      rename.mockRestore();
+      rm.mockRestore();
     }
-
-    const [blocked] = await sources.discover();
-    expect(blocked).toMatchObject({
-      relativePath: prepared.relativePath,
-      error: "source stage publication requires recovery",
-    });
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toHaveLength(2);
-    await fs.rm(join(paths.inboxRoot, prepared.relativePath), { recursive: true });
-    expect(await sources.discover()).toEqual([]);
-    expect((await fs.readdir(paths.workRoot)).filter((name) => name.includes(prepared.stageId))).toEqual([]);
     db.close();
   });
-  it("keeps committed targets visible while cleaning rootless descriptors", async () => {
-    const { root, paths, db, sources } = await fixture();
-    const source = join(root, "rootless-recovery.txt");
-    await fs.writeFile(source, "prepared\n");
-    const prepared = await sources.prepareStage({ path: source });
-    const stageRoot = join(paths.workRoot, `.source-stage-${prepared.stageId}`);
-    const target = join(paths.inboxRoot, prepared.relativePath);
-    await fs.link(join(stageRoot, "payload"), target);
-    const descriptor = join(paths.workRoot, `.source-stage-${prepared.stageId}.json`);
-    const committed = JSON.parse(await fs.readFile(descriptor, "utf8")) as Record<string, unknown>;
-    committed.state = "committed";
-    committed.targetCreated = true;
-    await fs.writeFile(descriptor, `${JSON.stringify(committed)}\n`);
-    await fs.rm(stageRoot, { recursive: true });
+  it("retains extraction diagnostics within the local UTF-8 byte bound", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "broken.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    sources.recordExtractFailure(entry, new Error(`conversion failed: ${"é".repeat(400)}`));
 
-    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([prepared.relativePath]);
-    expect(await fs.readFile(target, "utf8")).toBe("prepared\n");
-    await expect(fs.lstat(descriptor)).rejects.toMatchObject({ code: "ENOENT" });
+    const failure = db.get<{ error_message: string }>(
+      "SELECT error_message FROM sources WHERE status = 'failed' LIMIT 1",
+    );
+    expect(failure?.error_message.startsWith("conversion failed:")).toBe(true);
+    expect(Buffer.byteLength(failure?.error_message ?? "", "utf8")).toBeLessThanOrEqual(500);
     db.close();
   });
   it("resets Markdown fence normalization at native file boundaries", async () => {
@@ -553,8 +454,9 @@ describe("source admission mechanics", () => {
       originalName: "requested.txt",
       displayName: "Shown",
     });
-    expect(explicit.metadata).toMatchObject({ originalName: "requested.txt", displayName: "Shown" });
-    await sources.cleanupPreparedStage(explicit);
+    const explicitPublished = await sources.publishPreparedStage(explicit);
+    expect(explicitPublished.metadata).toMatchObject({ originalName: "requested.txt", displayName: "Shown" });
+    await fs.rm(explicitPublished.absolutePath, { recursive: true });
     const staged = await sources.stage({ url: "https://example.com/download" });
     expect(staged.metadata).toMatchObject({ originalName: "fetched.md", displayName: "fetched.md" });
     const [entry] = await sources.discover();
