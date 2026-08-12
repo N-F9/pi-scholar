@@ -907,7 +907,7 @@ describe("Pi package lifecycle", () => {
       });
       assert.equal(failure.status, "failed");
       assert.ok(Buffer.byteLength(failure.errorCode ?? "", "utf8") <= 100);
-      assert.ok(Buffer.byteLength(failure.errorMessage ?? "", "utf8") <= 500);
+      assert.equal(failure.errorMessage, "é".repeat(250));
     } finally {
       db.close();
       rmSync(root, { recursive: true, force: true });
@@ -943,7 +943,7 @@ describe("Pi package lifecycle", () => {
         assert.equal(workflow.status, "failed");
         assert.equal(workflow.message, "Workflow interrupted");
         assert.equal(workflow.errorCode, "PI_SESSION_INTERRUPTED");
-        assert.equal(workflow.errorMessage, "Workflow failed");
+        assert.equal(workflow.errorMessage, "The previous Pi session ended before completing this workflow.");
         assert.ok(workflow.finishedAt);
       }
       assert.equal(workflows.get(queuedId)?.status, "queued");

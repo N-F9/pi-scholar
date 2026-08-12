@@ -2353,7 +2353,10 @@ describe("application capability boundaries", () => {
       assert.equal(recovered.workflows[0]?.requestId, running.workflow.requestId);
       assert.equal(recovered.workflows[0]?.status, "failed");
       assert.equal(recovered.workflows[0]?.errorCode, "PI_SESSION_INTERRUPTED");
-      assert.equal(recovered.workflows[0]?.errorMessage, "Workflow failed");
+      assert.equal(
+        recovered.workflows[0]?.errorMessage,
+        "The previous Pi session ended before completing this workflow.",
+      );
     } finally {
       await app.close();
       db.close();

@@ -63,7 +63,8 @@ export interface WorkflowFinishOptions extends WorkflowUpdateInput {
 
 const WORKFLOW_MESSAGE_BYTES = 500;
 const WORKFLOW_ERROR_CODE_BYTES = 100;
-const WORKFLOW_ERROR_MESSAGE = "Workflow failed";
+const WORKFLOW_ERROR_MESSAGE_BYTES = 500;
+const WORKFLOW_ERROR_FALLBACK = "Workflow failed";
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function boundedUtf8(value: string, maxBytes: number): string {
@@ -82,6 +83,12 @@ function boundedText(value: string | undefined, maxBytes: number, label: string)
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
   return boundedUtf8(value, maxBytes);
+}
+
+function workflowErrorMessage(value: string | undefined): string {
+  if (value === undefined) return WORKFLOW_ERROR_FALLBACK;
+  if (typeof value !== "string") throw new Error("workflow error message must be a string");
+  return boundedUtf8(value.trim(), WORKFLOW_ERROR_MESSAGE_BYTES) || WORKFLOW_ERROR_FALLBACK;
 }
 
 function workflowProgress(value: number | undefined): number | undefined {
@@ -107,7 +114,7 @@ function rowToWorkflow(row: Record<string, unknown>): WorkflowRecord {
     progress: Number(row.progress ?? 0),
     ...(row.message ? { message: String(row.message) } : {}),
     ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
-    ...(row.error_message ? { errorMessage: WORKFLOW_ERROR_MESSAGE } : {}),
+    ...(row.error_message ? { errorMessage: String(row.error_message) } : {}),
   };
 }
 
@@ -193,7 +200,7 @@ export class WorkflowCoordinator {
   failRunningWorkflows(options: WorkflowFinishOptions): WorkflowRecord[] {
     const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
     const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
-    const errorMessage = WORKFLOW_ERROR_MESSAGE;
+    const errorMessage = workflowErrorMessage(options.errorMessage);
     return transaction(this.db, () => {
       const requestIds = this.db
         .all<Record<string, unknown>>(
@@ -243,7 +250,7 @@ export class WorkflowCoordinator {
     const progress = workflowProgress(options.progress);
     const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
     const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
-    const errorMessage = WORKFLOW_ERROR_MESSAGE;
+    const errorMessage = workflowErrorMessage(options.errorMessage);
     return transaction(this.db, () => {
       const current = this.get(requestId);
       if (!current) throw new Error("workflow not found");
