@@ -13,6 +13,7 @@ import {
   validateOkfIndex,
   validateOkfLog,
 } from "../src/okf.js";
+import { SchedulerService, ValidationError } from "../src/scheduler.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { requestSourceToFile, SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -306,6 +307,35 @@ describe("source admission mechanics", () => {
         ?.source_uri,
     ).toBe("https://example.com/path/remote.txt");
     db.close();
+  });
+
+  it("rejects control-character display names from default URL staging", async () => {
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.end("remote\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("URL test server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        await expect(
+          sources.stage({
+            url: `http://127.0.0.1:${address.port}/remote.txt`,
+            displayName: `remote${String.fromCharCode(10)}name`,
+          }),
+        ).rejects.toBeInstanceOf(ValidationError);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
   it("keeps streamed URL envelopes private until the payload is complete", async () => {
     const firstChunk = Promise.withResolvers<void>();
@@ -1447,15 +1477,17 @@ describe("wiki mechanics", () => {
   });
   it("repairs a directly drifted blank title through a guarded ingest update", async () => {
     const { paths, db } = await fixture();
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor,
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
-      const created = await app.wiki.create({ path: "drift-title.md", title: "Stable", body: "authored" });
+      const created = await wiki.create({ path: "drift-title.md", title: "Stable", body: "authored" });
       const pagePath = join(paths.wikiRoot, created.page.relativePath);
       const parsed = parseOkfConcept(await fs.readFile(pagePath, "utf8"));
       parsed.frontmatter.title = " \t";
@@ -1469,7 +1501,7 @@ describe("wiki mechanics", () => {
         title: "Repaired",
       });
       expect(result.page?.title).toBe("Repaired");
-      const repaired = await app.wiki.get(created.page.pageId);
+      const repaired = await wiki.get(created.page.pageId);
       expect(repaired.status).toBe("active");
       expect(parseOkfConcept(repaired.content).frontmatter.externallyAdded).toBeUndefined();
       const report = doctor(paths.vaultRoot);
@@ -1482,15 +1514,17 @@ describe("wiki mechanics", () => {
   });
   it("rejects drift repair when the authored snapshot bytes are tampered", async () => {
     const { paths, db } = await fixture();
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor,
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
-      const created = await app.wiki.create({
+      const created = await wiki.create({
         path: "tampered-snapshot.md",
         title: "Stable",
         body: "Authored baseline. \uFFFD",
@@ -1514,7 +1548,7 @@ describe("wiki mechanics", () => {
         expectedDigest: sha256(externalPage),
       };
 
-      await expect(app.wiki.prepareUpdate(created.page.pageId, repair)).rejects.toThrow(/product-authored snapshot/u);
+      await expect(wiki.prepareUpdate(created.page.pageId, repair)).rejects.toThrow(/product-authored snapshot/u);
       await expect(
         app.applyWikiChange({ kind: "update-page", pageId: created.page.pageId, ...repair }),
       ).rejects.toThrow(/product-authored snapshot/u);
@@ -1532,9 +1566,20 @@ describe("wiki mechanics", () => {
     const { paths, db } = await fixture();
     let mutateOther = false;
     let otherPath = "";
+    const wiki = new WikiService(db, paths, {
+      qmd: {
+        search: () => [],
+        index: async () => {
+          if (!mutateOther) return;
+          mutateOther = false;
+          await fs.appendFile(otherPath, "\nsecond unsupported edit");
+        },
+      },
+    });
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: {
         wiki: {
           qmd: {
@@ -1551,8 +1596,8 @@ describe("wiki mechanics", () => {
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
-      const target = await app.wiki.create({ path: "repair-target.md", body: "authored target" });
-      const other = await app.wiki.create({ path: "repair-other.md", body: "authored other" });
+      const target = await wiki.create({ path: "repair-target.md", body: "authored target" });
+      const other = await wiki.create({ path: "repair-other.md", body: "authored other" });
       const targetPath = join(paths.wikiRoot, target.page.relativePath);
       otherPath = join(paths.wikiRoot, other.page.relativePath);
       await fs.appendFile(targetPath, "\nfirst unsupported edit");
@@ -1881,23 +1926,26 @@ describe("wiki mechanics", () => {
 
   it("resolves an issue only after a corrected page passes together", async () => {
     const { db, paths } = await fixture();
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
+    const scheduler = new SchedulerService(db, paths);
     const app = new ScholarApplication({
       paths,
       db,
-      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      wikiService: wiki,
+      schedulerService: scheduler,
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
       const originalBody = "# Section\n\noriginal\n";
       const correctedBody = "# Section\n\ncorrected\n";
-      const page = await app.wiki.create({
+      const page = await wiki.create({
         path: "page-issue.md",
         description: "Issue correction behavior.",
         body: originalBody,
         quizWorthiness: "eligible",
       });
-      const issue = await app.wiki.report({
+      const issue = await wiki.report({
         pageId: page.page.pageId,
         heading: "Section",
         description: "The section is wrong.",
@@ -1909,16 +1957,16 @@ describe("wiki mechanics", () => {
         resolution: "Corrected the section.",
       });
       await expect(app.applyWikiChange(proposal(originalBody))).rejects.toThrow(/actual page correction/u);
-      expect((await app.wiki.get(page.page.pageId)).content).toContain("original");
+      expect((await wiki.get(page.page.pageId)).content).toContain("original");
       expect((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status).toBe("open");
 
       const applied = await app.applyWikiChange(proposal(correctedBody));
       expect(applied.issue?.status).toBe("resolved");
-      expect((await app.wiki.get(page.page.pageId)).content).toContain("corrected");
-      expect((await app.wiki.get(page.page.pageId)).revision).toBe(2);
-      expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
+      expect((await wiki.get(page.page.pageId)).content).toContain("corrected");
+      expect((await wiki.get(page.page.pageId)).revision).toBe(2);
+      expect(scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
 
-      const beforeRename = await app.wiki.get(page.page.pageId);
+      const beforeRename = await wiki.get(page.page.pageId);
       const renamed = await app.applyWikiChange({
         kind: "rename-page",
         pageId: page.page.pageId,
@@ -1926,8 +1974,8 @@ describe("wiki mechanics", () => {
         path: "page-issue-renamed.md",
       });
       expect(renamed.page?.relativePath).toBe("page-issue-renamed.md");
-      expect((await app.wiki.get(page.page.pageId)).digest).toBe(beforeRename.digest);
-      expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
+      expect((await wiki.get(page.page.pageId)).digest).toBe(beforeRename.digest);
+      expect(scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
     } finally {
       await app.close();
       db.close();

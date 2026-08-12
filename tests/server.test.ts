@@ -20,7 +20,7 @@ import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import type { QuizRecord } from "../src/contracts.js";
 import { type ServerOptions, startServer } from "../src/server.js";
-import { LockBusyError } from "../src/vault.js";
+import { initVault, LockBusyError } from "../src/vault.js";
 
 async function withServer(
   application: ScholarApplication,
@@ -600,7 +600,7 @@ describe("server browser boundary", () => {
               throw new Error("multipart failure response was not received");
             }),
           ]),
-          400,
+          500,
         );
         await setImmediate();
         assert.deepEqual(unhandled, []);
@@ -643,6 +643,32 @@ describe("server browser boundary", () => {
     });
   });
 
+  it("returns source URL validation failures as actionable client errors", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-source-url-"));
+    const application = new ScholarApplication({
+      paths: initVault(join(root, "vault")),
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    try {
+      await withServer(application, async (base) => {
+        const response = await fetch(`${base}/api/v1/sources`, {
+          method: "POST",
+          headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+          body: JSON.stringify({ kind: "url", url: "ftp://example.com/source.txt" }),
+        });
+        const body = (await response.json()) as {
+          readonly error: { readonly code: string; readonly message: string };
+        };
+        assert.equal(response.status, 400);
+        assert.equal(body.error.code, "validation-error");
+        assert.equal(body.error.message, "only HTTP(S) URLs are accepted");
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("sanitizes lock diagnostics at the HTTP boundary", async () => {
     const application = {
       stageSource: async () => {
@@ -668,6 +694,89 @@ describe("server browser boundary", () => {
       assert.equal(payload.includes("writer.lock"), false);
     });
   });
+  it("hides unexpected internal failures while preserving validation errors", async () => {
+    const sensitiveMessage = "SQLITE_ERROR: unable to open /private/vault/.pi-scholar/vault.sqlite";
+    const application = {
+      listSources: async () => {
+        throw Object.assign(new Error(sensitiveMessage), {
+          code: "SQLITE_ERROR",
+          details: { path: "/private/vault/.pi-scholar/vault.sqlite", query: "SELECT * FROM sources" },
+        });
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/sources`);
+      const payload = await response.text();
+      const body = JSON.parse(payload) as {
+        readonly error: {
+          readonly code: string;
+          readonly message: string;
+          readonly requestId: string;
+          readonly details?: unknown;
+        };
+      };
+      assert.equal(response.status, 500);
+      assert.equal(body.error.code, "INTERNAL_ERROR");
+      assert.equal(body.error.message, "Internal server error");
+      assert.ok(body.error.requestId);
+      assert.equal("details" in body.error, false);
+      assert.equal(payload.includes(sensitiveMessage), false);
+      assert.equal(payload.includes("vault.sqlite"), false);
+      assert.equal(payload.includes("SELECT * FROM sources"), false);
+
+      const validationResponse = await fetch(`${base}/api/v1/sources`, {
+        method: "POST",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ kind: "invalid", text: "payload" }),
+      });
+      const validationBody = (await validationResponse.json()) as {
+        readonly error: { readonly code: string; readonly message: string; readonly requestId: string };
+      };
+      assert.equal(validationResponse.status, 400);
+      assert.equal(validationBody.error.code, "validation-error");
+      assert.equal(validationBody.error.message, "source kind is invalid");
+      assert.ok(validationBody.error.requestId);
+    });
+  });
+
+  it("retains only safe metadata for applied finalization failures", async () => {
+    const secretCause = "projection not found: SQLITE_ERROR: unable to open /private/vault/.pi-scholar/vault.sqlite";
+    const application = {
+      listSources: async () => {
+        throw Object.assign(new Error(`mutation applied but projection failed: ${secretCause}`), {
+          code: "MUTATION_APPLIED_FINALIZATION_FAILED",
+          details: {
+            applied: true,
+            retryable: true,
+            stage: "projection",
+            secret: secretCause,
+          },
+        });
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/sources`);
+      const payload = await response.text();
+      const body = JSON.parse(payload) as {
+        readonly error: {
+          readonly code: string;
+          readonly message: string;
+          readonly details: Record<string, unknown>;
+        };
+      };
+      assert.equal(response.status, 500);
+      assert.equal(body.error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+      assert.equal(body.error.message, "Internal server error");
+      assert.deepEqual(body.error.details, { applied: true, retryable: true, stage: "projection" });
+      assert.equal(payload.includes(secretCause), false);
+      assert.equal(payload.includes("secret"), false);
+    });
+  });
+
   it("accepts deterministic RFC v5 source IDs for removal preview", async () => {
     const sourceId = "886313e1-3b8a-5372-9b90-0c9aee199e5d";
     let received: string | undefined;
@@ -706,6 +815,23 @@ describe("server browser boundary", () => {
 
     await withServer(application, async (base) => {
       const response = await fetch(`${base}/api/v1/wiki/search?q=term&mode=bogus`);
+      assert.equal(response.status, 400);
+      assert.equal(calls, 0);
+    });
+  });
+
+  it("rejects blank wiki searches before application dispatch", async () => {
+    let calls = 0;
+    const application = {
+      searchWiki: async () => {
+        calls += 1;
+        return { results: [] };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/wiki/search?q=`);
       assert.equal(response.status, 400);
       assert.equal(calls, 0);
     });

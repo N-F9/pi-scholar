@@ -15,9 +15,10 @@ import {
 import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { main } from "../src/cli.js";
-import { openDatabase, transaction } from "../src/database.js";
+import { openDatabase, SCHEMA_SQL, transaction, validateSchema } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { doclingDependencyIdentity, doclingEnvironment } from "../src/external/docling.js";
 import { gitDependencyIdentity, localCheckpointCommit, runGit, runGitSync } from "../src/external/git.js";
@@ -425,6 +426,78 @@ describe("vault foundation", () => {
     assert.equal(db.get("SELECT key FROM settings WHERE key = ?", ["x"]), undefined);
     db.close();
   });
+  it("rejects partial and non-canonical schema v5 definitions", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    db.exec("DROP TABLE settings");
+    assert.throws(() => validateSchema(db), /missing tables/u);
+    db.exec(`
+      CREATE TABLE settings (
+        key TEXT,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    assert.throws(() => validateSchema(db), /canonical schema v5/u);
+    db.close();
+  });
+  it("rejects case-changed quoted CHECK literals in canonical schema", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const canonicalSourcesSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'",
+    )?.sql;
+    assert.ok(canonicalSourcesSql);
+    db.exec("DROP TABLE sources");
+    db.exec(canonicalSourcesSql.replace("'url'", "'URL'"));
+    assert.equal(Number(db.get<{ user_version: number }>("PRAGMA user_version")?.user_version ?? 0), 5);
+    assert.throws(() => validateSchema(db), /canonical schema v5/u);
+    db.close();
+  });
+
+  it("rolls back failed first-time schema creation atomically", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const db = openDatabase(join(root, "state.sqlite"), { initializeSchema: false });
+    assert.throws(
+      () =>
+        transaction(db, () => {
+          db.exec(SCHEMA_SQL);
+          db.run("INSERT INTO schema_meta (schema_version, applied_at) VALUES (?, ?)", [5, new Date().toISOString()]);
+          db.exec("PRAGMA user_version = 5");
+          validateSchema(db);
+          throw new Error("abort schema creation");
+        }),
+      /abort schema creation/u,
+    );
+    assert.deepEqual(db.tableNames(), []);
+    assert.equal(Number(db.get<{ user_version: number }>("PRAGMA user_version")?.user_version ?? 0), 0);
+    db.close();
+  });
+  it("rejects incomplete WAL checkpoints while a reader pins frames", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-wal-"));
+    const paths = initVault(join(root, "vault"));
+    const writer = openDatabase(paths);
+    const reader = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    try {
+      reader.exec("BEGIN");
+      reader.get("SELECT COUNT(*) AS count FROM settings");
+      writer.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+        `wal-pin-${randomUUID()}`,
+        "{}",
+        new Date().toISOString(),
+      ]);
+      assert.throws(() => writer.checkpoint(), /WAL checkpoint incomplete/u);
+    } finally {
+      try {
+        reader.exec("ROLLBACK");
+      } finally {
+        reader.close();
+        writer.close();
+      }
+    }
+  });
 
   it("rejects unknown schema tables and follows no symlink reads", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -510,7 +583,7 @@ describe("vault foundation", () => {
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       questionId,
       pageId,
-      JSON.stringify("Explain the page"),
+      JSON.stringify("Identify the page's central idea"),
       1,
     ]);
     db.run("INSERT INTO quiz_answers (quiz_id, question_id, revision, answer_json, saved_at) VALUES (?, ?, 1, ?, ?)", [
@@ -533,7 +606,7 @@ describe("vault foundation", () => {
             ordinal: 0,
             kind: "free-response",
             prompt: "Explain the page",
-            pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
+            pages: [{ pageId, criterion: "Identify the page's central idea", weight: 1 }],
             sourceRefs: [],
           },
         ],
@@ -572,7 +645,7 @@ describe("vault foundation", () => {
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       questionId,
       pageId,
-      JSON.stringify("Explain the page"),
+      JSON.stringify("Identify the page's central idea"),
       1,
     ]);
     const quizService = new QuizService(db, paths);
@@ -617,6 +690,45 @@ describe("vault foundation", () => {
     );
     assert.equal(result.stdout, "€");
     assert.equal(result.outputOverflowed, false);
+  });
+  it("kills detached descendants after a timed-out leader exits", async () => {
+    // This integration check intentionally uses the real process-group timer; fake clocks cannot drive OS signals.
+    if (process.platform === "win32") return;
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const descendantPidPath = join(root, "descendant.pid");
+    const heartbeatPath = join(root, "descendant.heartbeat");
+    const descendantScript = [
+      "const { writeFileSync } = require('node:fs');",
+      "const path = process.env.PI_DESCENDANT_FILE;",
+      "const tick = () => writeFileSync(path, String(Date.now()));",
+      "tick();",
+      "setInterval(tick, 25);",
+      "process.on('SIGTERM', () => {});",
+    ].join("\n");
+    const leaderScript = [
+      "const { spawn } = require('node:child_process');",
+      "const { writeFileSync } = require('node:fs');",
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: 'ignore' });`,
+      "writeFileSync(process.env.PI_DESCENDANT_PID_FILE, String(child.pid));",
+      "process.on('SIGTERM', () => process.exit(0));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const result = await runChild(process.execPath, ["-e", leaderScript], {
+      cwd: root,
+      timeoutMs: 500,
+      env: { PI_DESCENDANT_FILE: heartbeatPath, PI_DESCENDANT_PID_FILE: descendantPidPath },
+    });
+    assert.equal(result.timedOut, true);
+    const descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
+    const heartbeatAtReturn = readFileSync(heartbeatPath, "utf8");
+    try {
+      await delay(150);
+      assert.equal(readFileSync(heartbeatPath, "utf8"), heartbeatAtReturn);
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {}
+    }
   });
   it("doctor rejects a non-removed source row whose packet is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -956,6 +1068,10 @@ do
     printf '%s\n' "later" > ${JSON.stringify(includedPath)}
     break
   fi
+  if [ "$arg" = "rev-parse" ]; then
+    printf '%s\n' "follow-up lookup disabled" >&2
+    exit 97
+  fi
 done
 exec ${JSON.stringify(realGit)} "$@"
 `,
@@ -974,7 +1090,7 @@ if (!modulePath || !vaultRoot) throw new Error("checkpoint child environment is 
 const loaded = await import(modulePath);
 const { localCheckpointCommit } = loaded.default ?? loaded;
 const result = localCheckpointCommit({ vaultRoot }, "test: indexed checkpoint");
-if (!result.committed) throw new Error("checkpoint did not commit");
+if (result.commitId !== undefined) throw new Error("checkpoint unexpectedly looked up a commit id");
 `,
       ],
       {

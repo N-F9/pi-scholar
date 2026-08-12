@@ -25,13 +25,17 @@ const issueLabels: Record<WikiIssueKind, string> = {
 export function NotesPage() {
   const queryClient = useQueryClient();
   const location = useLocation();
-  const [params] = useSearchParams();
-  const [searchText, setSearchText] = useState(params.get("q") ?? "");
-  const [search, setSearch] = useState(params.get("q") ?? "");
+  const [params, setParams] = useSearchParams();
+  const search = params.get("q") ?? "";
+  const [searchText, setSearchText] = useState(search);
   const [reporting, setReporting] = useState(false);
   const pageId = params.get("pageId") ?? undefined;
   const path = params.get("path") ?? undefined;
   const heading = params.get("heading") ?? undefined;
+
+  useEffect(() => {
+    setSearchText(search);
+  }, [search]);
 
   const pages = useQuery({
     queryKey: ["wiki", "list", search],
@@ -119,9 +123,17 @@ export function NotesPage() {
     setReporting(false);
   }, [pageId, path]);
 
+  function commitSearch(value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set("q", value);
+    else next.delete("q");
+    setSearchText(value);
+    if (next.toString() !== params.toString()) setParams(next);
+  }
+
   function submitSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setSearch(searchText.trim());
+    commitSearch(searchText.trim());
   }
 
   const pageIssues = issues.data?.issues.filter((issue) => issue.pageId === page.data?.page.pageId) ?? [];
@@ -161,14 +173,7 @@ export function NotesPage() {
           {search ? (
             <div className="mt-3 flex items-center justify-between gap-2 text-sm">
               <span className="truncate text-muted">Results for “{search}”</span>
-              <Button
-                className="min-h-9 px-2 py-1"
-                variant="quiet"
-                onClick={() => {
-                  setSearch("");
-                  setSearchText("");
-                }}
-              >
+              <Button className="min-h-9 px-2 py-1" variant="quiet" onClick={() => commitSearch("")}>
                 Clear
               </Button>
             </div>

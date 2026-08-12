@@ -259,11 +259,7 @@ export class WikiService {
     if (typeof index === "function") await index({ ignoredPaths: this.qmdIgnoredPaths() });
   }
   private async refreshQmd(): Promise<void> {
-    try {
-      await this.refreshQmdIndex();
-    } catch {
-      /* application maintenance checks enforce qmd */
-    }
+    await this.refreshQmdIndex();
   }
   private async atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
     await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -531,6 +527,7 @@ export class WikiService {
     const logPath = join(this.root(), "log.md");
     const priorIndex = await this.optionalBytes(indexPath);
     const priorLog = await this.optionalBytes(logPath);
+    let qmdFailed = false;
     const rollback = async (): Promise<void> => {
       const errors: unknown[] = [];
       const attempt = async (action: () => Promise<void> | void): Promise<void> => {
@@ -550,6 +547,7 @@ export class WikiService {
       });
       await attempt(() => this.restoreOptional(indexPath, priorIndex));
       await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki create rollback failed: ${detail}`, { cause: errors[0] });
@@ -559,7 +557,12 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, content);
       await this.writeCatalog(page, content);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
     } catch (error) {
       try {
         await rollback();
@@ -668,6 +671,7 @@ export class WikiService {
     const logPath = join(this.root(), "log.md");
     const priorIndex = await this.optionalBytes(indexPath);
     const priorLog = await this.optionalBytes(logPath);
+    let qmdFailed = false;
     const rollback = async (): Promise<void> => {
       const errors: unknown[] = [];
       const attempt = async (action: () => Promise<void> | void): Promise<void> => {
@@ -712,6 +716,7 @@ export class WikiService {
       });
       await attempt(() => this.restoreOptional(indexPath, priorIndex));
       await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki update rollback failed: ${detail}`, { cause: errors[0] });
@@ -721,7 +726,12 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, next.content);
       await this.writeCatalog(next.page, next.content);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
     } catch (error) {
       try {
         await rollback();
@@ -775,6 +785,7 @@ export class WikiService {
       updatedAt: now(),
       status: "active",
     };
+    let qmdFailed = false;
     const rollback = async (): Promise<void> => {
       const errors: unknown[] = [];
       const attempt = async (action: () => Promise<void> | void): Promise<void> => {
@@ -820,6 +831,7 @@ export class WikiService {
       });
       await attempt(() => this.restoreOptional(indexPath, priorIndex));
       await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki rename rollback failed: ${detail}`, { cause: errors[0] });
@@ -828,7 +840,12 @@ export class WikiService {
     try {
       await this.writeCatalog(updated, content, page.relativePath);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
     } catch (error) {
       try {
         await rollback();
@@ -1167,6 +1184,7 @@ export class WikiService {
     const logPath = join(this.root(), "log.md");
     const priorIndexBytes = await optionalBytes(indexPath);
     const priorLogBytes = await optionalBytes(logPath);
+    let qmdFailed = false;
     const issue =
       choice === "record-issue"
         ? {
@@ -1234,6 +1252,7 @@ export class WikiService {
         if (priorLogBytes === undefined) await fs.rm(logPath, { force: true });
         else await this.atomicWrite(logPath, priorLogBytes);
       });
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki drift resolution rollback failed: ${detail}`, { cause: errors[0] });
@@ -1251,7 +1270,12 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, snapshot.content);
       await this.writeCatalog(updated, snapshot.content);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
       if (issue) {
         transaction(this.db, () =>
           dbRun(

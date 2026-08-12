@@ -239,7 +239,7 @@ function boundedUtf8(value: string, maxBytes: number): string {
   return value.slice(0, end);
 }
 function mutationFinalizationError(
-  stage: "checkpoint" | "doctor" | "commit" | "projection" | "rollback",
+  stage: "checkpoint" | "doctor" | "commit" | "projection" | "qmd" | "rollback",
   cause: unknown,
   retryable = false,
 ): Error {
@@ -315,11 +315,11 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
 }
 export class ScholarApplication {
   readonly paths: VaultPaths;
-  readonly db: ScholarDatabase;
-  readonly sources: SourceService;
-  readonly wiki: WikiService;
-  readonly scheduler: SchedulerService;
-  readonly quiz: QuizService;
+  private readonly db: ScholarDatabase;
+  private readonly sources: SourceService;
+  private readonly wiki: WikiService;
+  private readonly scheduler: SchedulerService;
+  private readonly quiz: QuizService;
   private readonly workflows: WorkflowCoordinator;
   private readonly worker: BrowserMutationWorker;
   readonly version: string;
@@ -366,6 +366,7 @@ export class ScholarApplication {
     operation: () => T | PromiseLike<T>,
     subject: string,
     rollback?: DurableRollback<R>,
+    afterCommit?: () => void | PromiseLike<void>,
   ): Promise<T> {
     return withWriterLock(this.paths, async () => {
       let snapshot: R | undefined;
@@ -415,6 +416,7 @@ export class ScholarApplication {
             throw mutationFinalizationError("rollback", error);
           }
         }
+        await afterCommit?.();
         return value;
       } catch (error) {
         if (rollback && captured && !committed) {
@@ -734,16 +736,26 @@ export class ScholarApplication {
     context?: ApplicationMutationContext,
   ): Promise<SourceRemovalResult> {
     return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
-        try {
-          await this.wiki.refreshProjections();
-          await this.wiki.refreshQmdIndex().catch(() => undefined);
-        } catch (error) {
-          throw mutationFinalizationError("projection", error, true);
-        }
-        return { sourceId, status: "removed", dependentPageIds: removed.dependentPageIds };
-      }, "source:remove"),
+      this.durableDirect(
+        async () => {
+          const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
+          try {
+            await this.wiki.refreshProjections();
+          } catch (error) {
+            throw mutationFinalizationError("projection", error, true);
+          }
+          return { sourceId, status: "removed" as const, dependentPageIds: removed.dependentPageIds };
+        },
+        "source:remove",
+        undefined,
+        async () => {
+          try {
+            await this.wiki.refreshQmdIndex();
+          } catch (error) {
+            throw mutationFinalizationError("qmd", error, true);
+          }
+        },
+      ),
     );
   }
   private async quizDetail(quiz: QuizRecord): Promise<QuizDetailRecord> {
@@ -848,8 +860,8 @@ export class ScholarApplication {
     return { pages: (await this.wiki.list()).map(pageRecord) };
   }
   private async wikiResult(pageIdOrPath: string): Promise<WikiPageResult> {
-    const inspected = await this.wiki.inspectDrift(pageIdOrPath);
-    const value = await this.wiki.get(inspected.page.pageId);
+    const value = await this.wiki.get(pageIdOrPath);
+    const inspected = await this.wiki.inspectDrift(value.pageId);
     const page = pageRecord(inspected.page);
     const markdown = value.content;
     const pageSections = parseWikiDocumentSections(markdown, page.pageId);
@@ -967,19 +979,6 @@ export class ScholarApplication {
         if (updated.page.quizWorthiness === "eligible") this.scheduler.ensurePageLearning(updated.page.pageId);
         return this.wikiResult(updated.page.pageId);
       }, "wiki:update"),
-    );
-  }
-  async renameNote(
-    pageId: string,
-    requestedPath: string,
-    context?: ApplicationMutationContext,
-  ): Promise<WikiPageResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        this.assertPageMutationAllowed(pageId);
-        const updated = await this.wiki.rename(pageId, requestedPath);
-        return this.wikiResult(updated.pageId);
-      }, "wiki:rename"),
     );
   }
 
@@ -2161,6 +2160,7 @@ export class ScholarApplication {
             date: proposal.date,
             revision: proposal.revision,
             submissionId: proposal.submissionId,
+            requestId: proposal.requestId,
             questions: proposal.questions,
             pages: proposal.pages,
           },

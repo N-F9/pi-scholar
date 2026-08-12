@@ -191,9 +191,7 @@ export function localCheckpointCommit(
   if (result.code !== 1) throw commandFailure(result, "git diff");
   result = runGitSync(paths, ["commit", "--no-gpg-sign", "-m", subject]);
   if (result.code !== 0) throw commandFailure(result, "git commit");
-  const commitIdResult = runGitSync(paths, ["rev-parse", "HEAD"]);
-  if (commitIdResult.code !== 0) throw commandFailure(commitIdResult, "git rev-parse");
-  return { committed: true, commitId: commitIdResult.stdout.trim(), subject };
+  return { committed: true, subject };
 }
 
 function validateRemote(remote: string): void {

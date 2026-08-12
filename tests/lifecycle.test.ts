@@ -119,10 +119,16 @@ function fakeLifecycleApp(
   return { app, root, tools: registerLifecycleTools() };
 }
 
-async function invoke(tools: Map<string, ToolExecutor>, name: string, params: unknown, root: string): Promise<unknown> {
+async function invoke(
+  tools: Map<string, ToolExecutor>,
+  name: string,
+  params: unknown,
+  root: string,
+  signal?: AbortSignal,
+): Promise<unknown> {
   const execute = tools.get(name);
   if (!execute) throw new Error(`missing tool ${name}`);
-  return execute(name, params, undefined, undefined, { cwd: root });
+  return execute(name, params, signal, undefined, { cwd: root });
 }
 
 function claim(claimId: string, preparedId: string): Record<string, string> {
@@ -260,6 +266,26 @@ describe("Pi package lifecycle", () => {
     vaultResolutionHooks.delete(fixture.root);
 
     assert.equal(recoveries, 1);
+  });
+  it("does not claim a workflow when cancelled during initialization", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({}));
+    const recovery = Promise.withResolvers<void>();
+    const recoveryStarted = Promise.withResolvers<void>();
+    fixture.app.recoverAbandonedWorkflows = async () => {
+      fixture.app.order.push("recover");
+      recoveryStarted.resolve();
+      await recovery.promise;
+      return {};
+    };
+    const controller = new AbortController();
+    const call = invoke(fixture.tools, "scholar_get_lint_context", {}, fixture.root, controller.signal);
+    await recoveryStarted.promise;
+    controller.abort();
+    recovery.resolve();
+
+    await assert.rejects(call, /Operation cancelled/u);
+    assert.deepEqual(fixture.app.order, ["recover"]);
+    assert.deepEqual(fixture.app.finishes, []);
   });
 
   it("expands the current-session lint skill before sending the command", async () => {

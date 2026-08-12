@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, test } from "vitest";
 import { openDatabase, type ScholarDatabase } from "../src/database.js";
-import { QuizConflictError, QuizService } from "../src/quiz.js";
+import { QuizConflictError, QuizService, validateQuizVisibleText } from "../src/quiz.js";
 import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
 import { parseWikiBodySections, parseWikiDocumentSections } from "../src/wiki-sections.js";
 
@@ -23,17 +23,20 @@ const PAGE_BODY = `${[
 function pageDocument(pageId: string, body: string): string {
   return `---\ntype: note\nid: ${pageId}\ntitle: ${pageId}\ndescription: ${pageId} description\n---\n${body}`;
 }
+function syntheticPagePath(pageId: string): string {
+  return `fixture-${createHash("sha256").update(pageId).digest("hex").slice(0, 12)}.md`;
+}
 const PAGE_MARKDOWN = pageDocument("p1", PAGE_BODY);
 afterAll(() => rmSync(LEARNING_WIKI_ROOT, { recursive: true, force: true }));
 
 function addPage(db: ScholarDatabase, pageId: string, markdown = PAGE_BODY): void {
   const document = markdown.startsWith("---\n") ? markdown : pageDocument(pageId, markdown);
-  writeFileSync(join(LEARNING_WIKI_ROOT, `${pageId}.md`), document);
+  writeFileSync(join(LEARNING_WIKI_ROOT, syntheticPagePath(pageId)), document);
   const digest = createHash("sha256").update(document).digest("hex");
   const now = new Date().toISOString();
   db.run(
     "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
-    [pageId, `${pageId}.md`, pageId, digest, now, now],
+    [pageId, syntheticPagePath(pageId), pageId, digest, now, now],
   );
 }
 
@@ -263,7 +266,7 @@ test("headingless eligible pages publish page evidence and authorize page-only r
     ],
   });
   assert.equal(settled.pages[0]!.readings[0]!.anchor, "");
-  assert.equal(quiz.readingHref({ pageId: "headingless", anchor: "" }), "wiki/headingless.md");
+  assert.equal(quiz.readingHref({ pageId: "headingless", anchor: "" }), `wiki/${syntheticPagePath("headingless")}`);
   db.close();
 });
 test("grading rejects malformed stored evidence paths without a live vault", () => {
@@ -502,14 +505,14 @@ test("grading snapshots page sections directly and settles one FSRS transition p
       {
         pageId: "p1",
         rating: "Good" as const,
-        feedback: "P1 feedback",
+        feedback: "First page feedback",
         evidence: [authorized.reference],
         readings: [{ pageId: "p1", anchor: authorized.anchor }],
       },
       {
         pageId: "p2",
         rating: "Good" as const,
-        feedback: "P2 feedback",
+        feedback: "Second page feedback",
         evidence: [authorizedP2.reference],
         readings: [{ pageId: "p2", anchor: authorizedP2.anchor }],
       },
@@ -522,9 +525,9 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(settled.pages[0]!.evidence.length, 1);
   assert.equal(settled.pages[0]!.readings.length, 1);
   const sheet = quiz.renderSheet(settled.quiz, undefined, settled.questions, settled.pages);
-  const p1Feedback = sheet.indexOf("P1 feedback");
+  const p1Feedback = sheet.indexOf("First page feedback");
   const p1Reading = sheet.indexOf(`- [Reading 1](${quiz.readingHref(settled.pages[0]!.readings[0]!)})`);
-  const p2Feedback = sheet.indexOf("P2 feedback");
+  const p2Feedback = sheet.indexOf("Second page feedback");
   const p2Reading = sheet.indexOf(`- [Reading 1](${quiz.readingHref(settled.pages[1]!.readings[0]!)})`);
   assert.ok(p1Feedback >= 0 && p1Reading > p1Feedback);
   assert.ok(p2Feedback > p1Reading && p2Reading > p2Feedback);
@@ -542,6 +545,39 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
   assert.equal(scheduler.getPageLearning("p1").reps, 1);
   assert.equal(scheduler.getPageLearning("p2").reps, 1);
+  db.close();
+});
+
+test("grading rejects generated reading targets that expose page IDs before persistence", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({ date, selectedPageIds: ["p1"], questionSpecs: [question("p1")] });
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  db.run("UPDATE pages SET relative_path = ? WHERE page_id = ?", ["p1.md", "p1"]);
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        date,
+        revision: sealed.revision,
+        submissionId: "generated-reading-target",
+        questions: [{ questionId, feedback: "Valid feedback." }],
+        pages: [
+          {
+            pageId: "p1",
+            rating: "Good",
+            evidence: [evidence.reference],
+            readings: [{ pageId: "p1", anchor: evidence.anchor }],
+          },
+        ],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   db.close();
 });
 
@@ -564,7 +600,7 @@ test("grading rejects fabricated or stale direct evidence before page transition
   assert.throws(() => quiz.settleGrade(makeGrade("fabricated-reference")), ValidationError);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   writeFileSync(
-    join(LEARNING_WIKI_ROOT, "p1.md"),
+    join(LEARNING_WIKI_ROOT, syntheticPagePath("p1")),
     PAGE_MARKDOWN.replace("# Part\nsection text", "# Part\nchanged section text"),
   );
   assert.throws(() => quiz.settleGrade(makeGrade(authorized.reference)), ValidationError);
@@ -632,5 +668,302 @@ test("quiz publishes more than two synthesis questions", () => {
   assert.equal(generated.status, "open");
   assert.equal(generated.questions.length, 3);
   assert.ok(generated.questions.every((item) => item.pages.length === 2));
+  db.close();
+});
+
+test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedback", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const pageDigest = db.get<{ digest: string }>("SELECT digest FROM pages WHERE page_id = ?", ["p1"])!.digest;
+  const opaqueId = randomUUID();
+  const sourceReference = `${randomUUID()}:0`;
+  assert.throws(
+    () => validateQuizVisibleText(`x${opaqueId}`, [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x${sourceReference}`, [{ value: sourceReference, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace("-", "-\u200b"), [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-**$2**"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-~~$2~~"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)-/u, "$1-<em>$2</em>-"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(`![${opaqueId.replace("-", "\\-")}][img]\n\n[img]: image.png`, [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x${pageDigest}`, [{ value: pageDigest, match: "substring" }]),
+    ValidationError,
+  );
+  assert.doesNotThrow(() => validateQuizVisibleText("xp1", [{ value: "p1", match: "boundary" }]));
+  const storedCriterion = "Stored **grading crit\u00e9rion &amp; evidence**";
+  const renderedCriterion = "Stored grading crit\u00e9rion & evidence";
+  const softBreakCriterion = renderedCriterion.replace("grading ", "grading\n");
+  const decomposedCriterion = renderedCriterion.normalize("NFD");
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", "Explain p1")],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [
+          {
+            ...question("p1"),
+            kind: "multiple-choice",
+            choices: ["p1", "other"],
+          },
+        ],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", `Explain x${pageDigest}`)],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [{ ...question("p1", "Explain evidence-reference"), sourceRefs: ["evidence-reference"] }],
+      }),
+    ValidationError,
+  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        ...question("p1"),
+        pages: [{ pageId: "p1", criterion: storedCriterion, weight: 1 }],
+        sourceRefs: ["evidence-reference"],
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  assert.throws(
+    () =>
+      quiz.saveDraft({
+        date,
+        revision: generated.revision,
+        answers: { [questionId]: `page-${questionId.toUpperCase()}` },
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () => quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "p1" } }),
+    ValidationError,
+  );
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "valid answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  const requestId = randomUUID();
+  const requestGrade = {
+    date,
+    revision: sealed.revision,
+    requestId,
+    submissionId: "hidden-request-feedback",
+    questions: [{ questionId, feedback: `x${requestId}` }],
+    pages: [{ pageId: "p1", rating: "Good" as const, evidence: [evidence.reference] }],
+  };
+  assert.throws(() => quiz.settleGrade(requestGrade), ValidationError);
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        questions: [{ questionId, feedback: "visible feedback" }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: `x${requestId}` }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        date,
+        revision: sealed.revision,
+        submissionId: "hidden-feedback",
+        questions: [{ questionId, feedback: "p1" }],
+        pages: [{ pageId: "p1", rating: "Good", evidence: [evidence.reference] }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-criterion-feedback",
+        questions: [{ questionId, feedback: storedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-letter-adjacent-criterion-feedback",
+        questions: [{ questionId, feedback: `x${storedCriterion}` }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-rendered-criterion-feedback",
+        questions: [{ questionId, feedback: renderedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-soft-break-criterion-feedback",
+        questions: [{ questionId, feedback: softBreakCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-decomposed-criterion-feedback",
+        questions: [{ questionId, feedback: `x${decomposedCriterion}` }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
+test("quiz treats host-minted page UUIDs as opaque metadata", () => {
+  const { db, scheduler, date } = setup();
+  const pageId = randomUUID();
+  addPage(db, pageId);
+  ensureDue(scheduler, [pageId], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: [pageId],
+    questionSpecs: [
+      {
+        kind: "free-response",
+        prompt: "Explain the page",
+        pages: [{ pageId, criterion: "Identify the central idea", weight: 1 }],
+        sourceRefs: [],
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  assert.throws(
+    () =>
+      quiz.saveDraft({
+        date,
+        revision: generated.revision,
+        answers: { [questionId]: `x${pageId}` },
+      }),
+    ValidationError,
+  );
+  db.close();
+});
+
+test("quiz keeps permitted identity comments and does not block answer-key values", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        kind: "multiple-choice",
+        prompt: "Choose the correct statement",
+        choices: ["correct", "incorrect"],
+        pages: [{ pageId: "p1", criterion: "Explain the page", weight: 1 }],
+        sourceRefs: [],
+        answerKey: "correct",
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "correct" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const sheet = quiz.renderSheet(sealed, { [questionId]: "correct" });
+  assert.match(sheet, new RegExp(`pi-scholar:quiz format=1 id=${generated.quizId} revision=`, "u"));
+  assert.match(sheet, new RegExp(`pi-scholar:question id=${questionId}`, "u"));
+  assert.match(sheet, /correct/u);
+  db.close();
+});
+
+test("quiz rejects quiz and question identifiers outside identity comments", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [question("p1")],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  db.run("UPDATE quiz_questions SET prompt = ? WHERE question_id = ?", [generated.quizId, questionId]);
+  assert.throws(() => quiz.parseSheet(quiz.renderSheet(quiz.get(date)!)), ValidationError);
+  db.run("UPDATE quiz_questions SET prompt = ? WHERE question_id = ?", [questionId, questionId]);
+  assert.throws(() => quiz.parseSheet(quiz.renderSheet(quiz.get(date)!)), ValidationError);
   db.close();
 });
