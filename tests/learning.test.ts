@@ -700,7 +700,8 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
     ValidationError,
   );
   assert.doesNotThrow(() => validateQuizVisibleText("xp1", [{ value: "p1", match: "boundary" }]));
-  const storedCriterion = "Stored grading criterion";
+  const storedCriterion = "Stored grading crit\u00e9rion";
+  const decomposedCriterion = storedCriterion.normalize("NFD");
   assert.throws(
     () =>
       quiz.createDailyQuiz({
@@ -823,9 +824,51 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
       }),
     ValidationError,
   );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-decomposed-criterion-feedback",
+        questions: [{ questionId, feedback: `x${decomposedCriterion}` }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
   assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
+test("quiz treats host-minted page UUIDs as opaque metadata", () => {
+  const { db, scheduler, date } = setup();
+  const pageId = randomUUID();
+  addPage(db, pageId);
+  ensureDue(scheduler, [pageId], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: [pageId],
+    questionSpecs: [
+      {
+        kind: "free-response",
+        prompt: "Explain the page",
+        pages: [{ pageId, criterion: "Identify the central idea", weight: 1 }],
+        sourceRefs: [],
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  assert.throws(
+    () =>
+      quiz.saveDraft({
+        date,
+        revision: generated.revision,
+        answers: { [questionId]: `x${pageId}` },
+      }),
+    ValidationError,
+  );
   db.close();
 });
 

@@ -149,16 +149,25 @@ function boundaryToken(value: string): QuizVisibleTextToken {
 function substringToken(value: string): QuizVisibleTextToken {
   return { value, match: "substring" };
 }
+const UUID_PAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+function pageIdToken(value: string): QuizVisibleTextToken {
+  return UUID_PAGE_ID.test(value) ? substringToken(value) : boundaryToken(value);
+}
 
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
   const tokens = new Map<string, QuizVisibleTextToken["match"]>();
   for (const token of hiddenTokens) {
-    const normalized = token.value.replace(/\p{Default_Ignorable_Code_Point}/gu, "").trim();
+    const normalized = token.value
+      .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+      .trim()
+      .normalize("NFC");
     if (!normalized) continue;
     if (token.match === "substring" || !tokens.has(normalized)) tokens.set(normalized, token.match);
   }
   if (!tokens.size) return;
-  const searchable = `${value}\n${renderedMarkdownValues(value)}`.replace(/\p{Default_Ignorable_Code_Point}/gu, "");
+  const searchable = `${value}\n${renderedMarkdownValues(value)}`
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+    .normalize("NFC");
   const substringTokens = [...tokens].filter(([, match]) => match === "substring").map(([token]) => token);
   const boundaryTokens = [...tokens].filter(([, match]) => match === "boundary").map(([token]) => token);
   if (
@@ -933,7 +942,7 @@ export class QuizService {
     const evidenceTokens = evidence
       ? evidence.flatMap((item) => [
           substringToken(item.reference),
-          boundaryToken(item.pageId),
+          pageIdToken(item.pageId),
           substringToken(item.pageDigest),
           substringToken(item.textDigest),
         ])
@@ -945,7 +954,7 @@ export class QuizService {
           .flatMap((row) =>
             [
               typeof row.reference === "string" ? substringToken(row.reference) : undefined,
-              typeof row.page_id === "string" ? boundaryToken(row.page_id) : undefined,
+              typeof row.page_id === "string" ? pageIdToken(row.page_id) : undefined,
               typeof row.page_digest === "string" ? substringToken(row.page_digest) : undefined,
               typeof row.text_digest === "string" ? substringToken(row.text_digest) : undefined,
             ].filter((token): token is QuizVisibleTextToken => Boolean(token)),
@@ -954,7 +963,7 @@ export class QuizService {
       substringToken(quiz.quizId),
       ...quiz.questions.flatMap((question) => [
         substringToken(question.questionId),
-        ...question.pages.flatMap((page) => [boundaryToken(page.pageId), substringToken(page.criterion)]),
+        ...question.pages.flatMap((page) => [pageIdToken(page.pageId), substringToken(page.criterion)]),
         ...(question.sourceRefs ?? []).map(boundaryToken),
       ]),
       ...evidenceTokens,
@@ -1181,7 +1190,7 @@ export class QuizService {
       if (!question || (question.kind !== "free-response" && question.kind !== "multiple-choice"))
         throw new ValidationError("Question kind is invalid");
       const boundaryTokens = [
-        ...selectedPageIds.map(boundaryToken),
+        ...selectedPageIds.map(pageIdToken),
         ...(Array.isArray(question.sourceRefs)
           ? question.sourceRefs
               .filter((reference): reference is string => typeof reference === "string")
