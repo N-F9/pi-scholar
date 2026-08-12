@@ -110,15 +110,22 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 function renderedMarkdownValues(value: string): string {
-  const values: string[] = [];
-  const visit = (node: unknown): void => {
-    if (!node || typeof node !== "object") return;
+  const properties: string[] = [];
+  const render = (node: unknown): string => {
+    if (!node || typeof node !== "object") return "";
     const record = node as Record<string, unknown>;
-    for (const key of ["value", "url", "title", "alt"]) if (typeof record[key] === "string") values.push(record[key]);
-    if (Array.isArray(record.children)) for (const child of record.children) visit(child);
+    for (const key of ["url", "title"]) if (typeof record[key] === "string") properties.push(record[key]);
+    if (record.type === "image") return typeof record.alt === "string" ? record.alt : "";
+    if (record.type === "break") return "\n";
+    if (Array.isArray(record.children)) {
+      const separator = ["root", "blockquote", "list", "listItem", "table", "tableRow"].includes(String(record.type))
+        ? "\n"
+        : "";
+      return record.children.map(render).join(separator);
+    }
+    return typeof record.value === "string" ? record.value : "";
   };
-  visit(fromMarkdown(value));
-  return values.join("\n");
+  return [render(fromMarkdown(value)), ...properties].join("\n");
 }
 
 function isOpaqueIdentifier(value: string): boolean {

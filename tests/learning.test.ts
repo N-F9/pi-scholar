@@ -668,6 +668,10 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   assert.throws(() => validateQuizVisibleText(`x${opaqueId}`, [opaqueId]), ValidationError);
   assert.throws(() => validateQuizVisibleText(`x${sourceReference}`, [sourceReference]), ValidationError);
   assert.throws(() => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [opaqueId]), ValidationError);
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-**$2**"), [opaqueId]),
+    ValidationError,
+  );
   assert.throws(() => validateQuizVisibleText(`x${pageDigest}`, [pageDigest]), ValidationError);
   assert.doesNotThrow(() => validateQuizVisibleText("xp1", ["p1"]));
   const storedCriterion = "Stored grading criterion";
