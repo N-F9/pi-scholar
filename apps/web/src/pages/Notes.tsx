@@ -128,7 +128,7 @@ export function NotesPage() {
     if (value) next.set("q", value);
     else next.delete("q");
     setSearchText(value);
-    setParams(next);
+    if (next.toString() !== params.toString()) setParams(next);
   }
 
   function submitSearch(event: FormEvent<HTMLFormElement>) {

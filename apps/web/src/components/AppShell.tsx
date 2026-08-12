@@ -24,7 +24,9 @@ const linkClass = ({ isActive }: { isActive: boolean }) =>
 export function AppShell() {
   const location = useLocation();
   const main = useRef<HTMLElement>(null);
-  const previousPath = useRef(location.pathname);
+  const params = new URLSearchParams(location.search);
+  const contentPath = JSON.stringify([location.pathname, params.get("pageId"), params.get("path")]);
+  const previousContentPath = useRef(contentPath);
 
   useEffect(() => {
     const pathname = location.pathname.toLowerCase().replace(/\/+$/, "") || "/";
@@ -33,11 +35,11 @@ export function AppShell() {
       secondary.find((item) => item.to === pathname)?.label ??
       (/^\/history\/[^/]+$/.test(pathname) ? "Quiz history" : "Page not found");
     document.title = `${routeTitle} · Pi Scholar`;
-    if (previousPath.current !== location.pathname) {
+    if (previousContentPath.current !== contentPath) {
       main.current?.focus({ preventScroll: true });
-      previousPath.current = location.pathname;
+      previousContentPath.current = contentPath;
     }
-  }, [location.pathname]);
+  }, [contentPath, location.pathname]);
 
   return (
     <div className="min-h-screen">
