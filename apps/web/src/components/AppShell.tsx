@@ -68,9 +68,6 @@ export function AppShell() {
             </NavLink>
           ))}
         </nav>
-        <p className="mt-auto text-xs leading-5 text-muted">
-          Your vault stays on this machine. Changes use the same local application boundary as Pi.
-        </p>
       </aside>
 
       <div className="min-w-0 pb-24 lg:ml-64 lg:pb-0">

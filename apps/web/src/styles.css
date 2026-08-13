@@ -40,6 +40,23 @@
     --ui-shadow-quiet: 0 0.5rem 2rem hsl(var(--ink) / 0.08);
   }
 
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --canvas: 220 24% 10%;
+      --paper: 220 22% 14%;
+      --ink: 42 30% 90%;
+      --muted: 215 14% 68%;
+      --line: 218 16% 28%;
+      --accent: 37 92% 55%;
+      --accent-ink: 220 33% 10%;
+      --positive: 151 48% 65%;
+      --caution: 35 90% 67%;
+      --danger: 2 75% 70%;
+      --ui-shadow-quiet: 0 0.5rem 2rem hsl(220 50% 2% / 0.35);
+    }
+  }
+
   * {
     @apply border-line;
   }
