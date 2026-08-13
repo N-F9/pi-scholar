@@ -685,7 +685,7 @@ describe("source admission mechanics", () => {
     db.close();
   });
 
-  it("publishes referenced Docling images as immutable packet attachments", async () => {
+  it("publishes referenced Docling images and converter provenance as immutable packet artifacts", async () => {
     const { paths, db } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
     const attachmentPath = "document_artifacts/image.png";
@@ -701,6 +701,7 @@ describe("source admission mechanics", () => {
           `# Document\n\n![Image](${absoluteAttachment.replaceAll("\\", "/")})\n\nText\n`,
         );
         return {
+          converter: { name: "docling", version: "2.110.0" },
           outputDirectory,
           command: {
             executable: "docling",
@@ -730,8 +731,10 @@ describe("source admission mechanics", () => {
     expect(await fs.readFile(join(result.packetPath, "attachments", attachmentPath))).toEqual(image);
     const manifest = JSON.parse((await fs.readFile(join(result.packetPath, "manifest.json"))).toString()) as {
       attachments: Array<{ path: string }>;
+      converter: { name: string; version: string };
     };
     expect(manifest.attachments.map(({ path }) => path)).toEqual([attachmentPath]);
+    expect(manifest.converter).toEqual({ name: "docling", version: "2.110.0" });
     db.close();
   });
 

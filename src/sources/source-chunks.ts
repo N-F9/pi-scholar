@@ -493,11 +493,17 @@ export async function normalizeDoclingResult(
   if (isLocalDoclingResult(result)) return result;
   if (typeof result !== "object" || result === null || Array.isArray(result)) throw new Error("invalid Docling result");
   const record = result as unknown as Record<string, unknown>;
+  const converter = record.converter;
   if (
     typeof record.outputDirectory !== "string" ||
     record.command === null ||
     typeof record.command !== "object" ||
-    Array.isArray(record.command)
+    Array.isArray(record.command) ||
+    converter === null ||
+    typeof converter !== "object" ||
+    Array.isArray(converter) ||
+    typeof (converter as Record<string, unknown>).name !== "string" ||
+    typeof (converter as Record<string, unknown>).version !== "string"
   )
     throw new Error("invalid Docling result");
   const command = record.command as Record<string, unknown>;
@@ -508,7 +514,7 @@ export async function normalizeDoclingResult(
   if (!extracted) throw new Error("Docling produced no Markdown or text output");
   return {
     extractedPath: extracted.absolutePath,
-    converter: { name: "docling", version: "unknown" },
+    converter: converter as { name: string; version: string },
     attachments: files
       .filter((file) => file.path !== extracted.path)
       .map((file) => ({

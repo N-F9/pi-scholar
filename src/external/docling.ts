@@ -15,6 +15,7 @@ export interface DoclingRequest {
 export interface DoclingResult {
   readonly command: ChildResult;
   readonly outputDirectory: string;
+  readonly converter: { readonly name: "docling"; readonly version: string };
 }
 
 export type DoclingSyncRunner = (paths: VaultPaths, args: readonly string[], timeoutMs?: number) => ChildResult;
@@ -59,6 +60,7 @@ export function doclingEnvironment(paths: VaultPaths): Readonly<Record<string, s
 
 export async function convertWithDocling(paths: VaultPaths, request: DoclingRequest): Promise<DoclingResult> {
   const command = doclingArgs(paths, request);
+  const identity = doclingDependencyIdentity(paths);
   const result = await runChild("docling", command.args, {
     cwd: paths.workRoot,
     timeoutMs: request.timeoutMs ?? DOCLING_TIMEOUT_MS,
@@ -68,6 +70,7 @@ export async function convertWithDocling(paths: VaultPaths, request: DoclingRequ
   return {
     command: result,
     outputDirectory: command.outputDirectory,
+    converter: { name: "docling", version: identity.version },
   };
 }
 
