@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { safeRelativePath, type VaultPaths } from "../vault.js";
 import { type ChildResult, runChild, runChildSync } from "./process.js";
 
-const DOCLING_TIMEOUT_MS = 300_000;
+const DOCLING_TIMEOUT_MS = 60 * 60 * 1000;
 const DOCLING_VERSION_PATTERN = /^(?:docling(?:\s+version)?\s*:?\s+)?v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/iu;
 
 export interface DoclingRequest {
