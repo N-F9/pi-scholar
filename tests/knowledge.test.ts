@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
@@ -682,6 +682,69 @@ describe("source admission mechanics", () => {
     expect(await fs.stat(join(paths.workRoot, `admission-${prepared[0]?.preparedId}`))).toBeTruthy();
     expect(await fs.stat(join(paths.workRoot, `admission-${prepared[1]?.preparedId}`))).toBeTruthy();
     await Promise.all(prepared.map((item) => sources.cleanupPrepared(item.preparedId)));
+    db.close();
+  });
+
+  it("publishes referenced Docling images as immutable packet attachments", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const attachmentPath = "document_artifacts/image.png";
+    const image = Buffer.from("image");
+    const sources = new SourceService(db, paths, {
+      docling: async ({ originalPath }) => {
+        const outputDirectory = join(dirname(dirname(originalPath)), "docling-output");
+        const absoluteAttachment = join(outputDirectory, attachmentPath);
+        await fs.mkdir(dirname(absoluteAttachment), { recursive: true });
+        await fs.writeFile(absoluteAttachment, image);
+        await fs.writeFile(
+          join(outputDirectory, "document.md"),
+          `# Document\n\n![Image](${absoluteAttachment.replaceAll("\\", "/")})\n\nText\n`,
+        );
+        return {
+          outputDirectory,
+          command: {
+            executable: "docling",
+            args: [],
+            code: 0,
+            signal: null,
+            timedOut: false,
+            stdout: "",
+            stderr: "",
+          },
+        };
+      },
+    });
+    const [entry] = await sources.discover();
+    const claim = await sources.claim(entry);
+    const prepared = await sources.prepareClaim(claim);
+    const expected = `# Document\n\n![Image](attachments/${attachmentPath})\n\nText\n`;
+    expect((await fs.readFile(join(paths.vaultRoot, prepared.extractedPath))).toString()).toBe(expected);
+    const result = await sources.publishPreparedClaim({
+      prepared,
+      preparedId: prepared.preparedId,
+      claimId: prepared.claimId,
+      digest: prepared.digest,
+      endpoints: [5],
+    });
+    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).toString()).toBe(expected);
+    expect(await fs.readFile(join(result.packetPath, "attachments", attachmentPath))).toEqual(image);
+    const manifest = JSON.parse((await fs.readFile(join(result.packetPath, "manifest.json"))).toString()) as {
+      attachments: Array<{ path: string }>;
+    };
+    expect(manifest.attachments.map(({ path }) => path)).toEqual([attachmentPath]);
+    db.close();
+  });
+
+  it("rejects embedded Docling image data before chunk planning", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const sources = new SourceService(db, paths, {
+      docling: async () => ({ extracted: "![Image](data:image/png;base64,AAAA)\n" }),
+    });
+    const [entry] = await sources.discover();
+    const claim = await sources.claim(entry);
+    await expect(sources.prepareClaim(claim)).rejects.toThrow(/embedded image data URI/iu);
+    expect(await fs.readFile(join(paths.inboxRoot, "document.pdf"), "utf8")).toBe("document\n");
     db.close();
   });
 

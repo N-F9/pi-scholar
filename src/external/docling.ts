@@ -49,7 +49,7 @@ export function doclingArgs(
   return {
     inputPath,
     outputDirectory,
-    args: ["--output", outputDirectory, inputPath],
+    args: ["convert", "--image-export-mode", "referenced", "--output", outputDirectory, inputPath],
   };
 }
 

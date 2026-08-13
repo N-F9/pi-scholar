@@ -23,8 +23,10 @@ import { QuizService } from "../quiz.js";
 import { ValidationError } from "../scheduler.js";
 import { atomicWriteFile, readFileNoFollow, safeRelativePath, type VaultPaths } from "../vault.js";
 import {
+  assertNoEmbeddedDoclingImages,
   atomizeExtraction,
   chunkEndpointNumber,
+  copyDoclingExtraction,
   type ExtractionFileBoundary,
   normalizeDoclingResult,
   normalizeMarkdownFile,
@@ -1013,13 +1015,16 @@ export class SourceService {
           version: normalizedResult.converter?.version ?? "unknown",
         };
         if ("extractedPath" in normalizedResult) {
-          await copyFileNoFollow(normalizedResult.extractedPath, rawExtracted);
+          await copyDoclingExtraction(normalizedResult.extractedPath, rawExtracted);
           for (const attachment of normalizedResult.attachments) {
             const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, validRelativePath(attachment.path)));
+            await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
             await copyFileNoFollow(attachment.absolutePath, target);
           }
         } else {
-          await fs.writeFile(rawExtracted, Buffer.from(normalizedResult.extracted), { flag: "wx", mode: 0o600 });
+          const extracted = Buffer.from(normalizedResult.extracted);
+          assertNoEmbeddedDoclingImages(extracted);
+          await fs.writeFile(rawExtracted, extracted, { flag: "wx", mode: 0o600 });
           for (const attachment of normalizedResult.attachments ?? []) {
             const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, validRelativePath(attachment.path)));
             await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });

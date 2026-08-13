@@ -20,7 +20,7 @@ import { describe, it } from "vitest";
 import { main } from "../src/cli.js";
 import { openDatabase, SCHEMA_SQL, transaction, validateSchema } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
-import { doclingDependencyIdentity, doclingEnvironment } from "../src/external/docling.js";
+import { doclingArgs, doclingDependencyIdentity, doclingEnvironment } from "../src/external/docling.js";
 import { gitDependencyIdentity, localCheckpointCommit, runGit, runGitSync } from "../src/external/git.js";
 import { runChild, runChildSync } from "../src/external/process.js";
 import {
@@ -216,6 +216,19 @@ describe("vault foundation", () => {
       XDG_CACHE_HOME: join(paths.workRoot, "cache"),
       DOCLING_CACHE_DIR: paths.workRoot,
     });
+    writeFileSync(join(paths.workRoot, "input.pdf"), "pdf");
+    const command = doclingArgs(paths, {
+      inputRelativePath: "input.pdf",
+      outputRelativeDirectory: "docling-output",
+    });
+    assert.deepEqual(command.args, [
+      "convert",
+      "--image-export-mode",
+      "referenced",
+      "--output",
+      command.outputDirectory,
+      command.inputPath,
+    ]);
     const qmd = qmdDependencyIdentity(paths, (_paths, args) => ({
       executable: "/pinned/qmd",
       args: [...args],
