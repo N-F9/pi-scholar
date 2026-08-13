@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { createApplication } from "./application/application.js";
 import { openDatabase } from "./database.js";
 import { doctor } from "./doctor.js";
@@ -189,7 +187,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   throw new Error("unsupported CLI command");
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (import.meta.main) {
   main()
     .then((code) => {
       process.exitCode = code;

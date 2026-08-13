@@ -9,6 +9,7 @@ import { describe, it, vi } from "vitest";
 import piScholarExtension from "../pi/extension.ts";
 import { parseCliArgs } from "../src/cli.js";
 import { openDatabase } from "../src/database.js";
+import { runChildSync } from "../src/external/process.js";
 import { WorkflowCoordinator } from "../src/workflows.js";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -165,6 +166,15 @@ describe("Pi package lifecycle", () => {
         .sort(),
       ["daily", "extract", "ingest", "lint", "quiz-grader"],
     );
+  });
+
+  it("executes the built CLI entrypoint", () => {
+    const result = runChildSync(process.execPath, [join(repositoryRoot, "dist", "cli.js")], {
+      cwd: repositoryRoot,
+      timeoutMs: 5_000,
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Usage:/u);
   });
 
   it("registers public and typed internal Scholar tools without a process launcher", () => {
