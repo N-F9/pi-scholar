@@ -2396,6 +2396,30 @@ describe("application capability boundaries", () => {
       db.close();
     }
   });
+
+  it("rejects delegated ingest mutations after the owning workflow finishes", async () => {
+    const { app, db } = fixture();
+    try {
+      const ingest = await app.beginWorkflow("ingest");
+      await app.finishWorkflow(ingest.workflow.requestId, "succeeded");
+
+      await assert.rejects(
+        app.applyIngestChange(
+          {
+            kind: "create-page",
+            path: "late-delegated-ingest.md",
+            body: "# Late mutation\n\nThis must not be written.\n",
+          },
+          ingest.workflow.requestId,
+        ),
+        /ingest workflow is not running/u,
+      );
+      assert.equal((await app.listWiki()).pages.length, 0);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 });
 
 describe("ingest section-local citation boundaries", () => {

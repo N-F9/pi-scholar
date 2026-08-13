@@ -100,12 +100,15 @@ type ScholarApplication = {
     options?: WorkflowFinishOptions,
   ) => Promise<unknown>;
   readonly recoverAbandonedWorkflows: () => Promise<unknown>;
+  readonly getWorkflow: (
+    requestId: string,
+  ) => Promise<{ readonly requestId: string; readonly kind: string; readonly status: string }>;
   readonly getExtractContext: () => Promise<ExtractContext>;
   readonly publishExtraction: (input: ExtractPublicationInput) => Promise<ExtractPublicationResult>;
   readonly getIngestContext: () => Promise<IngestContext>;
   readonly getLintContext: (input?: { readonly description?: string }) => Promise<LintContext>;
   readonly applyWikiChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
-  readonly applyIngestChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
+  readonly applyIngestChange: (input: WikiChangeInput, workflowRequestId?: string) => Promise<WikiChangeResult>;
   readonly getQuizEvidence: (input: QuizEvidenceRequest) => Promise<readonly QuizEvidenceRecord[]>;
   readonly getQuizContext: (input?: { readonly date?: string }) => Promise<QuizContext>;
   readonly publishQuiz: (input: QuizPublicationInput) => Promise<QuizDetailRecord>;
@@ -273,6 +276,13 @@ const wikiChangeInput = Type.Union([
     expectedDigest: Type.String({ minLength: 1 }),
   }),
 ]);
+const ingestApplyInput = Type.Object({
+  workflowRequestId: Type.String({
+    minLength: 1,
+    description: "Opaque ingest workflow ID returned by scholar_get_ingest_context; pass it unchanged.",
+  }),
+  change: wikiChangeInput,
+});
 
 const quizQuestionPageInput = Type.Object({
   pageId: Type.String({ minLength: 1 }),
@@ -332,6 +342,8 @@ const gradeInput = Type.Object({
 });
 
 const appCache = new Map<string, Promise<ScholarApplication>>();
+const delegatedWorkflows = new Map<string, string>();
+const activeDelegatedOperations = new Set<Promise<void>>();
 const gradingClaimOwner = randomUUID();
 
 async function loadRuntimeModule(): Promise<RuntimeModule> {
@@ -360,6 +372,8 @@ function jsonResult(value: unknown): AgentToolResult<unknown> {
 async function applicationFor(ctx: ExtensionContext): Promise<ScholarApplication> {
   const module = await loadRuntimeModule();
   const paths = module.resolveVault(ctx.cwd);
+  if (delegatedWorkflows.has(paths.vaultRoot))
+    throw new Error("delegated ingest workers may only call scholar_apply_ingest");
   const cached = appCache.get(paths.vaultRoot);
   if (cached) return cached;
   const pending = (async () => {
@@ -405,6 +419,12 @@ async function call<T>(
 
 function workflowKey(app: ScholarApplication, kind: LifecycleKind): string {
   return `${app.paths.vaultRoot}:${kind}`;
+}
+
+function lifecycleContextValue<T>(kind: LifecycleKind, requestId: string, value: T): unknown {
+  if (kind !== "ingest") return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("ingest context must be an object");
+  return { ...value, workflowRequestId: requestId };
 }
 
 function workflowError(error: unknown): WorkflowFinishOptions {
@@ -504,7 +524,7 @@ async function lifecycleContext<T>(
     const { replayContext, finalizedReplay, ...activeState } = existingState;
     if (finalizedReplay) {
       workflowStates.delete(key);
-      return jsonResult(replayContext);
+      return jsonResult(lifecycleContextValue(kind, activeState.requestId, replayContext));
     }
     const automaticallyFinalized =
       ("remaining" in activeState && activeState.remaining === 0) ||
@@ -526,7 +546,7 @@ async function lifecycleContext<T>(
     } else {
       workflowStates.set(key, activeState);
     }
-    return jsonResult(replayContext);
+    return jsonResult(lifecycleContextValue(kind, activeState.requestId, replayContext));
   }
   if (existingState) throw new Error(`${kind} workflow is already running`);
   let state: WorkflowState | undefined;
@@ -616,7 +636,7 @@ async function lifecycleContext<T>(
     }
   }
   progress(onUpdate, "Pi Scholar completed");
-  return jsonResult(result);
+  return jsonResult(lifecycleContextValue(kind, requestId, result));
 }
 
 async function lifecycleFinal<T>(
@@ -706,6 +726,48 @@ async function lifecycleFinal<T>(
   return jsonResult(result);
 }
 
+async function lifecycleIngestApply<T>(
+  ctx: ExtensionContext,
+  signal: AbortSignal | undefined,
+  onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+  requestId: string,
+  operation: (app: ScholarApplication) => Promise<T>,
+): Promise<AgentToolResult<unknown>> {
+  const module = await loadRuntimeModule();
+  const paths = module.resolveVault(ctx.cwd);
+  const state = workflowStates.get(`${paths.vaultRoot}:ingest`);
+  if (state) {
+    if (state.requestId !== requestId) throw new Error("ingest workflow ID does not match the current context");
+    return lifecycleFinal(ctx, signal, onUpdate, "Applying guarded ingest change", "ingest", operation);
+  }
+  const delegatedRequestId = delegatedWorkflows.get(paths.vaultRoot);
+  if (delegatedRequestId !== undefined && delegatedRequestId !== requestId)
+    throw new Error("ingest workflow ID does not match the delegated context");
+
+  cancelled(signal);
+  progress(onUpdate, "Applying delegated ingest change");
+  const app = module.createApplication({ paths });
+  const completion = Promise.withResolvers<void>();
+  activeDelegatedOperations.add(completion.promise);
+  try {
+    const workflow = await app.getWorkflow(requestId);
+    if (workflow.kind !== "ingest" || workflow.status !== "running")
+      throw new Error("delegated ingest workflow is not running");
+    delegatedWorkflows.set(paths.vaultRoot, requestId);
+    cancelled(signal);
+    const result = await operation(app);
+    progress(onUpdate, "Pi Scholar completed");
+    return jsonResult(result);
+  } finally {
+    try {
+      await app.close?.();
+    } finally {
+      completion.resolve();
+      activeDelegatedOperations.delete(completion.promise);
+    }
+  }
+}
+
 async function lifecycleFinish<T>(
   ctx: ExtensionContext,
   signal: AbortSignal | undefined,
@@ -716,11 +778,13 @@ async function lifecycleFinish<T>(
 ): Promise<AgentToolResult<unknown>> {
   cancelled(signal);
   progress(onUpdate, message);
-  const app = await applicationFor(ctx);
-  cancelled(signal);
-  const key = workflowKey(app, kind);
+  const module = await loadRuntimeModule();
+  const paths = module.resolveVault(ctx.cwd);
+  const key = `${paths.vaultRoot}:${kind}`;
   const state = workflowStates.get(key);
   if (!state) throw new Error(`${kind} context is required before finishing`);
+  const app = await applicationFor(ctx);
+  cancelled(signal);
 
   let result: T;
   try {
@@ -985,12 +1049,14 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_apply_ingest",
     label: "scholar_apply_ingest",
     executionMode: "sequential",
-    description: "Apply one guarded source-grounded wiki change during ingest.",
-    parameters: wikiChangeInput,
+    description: "Apply one guarded source-grounded wiki change under the parent ingest workflow.",
+    parameters: ingestApplyInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      return lifecycleFinal(ctx, _signal, onUpdate, "Applying guarded ingest change", "ingest", (app) =>
-        app.applyIngestChange(params as WikiChangeInput),
-      );
+      const input = asRecord(params);
+      const requestId = String(input.workflowRequestId ?? "").trim();
+      if (!requestId) throw new Error("workflowRequestId is required");
+      const change = asRecord(input.change) as WikiChangeInput;
+      return lifecycleIngestApply(ctx, _signal, onUpdate, requestId, (app) => app.applyIngestChange(change, requestId));
     },
   });
   pi.registerTool({
@@ -1107,9 +1173,12 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    const delegated = [...activeDelegatedOperations];
+    delegatedWorkflows.clear();
+    workflowStates.clear();
+    await Promise.allSettled(delegated);
     const pending = [...appCache.values()];
     appCache.clear();
-    workflowStates.clear();
     const apps = await Promise.allSettled(pending);
     await Promise.all(apps.flatMap((result) => (result.status === "fulfilled" ? [result.value.close?.()] : [])));
   });

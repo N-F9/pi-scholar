@@ -28,6 +28,9 @@ type FakeLifecycleApp = {
   readonly order: readonly string[];
   recoverAbandonedWorkflows: () => Promise<unknown>;
   beginWorkflow: (kind: string) => Promise<{ readonly workflow: { readonly requestId: string } }>;
+  getWorkflow: (
+    requestId: string,
+  ) => Promise<{ readonly requestId: string; readonly kind: string; readonly status: string }>;
   getExtractContext: () => Promise<unknown>;
   getIngestContext: () => Promise<unknown>;
   getLintContext: () => Promise<unknown>;
@@ -36,9 +39,10 @@ type FakeLifecycleApp = {
   publishQuiz: (input: unknown) => Promise<unknown>;
   publishExtraction: (input: unknown) => Promise<unknown>;
   applyWikiChange: (input: unknown) => Promise<unknown>;
-  applyIngestChange: (input: unknown) => Promise<unknown>;
+  applyIngestChange: (input: unknown, workflowRequestId?: string) => Promise<unknown>;
   finishWorkflow: (requestId: string, status: string, options?: unknown) => Promise<unknown>;
   updateWorkflow: (requestId: string, options: unknown) => Promise<unknown>;
+  close?: () => Promise<void>;
 };
 
 const runtimeApps = vi.hoisted(() => new Map<string, FakeLifecycleApp>());
@@ -98,6 +102,7 @@ function fakeLifecycleApp(
       order.push(`begin:${kind}`);
       return { workflow: { requestId: `${kind}-${root}` } };
     },
+    getWorkflow: async (requestId) => ({ requestId, kind: "ingest", status: "running" }),
     getExtractContext: async () => context,
     getIngestContext: async () => ({}),
     getLintContext: async () => ({}),
@@ -276,6 +281,23 @@ describe("Pi package lifecycle", () => {
     vaultResolutionHooks.delete(fixture.root);
 
     assert.equal(recoveries, 1);
+  });
+
+  it("blocks other Scholar tools after a delegated apply without recovering", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({}));
+
+    await invoke(
+      fixture.tools,
+      "scholar_apply_ingest",
+      { workflowRequestId: "parent-ingest", change: { kind: "create-page" } },
+      fixture.root,
+    );
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_get_ingest_context", {}, fixture.root),
+      /delegated ingest workers may only call scholar_apply_ingest/u,
+    );
+
+    assert.deepEqual(fixture.app.order, []);
   });
   it("does not claim a workflow when cancelled during initialization", async () => {
     const fixture = fakeLifecycleApp({}, async () => ({}));
@@ -536,7 +558,10 @@ describe("Pi package lifecycle", () => {
 
         await assert.rejects(invoke(fixture.tools, contextTool, {}, fixture.root), /injected context update failure/u);
         const replay = (await invoke(fixture.tools, contextTool, {}, fixture.root)) as { readonly details: unknown };
-        assert.strictEqual(replay.details, context);
+        assert.deepEqual(
+          replay.details,
+          kind === "ingest" ? { ...context, workflowRequestId: `ingest-${fixture.root}` } : context,
+        );
         await assert.rejects(invoke(fixture.tools, contextTool, {}, fixture.root), /workflow is already running/u);
 
         if (finishTool) {
@@ -586,7 +611,12 @@ describe("Pi package lifecycle", () => {
         invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root),
         /injected context update failure/u,
       );
-      await invoke(fixture.tools, `scholar_apply_${kind}`, {}, fixture.root);
+      await invoke(
+        fixture.tools,
+        `scholar_apply_${kind}`,
+        kind === "ingest" ? { workflowRequestId: `ingest-${fixture.root}`, change: {} } : {},
+        fixture.root,
+      );
       await assert.rejects(
         invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root),
         /workflow is already running/u,
@@ -614,11 +644,34 @@ describe("Pi package lifecycle", () => {
         };
       }
 
-      await invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root);
+      const loaded = (await invoke(fixture.tools, `scholar_get_${kind}_context`, {}, fixture.root)) as {
+        readonly details: unknown;
+      };
+      assert.deepEqual(
+        loaded.details,
+        kind === "ingest" ? { ...context, workflowRequestId: `ingest-${fixture.root}` } : context,
+      );
       fixture.app.updateWorkflow = async () => {
         throw new Error("unexpected apply progress write");
       };
-      const applied = (await invoke(fixture.tools, `scholar_apply_${kind}`, {}, fixture.root)) as {
+      if (kind === "ingest") {
+        await assert.rejects(
+          invoke(
+            fixture.tools,
+            "scholar_apply_ingest",
+            { workflowRequestId: "wrong-workflow", change: {} },
+            fixture.root,
+          ),
+          /does not match the current context/u,
+        );
+        assert.equal(operationCalls, 0);
+      }
+      const applied = (await invoke(
+        fixture.tools,
+        `scholar_apply_${kind}`,
+        kind === "ingest" ? { workflowRequestId: `ingest-${fixture.root}`, change: {} } : {},
+        fixture.root,
+      )) as {
         readonly details: unknown;
       };
       assert.strictEqual(applied.details, result);
@@ -629,6 +682,73 @@ describe("Pi package lifecycle", () => {
         ["succeeded"],
       );
     }
+  });
+
+  it("lets a delegated ingest worker apply without recovering or owning the workflow", async () => {
+    const fixture = fakeLifecycleApp({}, async () => ({}));
+    const change = { kind: "create-page" };
+    const result = { kind: "create-page", applied: true };
+    let appliedInput: unknown;
+    let applyCalls = 0;
+    let requestedWorkflowId: string | undefined;
+    let appliedWorkflowId: string | undefined;
+    let closes = 0;
+    fixture.app.close = async () => {
+      closes += 1;
+    };
+    fixture.app.getWorkflow = async (requestId) => {
+      requestedWorkflowId = requestId;
+      return { requestId, kind: "ingest", status: "running" };
+    };
+    fixture.app.applyIngestChange = async (input, workflowRequestId) => {
+      applyCalls += 1;
+      appliedInput = input;
+      appliedWorkflowId = workflowRequestId;
+      return result;
+    };
+
+    const applied = (await invoke(
+      fixture.tools,
+      "scholar_apply_ingest",
+      { workflowRequestId: "parent-ingest", change },
+      fixture.root,
+    )) as { readonly details: unknown };
+
+    assert.strictEqual(applied.details, result);
+    assert.strictEqual(appliedInput, change);
+    assert.equal(applyCalls, 1);
+    assert.equal(requestedWorkflowId, "parent-ingest");
+    assert.equal(appliedWorkflowId, "parent-ingest");
+    assert.equal(closes, 1);
+    assert.deepEqual(fixture.app.order, []);
+    assert.deepEqual(fixture.app.finishes, []);
+
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_finish_ingest", {}, fixture.root),
+      /ingest context is required before finishing/u,
+    );
+    assert.deepEqual(fixture.app.order, []);
+    assert.deepEqual(fixture.app.finishes, []);
+
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_apply_ingest", { workflowRequestId: "other-ingest", change }, fixture.root),
+      /ingest workflow ID does not match the delegated context/u,
+    );
+    assert.equal(applyCalls, 1);
+    assert.equal(closes, 1);
+
+    for (const workflow of [
+      { kind: "lint", status: "running" },
+      { kind: "ingest", status: "failed" },
+    ]) {
+      fixture.app.getWorkflow = async (requestId) => ({ requestId, ...workflow });
+      await assert.rejects(
+        invoke(fixture.tools, "scholar_apply_ingest", { workflowRequestId: "parent-ingest", change }, fixture.root),
+        /delegated ingest workflow is not running/u,
+      );
+      assert.equal(applyCalls, 1);
+    }
+    assert.equal(closes, 3);
   });
 
   it("replays exact daily initialization context after applied and unapplied automatic finish failures", async () => {

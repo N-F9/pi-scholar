@@ -1625,6 +1625,7 @@ export class ScholarApplication {
   private async applyWikiChangeDecoded(
     proposal: WikiChangeInput,
     requireIngestCitation: boolean,
+    workflowRequestId?: string,
   ): Promise<WikiChangeResult> {
     const rollback = {
       capture: () => this.captureWikiChangeRollback(proposal),
@@ -1634,6 +1635,11 @@ export class ScholarApplication {
     let preexistingDrift: ReadonlyMap<string, string> = new Map();
     return this.durableDirect(
       async () => {
+        if (workflowRequestId !== undefined) {
+          const workflow = this.workflows.get(workflowRequestId);
+          if (workflow?.kind !== "ingest" || workflow.status !== "running")
+            throw new ValidationError("ingest workflow is not running");
+        }
         const allowDrift = proposal.kind === "update-page" || proposal.kind === "resolve-issue";
         preexistingDrift = allowDrift ? await this.liveDriftDigests() : new Map();
         if (preexistingDrift.size)
@@ -1791,8 +1797,8 @@ export class ScholarApplication {
   async applyWikiChange(input: WikiChangeInput): Promise<WikiChangeResult> {
     return this.applyWikiChangeDecoded(decodeWikiChangeInput(input), false);
   }
-  async applyIngestChange(input: WikiChangeInput): Promise<WikiChangeResult> {
-    return this.applyWikiChangeDecoded(decodeWikiChangeInput(input), true);
+  async applyIngestChange(input: WikiChangeInput, workflowRequestId?: string): Promise<WikiChangeResult> {
+    return this.applyWikiChangeDecoded(decodeWikiChangeInput(input), true, workflowRequestId);
   }
   private async quizEvidence(pages: readonly PageLearningRecord[]): Promise<QuizEvidenceRecord[]> {
     const contents = new Map<string, Buffer>();
