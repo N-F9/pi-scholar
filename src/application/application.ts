@@ -519,11 +519,14 @@ export class ScholarApplication {
     };
     const requireSectionCitation = (markdown: string, section: IngestSection): void => {
       const references = okfFootnoteLabels(sectionText(markdown, section)).references;
+      const label = section.anchor.replace(/^#+/u, "") || "preamble";
       if (!references.length)
-        throw new ValidationError("source-grounded ingest changes require an immutable source chunk citation");
+        throw new ValidationError(
+          `source-grounded ingest section "${label}" requires an immutable source chunk citation`,
+        );
       if (!references.some((reference) => authorized.has(reference)))
         throw new ValidationError(
-          "source-grounded ingest changes require an authorized immutable source chunk citation",
+          `source-grounded ingest section "${label}" requires an authorized immutable source chunk citation`,
         );
     };
     const nextSections = sections(body);

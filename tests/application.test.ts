@@ -2415,14 +2415,14 @@ describe("ingest section-local citation boundaries", () => {
         app.applyIngestChange({
           kind: "create-page",
           path: "ingest-create-rejected.md",
-          body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
+          body: `# Grounded\n\nClaim [^${chunkId}][^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
         }),
-        /immutable source chunk citation/u,
+        /section "uncited" requires an immutable source chunk citation/u,
       );
       const created = await app.applyIngestChange({
         kind: "create-page",
         path: "ingest-create-accepted.md",
-        body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
+        body: `# Grounded\n\nClaim [^${chunkId}][^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
       });
       assert.equal(created.page?.relativePath, "ingest-create-accepted.md");
     } finally {
