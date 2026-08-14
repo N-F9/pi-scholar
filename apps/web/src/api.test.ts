@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { managedImageUri, markdownImages, parseManagedImageUri } from "../../../src/markdown";
 import {
   api,
   isHealthResult,
@@ -307,7 +308,68 @@ describe("api response boundary", () => {
   });
 });
 
-describe("Markdown heading rendering", () => {
+describe("managed image Markdown", () => {
+  it("parses canonical inline and reference images while ignoring code examples", () => {
+    const sourceId = "11111111-1111-4111-8111-111111111111";
+    const digest = "a".repeat(64);
+    const uri = managedImageUri(sourceId, digest);
+    assert.deepEqual(parseManagedImageUri(uri), { sourceId, digest });
+    assert.equal(parseManagedImageUri(`${uri}/extra`), undefined);
+    assert.throws(() => managedImageUri(sourceId, digest.toUpperCase()), /malformed/u);
+    assert.deepEqual(
+      markdownImages(
+        `\`![Inline code](${uri})\`\n\n\`\`\`md\n![Fenced](${uri})\n\`\`\`\n\n![Inline](${uri})\n\n![Reference][figure]\n\n![Missing][absent]\n\n[figure]: ${uri}\n`,
+      ),
+      [
+        { url: uri, alt: "Inline" },
+        { url: uri, alt: "Reference" },
+      ],
+    );
+  });
+});
+
+describe("Markdown rendering", () => {
+  it("renders inline and display math with KaTeX", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: "Inline $E = mc^2$; blocked $\\href{https://example.com}{link}$.\n\n$$\n\\int_0^1 x^2\\,dx\n$$\n",
+      }),
+    );
+
+    assert.match(rendered, /class="katex"/u);
+    assert.match(rendered, /class="katex-display"/u);
+    assert.doesNotMatch(rendered, /<a\b/u);
+  });
+
+  it("highlights fenced code without changing its whitespace", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: "```ts\nconst answer = 42;\n  console.log(answer);\n```\n",
+      }),
+    );
+
+    assert.match(rendered, /class="code-toolbar"/u);
+    assert.match(rendered, /<span>ts<\/span>/u);
+    assert.match(rendered, /aria-label="Copy ts code"/u);
+    assert.match(rendered, />Copy<\/button>/u);
+    assert.match(rendered, /class="hljs-keyword"/u);
+
+    const code = rendered.match(/<code[^>]*>([\s\S]*?)<\/code>/u)?.[1];
+    assert.equal(code?.replace(/<[^>]+>/gu, ""), "const answer = 42;\n  console.log(answer);\n");
+  });
+
+  it("keeps Mermaid and raw HTML inert", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: '```mermaid\ngraph TD\nA-->B\n```\n\n<div onclick="alert(1)">unsafe</div>\n',
+      }),
+    );
+
+    assert.match(rendered, /class="language-mermaid mermaid-source"/u);
+    assert.match(rendered, /data-diagram="inert"/u);
+    assert.doesNotMatch(rendered, /<svg|onclick=|&lt;div/u);
+  });
+
   it("uses the image placeholder when assigning image-only heading ids", () => {
     const rendered = renderToStaticMarkup(
       createElement(Markdown, {
@@ -316,5 +378,35 @@ describe("Markdown heading rendering", () => {
       }),
     );
     assert.match(rendered, /<h1 id="image-architecture">.*\[Image: Architecture\].*<\/h1>/u);
+    assert.doesNotMatch(rendered, /<img/u);
+  });
+
+  it("renders only page-authorized managed images as same-origin attachments", () => {
+    const sourceId = "11111111-1111-4111-8111-111111111111";
+    const digest = "a".repeat(64);
+    const uri = `pi-scholar://source/${sourceId}/attachment/${digest}`;
+    const managed = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: `![Managed diagram][figure]\n\n[figure]: ${uri}\n`,
+        pageId: "22222222-2222-4222-8222-222222222222",
+      }),
+    );
+    assert.match(
+      managed,
+      new RegExp(
+        `<img alt="Managed diagram" loading="lazy" src="/api/v1/wiki/pages/22222222-2222-4222-8222-222222222222/attachments/${sourceId}/${digest}"`,
+        "u",
+      ),
+    );
+    assert.doesNotMatch(managed, /pi-scholar:/u);
+
+    const unavailable = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: `![No page](${uri})\n\n![External](https://example.com/image.png)\n\n[Managed link](${uri})\n`,
+      }),
+    );
+    assert.match(unavailable, /\[Image: No page\]/u);
+    assert.match(unavailable, /\[Image: External\]/u);
+    assert.doesNotMatch(unavailable, /<img|pi-scholar:|https:\/\/example\.com\/image\.png/u);
   });
 });

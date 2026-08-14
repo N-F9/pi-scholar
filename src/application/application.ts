@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import type {
   DoctorReport,
   ExtractContext,
+  ExtractContextRequest,
   ExtractFailureRecord,
+  ExtractProgressEvent,
+  ExtractProgressPhase,
   ExtractPublicationInput,
   ExtractPublicationResult,
   GradeSettlementInput,
@@ -12,6 +15,7 @@ import type {
   GradingResult,
   HealthResult,
   IngestContext,
+  IngestContextRequest,
   IngestSourceChunk,
   IngestSourceContext,
   LintContext,
@@ -65,6 +69,7 @@ import {
   safePush,
 } from "../external/git.js";
 import { qmdRefresh, qmdScopeCheck, qmdSearch } from "../external/qmd.js";
+import { managedImageUri, markdownImages } from "../markdown.js";
 import {
   okfCitationText,
   okfFootnoteLabels,
@@ -81,6 +86,7 @@ import {
   ValidationError,
 } from "../scheduler.js";
 import {
+  type InboxEntry,
   type SourceStageRequest as MechanicsSourceStageRequest,
   type SourceAdapters,
   type SourceClaim,
@@ -146,6 +152,10 @@ import {
   sourceRecord,
 } from "./projections.js";
 
+const EXTRACT_BATCH_SIZE = 3;
+const UUID_SOURCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const PENDING_SOURCE_ID = /^pending-[0-9a-f]{32}$/iu;
+
 export interface ApplicationMutationContext {
   readonly origin?: "browser" | "pi" | "cli" | "internal";
 }
@@ -170,6 +180,7 @@ export interface ApplicationStatus extends HealthResult {
   readonly settings: SettingsRecord;
   readonly workflows: readonly PublicWorkflowRecord[];
 }
+export type ExtractProgressObserver = (event: ExtractProgressEvent) => void | Promise<void>;
 export interface SourceStageResult {
   readonly source: PublicSourceRecord;
 }
@@ -246,6 +257,38 @@ function boundedUtf8(value: string, maxBytes: number): string {
     end += character.length;
   }
   return value.slice(0, end);
+}
+function sourceIdFilter(
+  value: unknown,
+  options: { readonly pending: boolean; readonly limit?: number },
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new ValidationError("source ID filter must be an array");
+  if (options.limit !== undefined && value.length > options.limit)
+    throw new ValidationError(`source ID filter is limited to ${options.limit} entries`);
+  const ids = value.map((entry) => {
+    if (
+      typeof entry !== "string" ||
+      !(options.pending ? PENDING_SOURCE_ID.test(entry) || UUID_SOURCE_ID.test(entry) : UUID_SOURCE_ID.test(entry))
+    )
+      throw new ValidationError("source ID filter contains a malformed ID");
+    return entry;
+  });
+  if (new Set(ids).size !== ids.length) throw new ValidationError("source ID filter contains duplicates");
+  return ids;
+}
+function safeExtractFilename(value: string): string {
+  const filename = basename(value.replace(/\\/gu, "/"))
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return boundedUtf8(filename || "source", 160);
+}
+function emitExtractProgress(observer: ExtractProgressObserver | undefined, event: ExtractProgressEvent): void {
+  try {
+    const result = observer?.(event);
+    if (result) void Promise.resolve(result).catch(() => undefined);
+  } catch {}
 }
 function mutationFinalizationError(
   stage: "checkpoint" | "doctor" | "commit" | "projection" | "qmd" | "rollback",
@@ -574,8 +617,11 @@ export class ScholarApplication {
       return localDate(new Date());
     }
   }
-  private pendingSource(entry: Awaited<ReturnType<SourceService["discover"]>>[number]): SourceRecord {
-    const sourceId = `pending-${sha256(`${entry.relativePath}:${JSON.stringify(entry.identity)}`).slice(0, 32)}`;
+  private pendingSourceId(entry: InboxEntry): string {
+    return `pending-${sha256(`${entry.relativePath}:${JSON.stringify(entry.identity)}`).slice(0, 32)}`;
+  }
+  private pendingSource(entry: InboxEntry): SourceRecord {
+    const sourceId = this.pendingSourceId(entry);
     const now = new Date().toISOString();
     return {
       sourceId,
@@ -600,19 +646,49 @@ export class ScholarApplication {
     this.extractionClaims.clear();
     for (const { prepared } of tracked) await this.sources.cleanupPrepared(prepared.preparedId);
   }
-  async getExtractContext(): Promise<ExtractContext> {
+  async getExtractContext(
+    input: ExtractContextRequest = {},
+    observer?: ExtractProgressObserver,
+  ): Promise<ExtractContext> {
+    const discovered = await this.sources.discover();
+    const requestedIds = sourceIdFilter(input.pendingSourceIds, { pending: true, limit: EXTRACT_BATCH_SIZE });
+    const entries =
+      requestedIds === undefined
+        ? discovered.slice(0, EXTRACT_BATCH_SIZE)
+        : (() => {
+            const pending = new Map(discovered.map((entry) => [this.pendingSourceId(entry), entry]));
+            const durable = new Set(this.sources.list().map((source) => String(source.sourceId ?? "")));
+            return requestedIds.map((sourceId) => {
+              const entry = pending.get(sourceId);
+              if (entry) return entry;
+              if (durable.has(sourceId)) throw new ValidationError("requested source is not pending");
+              throw new ValidationError("requested pending source is stale or missing");
+            });
+          })();
     await this.clearExtractionClaims();
     const claims: PreparedAdmission[] = [];
     const failures: ExtractFailureRecord[] = [];
     let recordingError: unknown;
-    for (const entry of await this.sources.discover()) {
+    for (const [index, entry] of entries.entries()) {
+      const filename = safeExtractFilename(
+        entry.metadata?.displayName ?? entry.metadata?.originalName ?? entry.relativePath,
+      );
+      const notify = (phase: ExtractProgressPhase): void =>
+        emitExtractProgress(observer, { entry: index + 1, total: entries.length, filename, phase });
       let claim: SourceClaim | undefined;
+      const progressState = { failed: false };
+      const observe = (phase: ExtractProgressPhase): void => {
+        progressState.failed ||= phase === "failed";
+        notify(phase);
+      };
+      notify("claiming");
       try {
         claim = await this.sources.claim(entry);
-        const prepared = await this.sources.prepareClaim(claim);
+        const prepared = await this.sources.prepareClaim(claim, observe);
         this.extractionClaims.set(claim.claimId, { claim, prepared });
         claims.push(prepared);
       } catch (error) {
+        if (!progressState.failed) notify("failed");
         try {
           await this.durableDirect(
             () => this.sources.recordExtractFailure(entry, error, claim),
@@ -888,6 +964,25 @@ export class ScholarApplication {
   }
   async getWiki(pageIdOrPath: string): Promise<WikiPageResult> {
     return this.wikiResult(pageIdOrPath);
+  }
+  async getWikiAttachment(pageId: string, sourceId: string, attachmentDigest: string) {
+    if (
+      !UUID_SOURCE_ID.test(pageId) ||
+      !UUID_SOURCE_ID.test(sourceId) ||
+      pageId !== pageId.toLowerCase() ||
+      sourceId !== sourceId.toLowerCase() ||
+      !/^[0-9a-f]{64}$/u.test(attachmentDigest)
+    )
+      throw new ValidationError("managed image identity is malformed");
+    const value = await this.wiki.get(pageId);
+    if (value.status === "retired") throw new Error("page not found");
+    const parsed = parseWikiMarkdown(value.content);
+    const uri = managedImageUri(sourceId, attachmentDigest);
+    if (!markdownImages(parsed.body).some((image) => image.url === uri))
+      throw new ValidationError("image is not referenced by page");
+    if (!this.wiki.citedSourceIds(parsed.body).has(sourceId))
+      throw new ValidationError("image source is not cited by page");
+    return this.sources.publishedAttachment(sourceId, attachmentDigest);
   }
   async searchWiki(
     query: string,
@@ -1321,9 +1416,18 @@ export class ScholarApplication {
     const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
     return { pages, issues };
   }
-  async getIngestContext(): Promise<IngestContext> {
+  async getIngestContext(input: IngestContextRequest = {}): Promise<IngestContext> {
+    const sourceIds = sourceIdFilter(input.sourceIds, { pending: false });
+    if (sourceIds !== undefined) {
+      const byId = new Map(this.sources.list().map((source) => [String(source.sourceId ?? ""), source]));
+      for (const sourceId of sourceIds) {
+        const source = byId.get(sourceId);
+        if (!source) throw new ValidationError("requested published source is stale or missing");
+        if (source.status !== "published") throw new ValidationError("requested source is not published");
+      }
+    }
     const { pages, issues } = await this.wikiMaintenanceContext();
-    const sources = await this.sources.publishedPackets();
+    const sources = await this.sources.publishedPackets(sourceIds);
     return {
       pages,
       issues,

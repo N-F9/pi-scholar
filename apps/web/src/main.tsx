@@ -11,6 +11,7 @@ import { NotFoundPage } from "./pages/NotFound";
 import { SettingsPage } from "./pages/Settings";
 import { TodayPage } from "./pages/Today";
 import { WorkflowsPage } from "./pages/Workflows";
+import "katex/dist/katex.min.css";
 import "./styles.css";
 
 const queryClient = new QueryClient({

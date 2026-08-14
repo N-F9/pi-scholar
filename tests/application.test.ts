@@ -7,8 +7,8 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
-import { publicSource, publicWorkflow } from "../src/application/projections.js";
-import type { GradingContext } from "../src/contracts.js";
+import { publicSource, publicWikiPage, publicWorkflow } from "../src/application/projections.js";
+import type { ExtractProgressEvent, GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
@@ -99,6 +99,32 @@ function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?
   };
   return { app, db, paths, calls, wiki, scheduler, quiz };
 }
+it("keeps internal wiki results as full OKF while projecting a public copy", async () => {
+  const { app, db } = fixture();
+  try {
+    const created = await app.createNote({
+      path: "public-projection.md",
+      title: "Public projection",
+      body: "# Projection\n\nBody.\n",
+      quizWorthiness: "skip",
+    });
+    const internal = await app.getWiki(created.page.pageId);
+    assert.match(internal.markdown, /^---\r?\n/u);
+    assert.equal(parseWikiMarkdown(internal.markdown).body, "# Projection\n\nBody.\n");
+
+    const projected = publicWikiPage(internal);
+    assert.notEqual(projected, internal);
+    assert.equal(projected.markdown, "# Projection\n\nBody.\n");
+    assert.equal(projected.markdown.includes("type:"), false);
+    assert.equal(projected.sections[0]?.heading, "Projection");
+    const firstSection = projected.sections[0];
+    assert.ok(firstSection);
+    assert.equal(projected.markdown.slice(firstSection.startOffset, firstSection.endOffset), projected.markdown);
+  } finally {
+    await app.close();
+    db.close();
+  }
+});
 
 async function publishedChunkId(app: ScholarApplication): Promise<string> {
   await app.stageSource({ kind: "text", text: "ingest evidence\n", name: "ingest-evidence.txt" });
@@ -142,6 +168,102 @@ describe("durable application writes", () => {
       const result = await app.stageSource({ kind: "text", text: "staged\n", name: "staged.txt" });
       assert.equal(result.source.status, "pending");
       assert.deepEqual(calls, ["checkpoint", "doctor", "commit:source:stage"]);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("drains five queued sources in extraction batches of three then two", async () => {
+    const { app, db } = fixture();
+    const names = ["01.txt", "02.txt", "03.txt", "04.txt", "05.txt"];
+    try {
+      for (const name of names) await app.stageSource({ kind: "text", text: `${name}\n`, name });
+
+      const first = await app.getExtractContext();
+      assert.equal(first.claims.length, 3);
+      for (const claim of first.claims)
+        await app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        });
+
+      const second = await app.getExtractContext();
+      assert.equal(second.claims.length, 2);
+      for (const claim of second.claims)
+        await app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        });
+      assert.deepEqual([...first.claims, ...second.claims].map(({ displayName }) => displayName).sort(), names);
+
+      assert.deepEqual((await app.getExtractContext()).claims, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("claims exact pending source IDs atomically and reports bounded preparation phases", async () => {
+    const { app, db } = fixture();
+    try {
+      const staged = [];
+      for (const name of ["01.txt", "02.txt", "03.txt", "04.txt"])
+        staged.push(await app.stageSource({ kind: "text", text: `${name}\n`, displayName: name }));
+      const pendingIds = staged.map(({ source }) => source.sourceId);
+      const invalidProgress: ExtractProgressEvent[] = [];
+      await assert.rejects(
+        app.getExtractContext({ pendingSourceIds: [pendingIds[0]!, pendingIds[0]!] }, (event) =>
+          invalidProgress.push(event),
+        ),
+        /duplicates/u,
+      );
+      await assert.rejects(
+        app.getExtractContext({ pendingSourceIds: ["pending-ffffffffffffffffffffffffffffffff"] }),
+        /stale or missing/u,
+      );
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: ["not-a-source"] }), /malformed/u);
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: pendingIds }), /limited to 3 entries/u);
+      assert.deepEqual(invalidProgress, []);
+
+      const progress: ExtractProgressEvent[] = [];
+      const selected = await app.getExtractContext({ pendingSourceIds: [pendingIds[2]!, pendingIds[0]!] }, (event) => {
+        progress.push(event);
+        if (event.phase === "normalizing") throw new Error("presentation failed");
+      });
+      assert.deepEqual(
+        selected.claims.map(({ displayName }) => displayName),
+        ["03.txt", "01.txt"],
+      );
+      for (const [index, filename] of ["03.txt", "01.txt"].entries()) {
+        assert.deepEqual(
+          progress.filter((event) => event.entry === index + 1),
+          ["claiming", "preparing", "extracting", "normalizing", "validating/indexing", "ready"].map((phase) => ({
+            entry: index + 1,
+            total: 2,
+            filename,
+            phase,
+          })),
+        );
+      }
+
+      const published = [];
+      for (const claim of selected.claims)
+        published.push(
+          await app.publishExtraction({
+            claimId: claim.claimId,
+            preparedId: claim.preparedId,
+            digest: claim.digest,
+            endpoints: [1],
+          }),
+        );
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: [published[0]!.sourceId] }), /not pending/u);
+      assert.deepEqual((await app.getExtractContext()).claims.map(({ displayName }) => displayName).sort(), [
+        "02.txt",
+        "04.txt",
+      ]);
     } finally {
       await app.close();
       db.close();
@@ -827,6 +949,54 @@ describe("knowledge capability contexts", () => {
         const { path: _path, ...manifestChunk } = chunk;
         assert.deepEqual(manifestChunk, packet.manifest.chunks[index]);
       }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("filters research ingest sources without capping ordinary pages or packets", async () => {
+    const { app, db } = fixture();
+    try {
+      for (const name of ["one.txt", "two.txt", "three.txt", "four.txt"])
+        await app.stageSource({ kind: "text", text: `${name}\n`, displayName: name });
+      const published = [];
+      for (let batch = await app.getExtractContext(); batch.claims.length; batch = await app.getExtractContext()) {
+        for (const claim of batch.claims)
+          published.push(
+            await app.publishExtraction({
+              claimId: claim.claimId,
+              preparedId: claim.preparedId,
+              digest: claim.digest,
+              endpoints: [1],
+            }),
+          );
+      }
+      for (const index of [1, 2, 3, 4])
+        await app.createNote({
+          path: `topic-${index}.md`,
+          body: `# Topic ${index}\n\nBody ${index}.\n`,
+          quizWorthiness: "skip",
+        });
+
+      const ordinary = await app.getIngestContext();
+      assert.equal(ordinary.sources.length, 4);
+      assert.equal(ordinary.pages.length >= 4, true);
+      const selectedIds = [published[3]!.sourceId, published[1]!.sourceId];
+      const filtered = await app.getIngestContext({ sourceIds: selectedIds });
+      assert.deepEqual(
+        filtered.sources.map(({ source }) => source.sourceId),
+        selectedIds,
+      );
+      assert.deepEqual(filtered.pages, ordinary.pages);
+      assert.deepEqual(filtered.issues, ordinary.issues);
+      assert.equal(
+        (await app.getIngestContext({ sourceIds: published.map(({ sourceId }) => sourceId) })).sources.length,
+        4,
+      );
+      await assert.rejects(app.getIngestContext({ sourceIds: [selectedIds[0]!, selectedIds[0]!] }), /duplicates/u);
+      await assert.rejects(app.getIngestContext({ sourceIds: ["not-a-source"] }), /malformed/u);
+      await assert.rejects(app.getIngestContext({ sourceIds: [randomUUID()] }), /stale or missing/u);
     } finally {
       await app.close();
       db.close();

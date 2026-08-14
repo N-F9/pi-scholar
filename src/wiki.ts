@@ -4,6 +4,7 @@ import { dirname, join, normalize, relative } from "node:path";
 import type { WikiIssueKind, WikiIssueRecord, WikiIssueStatus } from "./contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
 import { type QmdIndexOptions, qmdCollectionName } from "./external/qmd.js";
+import { markdownImages, parseManagedImageUri } from "./markdown.js";
 import {
   type OkfProjectionPage,
   okfCitationText,
@@ -188,7 +189,7 @@ function rowToIssue(row: IssueRow): WikiIssueRecord {
 }
 function linksFromMarkdown(body: string): string[] {
   const links: string[] = [];
-  const pattern = /!?(?:\[[^\]]*\])\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/gu;
+  const pattern = /(?<!!)\[[^\]]*\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/gu;
   for (const match of body.matchAll(pattern)) {
     const target = match[1];
     if (!target || target.startsWith("#") || /^https?:\/\//iu.test(target)) continue;
@@ -218,6 +219,13 @@ function resolveWikiLink(root: string, pagePath: string, target: string): string
 }
 function validateMarkdownLinks(root: string, pagePath: string, body: string): void {
   for (const target of linksFromMarkdown(body)) resolveWikiLink(root, pagePath, target);
+}
+function validateMarkdownImages(body: string, citedSourceIds: ReadonlySet<string>): void {
+  for (const image of markdownImages(body)) {
+    const managed = parseManagedImageUri(image.url);
+    if (!managed) throw new Error("wiki images must use canonical managed source URIs");
+    if (!citedSourceIds.has(managed.sourceId)) throw new Error("wiki image source is not cited by the page");
+  }
 }
 function titleFromPath(path: string): string {
   const name = path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? path;
@@ -395,6 +403,15 @@ export class WikiService {
       status: String(row.status),
     }));
   }
+  citedSourceIds(body: string): ReadonlySet<string> {
+    const byId = new Map(this.sourceRows().map((row) => [sourceCitationId(row), row.source_id]));
+    const cited = new Set<string>();
+    for (const label of okfFootnoteLabels(body).references) {
+      const sourceId = byId.get(label);
+      if (sourceId) cited.add(sourceId);
+    }
+    return cited;
+  }
   private sourceAwareContent(
     frontmatter: Record<string, unknown>,
     body: string,
@@ -487,6 +504,7 @@ export class WikiService {
   }
   private serializeContent(frontmatter: Record<string, unknown>, body: string): string {
     const prepared = this.sourceAwareContent(frontmatter, body);
+    validateMarkdownImages(prepared.body, this.citedSourceIds(prepared.body));
     return serializePage(prepared.frontmatter, prepared.body);
   }
   async create(input: WikiPageInput): Promise<WikiCreateResult> {
@@ -1359,6 +1377,7 @@ export class WikiService {
       const content = (await this.readExact(page.relativePath)).toString("utf8");
       const parsed = parseOkfConcept(content);
       assertPageTitle(parsed.frontmatter.title);
+      validateMarkdownImages(parsed.body, this.citedSourceIds(parsed.body));
       projectionPages.push({
         title: page.title,
         path: page.relativePath,
@@ -1396,6 +1415,7 @@ export class WikiService {
         const content = readFileSync(join(this.root(), page.relativePath), "utf8");
         assertInertMarkdown(content);
         const parsed = parseOkfConcept(content);
+        validateMarkdownImages(parsed.body, this.citedSourceIds(parsed.body));
         const parsedId = parsed.frontmatter.id;
         if (parsedId !== page.pageId || typeof parsedId !== "string" || !ID.test(parsedId))
           errors.push(`${page.relativePath}: stable page ID mismatch`);

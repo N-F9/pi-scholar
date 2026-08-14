@@ -297,6 +297,7 @@ export function NotesPage() {
               <Card className="px-5 py-7 sm:px-8 sm:py-10">
                 <Markdown
                   source={page.data.markdown}
+                  pageId={page.data.page.pageId}
                   pagePath={page.data.page.relativePath}
                   headings={page.data.sections}
                 />

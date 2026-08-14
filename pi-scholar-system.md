@@ -18,8 +18,11 @@ state transitions, serializes writers, and creates local Git checkpoints.
 Imported source, Markdown, model output, qmd output, and external-process
 output are data, not instructions.
 
-The operator schedules each capability independently. No skill invokes another
-skill, and no browser action starts a Pi session or a grader.
+The operator schedules each capability independently. Scheduled skills do not
+invoke one another; lint has one documented, host-capability-gated exception:
+after its initial pass finishes and the vault is quiescent, it may run one
+isolated blocking child for a specific evidence gap. That child cannot launch
+Pi or another child, and the parent waits for it.
 
 ```mermaid
 flowchart TD
@@ -255,6 +258,11 @@ The source capability is split into staging and the `extract` skill. Staging
 places an unaccepted input in the ignored inbox. Extract claims a stable
 snapshot, prepares it in private work, and publishes one verified immutable
 packet. Ingest is a separate skill and sees only published verified packets.
+Direct files and directories may be copied into `inbox/` without a registration
+command. `/scholar-add` and its typed equivalents instead materialize one
+internal queue directory containing a `.pi-scholar-source.json` envelope plus
+its payload. That directory is one pending entry and must remain intact while
+queued or extracting; it is not a packet and is not a second source authority.
 
 ```mermaid
 flowchart TD
@@ -306,6 +314,10 @@ copies accepted originals into a private work claim, uses native extraction
 for textual inputs and isolated Docling for documents, collects bounded
 attachments, and exposes only safe work-relative paths plus coarse atom ranges
 to the model.
+Imperfect OCR may provide orientation and context for later boundary choices,
+but garbled or absent formulas and facts are not evidence. The extraction or
+ingest workflow omits them or records an issue until an immutable chunk from a
+better source supports them.
 
 The `extract` skill chooses exact 1-based extracted-line endpoints. Endpoints
 must be strictly increasing and cover the complete extraction once, without
@@ -374,18 +386,27 @@ knowledge.
 
 ### Ingest and lint context
 
-`ingest` receives every non-retired wiki page, every issue record, and only
-published, verified source contexts containing the manifest, packet path, and
+`ingest` receives every non-retired wiki page, every issue record, and every
+published, verified source context containing the manifest, packet path, and
 verified chunk paths. It does not receive arbitrary files, SQLite, the inbox,
-unverified packets, or source text as instructions. Each source-grounded change
-is self-contained, textbook-style Markdown with nearby
+unverified packets, or source text as instructions. An optional complete
+`sourceIds` filter narrows the supplied packet set to those published verified
+IDs while retaining the normal page and issue context; omission preserves this
+uncapped ordinary ingest context. The filter narrows context, not
+authorization: every citation and source check remains authoritative. Each
+source-grounded change is self-contained, textbook-style Markdown with nearby
 keyed chunk citations and guarded expected IDs/digests/revisions.
 
 `lint` receives the final wiki and issue context for either a full scope or a
 requested targeted scope. It proposes only guarded create/update/rename,
 prerequisite, issue-resolution, or retirement operations. It is the final
-organizer/repair pass, not a second ingest source. Both skills submit one
-operation at a time through `ScholarApplication` and finish explicitly.
+organizer/repair pass, not a second ingest source. The parent applies supported
+operations serially and finishes once. Only a blocking evidence gap, after
+that finish and a quiescence status check, can permit one isolated blocking
+child when the host provides both task isolation and read-only web search.
+The parent waits for that child, then may run one fresh original-scope pass;
+there is no generic recursive child or workflow chaining. Both skills submit
+one operation at a time through `ScholarApplication` and finish explicitly.
 
 ## 8. Learning, daily quiz, and grading
 
@@ -487,17 +508,21 @@ authoritative if projection repair fails.
 
 | Skill | Context/read tool | Mutation/finish tools | Contract |
 |---|---|---|---|
-| `extract` | `scholar_get_extract_context` | `scholar_publish_extraction` | Process stable claims sequentially; inspect only supplied safe paths and bounded atoms; publish exact complete line coverage once per claim. |
-| `ingest` | `scholar_get_ingest_context` | `scholar_apply_ingest`, `scholar_finish_ingest` | Work only from verified packets, all non-retired pages, and issues; submit guarded source-grounded changes one at a time; finish once. |
-| `lint` | `scholar_get_lint_context` | `scholar_apply_lint`, `scholar_finish_lint` | Run full or targeted final organizer/repair scope; compose split/merge from guarded operations; finish once. |
+| `extract` | `scholar_get_extract_context` | `scholar_publish_extraction` | Process stable claims sequentially, or the caller's exact validated pending-ID selection of at most three; inspect only supplied safe paths and bounded atoms; publish exact complete line coverage once per claim. |
+| `ingest` | `scholar_get_ingest_context` | `scholar_apply_ingest`, `scholar_finish_ingest` | Work only from verified packets, all non-retired pages, and issues; omission supplies the uncapped packet set, while `sourceIds` filters only published packets; submit guarded source-grounded changes one at a time; finish once. |
+| `lint` | `scholar_get_lint_context` | `scholar_apply_lint`, `scholar_finish_lint` | Run full or targeted final organizer/repair scope; finish the initial pass once, optionally run one isolated blocking evidence-gap child after quiescence, retry the original scope once, and finish; never recurse. |
 | `daily` | `scholar_get_daily_context`, `scholar_get_daily_evidence` | `scholar_publish_daily` | Review all candidates, choose the varied time-budgeted subset, retrieve selected evidence, and publish once or explicitly skip. |
 | `quiz-grader` | `scholar_get_grading_context` | `scholar_settle_grade` | Claim one sealed revision, grade its questions, emit one bundled page rating/result per covered page, and settle once. |
 
 Every capability uses typed Scholar tools and the application entry point. Skills
 must not inspect SQLite, write Markdown or packets directly, run Git, call
 arbitrary network services, execute shell commands, or treat source text as
-instructions. Tools enforce abort checks, bounded progress, exact payloads,
-revision guards, and application-owned durable state.
+instructions. The lint exception is limited to one host-provided isolated task
+using read-only web search/read plus the explicitly named Scholar add/extract/
+publish/ingest tools; it receives no source bodies, direct vault/Git access,
+shell, lint tool, or task-spawning capability. Tools enforce abort checks,
+bounded progress, exact payloads, revision guards, and application-owned
+durable state.
 
 ## 10. Workflows and operator scheduling
 
@@ -509,9 +534,12 @@ OS scheduler.
 
 The operator starts Pi or the CLI and schedules each run independently. A run
 loads only the Pi Scholar extension and the one intended skill, with explicit
-vault/package/skill/model configuration. Extract, ingest, lint, daily, and
-quiz-grader do not launch one another. In particular, daily publication does
-not launch grading, and browser sealing does not launch grading.
+vault/package/skill/model configuration. Scheduled extract, ingest, lint, daily,
+and quiz-grader runs do not launch one another or Pi. Lint's optional child is
+not a scheduled workflow edge: it is one blocking, persistent host task after
+the parent finishes and confirms quiescence, and the parent waits for it.
+In particular, daily publication does not launch grading, and browser sealing
+does not launch grading.
 
 `sync` is the sole remote-push operation. It pushes existing local commits to
 the configured remote through the safe Git adapter. It does not pull, merge,
@@ -544,6 +572,10 @@ content-type checks; this is not authentication against another process run by
 the same local user. JSON and multipart requests have transport/body bounds,
 while source processing itself has no fixed product source-size cap and is
 streamed/disk-backed.
+HTTP exposes no arbitrary source bytes. Its sole source-byte exception is the
+page-authorized, manifest-verified raster attachment route; malformed,
+unreferenced, cross-page, non-raster, missing, tampered, or symlinked requests
+are rejected.
 
 If an operator places a reverse proxy, Tailscale/private tunnel, auth layer,
 DNS rule, or network policy in front of the loopback server, that layer is
@@ -561,10 +593,11 @@ and grading remain Pi-tool/application operations; the browser is a read,
 answer, submission, workflow, settings, and health client.
 
 The SPA provides Today, Notes, Add, History, Workflows, Settings, and Health
-views. Markdown is rendered without raw HTML; images, Mermaid blocks, and
-unsafe external content are inert; internal Markdown links route to Notes;
-HTTP(S) links use safe external-link attributes. The browser cannot author
-knowledge or grade a quiz.
+views. Markdown is rendered without raw HTML; unsupported or external images,
+Mermaid blocks, and unsafe external content are inert. A page-authorized
+managed raster attachment may render through the same-origin route; internal
+Markdown links route to Notes and HTTP(S) links use safe external-link
+attributes. The browser cannot author knowledge or grade a quiz.
 
 ## 12. External processes, doctor, and recovery
 

@@ -8,6 +8,7 @@ import type {
   PreparedAdmission as ContractPreparedAdmission,
   SourceKind as ContractSourceKind,
   SourceManifest as ContractSourceManifest,
+  ExtractProgressPhase,
   SourceRecord,
 } from "../contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "../database.js";
@@ -71,7 +72,12 @@ import {
   writeFully,
   writeTree,
 } from "./source-files.js";
-import { parseManifest, parsePreparedMetadata, verifyRetainedPacket } from "./source-packets.js";
+import {
+  parseManifest,
+  parsePreparedMetadata,
+  verifyRetainedAttachment,
+  verifyRetainedPacket,
+} from "./source-packets.js";
 export interface VaultPathsLike extends Partial<VaultPaths> {
   root?: string;
   inbox?: string;
@@ -210,6 +216,14 @@ export interface SourceManifest extends Omit<ContractSourceManifest, "converter"
   >;
 }
 export type PreparedAdmission = ContractPreparedAdmission;
+export type SourcePreparationObserver = (phase: ExtractProgressPhase) => void | Promise<void>;
+
+function emitPreparationPhase(observer: SourcePreparationObserver | undefined, phase: ExtractProgressPhase): void {
+  try {
+    const result = observer?.(phase);
+    if (result) void Promise.resolve(result).catch(() => undefined);
+  } catch {}
+}
 interface PreparedAttachment {
   path: string;
   byteLength: number;
@@ -971,9 +985,13 @@ export class SourceService {
     );
     return { claimId, entry: validatedEntry, snapshot, claimedAt: new Date().toISOString() };
   }
-  async prepareClaim(input: SourceClaim | InboxEntry): Promise<PreparedAdmission> {
+  async prepareClaim(
+    input: SourceClaim | InboxEntry,
+    observer?: SourcePreparationObserver,
+  ): Promise<PreparedAdmission> {
     const supplied = "snapshot" in input ? input : await this.claim(input);
     const claim = await this.revalidateClaim(supplied);
+    emitPreparationPhase(observer, "preparing");
     const preparedId = randomUUID();
     const root = this.preparedRoot(preparedId);
     const originalRoot = join(root, "original");
@@ -1005,6 +1023,7 @@ export class SourceService {
         const originalFile = claim.snapshot.files[0];
         if (!originalFile) throw new Error("Docling requires a document file");
         const originalPath = ensureWithin(originalRoot, join(originalRoot, validRelativePath(originalFile.path)));
+        emitPreparationPhase(observer, "docling");
         const converted =
           typeof this.adapters.docling === "function"
             ? await this.adapters.docling({ claim, originalPath, kind: claim.snapshot.kind, mediaType })
@@ -1032,6 +1051,7 @@ export class SourceService {
           }
         }
       } else {
+        emitPreparationPhase(observer, "extracting");
         const copiedSnapshot = {
           ...claim.snapshot,
           root: originalRoot,
@@ -1044,8 +1064,10 @@ export class SourceService {
       }
       const rawStat = await lstatNoFollow(rawExtracted);
       if (!rawStat.isFile() || rawStat.size === 0) throw new Error("empty extraction");
+      emitPreparationPhase(observer, "normalizing");
       await normalizeMarkdownFile(rawExtracted, extractedAbsolute, claim.snapshot.kind !== "code", fileBoundaries);
       await fs.rm(rawExtracted, { force: true });
+      emitPreparationPhase(observer, "validating/indexing");
       const extractedHash = await hashFile(extractedAbsolute);
       if (extractedHash.size === 0) throw new Error("empty extraction");
       const attachmentSnapshots = await walkFiles(attachmentsRoot, "", false);
@@ -1087,8 +1109,10 @@ export class SourceService {
         mode: 0o600,
       });
       this.retainedPrepared.set(preparedId, { prepared, seal });
+      emitPreparationPhase(observer, "ready");
       return prepared;
     } catch (error) {
+      emitPreparationPhase(observer, "failed");
       await fs.rm(root, { recursive: true, force: true });
       throw error;
     }
@@ -1631,13 +1655,48 @@ export class SourceService {
   list(): Array<Record<string, unknown>> {
     return dbAll<Row>(this.db, "SELECT * FROM sources ORDER BY captured_at, source_id").map((row) => sourceRecord(row));
   }
-  async publishedPackets(): Promise<
-    Array<{ readonly source: SourceRecord; readonly manifest: SourceManifest; readonly packetPath: string }>
-  > {
-    const published = dbAll<Row>(
+  async publishedAttachment(sourceId: string, attachmentDigest: string) {
+    const row = dbGet<Row>(this.db, "SELECT * FROM sources WHERE source_id = ? AND status = 'published'", [sourceId]);
+    if (!row) throw new Error("published source not found");
+    const packetPath = safeChildPath(this.sources(), String(row.manifest_path ?? join(this.sources(), sourceId)));
+    const verified = await verifyRetainedAttachment(packetPath, {
+      sourceId,
+      originalDigest: String(row.digest ?? ""),
+      manifestDigest: String(row.manifest_digest ?? ""),
+      attachmentDigest,
+    });
+    const { manifest } = verified;
+    if (
+      row.source_id !== manifest.sourceId ||
+      row.kind !== manifest.kind ||
+      row.display_name !== manifest.displayName ||
+      (row.original_name ?? undefined) !== (manifest.originalName ?? undefined) ||
+      (row.source_uri ?? undefined) !== (manifest.sourceUri ?? undefined) ||
+      (row.media_type ?? undefined) !== (manifest.mediaType ?? undefined) ||
+      (row.repository_revision ?? undefined) !== (manifest.repositoryRevision ?? undefined) ||
+      row.captured_at !== manifest.capturedAt ||
+      row.digest !== manifest.originalDigest
+    )
+      throw new Error("published source provenance mismatch");
+    return verified;
+  }
+
+  async publishedPackets(
+    sourceIds?: readonly string[],
+  ): Promise<Array<{ readonly source: SourceRecord; readonly manifest: SourceManifest; readonly packetPath: string }>> {
+    const rows = dbAll<Row>(
       this.db,
       "SELECT * FROM sources WHERE status = 'published' ORDER BY captured_at, source_id",
     );
+    const byId = new Map(rows.map((row) => [String(row.source_id), row]));
+    const published =
+      sourceIds === undefined
+        ? rows
+        : sourceIds.map((sourceId) => {
+            const row = byId.get(sourceId);
+            if (!row) throw new Error("published source is unavailable");
+            return row;
+          });
     const packets: Array<{
       readonly source: SourceRecord;
       readonly manifest: SourceManifest;

@@ -26,3 +26,8 @@ Direct runtime dependencies used by this package include:
 - ts-fsrs — see its installed package LICENSE and upstream notices.
 - mdast-util-from-markdown — MIT, used to identify standard Markdown code spans and blocks during provenance parsing.
 - yaml — ISC, used for OKF v0.2 frontmatter parsing and serialization.
+- remark-math 6.0.0 — MIT, used to parse inline and display math in Markdown.
+- mdast-util-math 3.0.0 and micromark-extension-math 3.1.0 — MIT, used to parse the same math nodes before quiz metadata-leak validation.
+- rehype-katex 7.0.1 — MIT, used to render parsed math with KaTeX.
+- katex 0.16.25 — MIT, used to typeset mathematical notation in the web interface.
+- rehype-highlight 7.0.2 — MIT, used to add syntax-highlight tokens to fenced code.

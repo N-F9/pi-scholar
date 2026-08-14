@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { glob, lstat } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
@@ -10,14 +11,18 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { ApplicationStatus } from "../src/application/application.js";
 import type {
   ExtractContext,
+  ExtractContextRequest,
+  ExtractProgressEvent,
   ExtractPublicationInput,
   ExtractPublicationResult,
   GradeSettlementInput,
   GradingContext,
   GradingResult,
   IngestContext,
+  IngestContextRequest,
   LintContext,
   QuizContext,
   QuizDetailRecord,
@@ -78,7 +83,7 @@ type VaultPaths = { readonly vaultRoot: string };
 
 type ScholarApplication = {
   readonly paths: VaultPaths;
-  readonly status: () => Promise<unknown>;
+  readonly status: () => Promise<ApplicationStatus>;
   readonly stageSource: (request: SourceRequest) => Promise<unknown>;
   readonly createNote: (input: WikiNoteInput) => Promise<unknown>;
   readonly updateNote: (pageId: string, input: WikiNoteUpdateInput) => Promise<unknown>;
@@ -103,9 +108,12 @@ type ScholarApplication = {
   readonly getWorkflow: (
     requestId: string,
   ) => Promise<{ readonly requestId: string; readonly kind: string; readonly status: string }>;
-  readonly getExtractContext: () => Promise<ExtractContext>;
+  readonly getExtractContext: (
+    input?: ExtractContextRequest,
+    observer?: (event: ExtractProgressEvent) => void | Promise<void>,
+  ) => Promise<ExtractContext>;
   readonly publishExtraction: (input: ExtractPublicationInput) => Promise<ExtractPublicationResult>;
-  readonly getIngestContext: () => Promise<IngestContext>;
+  readonly getIngestContext: (input?: IngestContextRequest) => Promise<IngestContext>;
   readonly getLintContext: (input?: { readonly description?: string }) => Promise<LintContext>;
   readonly applyWikiChange: (input: WikiChangeInput) => Promise<WikiChangeResult>;
   readonly applyIngestChange: (input: WikiChangeInput, workflowRequestId?: string) => Promise<WikiChangeResult>;
@@ -182,6 +190,23 @@ const searchInput = Type.Object({
 });
 const statusInput = Type.Object({});
 const emptyInput = Type.Object({});
+const extractContextInput = Type.Object({
+  pendingSourceIds: Type.Optional(
+    Type.Array(Type.String({ minLength: 1 }), {
+      maxItems: 3,
+      description:
+        "Exact pending source IDs to claim in caller order. Omit to claim the canonical next batch of at most three.",
+    }),
+  ),
+});
+const ingestContextInput = Type.Object({
+  sourceIds: Type.Optional(
+    Type.Array(Type.String({ minLength: 1 }), {
+      description:
+        "Exact published source IDs to include. Omit for every published verified packet; page and issue scope is unchanged.",
+    }),
+  ),
+});
 
 const extractionInput = Type.Object({
   claimId: Type.String({ minLength: 1 }),
@@ -399,6 +424,12 @@ async function applicationFor(ctx: ExtensionContext): Promise<ScholarApplication
 
 function progress(onUpdate: AgentToolUpdateCallback<unknown> | undefined, message: string): void {
   onUpdate?.({ content: [{ type: "text", text: message }], details: undefined });
+}
+function extractProgress(onUpdate: AgentToolUpdateCallback<unknown> | undefined, event: ExtractProgressEvent): void {
+  onUpdate?.({
+    content: [{ type: "text", text: `${event.entry}/${event.total} ${event.filename}: ${event.phase}` }],
+    details: event,
+  });
 }
 
 async function call<T>(
@@ -871,16 +902,82 @@ async function remove(app: ScholarApplication, sourceId: string, confirmationId:
   return app.removeSource(sourceId, confirmationId);
 }
 
+function parseAddArguments(raw: string): string[] {
+  const values: string[] = [];
+  let value = "";
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  let started = false;
+  for (const character of raw) {
+    if (escaped) {
+      value += character;
+      escaped = false;
+      started = true;
+    } else if (character === "\\") {
+      escaped = true;
+      started = true;
+    } else if (quote !== undefined) {
+      if (character === quote) quote = undefined;
+      else value += character;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+    } else if (/\s/u.test(character)) {
+      if (started) {
+        values.push(value);
+        value = "";
+        started = false;
+      }
+    } else {
+      value += character;
+      started = true;
+    }
+  }
+  if (escaped) throw new Error("Trailing escape in scholar-add arguments");
+  if (quote !== undefined) throw new Error("Unterminated quote in scholar-add arguments");
+  if (started) values.push(value);
+  return values;
+}
+
+async function expandAddPaths(patterns: readonly string[], cwd: string): Promise<string[]> {
+  const matches = new Set<string>();
+  for (const pattern of patterns) {
+    const absolute = resolve(cwd, pattern);
+    try {
+      await lstat(absolute);
+      matches.add(absolute);
+      continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    let matched = false;
+    for await (const match of glob(pattern, { cwd })) {
+      matched = true;
+      matches.add(resolve(cwd, match));
+    }
+    if (!matched) throw new Error(`No filesystem path matched "${pattern}"`);
+  }
+  return [...matches].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
 async function handleAddCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
   const raw = args.trim() || (ctx.hasUI ? await ctx.ui.input("Add source", "URL, path, or pasted text") : undefined);
   if (!raw) return;
-  await call(ctx, ctx.signal, undefined, "Staging source", (app) =>
-    stage(
-      app,
-      /^https?:\/\//iu.test(raw) ? { url: raw } : raw.startsWith("text:") ? { text: raw.slice(5) } : { path: raw },
-    ),
-  );
-  ctx.ui.notify("Source staged in inbox", "info");
+  if (/^https?:\/\//iu.test(raw) || raw.startsWith("text:")) {
+    await call(ctx, ctx.signal, undefined, "Staging source", (app) =>
+      stage(app, /^https?:\/\//iu.test(raw) ? { url: raw } : { text: raw.slice(5) }),
+    );
+    ctx.ui.notify("Source staged in inbox", "info");
+    return;
+  }
+
+  const paths = await expandAddPaths(parseAddArguments(raw), ctx.cwd);
+  await call(ctx, ctx.signal, undefined, paths.length === 1 ? "Staging source" : "Staging sources", async (app) => {
+    const results: unknown[] = [];
+    for (const path of paths) results.push(await stage(app, { path }));
+    return results.length === 1 ? results[0] : results;
+  });
+  ctx.ui.notify(paths.length === 1 ? "Source staged in inbox" : `${paths.length} sources staged in inbox`, "info");
 }
 
 async function handleIssueCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -897,10 +994,88 @@ async function handleIssueCommand(args: string, ctx: ExtensionCommandContext): P
   ctx.ui.notify("Wiki issue recorded", "info");
 }
 
+const STATUS_LABEL_LIMIT = 160;
+const STATUS_LIST_LIMIT = 5;
+
+function statusLabel(value: string | undefined, fallback = "none"): string {
+  const clean = (value ?? "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!clean) return fallback;
+  const characters = [...clean];
+  return characters.length <= STATUS_LABEL_LIMIT ? clean : `${characters.slice(0, STATUS_LABEL_LIMIT - 1).join("")}…`;
+}
+
+function statusList(label: string, entries: readonly string[]): string[] {
+  if (entries.length === 0) return [`${label}: none`];
+  const visible = entries.slice(0, STATUS_LIST_LIMIT);
+  return [
+    `${label}: ${entries.length}`,
+    ...visible.map((entry) => `  - ${entry}`),
+    ...(entries.length > visible.length ? [`  - … ${entries.length - visible.length} more`] : []),
+  ];
+}
+
+function workflowStatus(workflow: ApplicationStatus["workflows"][number]): string {
+  const timestamp = workflow.finishedAt ?? workflow.startedAt;
+  return [
+    `${workflow.kind} ${workflow.status}`,
+    workflow.message ? statusLabel(workflow.message) : undefined,
+    timestamp ? statusLabel(timestamp) : undefined,
+  ]
+    .filter((value): value is string => value !== undefined)
+    .join(" — ");
+}
+
+export function formatApplicationStatus(status: ApplicationStatus): string {
+  const facts = status.settings.facts;
+  const git = facts.git;
+  const gitState =
+    git.message && !git.branch
+      ? `unavailable — ${statusLabel(git.message)}`
+      : [
+          statusLabel(git.branch, "unknown branch"),
+          git.clean ? "clean" : "dirty",
+          git.upstream ? `upstream ${statusLabel(git.upstream)}` : undefined,
+          git.ahead ? `${git.ahead} ahead` : undefined,
+          git.behind ? `${git.behind} behind` : undefined,
+          git.diverged ? "diverged" : undefined,
+          git.message ? statusLabel(git.message) : undefined,
+        ]
+          .filter((value): value is string => value !== undefined)
+          .join(", ");
+  const lastResult = (kind: "Ingest" | "Lint", at?: string, result?: string): string =>
+    `${kind}: ${at || result ? [statusLabel(at, "unknown time"), statusLabel(result)].join(" — ") : "never"}`;
+  const active = status.workflows.filter((workflow) => workflow.status === "queued" || workflow.status === "running");
+  const recent = status.workflows.filter((workflow) => workflow.status !== "queued" && workflow.status !== "running");
+
+  return [
+    `Pi Scholar: ${status.status}`,
+    `Version: ${statusLabel(status.version)}`,
+    `Vault: ${statusLabel(status.vaultId)}`,
+    `Doctor: ${status.doctor ?? "unknown"}`,
+    `Date: ${statusLabel(facts.localDate)} (${statusLabel(status.settings.timezone)})`,
+    `Initialization: ${status.settings.initializationEnabled ? "enabled" : "disabled"}`,
+    `Inbox: ${facts.pendingInboxCount} pending`,
+    `Issues: ${facts.openIssueCount} open`,
+    lastResult("Ingest", facts.lastIngestAt, facts.lastIngestResult),
+    lastResult("Lint", facts.lastLintAt, facts.lastLintResult),
+    `Git: ${gitState}`,
+    ...statusList(
+      "Recent changes",
+      facts.recentChanges.map((change) => statusLabel(change)),
+    ),
+    ...statusList("Active workflows", active.map(workflowStatus)),
+    ...statusList("Recent workflows", recent.map(workflowStatus)),
+  ].join("\n");
+}
+
 async function handleStatusCommand(_args: string, ctx: ExtensionCommandContext): Promise<void> {
-  const result = await call(ctx, ctx.signal, undefined, "Reading Scholar status", (app) => app.status());
-  const text = result.content.find((part) => part.type === "text");
-  ctx.ui.notify(text && text.type === "text" ? text.text : "Pi Scholar status loaded", "info");
+  cancelled(ctx.signal);
+  const app = await applicationFor(ctx);
+  cancelled(ctx.signal);
+  ctx.ui.notify(formatApplicationStatus(await app.status()), "info");
 }
 
 async function handleLintCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -917,7 +1092,7 @@ async function handleLintCommand(pi: ExtensionAPI, args: string, ctx: ExtensionC
 
 export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerCommand("scholar-add", {
-    description: "Stage a URL, pasted source, file, directory, or repository",
+    description: "Stage one URL, pasted source, or one or more filesystem paths",
     handler: handleAddCommand,
   });
   pi.registerCommand("scholar-issue", {
@@ -1006,11 +1181,12 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_get_extract_context",
     label: "scholar_get_extract_context",
     executionMode: "sequential",
-    description: "List and claim the current stable extract context.",
-    parameters: emptyInput,
-    async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
+    description:
+      "Claim either the exact pending source IDs supplied or the canonical next stable batch of at most three.",
+    parameters: extractContextInput,
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleContext(ctx, _signal, onUpdate, "Loading extract context", "extract", (app) =>
-        app.getExtractContext(),
+        app.getExtractContext(params as ExtractContextRequest, (event) => extractProgress(onUpdate, event)),
       );
     },
   });
@@ -1037,11 +1213,12 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     name: "scholar_get_ingest_context",
     label: "scholar_get_ingest_context",
     executionMode: "sequential",
-    description: "Read the current wiki and only published, verified source packets for ingest.",
-    parameters: emptyInput,
-    async execute(_toolCallId, _params, _signal, onUpdate, ctx) {
+    description:
+      "Read the current wiki and either the exact requested published sources or every published verified packet.",
+    parameters: ingestContextInput,
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleContext(ctx, _signal, onUpdate, "Loading ingest context", "ingest", (app) =>
-        app.getIngestContext(),
+        app.getIngestContext(params as IngestContextRequest),
       );
     },
   });
@@ -1170,6 +1347,17 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
         app.settleGrade(params as GradeSettlementInput, gradingClaimOwner),
       );
     },
+  });
+
+  pi.on("agent_end", () => {
+    let remaining = 0;
+    for (const state of workflowStates.values())
+      if ("expectedClaimKeys" in state) remaining += state.expectedClaimKeys.size - state.attemptedClaimKeys.size;
+    if (remaining > 0)
+      pi.sendUserMessage(
+        `Continue the current extract batch: ${remaining} claimed source(s) still require a scholar_publish_extraction attempt. Do not summarize or stop until every claim has been attempted.`,
+        { deliverAs: "followUp" },
+      );
   });
 
   pi.on("session_shutdown", async () => {

@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,30 +14,50 @@ import { WorkflowCoordinator } from "../src/workflows.js";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+type ToolUpdate = {
+  readonly content: readonly { readonly type: string; readonly text: string }[];
+  readonly details: unknown;
+};
+
 type ToolExecutor = (
   toolCallId: string,
   params: unknown,
   signal: AbortSignal | undefined,
-  onUpdate: unknown,
+  onUpdate: ((update: ToolUpdate) => void) | undefined,
   ctx: { readonly cwd: string },
 ) => Promise<unknown>;
+type CommandHandler = (args: string, ctx: object) => Promise<void> | void;
+type LifecycleHooks = {
+  readonly agentEnd: Array<() => Promise<void> | void>;
+  readonly followUps: string[];
+};
 type FakeLifecycleApp = {
   readonly paths: { readonly vaultRoot: string };
   readonly finishes: { readonly requestId: string; readonly status: string; readonly options: unknown }[];
   readonly updates: readonly unknown[];
   readonly order: readonly string[];
   recoverAbandonedWorkflows: () => Promise<unknown>;
+  status: () => Promise<unknown>;
   beginWorkflow: (kind: string) => Promise<{ readonly workflow: { readonly requestId: string } }>;
   getWorkflow: (
     requestId: string,
   ) => Promise<{ readonly requestId: string; readonly kind: string; readonly status: string }>;
-  getExtractContext: () => Promise<unknown>;
-  getIngestContext: () => Promise<unknown>;
+  getExtractContext: (
+    input?: { readonly pendingSourceIds?: readonly string[] },
+    observer?: (event: {
+      readonly entry: number;
+      readonly total: number;
+      readonly filename: string;
+      readonly phase: string;
+    }) => void | Promise<void>,
+  ) => Promise<unknown>;
+  getIngestContext: (input?: { readonly sourceIds?: readonly string[] }) => Promise<unknown>;
   getLintContext: () => Promise<unknown>;
   getQuizContext: () => Promise<unknown>;
   getQuizEvidence: (input: unknown) => Promise<unknown>;
   publishQuiz: (input: unknown) => Promise<unknown>;
   publishExtraction: (input: unknown) => Promise<unknown>;
+  stageSource: (request: unknown) => Promise<unknown>;
   applyWikiChange: (input: unknown) => Promise<unknown>;
   applyIngestChange: (input: unknown, workflowRequestId?: string) => Promise<unknown>;
   finishWorkflow: (requestId: string, status: string, options?: unknown) => Promise<unknown>;
@@ -64,14 +84,24 @@ vi.mock("../dist/vault.js", () => ({
 
 let lifecycleTestNumber = 0;
 
-function registerLifecycleTools(): Map<string, ToolExecutor> {
+function registerLifecycleTools(
+  commands?: Map<string, CommandHandler>,
+  hooks?: LifecycleHooks,
+): Map<string, ToolExecutor> {
   const tools = new Map<string, ToolExecutor>();
   const pi = {
     registerTool: (tool: { readonly name: string; readonly execute: ToolExecutor }) => {
       tools.set(tool.name, tool.execute);
     },
-    registerCommand: () => undefined,
-    on: () => undefined,
+    registerCommand: (name: string, command: { readonly handler?: CommandHandler }) => {
+      if (command.handler) commands?.set(name, command.handler);
+    },
+    on: (event: string, handler: () => Promise<void> | void) => {
+      if (event === "agent_end") hooks?.agentEnd.push(handler);
+    },
+    sendUserMessage: (content: string) => {
+      hooks?.followUps.push(content);
+    },
   } as unknown as ExtensionAPI;
   piScholarExtension(pi);
   return tools;
@@ -80,15 +110,19 @@ function registerLifecycleTools(): Map<string, ToolExecutor> {
 function fakeLifecycleApp(
   context: unknown,
   publishExtraction: (input: unknown) => Promise<unknown>,
+  root = `lifecycle-test-${++lifecycleTestNumber}`,
+  commands?: Map<string, CommandHandler>,
 ): {
   readonly app: FakeLifecycleApp;
   readonly root: string;
   readonly tools: Map<string, ToolExecutor>;
+  readonly followUps: readonly string[];
+  readonly endAgent: () => Promise<void>;
 } {
-  const root = `lifecycle-test-${++lifecycleTestNumber}`;
   const finishes: { requestId: string; status: string; options: unknown }[] = [];
   const updates: unknown[] = [];
   const order: string[] = [];
+  const hooks: LifecycleHooks = { agentEnd: [], followUps: [] };
   const app: FakeLifecycleApp = {
     paths: { vaultRoot: root },
     finishes,
@@ -98,6 +132,7 @@ function fakeLifecycleApp(
       order.push("recover");
       return {};
     },
+    status: async () => ({}),
     beginWorkflow: async (kind) => {
       order.push(`begin:${kind}`);
       return { workflow: { requestId: `${kind}-${root}` } };
@@ -110,6 +145,7 @@ function fakeLifecycleApp(
     getQuizEvidence: async () => [],
     publishQuiz: async () => ({}),
     publishExtraction,
+    stageSource: async () => ({}),
     applyWikiChange: async () => ({}),
     applyIngestChange: async () => ({}),
     finishWorkflow: async (requestId, status, options) => {
@@ -122,7 +158,15 @@ function fakeLifecycleApp(
     },
   };
   runtimeApps.set(root, app);
-  return { app, root, tools: registerLifecycleTools() };
+  return {
+    app,
+    root,
+    tools: registerLifecycleTools(commands, hooks),
+    followUps: hooks.followUps,
+    endAgent: async () => {
+      for (const handler of hooks.agentEnd) await handler();
+    },
+  };
 }
 
 async function invoke(
@@ -131,10 +175,11 @@ async function invoke(
   params: unknown,
   root: string,
   signal?: AbortSignal,
+  onUpdate?: (update: ToolUpdate) => void,
 ): Promise<unknown> {
   const execute = tools.get(name);
   if (!execute) throw new Error(`missing tool ${name}`);
-  return execute(name, params, signal, undefined, { cwd: root });
+  return execute(name, params, signal, onUpdate, { cwd: root });
 }
 
 function claim(claimId: string, preparedId: string): Record<string, string> {
@@ -244,7 +289,7 @@ describe("Pi package lifecycle", () => {
     assert.equal(toolModes.get("scholar_search"), undefined);
     assert.equal(toolModes.get("scholar_status"), undefined);
     assert.deepEqual([...commands].sort(), ["scholar-add", "scholar-issue", "scholar-lint", "scholar-status"]);
-    assert.deepEqual(events, ["session_shutdown"]);
+    assert.deepEqual(events, ["agent_end", "session_shutdown"]);
   });
 
   it("recovers abandoned workflows before starting tool work", async () => {
@@ -320,8 +365,157 @@ describe("Pi package lifecycle", () => {
     assert.deepEqual(fixture.app.finishes, []);
   });
 
+  it("expands and stages scholar-add filesystem arguments", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-add-"));
+    const books = join(root, "books");
+    const other = join(root, "other");
+    mkdirSync(books);
+    mkdirSync(other);
+    writeFileSync(join(books, "book1.pdf"), "one");
+    writeFileSync(join(books, "book2.pdf"), "two");
+    writeFileSync(join(other, "golden notes.pdf"), "notes");
+    const commands = new Map<string, CommandHandler>();
+    const fixture = fakeLifecycleApp({}, async () => ({}), root, commands);
+    const staged: unknown[] = [];
+    const notifications: string[] = [];
+    fixture.app.stageSource = async (request) => {
+      staged.push(request);
+      return {};
+    };
+    const handler = commands.get("scholar-add");
+    if (!handler) throw new Error("scholar-add command was not registered");
+    const context = {
+      cwd: root,
+      hasUI: true,
+      signal: undefined,
+      ui: { notify: (message: string) => notifications.push(message) },
+    };
+
+    try {
+      await handler(`books/*.pdf books/book1.pdf "${join(other, "golden notes.pdf")}"`, context);
+      await handler("books/", context);
+      assert.deepEqual(staged, [
+        { path: join(books, "book1.pdf") },
+        { path: join(books, "book2.pdf") },
+        { path: join(other, "golden notes.pdf") },
+        { path: books },
+      ]);
+      assert.deepEqual(notifications, ["3 sources staged in inbox", "Source staged in inbox"]);
+      await assert.rejects(handler("missing/*.pdf", context), /No filesystem path matched "missing\/\*\.pdf"/u);
+      assert.equal(staged.length, 4);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("renders bounded human status while preserving structured tool status", async () => {
+    const commands = new Map<string, CommandHandler>();
+    const fixture = fakeLifecycleApp({}, async () => ({}), undefined, commands);
+    const status = {
+      status: "degraded",
+      version: "1.2.3\u0000candidate",
+      vaultId: "vault\nid",
+      doctor: "fail",
+      settings: {
+        initializationEnabled: true,
+        timezone: "America/New_York",
+        port: 4816,
+        host: "127.0.0.1",
+        updatedAt: "2026-08-14T12:00:00.000Z",
+        facts: {
+          localDate: "2026-08-14",
+          pendingInboxCount: 2,
+          openIssueCount: 3,
+          lastIngestAt: "2026-08-14T10:00:00.000Z",
+          lastIngestResult: "ingested\ncleanly",
+          lastLintAt: "2026-08-14T11:00:00.000Z",
+          lastLintResult: "failed\u0007 safely",
+          recentChanges: Array.from({ length: 7 }, (_, index) => `change-${index + 1}`),
+          git: {
+            branch: "release\nbranch",
+            clean: false,
+            ahead: 1,
+            behind: 2,
+            diverged: true,
+            upstream: "origin/release",
+          },
+        },
+      },
+      workflows: [
+        {
+          requestId: "active",
+          kind: "extract",
+          status: "running",
+          startedAt: "2026-08-14T12:00:00.000Z",
+          progress: 0.5,
+          message: "preparing\nbook.pdf",
+        },
+        ...Array.from({ length: 7 }, (_, index) => ({
+          requestId: `recent-${index}`,
+          kind: "lint",
+          status: "succeeded",
+          finishedAt: `2026-08-14T0${index}:00:00.000Z`,
+          progress: 1,
+          message: `lint-${index + 1}`,
+        })),
+      ],
+    };
+    fixture.app.status = async () => status;
+
+    const structured = (await invoke(fixture.tools, "scholar_status", {}, fixture.root)) as {
+      readonly content: readonly { readonly text: string }[];
+      readonly details: unknown;
+    };
+    assert.deepEqual(structured.details, status);
+    assert.equal(structured.content[0]?.text, JSON.stringify(status));
+
+    const notifications: string[] = [];
+    const handler = commands.get("scholar-status");
+    if (!handler) throw new Error("scholar-status command was not registered");
+    await handler("", {
+      cwd: fixture.root,
+      signal: undefined,
+      ui: { notify: (message: string) => notifications.push(message) },
+    });
+
+    assert.equal(notifications.length, 1);
+    const [notification] = notifications;
+    assert.doesNotMatch(notification!, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u);
+    assert.match(notification!, /^Pi Scholar: degraded\nVersion: 1\.2\.3 candidate\nVault: vault id\nDoctor: fail/mu);
+    assert.match(notification!, /Date: 2026-08-14 \(America\/New_York\)/u);
+    assert.match(notification!, /Inbox: 2 pending\nIssues: 3 open/u);
+    assert.match(notification!, /Git: release branch, dirty, upstream origin\/release, 1 ahead, 2 behind, diverged/u);
+    assert.match(notification!, /Recent changes: 7[\s\S]*change-5[\s\S]*… 2 more/u);
+    assert.match(notification!, /Active workflows: 1\n {2}- extract running — preparing book\.pdf/u);
+    assert.match(notification!, /Recent workflows: 7[\s\S]*lint-5[\s\S]*… 2 more/u);
+    assert.doesNotMatch(notification!, /change-6|lint-6/u);
+    assert.doesNotMatch(notification!, /\bdue\b/iu);
+
+    fixture.app.status = async () => ({
+      ...status,
+      settings: {
+        ...status.settings,
+        facts: {
+          ...status.settings.facts,
+          git: {
+            clean: false,
+            ahead: 0,
+            behind: 0,
+            diverged: false,
+            message: "Git state\nunavailable",
+          },
+        },
+      },
+    });
+    await handler("", {
+      cwd: fixture.root,
+      signal: undefined,
+      ui: { notify: (message: string) => notifications.push(message) },
+    });
+    assert.match(notifications[1]!, /Git: unavailable — Git state unavailable/u);
+  });
+
   it("expands the current-session lint skill before sending the command", async () => {
-    type CommandHandler = (args: string, ctx: object) => Promise<void> | void;
     const handlers = new Map<string, CommandHandler>();
     const messages: string[] = [];
     const order: string[] = [];
@@ -479,6 +673,31 @@ describe("Pi package lifecycle", () => {
     );
   });
 
+  it("continues an agent that stops before its extraction batch is complete", async () => {
+    const first = claim("claim-continue-first", "prepared-continue-first");
+    const second = claim("claim-continue-second", "prepared-continue-second");
+    const fixture = fakeLifecycleApp({ claims: [first, second] }, async (input) => ({
+      sourceId: (input as { readonly claimId: string }).claimId,
+      manifest: {},
+      removedInbox: true,
+    }));
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...first, endpoints: [1] }, fixture.root);
+    await fixture.endAgent();
+    assert.deepEqual(fixture.followUps, [
+      "Continue the current extract batch: 1 claimed source(s) still require a scholar_publish_extraction attempt. Do not summarize or stop until every claim has been attempted.",
+    ]);
+    assert.deepEqual(fixture.app.finishes, []);
+
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...second, endpoints: [1] }, fixture.root);
+    await fixture.endAgent();
+    assert.equal(fixture.followUps.length, 1);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+  });
+
   it("passes thrown extraction diagnostics to workflow finalization", async () => {
     const fixture = fakeLifecycleApp({}, async () => ({ sourceId: "unused", manifest: {}, removedInbox: false }));
     fixture.app.getExtractContext = async () => {
@@ -495,6 +714,56 @@ describe("Pi package lifecycle", () => {
         options: { errorCode: "PI_WORKFLOW_FAILED", errorMessage: "local extraction diagnostic" },
       },
     ]);
+  });
+
+  it("forwards exact source filters and structured extraction progress", async () => {
+    const fixture = fakeLifecycleApp({ claims: [] }, async () => ({}));
+    const extractInputs: unknown[] = [];
+    const ingestInputs: unknown[] = [];
+    const updates: ToolUpdate[] = [];
+    const progressEvent = {
+      entry: 2,
+      total: 3,
+      filename: "delayed.pdf",
+      phase: "docling",
+    };
+    fixture.app.getExtractContext = async (input, observer) => {
+      extractInputs.push(input);
+      await observer?.(progressEvent);
+      return { claims: [] };
+    };
+    fixture.app.getIngestContext = async (input) => {
+      ingestInputs.push(input);
+      return { packets: [] };
+    };
+
+    await invoke(
+      fixture.tools,
+      "scholar_get_extract_context",
+      { pendingSourceIds: ["pending-first", "pending-third"] },
+      fixture.root,
+      undefined,
+      (update) => updates.push(update),
+    );
+    const ingest = (await invoke(
+      fixture.tools,
+      "scholar_get_ingest_context",
+      { sourceIds: ["source-third", "source-first"] },
+      fixture.root,
+    )) as { readonly details: unknown };
+
+    assert.deepEqual(extractInputs, [{ pendingSourceIds: ["pending-first", "pending-third"] }]);
+    assert.deepEqual(ingestInputs, [{ sourceIds: ["source-third", "source-first"] }]);
+    assert.ok(
+      updates.some(
+        (update) => update.details === progressEvent && update.content[0]?.text === "2/3 delayed.pdf: docling",
+      ),
+    );
+    assert.deepEqual(ingest.details, {
+      packets: [],
+      workflowRequestId: `ingest-${fixture.root}`,
+    });
+    await invoke(fixture.tools, "scholar_finish_ingest", {}, fixture.root);
   });
   it("replays extraction after applied and unapplied initial progress failures", async () => {
     for (const applied of [false, true]) {

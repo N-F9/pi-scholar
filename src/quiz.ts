@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import katex from "katex";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
+import { mathFromMarkdown } from "mdast-util-math";
 import { gfm } from "micromark-extension-gfm";
+import { math } from "micromark-extension-math";
 import type {
   PageLearningRecord,
   QuizEvidenceRecord,
@@ -111,12 +114,32 @@ const FORBIDDEN_SHEET_TEXT = /answer\s*key|correct\s+answer|grading\s+criteria|r
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
+function decodePercentEscapes(value: string): string {
+  let decoded = value;
+  while (true) {
+    const next = decoded.replace(/(?:%[0-9a-f]{2})+/giu, (encoded) => {
+      try {
+        return decodeURIComponent(encoded);
+      } catch {
+        return encoded;
+      }
+    });
+    if (next === decoded) return decoded;
+    decoded = next;
+  }
+}
 function normalizeSearchable(value: string): string {
-  return value
+  return decodePercentEscapes(value)
     .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
     .normalize("NFC")
     .replace(/[ \t\n\f\r]+/gu, " ")
     .trim();
+}
+function renderedMathValue(value: string): string {
+  return katex
+    .renderToString(value, { maxExpand: 1_000, output: "mathml", throwOnError: false, trust: false })
+    .replace(/<annotation\b[\s\S]*?<\/annotation>/gu, "")
+    .replace(/<[^>]+>/gu, "");
 }
 function renderedMarkdownValues(value: string): string {
   const properties: string[] = [];
@@ -125,6 +148,8 @@ function renderedMarkdownValues(value: string): string {
     const record = node as Record<string, unknown>;
     if (record.type === "html") return "";
     for (const key of ["url", "title"]) if (typeof record[key] === "string") properties.push(record[key]);
+    if ((record.type === "inlineMath" || record.type === "math") && typeof record.value === "string")
+      properties.push(renderedMathValue(record.value));
     if (record.type === "image" || record.type === "imageReference")
       return typeof record.alt === "string" ? record.alt : "";
     if (record.type === "break") return "\n";
@@ -139,8 +164,8 @@ function renderedMarkdownValues(value: string): string {
   return [
     render(
       fromMarkdown(value, {
-        extensions: [gfm()],
-        mdastExtensions: [gfmFromMarkdown()],
+        extensions: [gfm(), math()],
+        mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()],
       }),
     ),
     ...properties,
@@ -162,8 +187,16 @@ const UUID_PAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 function pageIdToken(value: string): QuizVisibleTextToken {
   return UUID_PAGE_ID.test(value) ? substringToken(value) : boundaryToken(value);
 }
+const MANAGED_IMAGE_URI =
+  /pi-scholar:\/\/source\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/attachment\/[0-9a-f]{64}/iu;
+const PRIVATE_SOURCE_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/iu;
 
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
+  const rendered = decodePercentEscapes(`${value}\n${renderedMarkdownValues(value)}`);
+  if (/\p{Bidi_Control}/u.test(rendered)) throw new ValidationError("Quiz Markdown contains private metadata");
+  const searchable = normalizeSearchable(rendered);
+  if (MANAGED_IMAGE_URI.test(searchable) || PRIVATE_SOURCE_ID.test(searchable))
+    throw new ValidationError("Quiz Markdown contains private metadata");
   const tokens = new Map<string, QuizVisibleTextToken["match"]>();
   for (const token of hiddenTokens) {
     const normalized = normalizeSearchable(token.value);
@@ -171,7 +204,6 @@ export function validateQuizVisibleText(value: string, hiddenTokens: readonly Qu
     if (token.match === "substring" || !tokens.has(normalized)) tokens.set(normalized, token.match);
   }
   if (!tokens.size) return;
-  const searchable = normalizeSearchable(`${value}\n${renderedMarkdownValues(value)}`);
   const substringTokens = [...tokens].filter(([, match]) => match === "substring").map(([token]) => token);
   const boundaryTokens = [...tokens].filter(([, match]) => match === "boundary").map(([token]) => token);
   if (

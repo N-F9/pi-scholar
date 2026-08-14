@@ -106,6 +106,25 @@ export interface PreparedAdmission {
   readonly atoms: readonly PreparedAdmissionAtom[];
 }
 
+export interface ExtractContextRequest {
+  readonly pendingSourceIds?: readonly string[];
+}
+export type ExtractProgressPhase =
+  | "claiming"
+  | "preparing"
+  | "docling"
+  | "extracting"
+  | "normalizing"
+  | "validating/indexing"
+  | "ready"
+  | "failed";
+export interface ExtractProgressEvent {
+  readonly entry: number;
+  readonly total: number;
+  readonly filename: string;
+  readonly phase: ExtractProgressPhase;
+}
+
 export interface ExtractClaimRecord extends PreparedAdmission {
   readonly relativePath: string;
   readonly originalName?: string;
@@ -280,6 +299,10 @@ export interface IngestContext {
   readonly pages: readonly WikiPageResult[];
   readonly issues: readonly WikiIssueRecord[];
   readonly sources: readonly IngestSourceContext[];
+}
+
+export interface IngestContextRequest {
+  readonly sourceIds?: readonly string[];
 }
 
 export interface LintContext {

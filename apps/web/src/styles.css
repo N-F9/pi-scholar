@@ -38,6 +38,12 @@
     --ui-radius-md: 0.625rem;
     --ui-radius-lg: 1rem;
     --ui-shadow-quiet: 0 0.5rem 2rem hsl(var(--ink) / 0.08);
+    --syntax-comment: 40 12% 68%;
+    --syntax-keyword: 37 92% 68%;
+    --syntax-string: 151 48% 68%;
+    --syntax-number: 2 75% 74%;
+    --syntax-title: 205 75% 75%;
+    --syntax-variable: 28 85% 75%;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -54,6 +60,12 @@
       --caution: 35 90% 67%;
       --danger: 2 75% 70%;
       --ui-shadow-quiet: 0 0.5rem 2rem hsl(220 50% 2% / 0.35);
+      --syntax-comment: 218 12% 42%;
+      --syntax-keyword: 26 75% 38%;
+      --syntax-string: 151 39% 30%;
+      --syntax-number: 2 60% 43%;
+      --syntax-title: 205 65% 36%;
+      --syntax-variable: 28 75% 38%;
     }
   }
 
@@ -155,8 +167,86 @@
     @apply font-semibold underline decoration-accent decoration-2 underline-offset-4 hover:text-muted;
   }
 
+  .markdown img {
+    @apply h-auto max-w-full;
+  }
+
+  .markdown .code-block {
+    @apply overflow-hidden rounded-md border border-line bg-ink text-paper;
+  }
+
+  .markdown .code-toolbar {
+    @apply flex items-center justify-between border-b border-paper/20 px-4 py-2 font-sans text-xs font-bold text-paper;
+  }
+
+  .markdown .code-toolbar > span {
+    @apply uppercase tracking-widest;
+  }
+
+  .markdown .code-toolbar button {
+    @apply min-h-9 rounded-sm px-3 transition-colors duration-200 ease-expo hover:bg-paper/10;
+  }
+
   .markdown pre {
-    @apply overflow-x-auto rounded-md border border-line bg-ink p-4 font-mono text-sm text-paper;
+    @apply m-0 overflow-x-auto bg-transparent p-4 font-mono text-sm text-paper;
+  }
+
+  .markdown .katex-display {
+    @apply overflow-x-auto overflow-y-hidden py-1;
+  }
+
+  .markdown .hljs-comment,
+  .markdown .hljs-quote {
+    color: hsl(var(--syntax-comment));
+    @apply italic;
+  }
+
+  .markdown .hljs-keyword,
+  .markdown .hljs-selector-tag,
+  .markdown .hljs-literal,
+  .markdown .hljs-section,
+  .markdown .hljs-link {
+    color: hsl(var(--syntax-keyword));
+  }
+
+  .markdown .hljs-string,
+  .markdown .hljs-regexp,
+  .markdown .hljs-addition,
+  .markdown .hljs-attribute,
+  .markdown .hljs-meta .hljs-string {
+    color: hsl(var(--syntax-string));
+  }
+
+  .markdown .hljs-number,
+  .markdown .hljs-symbol,
+  .markdown .hljs-bullet {
+    color: hsl(var(--syntax-number));
+  }
+
+  .markdown .hljs-title,
+  .markdown .hljs-title.class_,
+  .markdown .hljs-title.function_ {
+    color: hsl(var(--syntax-title));
+  }
+
+  .markdown .hljs-built_in,
+  .markdown .hljs-type,
+  .markdown .hljs-variable,
+  .markdown .hljs-template-variable,
+  .markdown .hljs-params {
+    color: hsl(var(--syntax-variable));
+  }
+
+  .markdown .hljs-deletion {
+    color: hsl(var(--syntax-number));
+  }
+
+  .markdown .hljs-emphasis {
+    @apply italic;
+  }
+
+  .markdown .hljs-strong {
+    @apply font-bold;
   }
 
   .markdown :not(pre) > code {

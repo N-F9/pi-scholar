@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { setTimeout as delay, setImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
-import type { QuizRecord } from "../src/contracts.js";
+import type { QuizRecord, WikiPageResult } from "../src/contracts.js";
 import { type ServerOptions, startServer } from "../src/server.js";
 import { initVault, LockBusyError } from "../src/vault.js";
 
@@ -79,6 +79,124 @@ function publicQuizFixture(): QuizRecord {
 }
 
 describe("server browser boundary", () => {
+  it("projects full OKF only at the wiki HTTP response boundaries", async () => {
+    const pageId = "11111111-1111-4111-8111-111111111111";
+    const result: WikiPageResult = {
+      page: {
+        pageId,
+        relativePath: "public.md",
+        title: "Public",
+        digest: "page-digest",
+        revision: 1,
+        status: "active",
+        quizWorthiness: "skip",
+        updatedAt: new Date(0).toISOString(),
+      },
+      markdown: "---\ntype: note\ntitle: Public\n---\n# Public body\n\nText.\n",
+      sections: [],
+      learning: { prerequisites: [] },
+      drift: { expectedDigest: "expected", actualDigest: "actual", diff: "diff" },
+    };
+    let pageReads = 0;
+    let driftResolutions = 0;
+    const application = {
+      getWiki: async () => {
+        pageReads += 1;
+        return result;
+      },
+      resolveDrift: async () => {
+        driftResolutions += 1;
+        return result;
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const pageResponse = await fetch(`${base}/api/v1/wiki/page?pageId=${pageId}`);
+      assert.equal(pageResponse.status, 200);
+      const pagePayload = (await pageResponse.json()) as { data: WikiPageResult };
+      assert.equal(pagePayload.data.markdown, "# Public body\n\nText.\n");
+      assert.equal(pagePayload.data.markdown.includes("type:"), false);
+      assert.deepEqual(
+        pagePayload.data.sections.map((section) => section.heading),
+        ["Public body"],
+      );
+      assert.deepEqual(pagePayload.data.drift?.diff, result.drift?.diff);
+
+      const driftResponse = await fetch(`${base}/api/v1/wiki/pages/${pageId}/drift-resolution`, {
+        method: "POST",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ action: "restore", expectedDigest: "expected" }),
+      });
+      assert.equal(driftResponse.status, 200);
+      const driftPayload = (await driftResponse.json()) as { data: WikiPageResult };
+      assert.equal(driftPayload.data.markdown, "# Public body\n\nText.\n");
+      assert.deepEqual(
+        driftPayload.data.sections.map((section) => section.heading),
+        ["Public body"],
+      );
+      assert.equal(driftPayload.data.drift?.diff, "diff");
+    });
+    assert.equal(pageReads, 1);
+    assert.equal(driftResolutions, 1);
+  });
+
+  it("serves only the page attachment response shape", async () => {
+    const pageId = "a1111111-1111-4111-8111-111111111111";
+    const sourceId = "b2222222-2222-4222-8222-222222222222";
+    const digest = "a".repeat(64);
+    const bytes = Buffer.from([1, 2, 3]);
+    const application = {
+      getWikiAttachment: async (requestedPage: string, requestedSource: string, requestedDigest: string) => {
+        assert.deepEqual([requestedPage, requestedSource, requestedDigest], [pageId, sourceId, digest]);
+        return { bytes, byteLength: bytes.byteLength, contentType: "image/png" };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/wiki/pages/${pageId}/attachments/${sourceId}/${digest}`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("content-type"), "image/png");
+      assert.equal(response.headers.get("content-length"), String(bytes.byteLength));
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.equal(response.headers.get("content-security-policy")?.includes("img-src 'self'"), true);
+      assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytes]);
+      const malformed = await fetch(
+        `${base}/api/v1/wiki/pages/${pageId.toUpperCase()}/attachments/${sourceId}/${digest}`,
+      );
+      assert.equal(malformed.status, 400);
+    });
+  });
+  it("keeps malformed full OKF on the existing internal-error path", async () => {
+    const pageId = "11111111-1111-4111-8111-111111111111";
+    const application = {
+      getWiki: async () => ({
+        page: {
+          pageId,
+          relativePath: "malformed.md",
+          title: "Malformed",
+          digest: "page-digest",
+          revision: 1,
+          status: "active",
+          quizWorthiness: "skip",
+          updatedAt: new Date(0).toISOString(),
+        },
+        markdown: "# missing OKF\n",
+        sections: [],
+        learning: { prerequisites: [] },
+      }),
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/wiki/page?pageId=${pageId}`);
+      assert.equal(response.status, 500);
+      const payload = (await response.json()) as { error: { code: string; message: string } };
+      assert.equal(payload.error.code, "INTERNAL_ERROR");
+      assert.equal(payload.error.message, "Internal server error");
+    });
+  });
   it("rejects route-disallowed methods before application dispatch", async () => {
     const unexpectedDispatch = () => assert.fail("route method policy allowed application dispatch");
     const application = {

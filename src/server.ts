@@ -6,6 +6,7 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import busboy from "busboy";
 import { createApplication, type ScholarApplication } from "./application/application.js";
+import { publicWikiPage } from "./application/projections.js";
 import type {
   ApiEnvelope,
   JsonValue,
@@ -135,6 +136,7 @@ function assertRouteMethod(path: string, method: string): void {
     allowed = ["GET"];
   else if (path === "/api/v1/wiki/issues") allowed = ["GET", "POST"];
   else if (/^\/api\/v1\/wiki\/issues\/[^/]+$/u.test(path)) allowed = ["PATCH"];
+  else if (/^\/api\/v1\/wiki\/pages\/[^/]+\/attachments\/[^/]+\/[^/]+$/u.test(path)) allowed = ["GET"];
   else if (/^\/api\/v1\/wiki\/pages\/[^/]+\/drift-resolution$/u.test(path)) allowed = ["POST"];
   else if (/^\/api\/v1\/quizzes\/[^/]+(?:\/(answers|submission))?$/u.test(path)) {
     const action = /^\/api\/v1\/quizzes\/[^/]+(?:\/(answers|submission))?$/u.exec(path)?.[1];
@@ -193,7 +195,7 @@ function jsonSafe(value: unknown): JsonValue {
 function securityHeaders(res: ServerResponse): void {
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   );
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -207,6 +209,17 @@ function sendJson<T>(res: ServerResponse, status: number, data: T, requestId: st
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Content-Length", Buffer.byteLength(body));
   res.end(body);
+}
+function sendAttachment(
+  res: ServerResponse,
+  attachment: { readonly bytes: Buffer; readonly byteLength: number; readonly contentType: string },
+): void {
+  securityHeaders(res);
+  res.statusCode = 200;
+  res.setHeader("Content-Type", attachment.contentType);
+  res.setHeader("Content-Length", attachment.byteLength);
+  res.setHeader("Cache-Control", "no-store");
+  res.end(attachment.bytes);
 }
 function sendError(res: ServerResponse, status: number, error: unknown, requestId: string): void {
   const internal = status >= 500;
@@ -710,7 +723,20 @@ async function apiRoute(
     if ((pageId ? 1 : 0) + (pagePath ? 1 : 0) !== 1)
       throw new ValidationError("exactly one of pageId or path is required");
     if (pageId && !UUID.test(pageId)) throw new ValidationError("page ID is malformed");
-    sendJson(res, 200, await app.getWiki(pageId ?? pagePath!), requestId);
+    sendJson(res, 200, publicWikiPage(await app.getWiki(pageId ?? pagePath!)), requestId);
+    return;
+  }
+  const attachmentMatch = /^\/api\/v1\/wiki\/pages\/([^/]+)\/attachments\/([^/]+)\/([^/]+)$/u.exec(path);
+  if (attachmentMatch) {
+    queryOnly(url, []);
+    const pageId = pathSegment(attachmentMatch[1]!, "page");
+    const sourceId = pathSegment(attachmentMatch[2]!, "source");
+    const digest = pathSegment(attachmentMatch[3]!, "attachment");
+    if (!UUID.test(pageId) || pageId !== pageId.toLowerCase()) throw new ValidationError("page ID is malformed");
+    if (!UUID.test(sourceId) || sourceId !== sourceId.toLowerCase())
+      throw new ValidationError("source ID is malformed");
+    if (!/^[0-9a-f]{64}$/u.test(digest)) throw new ValidationError("attachment digest is malformed");
+    sendAttachment(res, await app.getWikiAttachment(pageId, sourceId, digest));
     return;
   }
   if (path === "/api/v1/wiki/search") {
@@ -776,7 +802,7 @@ async function apiRoute(
       expectedDigest: stringField(value, "expectedDigest", true)!,
       ...(value.description === undefined ? {} : { description: stringField(value, "description") }),
     };
-    sendJson(res, 200, await app.resolveDrift(pageId, input, { origin: "browser" }), requestId);
+    sendJson(res, 200, publicWikiPage(await app.resolveDrift(pageId, input, { origin: "browser" })), requestId);
     return;
   }
   if (path === "/api/v1/quizzes") {

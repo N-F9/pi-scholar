@@ -1,21 +1,30 @@
-import { type ComponentPropsWithoutRef, isValidElement, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
+import { type ComponentPropsWithoutRef, isValidElement, type ReactNode, useState } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
-import { headingAnchor, imagePlaceholder } from "../../../../src/markdown";
+import remarkMath from "remark-math";
+import { headingAnchor, imagePlaceholder, parseManagedImageUri } from "../../../../src/markdown";
 
 export { headingAnchor };
 
-type MarkdownImageProps = { alt?: string; node?: unknown };
+type MarkdownImageProps = ComponentPropsWithoutRef<"img"> & { node?: unknown; pageId?: string };
 
-function MarkdownImage({ alt }: MarkdownImageProps) {
-  return <span className="text-sm italic text-muted">{imagePlaceholder(alt)}</span>;
+function MarkdownImage({ alt, src, node: _node, pageId, ...props }: MarkdownImageProps) {
+  const [failedSource, setFailedSource] = useState<string>();
+  const managed = typeof src === "string" ? parseManagedImageUri(src) : undefined;
+  if (!managed || !pageId) return <span className="text-sm italic text-muted">{imagePlaceholder(alt)}</span>;
+  const attachment = `/api/v1/wiki/pages/${encodeURIComponent(pageId)}/attachments/${encodeURIComponent(managed.sourceId)}/${managed.digest}`;
+  if (failedSource === attachment) return <span className="text-sm italic text-muted">{imagePlaceholder(alt)}</span>;
+  return <img {...props} alt={alt ?? ""} loading="lazy" onError={() => setFailedSource(attachment)} src={attachment} />;
 }
 
 function textFrom(children: ReactNode): string {
   if (typeof children === "string" || typeof children === "number") return String(children);
   if (Array.isArray(children)) return children.map(textFrom).join("");
   if (isValidElement<MarkdownImageProps & { children?: ReactNode }>(children)) {
-    if (children.type === MarkdownImage) return imagePlaceholder(children.props.alt);
+    if (children.type === MarkdownImage || ("alt" in children.props && "src" in children.props))
+      return imagePlaceholder(children.props.alt);
     return textFrom(children.props.children);
   }
   return "";
@@ -53,13 +62,45 @@ function InertCode({ className, children, node: _node, ...props }: MarkdownCodeP
   );
 }
 
+type MarkdownPreProps = ComponentPropsWithoutRef<"pre"> & { node?: unknown };
+
+function CodeBlock({ children, node: _node, ...props }: MarkdownPreProps) {
+  const [copied, setCopied] = useState(false);
+  const code = isValidElement<MarkdownCodeProps>(children) ? children : undefined;
+  const language = code?.props.className?.match(/(?:^|\s)language-([^\s]+)/u)?.[1] ?? "text";
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(textFrom(code?.props.children ?? children));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="code-block">
+      <div className="code-toolbar">
+        <span>{language}</span>
+        <button aria-label={`Copy ${language} code`} aria-live="polite" onClick={copy} type="button">
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre {...props}>{children}</pre>
+    </div>
+  );
+}
+
 export function Markdown({
   source,
   pagePath = "",
+  pageId,
   headings = [],
 }: {
   source: string;
   pagePath?: string;
+  pageId?: string;
   headings?: readonly { readonly heading?: string; readonly anchor: string }[];
 }) {
   const canonical = new Map<string, string[]>();
@@ -80,7 +121,14 @@ export function Markdown({
   return (
     <div className="markdown">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[
+          [rehypeKatex, { throwOnError: false, trust: false }],
+          [rehypeHighlight, { plainText: ["mermaid"] }],
+        ]}
+        urlTransform={(url, key, node) =>
+          key === "src" && node.tagName === "img" && parseManagedImageUri(url) ? url : defaultUrlTransform(url)
+        }
         skipHtml
         components={{
           a: ({ href, children, node: _node, ...props }) => {
@@ -94,7 +142,8 @@ export function Markdown({
             );
           },
           code: InertCode,
-          img: MarkdownImage,
+          img: (props) => <MarkdownImage {...props} pageId={pageId} />,
+          pre: CodeBlock,
           h1: ({ children, node: _node, ...props }) => (
             <h1 id={idFor(children)} {...props}>
               {children}

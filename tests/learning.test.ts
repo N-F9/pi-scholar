@@ -691,6 +691,21 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
     () => validateQuizVisibleText(`x${sourceReference}`, [{ value: sourceReference, match: "substring" }]),
     ValidationError,
   );
+  const managedImage = `pi-scholar://source/${randomUUID()}/attachment/${"a".repeat(64)}`;
+  assert.throws(() => validateQuizVisibleText(`![image](${managedImage})`, []), ValidationError);
+  assert.throws(() => validateQuizVisibleText(`source ${sourceReference.slice(0, -2)}`, []), ValidationError);
+  const sourceId = sourceReference.slice(0, -2);
+  assert.throws(() => validateQuizVisibleText(`$${sourceId.replaceAll("-", "\\text{-}")}$`, []), ValidationError);
+  assert.throws(() => validateQuizVisibleText(`x $$$${sourceId.replaceAll("-", "\\text{-}")}$$$`, []), ValidationError);
+  assert.throws(
+    () => validateQuizVisibleText(`[reference](https://example.test/${sourceId.replaceAll("-", "%2D")})`, []),
+    ValidationError,
+  );
+  assert.throws(() => validateQuizVisibleText(`\u202e${[...sourceId].reverse().join("")}\u202c`, []), ValidationError);
+  assert.throws(
+    () => validateQuizVisibleText(`&#x202e;${[...sourceId].reverse().join("")}&#x202c;`, []),
+    ValidationError,
+  );
   assert.throws(
     () => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [{ value: opaqueId, match: "substring" }]),
     ValidationError,

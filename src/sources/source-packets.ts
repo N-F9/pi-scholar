@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { promises as fs, lstatSync } from "node:fs";
-import { join } from "node:path";
+import { extname, join } from "node:path";
 import { readFileNoFollow } from "../vault.js";
 import { validateFileEndpoints } from "./source-chunks.js";
 import {
@@ -162,6 +162,62 @@ function manifestAttachments(value: unknown): Array<{ path: string; byteLength: 
     })
     .sort((left, right) => left.path.localeCompare(right.path));
 }
+export interface VerifiedSourceAttachment {
+  readonly bytes: Buffer;
+  readonly byteLength: number;
+  readonly contentType: "image/png" | "image/jpeg" | "image/webp";
+  readonly manifest: SourceManifest;
+  readonly manifestDigest: string;
+}
+
+function rasterContentType(path: string): VerifiedSourceAttachment["contentType"] {
+  switch (extname(path).toLocaleLowerCase()) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    default:
+      throw new Error("source attachment media type is not renderable");
+  }
+}
+
+export async function verifyRetainedAttachment(
+  packet: string,
+  expected: { sourceId: string; originalDigest: string; manifestDigest: string; attachmentDigest: string },
+): Promise<VerifiedSourceAttachment> {
+  const packetStat = await lstatNoFollow(packet);
+  if (!packetStat.isDirectory()) throw new Error("source packet must be a directory");
+  const attachmentsRoot = join(packet, "attachments");
+  if (!(await lstatNoFollow(attachmentsRoot)).isDirectory())
+    throw new Error("source packet attachments are unavailable");
+  const manifestPath = join(packet, "manifest.json");
+  if (!(await lstatNoFollow(manifestPath)).isFile()) throw new Error("source manifest must be a regular file");
+  const manifestBytes = await readNoFollow(manifestPath);
+  const manifestDigestValue = createHash("sha256").update(manifestBytes).digest("hex");
+  if (manifestDigestValue !== expected.manifestDigest) throw new Error("source manifest digest mismatch");
+  const manifest = parseManifestValue(JSON.parse(manifestBytes.toString("utf8")) as unknown);
+  if (
+    manifest.id !== manifest.sourceId ||
+    manifest.sourceId !== expected.sourceId ||
+    manifest.originalDigest !== expected.originalDigest
+  )
+    throw new Error("source packet identity mismatch");
+  const attachments = manifestAttachments(manifest.attachments);
+  const matches = attachments.filter((attachment) => attachment.digest === expected.attachmentDigest);
+  if (matches.length !== 1) throw new Error("source attachment identity is ambiguous or unavailable");
+  const attachment = matches[0]!;
+  const contentType = rasterContentType(attachment.path);
+  const attachmentPath = join(attachmentsRoot, attachment.path);
+  const bytes = await readNoFollow(attachmentPath);
+  if (bytes.byteLength !== attachment.byteLength) throw new Error("source attachment byte length mismatch");
+  if (createHash("sha256").update(bytes).digest("hex") !== attachment.digest)
+    throw new Error("source attachment digest mismatch");
+  return { bytes, byteLength: bytes.byteLength, contentType, manifest, manifestDigest: manifestDigestValue };
+}
+
 export async function verifyRetainedPacket(
   packet: string,
   expected: { sourceId: string; originalDigest: string },

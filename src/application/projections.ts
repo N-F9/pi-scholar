@@ -9,9 +9,12 @@ import type {
   QuizRecord,
   SourceRecord,
   WikiIssueRecord,
+  WikiPageResult,
   WorkflowRecord,
 } from "../contracts.js";
+import { parseOkfConcept } from "../okf.js";
 import type { WikiPage } from "../wiki.js";
+import { parseWikiBodySections } from "../wiki-sections.js";
 
 export function sourceRecord(value: Record<string, unknown>): SourceRecord {
   return {
@@ -63,6 +66,15 @@ export function pageRecord(value: WikiPage): PageRecord {
     status: value.status,
     quizWorthiness: value.quizWorthiness,
     updatedAt: value.updatedAt,
+  };
+}
+
+export function publicWikiPage(result: WikiPageResult): WikiPageResult {
+  const { body } = parseOkfConcept(result.markdown);
+  return {
+    ...result,
+    markdown: body,
+    sections: parseWikiBodySections(body, result.page.pageId),
   };
 }
 
