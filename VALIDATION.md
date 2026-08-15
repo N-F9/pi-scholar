@@ -11,9 +11,13 @@ Test the packed artifact rather than loading the repository directly:
 3. Point `PI_CODING_AGENT_DIR` at a temporary directory.
 4. Install the temporary package with `pi install <package-path>`.
 5. Confirm `pi list` discovers one extension and the five declared skills: `extract`, `ingest`, `lint`, `daily`, and `quiz-grader`.
-6. Start Pi in RPC mode and invoke `/scholar-add`, `/scholar-issue`, `/scholar-status`, and `/scholar-lint`.
+6. Start Pi in RPC mode and invoke `/scholar-add`, `/scholar-issue`,
+   `/scholar-status`, `/scholar-lint`, and `/scholar-maintenance`. Confirm add
+   keeps visible activity status through success/failure, lint prompts for full
+   or targeted scope and loads the packaged skill, and maintenance accepts
+   explicit `on`/`off`.
 
-Pass when Pi loads without startup errors, exposes all four namespaced commands, registers all five skills and package resources, and needs no file omitted from the tarball.
+Pass when Pi loads without startup errors, exposes all five namespaced commands, registers all five skills and package resources, and needs no file omitted from the tarball.
 
 ## End-to-end product validation
 
@@ -32,18 +36,21 @@ Use real Git, qmd, Docling, and a configured Pi provider with a source whose cor
    coherent topic boundaries and textbook teaching depth determine page count.
    Then request an ingest context with a complete `sourceIds` filter and
    confirm only those published packets are supplied while the normal page and
-   issue context remains. Submit guarded source-driven changes only through
-   Scholar tools; confirm valid nearby OKF citations and coverage of central
-   terminology, mechanisms, equations or algorithms, examples, empirical
-   results, assumptions, tradeoffs, and supported limitations.
+   issue context remains. Confirm the parent makes one structural plan, may
+   delegate only disjoint source/page groups for read-only analysis, and keeps
+   every guarded apply and the final finish in the parent session. Confirm
+   valid nearby OKF citations and coverage of central terminology, mechanisms,
+   equations or algorithms, examples, empirical results, assumptions,
+   tradeoffs, and supported limitations.
 6. Run the initial `lint` pass once full-scope and once targeted. Confirm full
    scope reads every non-retired page (active or drifted) and issue, targeted
    scope stays bounded to its description and directly related pages, and each
-   pass applies supported guarded repairs serially before finishing exactly once.
-   For one deliberately blocking evidence gap, finish the initial pass, read
-   structured status, require a quiescent vault, and—only when isolated task
-   plus read-only web search are available—run exactly one blocking child to
-   stage at most three authoritative URLs, target only its pending IDs for
+   pass may fan out disjoint read-only audit slices while the parent merges
+   findings, applies supported guarded repairs serially, and finishes exactly
+   once. For one deliberately blocking evidence gap, finish the initial pass,
+   read structured status, require a quiescent vault, and—only when isolated
+   task plus read-only web search are available—run exactly one blocking child
+   to stage at most three authoritative URLs, target only its pending IDs for
    extraction, publish each claim once, ingest only its newly published IDs,
    and return metadata only. Confirm the parent runs one fresh original-scope
    pass and cannot start a second child. With missing capabilities,
@@ -52,9 +59,9 @@ Use real Git, qmd, Docling, and a configured Pi provider with a source whose cor
 7. Find a known phrase and concept through exact, lexical, or qmd search without treating qmd or projections as canonical state.
 8. Confirm every eligible page has one page-level FSRS record, stable page IDs across rename, and an acyclic prerequisite graph that blocks due pages until prerequisites reach FSRS `Review`.
 9. Observe the daily flow `candidate -> evidence -> publish`: the host returns every compact due, prerequisite-unblocked, non-drifted candidate; the model chooses a varied related subset; `scholar_get_daily_evidence` retrieves authoritative evidence for the selected pages; and one `scholar_publish_daily` call publishes the proposal or an explicit skip when no candidate exists. Target 15–45 minutes of combined reading and questions with a mental median near 30 minutes, without imposing a fixed question or page count or hard timer cap. For a headingless eligible page with non-empty OKF description and renderable body, verify selection uses title/description metadata, evidence contains one page-level record with anchor `""` and no heading while omitting YAML frontmatter, and the published reading href has no fragment; headed pages still return separate section records.
-10. Confirm daily questions use only `free-response` or `multiple-choice`, may include multiple questions for one page and connections among related pages, and bind every question to returned evidence. The host mints opaque question UUIDs and revalidates eligibility, prerequisites, drift, due state, evidence, and publication.
-11. Inspect the quiz Markdown and confirm visible headings are numeric, the only comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`, and no page/source/evidence/rubric/answer-key/FSRS metadata appears before grading.
-12. Submit answers to seal a revision, then run `quiz-grader` independently. Confirm it settles that sealed revision, preserves question feedback separately, and writes one bundled result, rating, review, and FSRS transition per covered page regardless of how many questions mention it. Browser sealing queues grading but does not launch a Pi process.
+10. Confirm daily questions use only `free-response` or `multiple-choice`, may include multiple questions for one page and connections among related pages, and bind every question to returned evidence. The host mints opaque question UUIDs and revalidates eligibility, prerequisites, drift, due state, evidence, and publication. In Today, confirm progress and labels are one-based, multiple-choice labels render safe inline Markdown without nested interactive controls, and malformed choice state is explicit. Confirm free-response editing is controlled, offers only the supported inline/link/quote/list/code commands, preserves Markdown through autosave and seal, and renders a non-announcing live preview.
+11. Inspect the quiz Markdown and confirm visible headings are numeric, the only comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`, and no page/source/evidence/rubric/answer-key/FSRS metadata appears before grading. Confirm the same-date publication guard permits only one durable quiz per local date; repeat-run debugging must reset or create a disposable vault rather than overwrite the row or Markdown.
+12. Submit answers to seal a revision, then run `quiz-grader` independently. Confirm it settles that sealed revision, preserves Markdown question feedback separately, and writes one bundled result, rating, review, and FSRS transition per covered page regardless of how many questions mention it. Browser sealing queues grading but does not launch a Pi process. In Today and History, confirm canonical question order and first-page-coverage order, stable linked Notes targets, exact settled readings and feedback, separate current-wiki recommendations, and bounded missing/unclear/drifted gaps. Before settlement recommendations must be empty. If qmd is unavailable, semantic recommendations disappear while exact results, prerequisite recommendations, and gaps remain; reading the projection must not change SQLite or FSRS.
 13. Restart Pi Scholar and confirm durable page learning, prerequisites, quiz identity, results, source packets, wiki, and Git history remain available.
 14. Rerun the same workflow and confirm it does not duplicate canonical artifacts, republish a completed extraction, or settle the same sealed submission twice.
 15. Inspect Git history and confirm each completed durable operation produced a coherent local commit; run `pi-scholar sync` separately and verify it only pushes existing local commits to the configured remote.
@@ -71,6 +78,12 @@ second child and the parent waits for it. Daily and grading remain separate,
 and `sync` is separately invoked or scheduled. The loopback server and
 explicit CLI operations may contend with a Pi session; conflicts must be
 reported rather than merged or force-written.
+
+Initialize with maintenance mode enabled. Confirm daily refuses generation
+until the user runs `/scholar-maintenance off` or uses Settings, while extract,
+ingest, lint, grading, status, doctor, and sync remain available. Re-enable it
+with `/scholar-maintenance on` and confirm no readiness label or implicit mode
+change occurs.
 
 Verify `.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and Docling scratch, never Git content or authority. Verify `sources/` contains immutable published packets and rejects hand-edit assumptions. Successful operations clean scratch; failures use rollback data; crash remnants cannot override SQLite or durable packets, wiki, or quizzes. Recovery must go through ScholarApplication, `doctor`, and a safe retry rather than reading work files as state.
 

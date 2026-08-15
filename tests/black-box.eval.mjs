@@ -187,12 +187,12 @@ test("daily quiz is guarded in a fresh vault", async () => {
     );
     const context = actor.toolCalls[0].result?.details;
     assert.equal([dateBefore, dateAfter].includes(context?.date), true);
-    assert.equal(context?.initializationEnabled, true);
+    assert.equal(context?.maintenanceEnabled, true);
     assert.equal(context?.expiredCount, 0);
     assert.deepEqual(context?.candidates, []);
     assert.equal(Object.hasOwn(context, "evidence"), false);
     assert.equal(Object.hasOwn(context, "quiz"), false);
-    assert.equal(context?.message, "Initialization maintenance is active; quiz publication is blocked.");
+    assert.equal(context?.message, "Maintenance mode is active; quiz publication is blocked.");
     assertDomainSnapshot(vault, initial);
 
     const report = doctor(vault);

@@ -46,14 +46,15 @@ The server binds `127.0.0.1:4816` by default. It is not a public authentication 
 
 ## Pi commands
 
-The installed Pi extension exposes four namespaced commands:
+The installed Pi extension exposes five namespaced commands:
 
-- `/scholar-add` stages one URL, pasted `text:`, or one or more filesystem paths (including directories and native glob patterns), such as `/scholar-add books/*.pdf`, `/scholar-add books/`, or `/scholar-add books/book1.pdf books/book2.pdf`.
+- `/scholar-add` stages one URL, pasted `text:`, or one or more filesystem paths (including directories and native glob patterns), such as `/scholar-add books/*.pdf`, `/scholar-add books/`, or `/scholar-add books/book1.pdf books/book2.pdf`. It keeps a visible activity status until staging succeeds or fails.
 - `/scholar-issue` records an incorrect, unclear, missing, or badly bounded wiki item.
 - `/scholar-status` reports bounded vault, workflow, learning, doctor, and Git facts.
-- `/scholar-lint` requests a full or targeted final organizer/repair pass.
+- `/scholar-lint` prompts for full or targeted scope, then loads the packaged lint skill for the requested final organizer/repair pass.
+- `/scholar-maintenance off` disables the user-owned quiz-generation guard; `/scholar-maintenance on` enables it.
 
-Commands and skills use ScholarApplication for durable operations; they do not create a second writer or scheduler.
+Commands and skills use ScholarApplication for durable operations; they do not create a second writer or scheduler. Maintenance mode starts enabled and blocks only daily quiz generation.
 
 ## User-controlled cron jobs
 
@@ -78,6 +79,13 @@ context filter narrows packets to a complete validated published selection
 without narrowing pages or issues; omission preserves ordinary uncapped
 ingest. Coherent topic boundaries and teaching depth determine page count.
 
+Ingest first plans non-overlapping source/page groups, may delegate only
+read-only analysis of those groups, then applies every guarded change serially
+in the parent session. Lint may fan out its initial full or targeted audit to
+read-only children, but the parent alone applies changes and finishes the
+workflow. Lint's later evidence-gap child remains the single bounded exception
+described below.
+
 ```cron
 # extract: choose its own minute/hour/day fields
 0 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/extract/SKILL.md --no-context-files --no-session -p "Process every source in the current extract batch of at most three and publish each verified immutable source packet through Scholar tools; do not stop early." >> /absolute/path/to/pi-scholar/logs/extract.log 2>&1
@@ -89,7 +97,7 @@ ingest. Coherent topic boundaries and teaching depth determine page count.
 30 6 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/lint/SKILL.md --no-context-files --no-session -p "Inspect the final wiki with lint and submit guarded organizer or repair changes through Scholar tools; report concise status." >> /absolute/path/to/pi-scholar/logs/lint.log 2>&1
 
 # daily: choose its own minute/hour/day fields
-0 7 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Read today's daily context. If initialization is enabled, stop and report the date, expiry count, and guarded outcome without requesting evidence or publishing a quiz or skip. Otherwise review every compact due, prerequisite-unblocked, non-drifted candidate by title and OKF description; choose a varied related subset, retrieve its evidence, and publish today's 15–45-minute daily review with a mental median near 30 minutes, any number of free-response or multiple-choice questions, and multiple questions per page when useful, or an explicit skip when no candidate exists; report concise status." >> /absolute/path/to/pi-scholar/logs/daily.log 2>&1
+0 7 * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Read today's daily context. If maintenance mode is enabled, stop and report the date, expiry count, and guarded outcome without requesting evidence or publishing a quiz or skip. Otherwise review every compact due, prerequisite-unblocked, non-drifted candidate by title and OKF description; choose a varied related subset, retrieve its evidence, and publish today's 15–45-minute daily review with a mental median near 30 minutes, any number of free-response or multiple-choice questions, and multiple questions per page when useful, or an explicit skip when no candidate exists; report concise status." >> /absolute/path/to/pi-scholar/logs/daily.log 2>&1
 
 # quiz-grader: choose its own minute/hour/day fields (usually event-driven or frequent)
 */15 * * * * . /absolute/path/to/pi-scholar.env && cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/quiz-grader/SKILL.md --no-context-files --no-session -p "Settle the current sealed quiz submission with quiz-grader and Scholar tools; report concise status." >> /absolute/path/to/pi-scholar/logs/quiz-grader.log 2>&1
@@ -115,6 +123,10 @@ not launch it. A failed run leaves canonical inbox/SQLite state and local
 commits recoverable. Run `pi-scholar doctor /absolute/path/to/vault`, then rerun
 only the affected skill or `pi-scholar sync`; never replay opaque model output.
 
+The current release stores at most one durable quiz for each local date. To
+repeat quiz generation while debugging, reset or create a disposable vault;
+there is no overwrite or regeneration backdoor.
+
 ## Storage, recovery, and boundaries
 
 Run `pi-scholar doctor /absolute/path/to/vault` after an interrupted command or dependency change. Before retrying a skill after a crash, start no competing Pi session for that vault; the retry first records abandoned running workflows as interrupted. Source extraction is idempotent by claimed physical identity and digest, quiz grading by sealed submission identity, and Git synchronization by the repository's own object state.
@@ -122,5 +134,13 @@ Run `pi-scholar doctor /absolute/path/to/vault` after an interrupted command or 
 `.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and Docling scratch. It is never Git content or authority. `sources/` contains immutable published packets and must not be hand-edited. Successful operations clean their scratch; failures use rollback data; crash remnants do not override SQLite or durable packets, wiki, or quiz artifacts. Recovery stays behind ScholarApplication: use `doctor`, then retry the affected operation rather than treating work files as state. Shared I/O accepts regular files and directories only; symlinks are unsupported at that boundary.
 
 Source removal begins with an explicit operator request, a fresh preview, and confirmation. It deletes current dependent artifacts without erasing Git history; recover a prior version from Git when necessary. Browser drafts and inbox staging are intentionally not commits until the corresponding durable operation succeeds. The wiki is strict OKF v0.2, and qmd remains derived rather than canonical.
+
+Today and History number displayed questions from one, render safe Markdown in
+prompts, choices, answers, and feedback, and use a controlled Markdown editor
+for free responses. Settled Results preserve canonical quiz order and stable
+Notes links. Exact page/section readings and feedback describe the settled
+quiz; separate bounded recommendations and knowledge gaps are derived from the
+current non-retired wiki. Missing qmd removes only semantic recommendations,
+not exact results, prerequisites, or gaps.
 
 Pi tools, the browser API, and the FIFO browser worker call the same `ScholarApplication` application entry point. No public user/auth system, arbitrary HTTP shell, second persistence layer, custom Pi runner, or alternate writer is provided. Private tunnels, including Tailscale, remain external operator context.

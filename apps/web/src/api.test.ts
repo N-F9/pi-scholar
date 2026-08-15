@@ -135,54 +135,126 @@ describe("api response boundary", () => {
       gradedAt: new Date(0).toISOString(),
       reviewId: "review-1",
     };
-    assert.equal(
-      isQuizResult({
-        outcome: "submitted",
-        quiz: {
-          quizId: "quiz-1",
-          date: "2026-08-09",
-          revision: 2,
-          status: "submitted",
-          questions: [
-            {
-              questionId: "question-1",
-              quizId: "quiz-1",
-              ordinal: 1,
-              kind: "free-response",
-              prompt: "Explain",
-            },
-          ],
-          answers: [{ questionId: "question-1", answer: "An explanation" }],
-          questionResults: [
-            {
-              resultId: "question-result-1",
-              quizId: "quiz-1",
-              questionId: "question-1",
-              answerRevision: 2,
-              feedback: "The answer addresses the prompt.",
-              gradedAt: new Date(0).toISOString(),
-            },
-          ],
-          pageResults: [
-            {
-              resultId: "page-result-1",
-              quizId: "quiz-1",
-              pageId: "page-1",
-              rating: "Good",
-              feedback: "Clear explanation.",
-              reviewId: "review-1",
-              evidence: ["evidence-1"],
-              readings: [reading],
-            },
-          ],
-          grades: [grade],
-          readings: [reading],
+    const recommendations = {
+      readings: [
+        {
+          pageId: "page-2",
+          path: "reference.md",
+          title: "Reference",
+          href: "/notes?pageId=page-2",
+          reason: "related",
         },
-        answers: [{ questionId: "question-1", answer: "An explanation" }],
+      ],
+      gaps: [
+        {
+          pageId: "page-3",
+          path: "gap.md",
+          title: "Gap",
+          href: "/notes?pageId=page-3",
+          kind: "unclear",
+        },
+      ],
+    };
+    const result = {
+      outcome: "submitted",
+      quiz: {
+        quizId: "quiz-1",
+        date: "2026-08-09",
+        revision: 2,
+        status: "submitted",
+        questions: [
+          {
+            questionId: "question-1",
+            quizId: "quiz-1",
+            ordinal: 1,
+            kind: "free-response",
+            prompt: "Explain `x` and **why** it works.",
+          },
+        ],
+        answers: [{ questionId: "question-1", answer: "An **explanation** with `code`." }],
+        questionResults: [
+          {
+            resultId: "question-result-1",
+            quizId: "quiz-1",
+            questionId: "question-1",
+            answerRevision: 2,
+            feedback: "The answer addresses the **prompt**.",
+            gradedAt: new Date(0).toISOString(),
+          },
+        ],
+        pageResults: [
+          {
+            resultId: "page-result-1",
+            quizId: "quiz-1",
+            pageId: "page-1",
+            pageLink: { pageId: "page-1", path: "guide.md", href: "/notes?pageId=page-1#note-content" },
+            rating: "Good",
+            feedback: "Clear **explanation**.",
+            reviewId: "review-1",
+            evidence: ["evidence-1"],
+            readings: [reading],
+          },
+        ],
         grades: [grade],
         readings: [reading],
+      },
+      answers: [{ questionId: "question-1", answer: "An **explanation** with `code`." }],
+      grades: [grade],
+      readings: [reading],
+      recommendations,
+    };
+    assert.equal(isQuizResult(result), true);
+    const { pageLink: _pageLink, ...withoutPageLink } = result.quiz.pageResults[0]!;
+    assert.equal(isQuizResult({ ...result, quiz: { ...result.quiz, pageResults: [withoutPageLink] } }), false);
+    assert.equal(
+      isQuizResult({
+        ...result,
+        quiz: {
+          ...result.quiz,
+          pageResults: [{ ...result.quiz.pageResults[0]!, sourceRefs: ["private-source"] }],
+        },
       }),
-      true,
+      false,
+    );
+  });
+  it("requires exact public recommendation metadata", () => {
+    const result = {
+      outcome: "not-yet-run",
+      answers: [],
+      grades: [],
+      readings: [],
+      recommendations: {
+        readings: [
+          {
+            pageId: "page-1",
+            path: "guide.md",
+            title: "Guide",
+            href: "/notes?pageId=page-1",
+            reason: "prerequisite",
+          },
+        ],
+        gaps: [
+          {
+            pageId: "page-2",
+            path: "gap.md",
+            title: "Gap",
+            href: "/notes?pageId=page-2",
+            kind: "missing",
+          },
+        ],
+      },
+    };
+    assert.equal(isQuizResult(result), true);
+    assert.equal(isQuizResult({ ...result, recommendations: undefined }), false);
+    assert.equal(
+      isQuizResult({
+        ...result,
+        recommendations: {
+          ...result.recommendations,
+          gaps: [{ ...result.recommendations.gaps[0], issueId: "private-issue" }],
+        },
+      }),
+      false,
     );
   });
 
@@ -294,6 +366,7 @@ describe("api response boundary", () => {
       pageResults: [],
       grades: [],
       readings: [],
+      recommendations: { readings: [], gaps: [] },
     };
     assert.equal(
       isQuizSubmissionResult({
@@ -302,6 +375,7 @@ describe("api response boundary", () => {
         quiz,
         grades: [],
         readings: [],
+        recommendations: { readings: [], gaps: [] },
       }),
       false,
     );

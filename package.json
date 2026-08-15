@@ -55,6 +55,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
+    "@uiw/react-md-editor": "4.1.1",
     "busboy": "1.6.0",
     "katex": "0.16.25",
     "mdast-util-from-markdown": "2.0.3",

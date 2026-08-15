@@ -29,7 +29,7 @@ export function SettingsPage() {
       <header>
         <p className="eyebrow">Vault facts</p>
         <h1 className="page-heading mt-2">Settings</h1>
-        <p className="mt-3 max-w-2xl text-muted">Inspect initialization and synchronization facts.</p>
+        <p className="mt-3 max-w-2xl text-muted">Inspect maintenance and synchronization facts.</p>
       </header>
 
       {query.isLoading ? <Spinner label="Loading settings" /> : null}
@@ -45,33 +45,33 @@ export function SettingsPage() {
               <div>
                 <p className="eyebrow">Quiz publishing</p>
                 <h2 className="mt-2 font-serif text-3xl font-semibold">
-                  Initialization {query.data.settings.initializationEnabled ? "enabled" : "disabled"}
+                  Maintenance mode {query.data.settings.maintenanceEnabled ? "enabled" : "disabled"}
                 </h2>
                 <p className="mt-3 max-w-2xl text-muted">
-                  {query.data.settings.initializationEnabled
-                    ? "Initialization blocks quiz publishing until you turn it off."
+                  {query.data.settings.maintenanceEnabled
+                    ? "Maintenance mode blocks quiz publishing until you turn it off."
                     : "Quiz publishing is enabled. Skills run independently according to your cron entries."}
                 </p>
               </div>
-              <Badge tone={query.data.settings.initializationEnabled ? "caution" : "neutral"}>
-                {query.data.settings.initializationEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}
+              <Badge tone={query.data.settings.maintenanceEnabled ? "caution" : "neutral"}>
+                {query.data.settings.maintenanceEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}
               </Badge>
             </div>
 
-            {query.data.settings.initializationEnabled && !confirming ? (
+            {query.data.settings.maintenanceEnabled && !confirming ? (
               <Button className="mt-6" variant="secondary" onClick={() => setConfirming(true)}>
-                Turn off initialization
+                Turn off maintenance mode
               </Button>
             ) : null}
-            {query.data.settings.initializationEnabled && confirming ? (
+            {query.data.settings.maintenanceEnabled && confirming ? (
               <div className="mt-6 rounded-md border border-caution/40 bg-caution/10 p-4">
-                <h3 className="font-bold">Turn off initialization?</h3>
+                <h3 className="font-bold">Turn off maintenance mode?</h3>
                 <p className="mt-2 text-sm text-muted">
                   Quiz publishing will be enabled. Skills will run independently according to your cron entries.
                 </p>
                 <div className="mt-4 flex flex-wrap gap-3">
-                  <Button onClick={() => update.mutate({ initializationEnabled: false })} disabled={update.isPending}>
-                    {update.isPending ? "Saving…" : "Turn off initialization"}
+                  <Button onClick={() => update.mutate({ maintenanceEnabled: false })} disabled={update.isPending}>
+                    {update.isPending ? "Saving…" : "Turn off maintenance mode"}
                   </Button>
                   <Button variant="quiet" onClick={() => setConfirming(false)} disabled={update.isPending}>
                     Cancel

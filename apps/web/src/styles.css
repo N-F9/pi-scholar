@@ -120,6 +120,36 @@
   .markdown {
     @apply max-w-none text-lg leading-7 text-ink;
   }
+  .markdown-inline {
+    display: inline;
+    font-size: inherit;
+    line-height: inherit;
+  }
+  .scholar-answer-editor.w-md-editor {
+    --color-accent-fg: hsl(var(--ink));
+    --color-fg-default: hsl(var(--ink));
+    --color-neutral-muted: hsl(var(--canvas));
+    --md-editor-background-color: hsl(var(--paper));
+    --md-editor-box-shadow-color: hsl(var(--line));
+    --md-editor-font-family: var(--font-sans);
+    border-radius: var(--ui-radius-md);
+  }
+
+  .scholar-answer-editor.w-md-editor:focus-within {
+    box-shadow:
+      0 0 0 2px hsl(var(--accent)),
+      0 0 0 4px hsl(var(--paper));
+  }
+
+  .scholar-answer-editor .w-md-editor-toolbar li > button {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
+    color: hsl(var(--ink));
+  }
+
+  .scholar-answer-editor .w-md-editor-text-input {
+    color: hsl(var(--ink));
+  }
 
   .markdown > * + * {
     @apply mt-4;

@@ -31,3 +31,4 @@ Direct runtime dependencies used by this package include:
 - rehype-katex 7.0.1 — MIT, used to render parsed math with KaTeX.
 - katex 0.16.25 — MIT, used to typeset mathematical notation in the web interface.
 - rehype-highlight 7.0.2 — MIT, used to add syntax-highlight tokens to fenced code.
+- @uiw/react-md-editor 4.1.1 — MIT, used for the controlled Markdown free-response editor.

@@ -22,7 +22,6 @@ import type {
   PageLearningRecord,
   PageRecord,
   PreparedAdmission,
-  PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
   PublicWorkflowRecord,
@@ -38,7 +37,9 @@ import type {
   QuizQuestionProposal,
   QuizQuestionResultRecord,
   QuizReadingRecord,
+  QuizRecommendations,
   QuizRecord,
+  QuizResult,
   QuizSubmissionResult,
   SettingsFacts,
   SettingsRecord,
@@ -123,7 +124,6 @@ import {
   decodeExtractPublicationInput,
   decodeGrade,
   decodeQuizPublication,
-  decodeReading,
   decodeWikiChangeInput,
   exact,
   isRecord,
@@ -142,6 +142,7 @@ import {
 } from "./grader-binding.js";
 import {
   answersObject,
+  notesPageHref,
   pageRecord,
   publicQuiz,
   publicQuizDetail,
@@ -257,6 +258,23 @@ function boundedUtf8(value: string, maxBytes: number): string {
     end += character.length;
   }
   return value.slice(0, end);
+}
+const QUIZ_RECOMMENDATION_LIMIT = 5;
+const QUIZ_GAP_LIMIT = 3;
+const QUIZ_RECOMMENDATION_QUERY_BYTES = 16_384;
+function quizRecommendationQuery(quiz: QuizDetailRecord): string {
+  return boundedUtf8(
+    [
+      ...quiz.questions.flatMap((question) => [question.prompt, ...(question.choices ?? [])]),
+      ...quiz.answers.flatMap((answer) => answer.answer),
+      ...quiz.questionResults.map((result) => result.feedback),
+      ...quiz.pageResults.map((result) => result.feedback),
+    ]
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .join("\n"),
+    QUIZ_RECOMMENDATION_QUERY_BYTES,
+  );
 }
 function sourceIdFilter(
   value: unknown,
@@ -844,17 +862,23 @@ export class ScholarApplication {
     );
   }
   private async quizDetail(quiz: QuizRecord): Promise<QuizDetailRecord> {
-    const answers = this.db
-      .all<Record<string, unknown>>(
-        "SELECT question_id, answer_json FROM quiz_answers WHERE quiz_id = ? ORDER BY question_id",
-        [quiz.quizId],
-      )
-      .flatMap((row) => {
-        const answer = jsonValue(row.answer_json);
-        return typeof answer === "string" || (Array.isArray(answer) && answer.every((item) => typeof item === "string"))
-          ? [{ questionId: String(row.question_id), answer: answer as string | readonly string[] }]
-          : [];
-      });
+    const answerByQuestion = new Map(
+      this.db
+        .all<Record<string, unknown>>("SELECT question_id, answer_json FROM quiz_answers WHERE quiz_id = ?", [
+          quiz.quizId,
+        ])
+        .flatMap((row) => {
+          const answer = jsonValue(row.answer_json);
+          return typeof answer === "string" ||
+            (Array.isArray(answer) && answer.every((item) => typeof item === "string"))
+            ? [[String(row.question_id), answer as string | readonly string[]] as const]
+            : [];
+        }),
+    );
+    const answers = quiz.questions.flatMap((question) => {
+      const answer = answerByQuestion.get(question.questionId);
+      return answer === undefined ? [] : [{ questionId: question.questionId, answer }];
+    });
     const answerSaved = this.db.get<Record<string, unknown>>(
       "SELECT saved_at FROM quiz_answers WHERE quiz_id = ? ORDER BY saved_at DESC LIMIT 1",
       [quiz.quizId],
@@ -864,72 +888,70 @@ export class ScholarApplication {
         ? { revision: quiz.revision, savedAt: String(answerSaved.saved_at), answers }
         : undefined;
     const settled = this.quiz.readSettledResult(quiz);
-    const settledByQuestion = new Map((settled?.questions ?? []).map((question) => [question.questionId, question]));
-    const settledByPage = new Map((settled?.pages ?? []).map((page) => [page.pageId, page]));
-    const questionResults: QuizQuestionResultRecord[] = this.db
-      .all<Record<string, unknown>>("SELECT * FROM question_results WHERE quiz_id = ? ORDER BY question_id", [
-        quiz.quizId,
-      ])
-      .map((row) => ({
+    const questionRows = new Map(
+      this.db
+        .all<Record<string, unknown>>("SELECT * FROM question_results WHERE quiz_id = ?", [quiz.quizId])
+        .map((row) => [String(row.question_id), row] as const),
+    );
+    const questionResults: QuizQuestionResultRecord[] = (settled?.questions ?? []).map((question) => {
+      const row = questionRows.get(question.questionId);
+      if (!row) throw new ValidationError(`Committed question result is missing: ${question.questionId}`);
+      return {
         resultId: String(row.result_id),
         quizId: String(row.quiz_id),
-        questionId: String(row.question_id),
+        questionId: question.questionId,
         answerRevision: Number(row.answer_revision),
-        feedback: settledByQuestion.get(String(row.question_id))?.feedback ?? "",
+        feedback: question.feedback,
         gradedAt: String(row.graded_at),
-      }));
-    const publicReading = (reading: ReadingLink): QuizReadingRecord => {
-      const page = this.db.get<Record<string, unknown>>("SELECT relative_path FROM pages WHERE page_id = ?", [
-        reading.pageId,
-      ]);
-      if (!page) throw new ValidationError(`Committed grade reading page is missing: ${reading.pageId}`);
-      return {
-        pageId: reading.pageId,
-        path: String(page.relative_path),
-        ...(reading.heading === undefined ? {} : { heading: reading.heading }),
-        href: this.quiz.readingHref(reading),
       };
+    });
+    const pagePath = (pageId: string): string => {
+      const page = this.db.get<Record<string, unknown>>("SELECT relative_path FROM pages WHERE page_id = ?", [pageId]);
+      if (!page) throw new ValidationError(`Committed grade page is missing: ${pageId}`);
+      return String(page.relative_path);
     };
-    const internalPageResults = this.db
-      .all<Record<string, unknown>>("SELECT * FROM page_results WHERE quiz_id = ? ORDER BY page_id", [quiz.quizId])
-      .map((row) => {
-        const pageId = String(row.page_id);
-        const settledPage = settledByPage.get(pageId);
-        const evidenceValue = jsonValue(row.evidence_json);
-        const readingsValue = jsonValue(row.readings_json);
-        const evidence =
-          settledPage?.evidence ??
-          (Array.isArray(evidenceValue)
-            ? evidenceValue.filter((item): item is string => typeof item === "string")
-            : []);
-        const readings: readonly ReadingLink[] =
-          settledPage?.readings ?? (Array.isArray(readingsValue) ? readingsValue.map(decodeReading) : []);
-        return {
-          resultId: String(row.result_id),
-          quizId: String(row.quiz_id),
-          pageId,
-          rating: String(row.rating) as QuizPageResultRecord["rating"],
-          feedback: settledPage?.feedback ?? String(row.feedback ?? ""),
-          reviewId: String(row.review_id),
-          evidence,
-          readings,
-        };
-      });
+    const publicReading = (reading: ReadingLink): QuizReadingRecord => ({
+      pageId: reading.pageId,
+      path: pagePath(reading.pageId),
+      ...(reading.heading === undefined ? {} : { heading: reading.heading }),
+      href: this.quiz.readingHref(reading),
+    });
+    const pageRows = new Map(
+      this.db
+        .all<Record<string, unknown>>("SELECT * FROM page_results WHERE quiz_id = ?", [quiz.quizId])
+        .map((row) => [String(row.page_id), row] as const),
+    );
+    const internalPageResults = (settled?.pages ?? []).map((page) => {
+      const row = pageRows.get(page.pageId);
+      if (!row) throw new ValidationError(`Committed page result is missing: ${page.pageId}`);
+      return {
+        resultId: String(row.result_id),
+        quizId: page.quizId,
+        pageId: page.pageId,
+        rating: page.rating,
+        feedback: page.feedback,
+        reviewId: page.reviewId,
+        evidence: page.evidence,
+        readings: page.readings,
+      };
+    });
     const pageResults: QuizPageResultRecord[] = internalPageResults.map((page) => ({
       ...page,
+      pageLink: {
+        pageId: page.pageId,
+        path: pagePath(page.pageId),
+        href: notesPageHref(page.pageId),
+      },
       readings: page.readings.map(publicReading),
     }));
-    const grades: QuizGradeRecord[] = pageResults.map((row) => ({
-      gradeId: row.reviewId,
-      quizId: row.quizId,
-      pageId: row.pageId,
-      rating: row.rating,
-      feedback: row.feedback,
-      gradedAt: String(
-        this.db.get<Record<string, unknown>>("SELECT reviewed_at FROM page_reviews WHERE review_id = ?", [row.reviewId])
-          ?.reviewed_at ?? new Date().toISOString(),
-      ),
-      reviewId: row.reviewId,
+    const grades: QuizGradeRecord[] = (settled?.pages ?? []).map((page) => ({
+      gradeId: page.gradeId,
+      quizId: page.quizId,
+      pageId: page.pageId,
+      rating: page.rating,
+      feedback: page.feedback,
+      gradedAt: page.gradedAt,
+      reviewId: page.reviewId,
     }));
     const readings = [
       ...new Map(
@@ -1089,25 +1111,139 @@ export class ScholarApplication {
   async listQuizzes(): Promise<{ readonly quizzes: readonly PublicQuizRecord[] }> {
     return { quizzes: this.quiz.list().map(publicQuiz) };
   }
-  async getQuiz(date: string): Promise<{
-    readonly quiz?: PublicQuizDetailRecord;
-    readonly outcome: "available" | "submitted" | "expired" | "skipped" | "failed" | "not-yet-run" | "maintenance-day";
-    readonly answers: readonly QuizAnswerInput[];
-    readonly grades: readonly QuizGradeRecord[];
-    readonly readings: readonly QuizReadingRecord[];
-    readonly message?: string;
-  }> {
+  private async quizRecommendations(detail: QuizDetailRecord): Promise<QuizRecommendations> {
+    if (!detail.pageResults.length) return { readings: [], gaps: [] };
+
+    const excluded = new Set([
+      ...detail.pageResults.map((result) => result.pageId),
+      ...detail.readings.map((reading) => reading.pageId),
+    ]);
+    const currentPages = await Promise.all(
+      (await this.wiki.list())
+        .filter((page) => page.status !== "retired")
+        .map(async (page) => {
+          try {
+            const inspected = await this.wiki.inspectDrift(page.pageId);
+            return { page: pageRecord(inspected.page), drifted: inspected.drifted, readable: true };
+          } catch {
+            return { page: pageRecord(page), drifted: page.status === "drifted", readable: false };
+          }
+        }),
+    );
+    const currentById = new Map(currentPages.map((page) => [page.page.pageId, page]));
+    const currentByPath = new Map(currentPages.map((page) => [page.page.relativePath, page]));
+    const candidates = new Map(
+      currentPages
+        .filter(
+          ({ page, drifted, readable }) =>
+            page.status === "active" && !drifted && readable && !excluded.has(page.pageId),
+        )
+        .map(({ page }) => [page.pageId, page]),
+    );
+    const prerequisiteIds = new Set(
+      detail.pageResults.flatMap((result) =>
+        this.scheduler.listPrerequisites(result.pageId).map((edge) => edge.prerequisitePageId),
+      ),
+    );
+    const prerequisites = [...prerequisiteIds]
+      .flatMap((pageId) => {
+        const page = candidates.get(pageId);
+        return page ? [page] : [];
+      })
+      .sort((left, right) => left.pageId.localeCompare(right.pageId));
+    const selected = new Set(prerequisites.map((page) => page.pageId));
+    const semanticScores = new Map<string, number>();
+    const query = quizRecommendationQuery(detail);
+    if (query) {
+      try {
+        for (const value of await this.wiki.semanticSearch(query, 100)) {
+          if (!isRecord(value) || typeof value.path !== "string" || typeof value.score !== "number") continue;
+          const current = currentByPath.get(value.path);
+          if (
+            current?.page.status !== "active" ||
+            current.drifted ||
+            !current.readable ||
+            !Number.isFinite(value.score)
+          )
+            continue;
+          const previous = semanticScores.get(current.page.pageId);
+          if (previous === undefined || value.score > previous) semanticScores.set(current.page.pageId, value.score);
+        }
+      } catch {
+        semanticScores.clear();
+      }
+    }
+    const related = [...semanticScores]
+      .flatMap(([pageId, score]) => {
+        const page = candidates.get(pageId);
+        return page && !selected.has(pageId) ? [{ page, score }] : [];
+      })
+      .sort((left, right) => right.score - left.score || left.page.pageId.localeCompare(right.page.pageId));
+
+    const gapPages = new Map<string, { readonly page: PageRecord; readonly kind: "missing" | "unclear" | "drifted" }>();
+    for (const issue of (await this.listIssues()).issues) {
+      if (
+        !issue.pageId ||
+        (issue.status !== "open" && issue.status !== "reopened") ||
+        (issue.kind !== "missing" && issue.kind !== "unclear")
+      )
+        continue;
+      const page = currentById.get(issue.pageId)?.page;
+      if (page) gapPages.set(`${page.pageId}\u0000${issue.kind}`, { page, kind: issue.kind });
+    }
+    for (const { page, drifted } of currentPages)
+      if (drifted) gapPages.set(`${page.pageId}\u0000drifted`, { page, kind: "drifted" });
+    const kindOrder = { missing: 0, unclear: 1, drifted: 2 } as const;
+    const gaps = [...gapPages.values()]
+      .sort((left, right) => {
+        const leftScore = semanticScores.get(left.page.pageId) ?? Number.NEGATIVE_INFINITY;
+        const rightScore = semanticScores.get(right.page.pageId) ?? Number.NEGATIVE_INFINITY;
+        if (leftScore !== rightScore) return rightScore - leftScore;
+        return kindOrder[left.kind] - kindOrder[right.kind] || left.page.pageId.localeCompare(right.page.pageId);
+      })
+      .slice(0, QUIZ_GAP_LIMIT)
+      .map(({ page, kind }) => ({
+        pageId: page.pageId,
+        path: page.relativePath,
+        title: page.title,
+        href: notesPageHref(page.pageId),
+        kind,
+      }));
+
+    return {
+      readings: [
+        ...prerequisites.map((page) => ({
+          pageId: page.pageId,
+          path: page.relativePath,
+          title: page.title,
+          href: notesPageHref(page.pageId),
+          reason: "prerequisite" as const,
+        })),
+        ...related.map(({ page }) => ({
+          pageId: page.pageId,
+          path: page.relativePath,
+          title: page.title,
+          href: notesPageHref(page.pageId),
+          reason: "related" as const,
+        })),
+      ].slice(0, QUIZ_RECOMMENDATION_LIMIT),
+      gaps,
+    };
+  }
+
+  async getQuiz(date: string): Promise<QuizResult> {
     const quiz = this.quiz.get(date);
     if (!quiz) {
       const settings = await this.getSettings();
-      const maintenance = settings.settings.initializationEnabled && date === settings.settings.facts.localDate;
+      const maintenance = settings.settings.maintenanceEnabled && date === settings.settings.facts.localDate;
       return {
         outcome: maintenance ? "maintenance-day" : "not-yet-run",
         answers: [],
         grades: [],
         readings: [],
+        recommendations: { readings: [], gaps: [] },
         message: maintenance
-          ? "Initialization maintenance is active; no quiz is generated today."
+          ? "Maintenance mode is active; no quiz is generated today."
           : "No quiz has been generated for this date.",
       };
     }
@@ -1118,6 +1254,7 @@ export class ScholarApplication {
       answers: detail.answers,
       grades: detail.grades,
       readings: detail.readings,
+      recommendations: await this.quizRecommendations(detail),
       ...(quiz.status === "failed" ? { message: "Quiz generation failed." } : {}),
     };
   }
@@ -1176,6 +1313,7 @@ export class ScholarApplication {
           quiz: publicQuizDetail(detail),
           grades: detail.grades,
           readings: detail.readings,
+          recommendations: { readings: [], gaps: [] },
         };
       }, "quiz:seal"),
     );
@@ -1256,7 +1394,7 @@ export class ScholarApplication {
     return publicWorkflow(workflow);
   }
   async getSettings(): Promise<{ readonly settings: SettingsRecord }> {
-    const initializationEnabled = await this.readSetting("initializationEnabled", true);
+    const maintenanceEnabled = await this.readSetting("maintenanceEnabled", true);
     const timezone = await this.readSetting("timezone", "local");
     const port = await this.readSetting("port", DEFAULT_VAULT_PORT);
     const host = await this.readSetting("host", DEFAULT_VAULT_HOST);
@@ -1316,7 +1454,7 @@ export class ScholarApplication {
     };
     return {
       settings: {
-        initializationEnabled: Boolean(initializationEnabled),
+        maintenanceEnabled: Boolean(maintenanceEnabled),
         timezone: String(timezone),
         port: Number(port),
         host: String(host),
@@ -1336,10 +1474,10 @@ export class ScholarApplication {
       this.durableDirect(async () => {
         const now = new Date().toISOString();
         const updates: [string, unknown][] = [];
-        if (input.initializationEnabled !== undefined) {
-          if (typeof input.initializationEnabled !== "boolean")
-            throw new ValidationError("initializationEnabled must be boolean");
-          updates.push(["initializationEnabled", input.initializationEnabled]);
+        if (input.maintenanceEnabled !== undefined) {
+          if (typeof input.maintenanceEnabled !== "boolean")
+            throw new ValidationError("maintenanceEnabled must be boolean");
+          updates.push(["maintenanceEnabled", input.maintenanceEnabled]);
         }
         if (input.timezone !== undefined) {
           if (typeof input.timezone !== "string" || !input.timezone.trim() || input.timezone.length > 100)
@@ -1998,12 +2136,12 @@ export class ScholarApplication {
       const quiz = this.quiz.get(date);
       return {
         date,
-        initializationEnabled: settings.settings.initializationEnabled,
+        maintenanceEnabled: settings.settings.maintenanceEnabled,
         expiredCount,
         candidates: await this.quizCandidates(duePages),
         ...(quiz ? { quiz: await this.quizDetail(quiz) } : {}),
-        ...(settings.settings.initializationEnabled
-          ? { message: "Initialization maintenance is active; quiz publication is blocked." }
+        ...(settings.settings.maintenanceEnabled
+          ? { message: "Maintenance mode is active; quiz publication is blocked." }
           : {}),
       };
     }, "quiz:context");
@@ -2023,8 +2161,8 @@ export class ScholarApplication {
     return withWriterLock(this.paths, async () => {
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz evidence is limited to the current local date");
-      if (await this.readSetting("initializationEnabled", true))
-        throw new ValidationError("Initialization maintenance is active; quiz evidence is blocked");
+      if (await this.readSetting("maintenanceEnabled", true))
+        throw new ValidationError("Maintenance mode is active; quiz evidence is blocked");
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date, false));
       const byId = new Map(duePages.map((page) => [page.pageId, page]));
       const selectedPages = pageIds.map((pageId) => {
@@ -2068,8 +2206,8 @@ export class ScholarApplication {
     return this.durableDirect(async () => {
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz publication is limited to the current local date");
-      if (await this.readSetting("initializationEnabled", true))
-        throw new ValidationError("Initialization maintenance is active; quiz publication is blocked");
+      if (await this.readSetting("maintenanceEnabled", true))
+        throw new ValidationError("Maintenance mode is active; quiz publication is blocked");
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       if (proposal.status === "skipped") {
         if (duePages.length) throw new ValidationError("A quiz may be skipped only when no pages are eligible");

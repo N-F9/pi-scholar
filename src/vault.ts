@@ -373,7 +373,7 @@ function seedDefaultSettings(paths: VaultPaths): void {
     transaction(db, () => {
       const now = new Date().toISOString();
       const defaults: readonly [string, string][] = [
-        ["initializationEnabled", "true"],
+        ["maintenanceEnabled", "true"],
         ["timezone", JSON.stringify("local")],
         ["port", String(DEFAULT_VAULT_PORT)],
         ["host", JSON.stringify(DEFAULT_VAULT_HOST)],

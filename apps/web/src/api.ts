@@ -56,6 +56,8 @@ const ISSUE_KINDS = ["incorrect", "unclear", "missing", "bad-boundary"] as const
 const ISSUE_STATUSES = ["open", "resolved", "reopened"] as const;
 const FSRS_STATES = ["New", "Learning", "Review", "Relearning"] as const;
 const REVIEW_RATINGS = ["Again", "Hard", "Good", "Easy"] as const;
+const RECOMMENDATION_REASONS = ["prerequisite", "related"] as const;
+const RECOMMENDATION_GAP_KINDS = ["missing", "unclear", "drifted"] as const;
 const WORKFLOW_KINDS = ["extract", "ingest", "lint", "daily", "quiz-grader", "sync"] as const;
 const WORKFLOW_STATUSES = ["queued", "running", "succeeded", "failed", "cancelled"] as const;
 function isEnum(value: unknown, values: readonly string[]): boolean {
@@ -91,6 +93,28 @@ function isReading(value: unknown): boolean {
     (value.heading === undefined || typeof value.heading === "string")
   );
 }
+function isRecommendations(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((field) => ["readings", "gaps"].includes(field)) &&
+    Array.isArray(value.readings) &&
+    value.readings.every(
+      (reading) =>
+        isRecord(reading) &&
+        Object.keys(reading).every((field) => ["pageId", "path", "title", "href", "reason"].includes(field)) &&
+        hasStrings(reading, ["pageId", "path", "title", "href", "reason"]) &&
+        isEnum(reading.reason, RECOMMENDATION_REASONS),
+    ) &&
+    Array.isArray(value.gaps) &&
+    value.gaps.every(
+      (gap) =>
+        isRecord(gap) &&
+        Object.keys(gap).every((field) => ["pageId", "path", "title", "href", "kind"].includes(field)) &&
+        hasStrings(gap, ["pageId", "path", "title", "href", "kind"]) &&
+        isEnum(gap.kind, RECOMMENDATION_GAP_KINDS),
+    )
+  );
+}
 
 function isQuestionResult(value: unknown): boolean {
   return (
@@ -107,9 +131,12 @@ function isPageResult(value: unknown): boolean {
   return (
     isRecord(value) &&
     Object.keys(value).every((field) =>
-      ["resultId", "quizId", "pageId", "rating", "feedback", "reviewId", "evidence", "readings"].includes(field),
+      ["resultId", "quizId", "pageId", "pageLink", "rating", "feedback", "reviewId", "evidence", "readings"].includes(
+        field,
+      ),
     ) &&
     hasStrings(value, ["resultId", "quizId", "pageId", "rating", "feedback", "reviewId"]) &&
+    isReading(value.pageLink) &&
     isEnum(value.rating, REVIEW_RATINGS) &&
     isStringArray(value.evidence) &&
     Array.isArray(value.readings) &&
@@ -369,7 +396,7 @@ export const isQuizListResult: ResultGuard<QuizListResult> = (value): value is Q
 export const isQuizResult: ResultGuard<QuizResult> = (value): value is QuizResult =>
   isRecord(value) &&
   Object.keys(value).every((field) =>
-    ["quiz", "outcome", "answers", "grades", "readings", "message"].includes(field),
+    ["quiz", "outcome", "answers", "grades", "readings", "recommendations", "message"].includes(field),
   ) &&
   typeof value.outcome === "string" &&
   ["available", "submitted", "expired", "skipped", "failed", "not-yet-run", "maintenance-day"].includes(
@@ -381,6 +408,7 @@ export const isQuizResult: ResultGuard<QuizResult> = (value): value is QuizResul
   value.grades.every(isGrade) &&
   Array.isArray(value.readings) &&
   value.readings.every(isReading) &&
+  isRecommendations(value.recommendations) &&
   (value.quiz === undefined || isQuizDetail(value.quiz));
 
 export const isQuizAnswersResult: ResultGuard<QuizAnswersResult> = (value): value is QuizAnswersResult =>
@@ -393,14 +421,17 @@ export const isQuizAnswersResult: ResultGuard<QuizAnswersResult> = (value): valu
 
 export const isQuizSubmissionResult: ResultGuard<QuizSubmissionResult> = (value): value is QuizSubmissionResult =>
   isRecord(value) &&
-  Object.keys(value).every((field) => ["status", "workflow", "quiz", "grades", "readings"].includes(field)) &&
+  Object.keys(value).every((field) =>
+    ["status", "workflow", "quiz", "grades", "readings", "recommendations"].includes(field),
+  ) &&
   value.status === "sealed" &&
   isWorkflow(value.workflow) &&
   isQuizDetail(value.quiz) &&
   Array.isArray(value.grades) &&
   value.grades.every(isGrade) &&
   Array.isArray(value.readings) &&
-  value.readings.every(isReading);
+  value.readings.every(isReading) &&
+  isRecommendations(value.recommendations);
 
 export const isWorkflowListResult: ResultGuard<WorkflowListResult> = (value): value is WorkflowListResult =>
   isRecord(value) && Array.isArray(value.workflows) && value.workflows.every(isWorkflow);
@@ -408,7 +439,7 @@ export const isWorkflowListResult: ResultGuard<WorkflowListResult> = (value): va
 export const isSettingsResult: ResultGuard<SettingsResult> = (value): value is SettingsResult =>
   isRecord(value) &&
   isRecord(value.settings) &&
-  typeof value.settings.initializationEnabled === "boolean" &&
+  typeof value.settings.maintenanceEnabled === "boolean" &&
   hasStrings(value.settings, ["timezone", "host", "updatedAt"]) &&
   typeof value.settings.port === "number" &&
   isRecord(value.settings.facts) &&

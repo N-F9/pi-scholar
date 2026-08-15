@@ -859,12 +859,12 @@ async function apiRoute(
       return;
     }
     const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-    if (!keysExactly(value, ["initializationEnabled", "timezone", "port", "host"]))
+    if (!keysExactly(value, ["maintenanceEnabled", "timezone", "port", "host"]))
       throw new ValidationError("settings request has unsupported fields");
     const input: SettingsUpdateRequest = {
-      ...(value.initializationEnabled === undefined
+      ...(value.maintenanceEnabled === undefined
         ? {}
-        : { initializationEnabled: booleanField(value, "initializationEnabled") }),
+        : { maintenanceEnabled: booleanField(value, "maintenanceEnabled") }),
       ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
       ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
       ...(value.host === undefined ? {} : { host: stringField(value, "host") }),

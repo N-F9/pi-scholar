@@ -1298,19 +1298,19 @@ describe("application quiz date guards", () => {
 });
 
 describe("application quiz publication guards", () => {
-  it("blocks quiz evidence and publication while initialization is active", async () => {
+  it("blocks quiz evidence and publication while maintenance mode is active", async () => {
     const { app, db, calls } = fixture();
     const date = localDate(new Date());
     try {
       await assert.rejects(app.getQuizEvidence({ date, pageIds: ["nonexistent-page"] }), (error: Error) => {
-        assert.equal(error.message, "Initialization maintenance is active; quiz evidence is blocked");
+        assert.equal(error.message, "Maintenance mode is active; quiz evidence is blocked");
         return true;
       });
       calls.length = 0;
       await assert.rejects(
-        app.publishQuiz({ status: "skipped", date, reason: "Initialization maintenance is active" }),
+        app.publishQuiz({ status: "skipped", date, reason: "Maintenance mode is active" }),
         (error: Error) => {
-          assert.equal(error.message, "Initialization maintenance is active; quiz publication is blocked");
+          assert.equal(error.message, "Maintenance mode is active; quiz publication is blocked");
           return true;
         },
       );
@@ -1333,10 +1333,10 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const context = await app.getQuizContext({ date });
-      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "initializationEnabled"]);
+      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "maintenanceEnabled"]);
       assert.equal(context.candidates.length, 1);
       const candidate = context.candidates[0]!;
       assert.deepEqual(Object.keys(candidate).sort(), ["description", "dueAt", "pageId", "path", "title"]);
@@ -1364,7 +1364,7 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const candidate = (await app.getQuizContext({ date })).candidates.find((item) => item.pageId === pageId);
       assert.equal(candidate?.description, "é".repeat(512));
@@ -1388,7 +1388,7 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
       assert.equal(evidence.length, 1);
@@ -1441,7 +1441,7 @@ describe("application quiz publication guards", () => {
       new Date(Date.now() + 2 * 86_400_000).toISOString(),
       future.page.pageId,
     ]);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     calls.length = 0;
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [second.page.pageId, first.page.pageId] });
@@ -1465,7 +1465,7 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     await fs.appendFile(join(paths.wikiRoot, page.page.relativePath), "\nPhysical edit\n");
     try {
       const context = await app.getQuizContext({ date });
@@ -1533,7 +1533,7 @@ describe("application quiz publication guards", () => {
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
     scheduler.ensurePageLearning(unselected.page.pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
       const sourceRefs = evidence.map((item) => item.reference);
@@ -1636,8 +1636,8 @@ describe("application browser mutation boundary", () => {
   });
 });
 
-async function gradingFixture() {
-  const fixtureValue = fixture();
+async function gradingFixture(options: Parameters<typeof fixture>[0] = {}) {
+  const fixtureValue = fixture(options);
   const { wiki, scheduler, quiz: quizService } = fixtureValue;
   const date = localDate(new Date());
   const page = await wiki.create({
@@ -1709,6 +1709,250 @@ function gradeFor(context: GradingContext, pageId: string, questionId: string, e
 }
 
 describe("quiz grading workflow lifecycle", () => {
+  it("derives bounded whole-wiki readings only after settlement", async () => {
+    const { app, db, date, pageId, questionId, draft, scheduler, wiki, paths } = await gradingFixture({
+      maintenance: true,
+    });
+    const owner = randomUUID();
+    try {
+      const prerequisite = await app.createNote({
+        path: "recommendation-prerequisite.md",
+        title: "Recommendation prerequisite",
+        description: "Foundational material for the graded page.",
+        body: "# Prerequisite\n\nFoundational material.\n",
+        quizWorthiness: "eligible",
+      });
+      scheduler.ensurePageLearning(prerequisite.page.pageId);
+      scheduler.setPrerequisites(pageId, [prerequisite.page.pageId]);
+      const related = [];
+      for (let index = 0; index < 6; index += 1)
+        related.push(
+          await app.createNote({
+            path: `recommendation-related-${index}.md`,
+            title: `Related ${index}`,
+            body: `# Related ${index}\n\nRelated material ${index}.\n`,
+            quizWorthiness: "skip",
+          }),
+        );
+      const tiedRelated = [...related].sort((left, right) => left.page.pageId.localeCompare(right.page.pageId));
+      const drifted = await app.createNote({
+        path: "recommendation-drifted.md",
+        title: "Drifted recommendation",
+        body: "# Drifted\n\nOriginal material.\n",
+        quizWorthiness: "skip",
+      });
+      await app.reportIssue({
+        pageId: related[0]!.page.pageId,
+        kind: "missing",
+        description: "Missing related explanation.",
+      });
+      await app.reportIssue({
+        pageId: related[0]!.page.pageId,
+        kind: "missing",
+        description: "The same missing page must remain one gap.",
+      });
+      await app.reportIssue({
+        pageId: related[1]!.page.pageId,
+        kind: "unclear",
+        description: "Unclear related explanation.",
+      });
+      await fs.appendFile(join(paths.wikiRoot, drifted.page.relativePath), "\nDirect edit.\n");
+
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      assert.deepEqual((await app.getQuiz(date)).recommendations, { readings: [], gaps: [] });
+      const context = await app.getGradingContext({ date }, owner);
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(evidence);
+      await app.settleGrade(gradeFor(context, pageId, questionId, [evidence]), owner);
+
+      const gradedPath = (await app.getWiki(pageId)).page.relativePath;
+      const databaseState = () =>
+        Object.fromEntries(
+          db.tableNames().map((table) => [
+            table,
+            db
+              .all(`SELECT * FROM "${table}"`)
+              .map((row) => JSON.stringify(row, (_key, value) => (typeof value === "bigint" ? String(value) : value)))
+              .sort(),
+          ]),
+        );
+      const beforeProjection = databaseState();
+      wiki.adapters.qmd!.search = () => [
+        ...related.map((page) => ({ path: page.page.relativePath, score: 1 })),
+        { path: related[0]!.page.relativePath, score: 1 },
+        { path: gradedPath, score: 2 },
+        { path: drifted.page.relativePath, score: 3 },
+      ];
+      const result = await app.getQuiz(date);
+      assert.deepEqual(
+        result.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [
+          [prerequisite.page.pageId, "prerequisite"],
+          ...tiedRelated.slice(0, 4).map((page) => [page.page.pageId, "related"]),
+        ],
+      );
+      assert.equal(result.recommendations.readings.length, 5);
+      assert.ok(result.recommendations.readings.every((reading) => reading.href.includes(`pageId=${reading.pageId}`)));
+      assert.deepEqual(
+        result.recommendations.gaps.map(({ pageId: id, kind }) => [id, kind]),
+        [
+          [related[0]!.page.pageId, "missing"],
+          [related[1]!.page.pageId, "unclear"],
+          [drifted.page.pageId, "drifted"],
+        ],
+      );
+      assert.ok(result.recommendations.gaps.every((gap) => gap.href.includes(`pageId=${gap.pageId}`)));
+      wiki.adapters.qmd!.search = () => {
+        throw new Error("qmd unavailable");
+      };
+      const fallback = await app.getQuiz(date);
+      assert.deepEqual(
+        fallback.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [[prerequisite.page.pageId, "prerequisite"]],
+      );
+      assert.equal(fallback.recommendations.gaps.length, 3);
+      assert.equal(
+        result.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.equal(sealed.quiz.pageResults.length, 0);
+      assert.deepEqual(databaseState(), beforeProjection);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("projects settled questions and reverse-lexical pages in canonical order", async () => {
+    const { app, db, wiki, scheduler, quiz: quizService } = fixture();
+    const date = localDate(new Date());
+    const owner = randomUUID();
+    try {
+      const pages = [];
+      for (const [path, title] of [
+        ["covered-a.md", "Covered A"],
+        ["covered-b.md", "Covered B"],
+      ] as const) {
+        const created = await wiki.create({
+          path,
+          title,
+          description: `${title} grading page.`,
+          body: `# Section\n\n${title} material.\n`,
+          quizWorthiness: "eligible",
+        });
+        scheduler.ensurePageLearning(created.page.pageId, `${date}T00:00:00.000Z`);
+        pages.push(created.page);
+      }
+      pages.sort((left, right) => right.pageId.localeCompare(left.pageId));
+      const [firstPage, secondPage] = pages;
+      assert.ok(firstPage && secondPage);
+      const firstPageId = firstPage.pageId;
+      const secondPageId = secondPage.pageId;
+      const quiz = quizService.createDailyQuiz({
+        date,
+        selectedPageIds: [firstPageId, secondPageId],
+        questionSpecs: [
+          {
+            kind: "free-response",
+            prompt: "First prompt",
+            pages: [{ pageId: firstPageId, criterion: "First criterion", weight: 1 }],
+            sourceRefs: [],
+          },
+          {
+            kind: "free-response",
+            prompt: "Second prompt",
+            pages: [{ pageId: secondPageId, criterion: "Second criterion", weight: 1 }],
+            sourceRefs: [],
+          },
+        ],
+      });
+      const [firstQuestion, secondQuestion] = quiz.questions;
+      assert.ok(firstQuestion && secondQuestion);
+      const draft = quizService.saveDraft({
+        date,
+        revision: quiz.revision,
+        answers: {
+          [secondQuestion.questionId]: "Second answer",
+          [firstQuestion.questionId]: "First answer",
+        },
+      });
+      await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const context = await app.getGradingContext({ date }, owner);
+      const firstEvidence = context.evidence?.find((item) => item.pageId === firstPageId)?.reference;
+      const secondEvidence = context.evidence?.find((item) => item.pageId === secondPageId)?.reference;
+      assert.ok(firstEvidence && secondEvidence);
+      await app.settleGrade(
+        {
+          requestId: context.requestId!,
+          date,
+          revision: context.revision!,
+          submissionId: context.submissionId!,
+          questions: [
+            { questionId: secondQuestion.questionId, feedback: "Second feedback" },
+            { questionId: firstQuestion.questionId, feedback: "First feedback" },
+          ],
+          pages: [
+            {
+              pageId: secondPageId,
+              rating: "Hard",
+              feedback: "Second page feedback",
+              evidence: [secondEvidence],
+              readings: [{ pageId: secondPageId, anchor: "#section" }],
+            },
+            {
+              pageId: firstPageId,
+              rating: "Good",
+              feedback: "First page feedback",
+              evidence: [firstEvidence],
+              readings: [{ pageId: firstPageId, anchor: "#section" }],
+            },
+          ],
+        },
+        owner,
+      );
+
+      const result = await app.getQuiz(date);
+      assert.ok(result.quiz);
+      assert.deepEqual(
+        result.quiz.answers.map((answer) => answer.questionId),
+        [firstQuestion.questionId, secondQuestion.questionId],
+      );
+      assert.deepEqual(
+        result.quiz.questionResults.map((question) => question.questionId),
+        [firstQuestion.questionId, secondQuestion.questionId],
+      );
+      assert.deepEqual(
+        result.quiz.pageResults.map((page) => page.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.grades.map((grade) => grade.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.readings.map((reading) => reading.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.pageResults.map((page) => page.pageLink),
+        [
+          {
+            pageId: firstPageId,
+            path: firstPage.relativePath,
+            href: `/notes?pageId=${firstPageId}#note-content`,
+          },
+          {
+            pageId: secondPageId,
+            path: secondPage.relativePath,
+            href: `/notes?pageId=${secondPageId}#note-content`,
+          },
+        ],
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
   it("rejects workflow request IDs in question and page feedback before persistence", async () => {
     const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const owner = randomUUID();

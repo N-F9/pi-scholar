@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { glob, lstat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
@@ -84,6 +85,7 @@ type VaultPaths = { readonly vaultRoot: string };
 type ScholarApplication = {
   readonly paths: VaultPaths;
   readonly status: () => Promise<ApplicationStatus>;
+  readonly updateSettings: (input: { readonly maintenanceEnabled?: boolean }) => Promise<unknown>;
   readonly stageSource: (request: SourceRequest) => Promise<unknown>;
   readonly createNote: (input: WikiNoteInput) => Promise<unknown>;
   readonly updateNote: (pageId: string, input: WikiNoteUpdateInput) => Promise<unknown>;
@@ -105,9 +107,6 @@ type ScholarApplication = {
     options?: WorkflowFinishOptions,
   ) => Promise<unknown>;
   readonly recoverAbandonedWorkflows: () => Promise<unknown>;
-  readonly getWorkflow: (
-    requestId: string,
-  ) => Promise<{ readonly requestId: string; readonly kind: string; readonly status: string }>;
   readonly getExtractContext: (
     input?: ExtractContextRequest,
     observer?: (event: ExtractProgressEvent) => void | Promise<void>,
@@ -367,8 +366,6 @@ const gradeInput = Type.Object({
 });
 
 const appCache = new Map<string, Promise<ScholarApplication>>();
-const delegatedWorkflows = new Map<string, string>();
-const activeDelegatedOperations = new Set<Promise<void>>();
 const gradingClaimOwner = randomUUID();
 
 async function loadRuntimeModule(): Promise<RuntimeModule> {
@@ -397,8 +394,6 @@ function jsonResult(value: unknown): AgentToolResult<unknown> {
 async function applicationFor(ctx: ExtensionContext): Promise<ScholarApplication> {
   const module = await loadRuntimeModule();
   const paths = module.resolveVault(ctx.cwd);
-  if (delegatedWorkflows.has(paths.vaultRoot))
-    throw new Error("delegated ingest workers may only call scholar_apply_ingest");
   const cached = appCache.get(paths.vaultRoot);
   if (cached) return cached;
   const pending = (async () => {
@@ -647,7 +642,7 @@ async function lifecycleContext<T>(
       throw persistenceError;
     }
   } else {
-    const remaining = kind === "daily" && (result as QuizContext).initializationEnabled ? 0 : 1;
+    const remaining = kind === "daily" && (result as QuizContext).maintenanceEnabled ? 0 : 1;
     const nextState: ContextWorkflowState = { requestId, remaining };
     workflowStates.set(key, nextState);
     try {
@@ -767,36 +762,9 @@ async function lifecycleIngestApply<T>(
   const module = await loadRuntimeModule();
   const paths = module.resolveVault(ctx.cwd);
   const state = workflowStates.get(`${paths.vaultRoot}:ingest`);
-  if (state) {
-    if (state.requestId !== requestId) throw new Error("ingest workflow ID does not match the current context");
-    return lifecycleFinal(ctx, signal, onUpdate, "Applying guarded ingest change", "ingest", operation);
-  }
-  const delegatedRequestId = delegatedWorkflows.get(paths.vaultRoot);
-  if (delegatedRequestId !== undefined && delegatedRequestId !== requestId)
-    throw new Error("ingest workflow ID does not match the delegated context");
-
-  cancelled(signal);
-  progress(onUpdate, "Applying delegated ingest change");
-  const app = module.createApplication({ paths });
-  const completion = Promise.withResolvers<void>();
-  activeDelegatedOperations.add(completion.promise);
-  try {
-    const workflow = await app.getWorkflow(requestId);
-    if (workflow.kind !== "ingest" || workflow.status !== "running")
-      throw new Error("delegated ingest workflow is not running");
-    delegatedWorkflows.set(paths.vaultRoot, requestId);
-    cancelled(signal);
-    const result = await operation(app);
-    progress(onUpdate, "Pi Scholar completed");
-    return jsonResult(result);
-  } finally {
-    try {
-      await app.close?.();
-    } finally {
-      completion.resolve();
-      activeDelegatedOperations.delete(completion.promise);
-    }
-  }
+  if (!state) throw new Error("ingest context is required before applying");
+  if (state.requestId !== requestId) throw new Error("ingest workflow ID does not match the current context");
+  return lifecycleFinal(ctx, signal, onUpdate, "Applying guarded ingest change", "ingest", operation);
 }
 
 async function lifecycleFinish<T>(
@@ -963,21 +931,27 @@ async function expandAddPaths(patterns: readonly string[], cwd: string): Promise
 async function handleAddCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
   const raw = args.trim() || (ctx.hasUI ? await ctx.ui.input("Add source", "URL, path, or pasted text") : undefined);
   if (!raw) return;
-  if (/^https?:\/\//iu.test(raw) || raw.startsWith("text:")) {
-    await call(ctx, ctx.signal, undefined, "Staging source", (app) =>
-      stage(app, /^https?:\/\//iu.test(raw) ? { url: raw } : { text: raw.slice(5) }),
-    );
-    ctx.ui.notify("Source staged in inbox", "info");
-    return;
-  }
+  ctx.ui.setStatus("pi-scholar", "Staging source");
+  try {
+    if (/^https?:\/\//iu.test(raw) || raw.startsWith("text:")) {
+      await call(ctx, ctx.signal, undefined, "Staging source", (app) =>
+        stage(app, /^https?:\/\//iu.test(raw) ? { url: raw } : { text: raw.slice(5) }),
+      );
+      ctx.ui.notify("Source staged in inbox", "info");
+      return;
+    }
 
-  const paths = await expandAddPaths(parseAddArguments(raw), ctx.cwd);
-  await call(ctx, ctx.signal, undefined, paths.length === 1 ? "Staging source" : "Staging sources", async (app) => {
-    const results: unknown[] = [];
-    for (const path of paths) results.push(await stage(app, { path }));
-    return results.length === 1 ? results[0] : results;
-  });
-  ctx.ui.notify(paths.length === 1 ? "Source staged in inbox" : `${paths.length} sources staged in inbox`, "info");
+    const paths = await expandAddPaths(parseAddArguments(raw), ctx.cwd);
+    ctx.ui.setStatus("pi-scholar", paths.length === 1 ? "Staging source" : "Staging sources");
+    await call(ctx, ctx.signal, undefined, paths.length === 1 ? "Staging source" : "Staging sources", async (app) => {
+      const results: unknown[] = [];
+      for (const path of paths) results.push(await stage(app, { path }));
+      return results.length === 1 ? results[0] : results;
+    });
+    ctx.ui.notify(paths.length === 1 ? "Source staged in inbox" : `${paths.length} sources staged in inbox`, "info");
+  } finally {
+    ctx.ui.setStatus("pi-scholar", undefined);
+  }
 }
 
 async function handleIssueCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -1056,7 +1030,7 @@ export function formatApplicationStatus(status: ApplicationStatus): string {
     `Vault: ${statusLabel(status.vaultId)}`,
     `Doctor: ${status.doctor ?? "unknown"}`,
     `Date: ${statusLabel(facts.localDate)} (${statusLabel(status.settings.timezone)})`,
-    `Initialization: ${status.settings.initializationEnabled ? "enabled" : "disabled"}`,
+    `Maintenance: ${status.settings.maintenanceEnabled ? "enabled" : "disabled"}`,
     `Inbox: ${facts.pendingInboxCount} pending`,
     `Issues: ${facts.openIssueCount} open`,
     lastResult("Ingest", facts.lastIngestAt, facts.lastIngestResult),
@@ -1077,17 +1051,34 @@ async function handleStatusCommand(_args: string, ctx: ExtensionCommandContext):
   cancelled(ctx.signal);
   ctx.ui.notify(formatApplicationStatus(await app.status()), "info");
 }
+async function handleMaintenanceCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+  if (args.trim() !== "off") {
+    ctx.ui.notify("Usage: /scholar-maintenance off", "error");
+    return;
+  }
+  cancelled(ctx.signal);
+  const app = await applicationFor(ctx);
+  cancelled(ctx.signal);
+  await app.updateSettings({ maintenanceEnabled: false });
+  ctx.ui.notify("Maintenance mode disabled; daily quiz publishing is enabled", "info");
+}
 
 async function handleLintCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
-  const command = pi.getCommands().find((entry) => entry.source === "skill" && entry.name === "skill:lint");
-  if (!command) throw new Error("lint skill is unavailable");
-  const location = command.sourceInfo.path;
-  const baseDir = command.sourceInfo.baseDir ?? dirname(location);
-  const body = stripFrontmatter(readFileSync(location, "utf8")).trim();
-  const skillBlock = `<skill name="lint" location="${location}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
-  const description = args.trim();
+  const description =
+    args.trim() ||
+    (ctx.hasUI ? (await ctx.ui.input("Lint wiki", "Full-wiki concern, page, or topic"))?.trim() : undefined);
+  if (!description) return;
+  const location = resolve(dirname(fileURLToPath(import.meta.url)), "../skills/lint/SKILL.md");
+  let body: string;
+  try {
+    body = stripFrontmatter(readFileSync(location, "utf8")).trim();
+  } catch {
+    ctx.ui.notify("Bundled lint skill is unavailable", "error");
+    return;
+  }
+  const skillBlock = `<skill name="lint" location="${location}">\nReferences are relative to ${dirname(location)}.\n\n${body}\n</skill>`;
   await ctx.waitForIdle();
-  pi.sendUserMessage(description ? `${skillBlock}\n\n${description}` : skillBlock);
+  pi.sendUserMessage(`${skillBlock}\n\n${description}`);
 }
 
 export default function piScholarExtension(pi: ExtensionAPI): void {
@@ -1108,6 +1099,10 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     handler: async (args, ctx) => handleLintCommand(pi, args, ctx),
   });
 
+  pi.registerCommand("scholar-maintenance", {
+    description: "Disable maintenance mode and enable daily quiz publishing",
+    handler: handleMaintenanceCommand,
+  });
   pi.registerTool({
     name: "scholar_add",
     label: "scholar_add",
@@ -1291,7 +1286,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     label: "scholar_get_daily_context",
     executionMode: "sequential",
     description:
-      "Read the current local-date daily quiz context and initialization guard. If initializationEnabled is true, call no other tool and answer exactly: Daily quiz guarded for <date>. Expired prior quizzes: <expiredCount>. No quiz was published. Substitute the returned values.",
+      "Read the current local-date daily quiz context and maintenance guard. If maintenanceEnabled is true, call no other tool and answer exactly: Daily quiz guarded for <date>. Expired prior quizzes: <expiredCount>. No quiz was published. Substitute the returned values.",
     parameters: contextDateInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleContext(ctx, _signal, onUpdate, "Loading daily context", "daily", (app) =>
@@ -1316,7 +1311,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
     label: "scholar_publish_daily",
     executionMode: "sequential",
     description:
-      "Publish one validated daily quiz proposal or explicit skip after an unguarded daily context; never call when initialization is enabled.",
+      "Publish one validated daily quiz proposal or explicit skip after an unguarded daily context; never call when maintenance mode is enabled.",
     parameters: quizInput,
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       return lifecycleFinal(ctx, _signal, onUpdate, "Publishing daily quiz", "daily", (app) =>
@@ -1361,10 +1356,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    const delegated = [...activeDelegatedOperations];
-    delegatedWorkflows.clear();
     workflowStates.clear();
-    await Promise.allSettled(delegated);
     const pending = [...appCache.values()];
     appCache.clear();
     const apps = await Promise.allSettled(pending);

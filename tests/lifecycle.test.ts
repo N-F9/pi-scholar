@@ -38,10 +38,8 @@ type FakeLifecycleApp = {
   readonly order: readonly string[];
   recoverAbandonedWorkflows: () => Promise<unknown>;
   status: () => Promise<unknown>;
+  updateSettings: (input: unknown) => Promise<unknown>;
   beginWorkflow: (kind: string) => Promise<{ readonly workflow: { readonly requestId: string } }>;
-  getWorkflow: (
-    requestId: string,
-  ) => Promise<{ readonly requestId: string; readonly kind: string; readonly status: string }>;
   getExtractContext: (
     input?: { readonly pendingSourceIds?: readonly string[] },
     observer?: (event: {
@@ -133,11 +131,14 @@ function fakeLifecycleApp(
       return {};
     },
     status: async () => ({}),
+    updateSettings: async (input) => {
+      updates.push(input);
+      return {};
+    },
     beginWorkflow: async (kind) => {
       order.push(`begin:${kind}`);
       return { workflow: { requestId: `${kind}-${root}` } };
     },
-    getWorkflow: async (requestId) => ({ requestId, kind: "ingest", status: "running" }),
     getExtractContext: async () => context,
     getIngestContext: async () => ({}),
     getLintContext: async () => ({}),
@@ -288,7 +289,13 @@ describe("Pi package lifecycle", () => {
     );
     assert.equal(toolModes.get("scholar_search"), undefined);
     assert.equal(toolModes.get("scholar_status"), undefined);
-    assert.deepEqual([...commands].sort(), ["scholar-add", "scholar-issue", "scholar-lint", "scholar-status"]);
+    assert.deepEqual([...commands].sort(), [
+      "scholar-add",
+      "scholar-issue",
+      "scholar-lint",
+      "scholar-maintenance",
+      "scholar-status",
+    ]);
     assert.deepEqual(events, ["agent_end", "session_shutdown"]);
   });
 
@@ -328,22 +335,6 @@ describe("Pi package lifecycle", () => {
     assert.equal(recoveries, 1);
   });
 
-  it("blocks other Scholar tools after a delegated apply without recovering", async () => {
-    const fixture = fakeLifecycleApp({}, async () => ({}));
-
-    await invoke(
-      fixture.tools,
-      "scholar_apply_ingest",
-      { workflowRequestId: "parent-ingest", change: { kind: "create-page" } },
-      fixture.root,
-    );
-    await assert.rejects(
-      invoke(fixture.tools, "scholar_get_ingest_context", {}, fixture.root),
-      /delegated ingest workers may only call scholar_apply_ingest/u,
-    );
-
-    assert.deepEqual(fixture.app.order, []);
-  });
   it("does not claim a workflow when cancelled during initialization", async () => {
     const fixture = fakeLifecycleApp({}, async () => ({}));
     const recovery = Promise.withResolvers<void>();
@@ -378,6 +369,7 @@ describe("Pi package lifecycle", () => {
     const fixture = fakeLifecycleApp({}, async () => ({}), root, commands);
     const staged: unknown[] = [];
     const notifications: string[] = [];
+    const statuses: Array<string | undefined> = [];
     fixture.app.stageSource = async (request) => {
       staged.push(request);
       return {};
@@ -388,7 +380,10 @@ describe("Pi package lifecycle", () => {
       cwd: root,
       hasUI: true,
       signal: undefined,
-      ui: { notify: (message: string) => notifications.push(message) },
+      ui: {
+        notify: (message: string) => notifications.push(message),
+        setStatus: (_key: string, status: string | undefined) => statuses.push(status),
+      },
     };
 
     try {
@@ -403,6 +398,16 @@ describe("Pi package lifecycle", () => {
       assert.deepEqual(notifications, ["3 sources staged in inbox", "Source staged in inbox"]);
       await assert.rejects(handler("missing/*.pdf", context), /No filesystem path matched "missing\/\*\.pdf"/u);
       assert.equal(staged.length, 4);
+      assert.deepEqual(statuses, [
+        "Staging source",
+        "Staging sources",
+        undefined,
+        "Staging source",
+        "Staging source",
+        undefined,
+        "Staging source",
+        undefined,
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -417,7 +422,7 @@ describe("Pi package lifecycle", () => {
       vaultId: "vault\nid",
       doctor: "fail",
       settings: {
-        initializationEnabled: true,
+        maintenanceEnabled: true,
         timezone: "America/New_York",
         port: 4816,
         host: "127.0.0.1",
@@ -483,6 +488,7 @@ describe("Pi package lifecycle", () => {
     assert.doesNotMatch(notification!, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u);
     assert.match(notification!, /^Pi Scholar: degraded\nVersion: 1\.2\.3 candidate\nVault: vault id\nDoctor: fail/mu);
     assert.match(notification!, /Date: 2026-08-14 \(America\/New_York\)/u);
+    assert.match(notification!, /Maintenance: enabled/u);
     assert.match(notification!, /Inbox: 2 pending\nIssues: 3 open/u);
     assert.match(notification!, /Git: release branch, dirty, upstream origin\/release, 1 ahead, 2 behind, diverged/u);
     assert.match(notification!, /Recent changes: 7[\s\S]*change-5[\s\S]*… 2 more/u);
@@ -515,10 +521,11 @@ describe("Pi package lifecycle", () => {
     assert.match(notifications[1]!, /Git: unavailable — Git state unavailable/u);
   });
 
-  it("expands the current-session lint skill before sending the command", async () => {
+  it("prompts and expands the bundled lint skill without command metadata", async () => {
     const handlers = new Map<string, CommandHandler>();
     const messages: string[] = [];
     const order: string[] = [];
+    const prompts: Array<string | undefined> = ["  whole wiki  ", undefined];
     const skillPath = join(repositoryRoot, "skills", "lint", "SKILL.md");
     const baseDir = dirname(skillPath);
     const pi = {
@@ -526,16 +533,7 @@ describe("Pi package lifecycle", () => {
       registerCommand: (name: string, command: { readonly handler: CommandHandler }) => {
         handlers.set(name, command.handler);
       },
-      getCommands: () => [
-        {
-          name: "skill:lint",
-          source: "skill",
-          sourceInfo: { path: skillPath, baseDir },
-        },
-      ],
-      waitForIdle: async () => {
-        order.push("idle");
-      },
+      getCommands: () => [{ name: "skill:lint", source: "skill" }],
       sendUserMessage: (message: string) => {
         order.push("send");
         messages.push(message);
@@ -545,26 +543,57 @@ describe("Pi package lifecycle", () => {
     piScholarExtension(pi);
     const handler = handlers.get("scholar-lint");
     if (!handler) throw new Error("scholar-lint command was not registered");
-    const context = { waitForIdle: async () => order.push("idle") };
+    const context = {
+      hasUI: true,
+      ui: {
+        input: async () => prompts.shift(),
+        notify: () => undefined,
+      },
+      waitForIdle: async () => order.push("idle"),
+    };
     await handler("  repair broken references  ", context);
     await handler("   ", context);
+    await handler("", context);
     const body = stripFrontmatter(readFileSync(skillPath, "utf8")).trim();
     const skillBlock = `<skill name="lint" location="${skillPath}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
-    assert.deepEqual(messages, [`${skillBlock}\n\nrepair broken references`, skillBlock]);
+    assert.deepEqual(messages, [`${skillBlock}\n\nrepair broken references`, `${skillBlock}\n\nwhole wiki`]);
     assert.deepEqual(order, ["idle", "send", "idle", "send"]);
     assert.equal(
       messages.some((message) => message.includes("/skill:lint")),
       false,
     );
   });
+  it("disables maintenance mode only through scholar-maintenance off", async () => {
+    const commands = new Map<string, CommandHandler>();
+    const fixture = fakeLifecycleApp({}, async () => ({}), undefined, commands);
+    const notifications: string[] = [];
+    const handler = commands.get("scholar-maintenance");
+    if (!handler) throw new Error("scholar-maintenance command was not registered");
+    const context = {
+      cwd: fixture.root,
+      signal: undefined,
+      ui: { notify: (message: string) => notifications.push(message) },
+    };
+
+    await handler("", context);
+    await handler("on", context);
+    assert.deepEqual(fixture.app.updates, []);
+    await handler(" off ", context);
+    assert.deepEqual(fixture.app.updates, [{ maintenanceEnabled: false }]);
+    assert.deepEqual(notifications, [
+      "Usage: /scholar-maintenance off",
+      "Usage: /scholar-maintenance off",
+      "Maintenance mode disabled; daily quiz publishing is enabled",
+    ]);
+  });
   it("keeps the daily publish action available after context and evidence reads", async () => {
     const calls: string[] = [];
-    const fixture = fakeLifecycleApp({ initializationEnabled: false }, async () => ({}));
+    const fixture = fakeLifecycleApp({ maintenanceEnabled: false }, async () => ({}));
     fixture.app.getQuizContext = async () => {
       calls.push("context");
       return {
         date: "2026-08-10",
-        initializationEnabled: false,
+        maintenanceEnabled: false,
         expiredCount: 0,
         candidates: [
           {
@@ -805,7 +834,7 @@ describe("Pi package lifecycle", () => {
     for (const applied of [false, true]) {
       for (const kind of ["ingest", "lint", "daily"] as const) {
         const context =
-          kind === "daily" ? { date: "2026-08-10", initializationEnabled: false, marker: kind } : { marker: kind };
+          kind === "daily" ? { date: "2026-08-10", maintenanceEnabled: false, marker: kind } : { marker: kind };
         const fixture = fakeLifecycleApp(context, async () => ({}));
         const contextTool = `scholar_get_${kind}_context`;
         const finishTool =
@@ -840,14 +869,14 @@ describe("Pi package lifecycle", () => {
           await invoke(
             fixture.tools,
             "scholar_publish_daily",
-            { status: "skipped", date: "2026-08-10", reason: "initialization disabled" },
+            { status: "skipped", date: "2026-08-10", reason: "maintenance disabled" },
             fixture.root,
           );
           await assert.rejects(
             invoke(
               fixture.tools,
               "scholar_publish_daily",
-              { status: "skipped", date: "2026-08-10", reason: "initialization disabled" },
+              { status: "skipped", date: "2026-08-10", reason: "maintenance disabled" },
               fixture.root,
             ),
             /context is required/u,
@@ -953,76 +982,30 @@ describe("Pi package lifecycle", () => {
     }
   });
 
-  it("lets a delegated ingest worker apply without recovering or owning the workflow", async () => {
+  it("rejects ingest apply outside the parent-owned context", async () => {
     const fixture = fakeLifecycleApp({}, async () => ({}));
-    const change = { kind: "create-page" };
-    const result = { kind: "create-page", applied: true };
-    let appliedInput: unknown;
     let applyCalls = 0;
-    let requestedWorkflowId: string | undefined;
-    let appliedWorkflowId: string | undefined;
-    let closes = 0;
-    fixture.app.close = async () => {
-      closes += 1;
-    };
-    fixture.app.getWorkflow = async (requestId) => {
-      requestedWorkflowId = requestId;
-      return { requestId, kind: "ingest", status: "running" };
-    };
-    fixture.app.applyIngestChange = async (input, workflowRequestId) => {
+    fixture.app.applyIngestChange = async () => {
       applyCalls += 1;
-      appliedInput = input;
-      appliedWorkflowId = workflowRequestId;
-      return result;
+      return {};
     };
 
-    const applied = (await invoke(
-      fixture.tools,
-      "scholar_apply_ingest",
-      { workflowRequestId: "parent-ingest", change },
-      fixture.root,
-    )) as { readonly details: unknown };
-
-    assert.strictEqual(applied.details, result);
-    assert.strictEqual(appliedInput, change);
-    assert.equal(applyCalls, 1);
-    assert.equal(requestedWorkflowId, "parent-ingest");
-    assert.equal(appliedWorkflowId, "parent-ingest");
-    assert.equal(closes, 1);
-    assert.deepEqual(fixture.app.order, []);
-    assert.deepEqual(fixture.app.finishes, []);
-
     await assert.rejects(
-      invoke(fixture.tools, "scholar_finish_ingest", {}, fixture.root),
-      /ingest context is required before finishing/u,
+      invoke(
+        fixture.tools,
+        "scholar_apply_ingest",
+        { workflowRequestId: "parent-ingest", change: { kind: "create-page" } },
+        fixture.root,
+      ),
+      /ingest context is required before applying/u,
     );
+    assert.equal(applyCalls, 0);
     assert.deepEqual(fixture.app.order, []);
-    assert.deepEqual(fixture.app.finishes, []);
-
-    await assert.rejects(
-      invoke(fixture.tools, "scholar_apply_ingest", { workflowRequestId: "other-ingest", change }, fixture.root),
-      /ingest workflow ID does not match the delegated context/u,
-    );
-    assert.equal(applyCalls, 1);
-    assert.equal(closes, 1);
-
-    for (const workflow of [
-      { kind: "lint", status: "running" },
-      { kind: "ingest", status: "failed" },
-    ]) {
-      fixture.app.getWorkflow = async (requestId) => ({ requestId, ...workflow });
-      await assert.rejects(
-        invoke(fixture.tools, "scholar_apply_ingest", { workflowRequestId: "parent-ingest", change }, fixture.root),
-        /delegated ingest workflow is not running/u,
-      );
-      assert.equal(applyCalls, 1);
-    }
-    assert.equal(closes, 3);
   });
 
-  it("replays exact daily initialization context after applied and unapplied automatic finish failures", async () => {
+  it("replays exact daily maintenance context after applied and unapplied automatic finish failures", async () => {
     for (const applied of [false, true]) {
-      const context = { date: "2026-08-10", initializationEnabled: true, expiredCount: 1 };
+      const context = { date: "2026-08-10", maintenanceEnabled: true, expiredCount: 1 };
       const fixture = fakeLifecycleApp(context, async () => ({}));
       let contextCalls = 0;
       fixture.app.getQuizContext = async () => ({ ...context, expiredCount: ++contextCalls });
@@ -1060,7 +1043,7 @@ describe("Pi package lifecycle", () => {
         invoke(
           fixture.tools,
           "scholar_publish_daily",
-          { status: "skipped", date: "2026-08-10", reason: "initialization disabled" },
+          { status: "skipped", date: "2026-08-10", reason: "maintenance disabled" },
           fixture.root,
         ),
         /context is required/u,

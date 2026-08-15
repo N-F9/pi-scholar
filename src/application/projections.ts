@@ -16,6 +16,9 @@ import { parseOkfConcept } from "../okf.js";
 import type { WikiPage } from "../wiki.js";
 import { parseWikiBodySections } from "../wiki-sections.js";
 
+export function notesPageHref(pageId: string): string {
+  return `/notes?pageId=${encodeURIComponent(pageId)}#note-content`;
+}
 export function sourceRecord(value: Record<string, unknown>): SourceRecord {
   return {
     sourceId: String(value.sourceId ?? value.source_id),

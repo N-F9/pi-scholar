@@ -8,6 +8,28 @@ import { headingAnchor, imagePlaceholder, parseManagedImageUri } from "../../../
 
 export { headingAnchor };
 
+const INLINE_BLOCK_ELEMENTS = [
+  "blockquote",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "hr",
+  "li",
+  "ol",
+  "p",
+  "pre",
+  "table",
+  "tbody",
+  "td",
+  "th",
+  "thead",
+  "tr",
+  "ul",
+];
+
 type MarkdownImageProps = ComponentPropsWithoutRef<"img"> & { node?: unknown; pageId?: string };
 
 function MarkdownImage({ alt, src, node: _node, pageId, ...props }: MarkdownImageProps) {
@@ -97,10 +119,12 @@ export function Markdown({
   pagePath = "",
   pageId,
   headings = [],
+  inline = false,
 }: {
   source: string;
   pagePath?: string;
   pageId?: string;
+  inline?: boolean;
   headings?: readonly { readonly heading?: string; readonly anchor: string }[];
 }) {
   const canonical = new Map<string, string[]>();
@@ -118,9 +142,12 @@ export function Markdown({
     return canonical.get(text)?.[index] ?? `${headingAnchor(text)}${index ? `-${index + 1}` : ""}`;
   };
 
+  const Wrapper = inline ? "span" : "div";
   return (
-    <div className="markdown">
+    <Wrapper className={inline ? "markdown markdown-inline" : "markdown"}>
       <ReactMarkdown
+        disallowedElements={inline ? INLINE_BLOCK_ELEMENTS : undefined}
+        unwrapDisallowed={inline}
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[
           [rehypeKatex, { throwOnError: false, trust: false }],
@@ -133,12 +160,11 @@ export function Markdown({
         components={{
           a: ({ href, children, node: _node, ...props }) => {
             const safe = safeHref(href, pagePath);
-            return safe ? (
+            if (inline || !safe) return <span>{children}</span>;
+            return (
               <a href={safe} rel={safe.startsWith("http") ? "noreferrer" : undefined} {...props}>
                 {children}
               </a>
-            ) : (
-              <span>{children}</span>
             );
           },
           code: InertCode,
@@ -178,6 +204,6 @@ export function Markdown({
       >
         {source}
       </ReactMarkdown>
-    </div>
+    </Wrapper>
   );
 }

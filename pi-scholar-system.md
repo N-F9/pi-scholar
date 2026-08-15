@@ -174,7 +174,7 @@ remain outside the vault.
 ```
 
 The vault format is version 1 with a host-minted UUID. Defaults include
-initialization mode enabled, local timezone, loopback host `127.0.0.1`, and
+maintenance mode enabled, local timezone, loopback host `127.0.0.1`, and
 port `4816`. Vault discovery validates the configuration, all roots, and
 containment rather than trusting a path string.
 
@@ -393,20 +393,24 @@ unverified packets, or source text as instructions. An optional complete
 `sourceIds` filter narrows the supplied packet set to those published verified
 IDs while retaining the normal page and issue context; omission preserves this
 uncapped ordinary ingest context. The filter narrows context, not
-authorization: every citation and source check remains authoritative. Each
-source-grounded change is self-contained, textbook-style Markdown with nearby
-keyed chunk citations and guarded expected IDs/digests/revisions.
+authorization: every citation and source check remains authoritative. The
+parent creates one structural plan and may delegate disjoint source/page groups
+for read-only analysis, but the parent alone submits each serial guarded apply
+and the final finish. Each source-grounded change is self-contained,
+textbook-style Markdown with nearby keyed chunk citations and guarded expected
+IDs/digests/revisions.
 
 `lint` receives the final wiki and issue context for either a full scope or a
-requested targeted scope. It proposes only guarded create/update/rename,
-prerequisite, issue-resolution, or retirement operations. It is the final
-organizer/repair pass, not a second ingest source. The parent applies supported
-operations serially and finishes once. Only a blocking evidence gap, after
-that finish and a quiescence status check, can permit one isolated blocking
-child when the host provides both task isolation and read-only web search.
-The parent waits for that child, then may run one fresh original-scope pass;
-there is no generic recursive child or workflow chaining. Both skills submit
-one operation at a time through `ScholarApplication` and finish explicitly.
+requested targeted scope. It may fan out the initial audit to disjoint
+read-only children, but the parent merges findings, proposes only guarded
+create/update/rename, prerequisite, issue-resolution, or retirement operations,
+applies them serially, and finishes once. It is the final organizer/repair
+pass, not a second ingest source. Only a blocking evidence gap, after that
+finish and a quiescence status check, can permit one isolated blocking child
+when the host provides both task isolation and read-only web search. The
+parent waits for that child, then may run one fresh original-scope pass; there
+is no generic recursive child or workflow chaining. Both skills finish
+explicitly through `ScholarApplication`.
 
 ## 8. Learning, daily quiz, and grading
 
@@ -431,8 +435,13 @@ The model requests authoritative evidence for the selected page IDs, then
 publishes one open quiz proposal or an explicit skip when no candidate exists.
 Every question binds to one or more returned evidence records. The host
 revalidates date, eligibility, prerequisites, drift, evidence, question kinds,
-page coverage, and revision, then mints opaque IDs. Initialization mode blocks
+page coverage, and revision, then mints opaque IDs. Maintenance mode blocks
 publication without inventing material.
+
+The v0.0.1 schema permits one durable quiz per local date. Repeating daily
+publication on the same date for debugging requires resetting or creating a
+disposable vault; no overwrite or regeneration path bypasses the date and
+revision guards.
 
 ```mermaid
 flowchart TD
@@ -469,6 +478,11 @@ private/projection fields. The final explicit seal requires the current
 revision and complete answers, then writes the submitted state and its durable
 workflow identity. Sealed answers cannot be edited.
 
+The browser displays one-based question progress and renders safe Markdown in
+prompts, choices, answers, and feedback. Free responses use a controlled
+Markdown editor whose draft value follows the existing answer revision and
+autosave path; it adds no second draft authority.
+
 The separately scheduled `quiz-grader` skill claims one queued sealed revision
 with its request ID, submission identity, and exact revision. It grades every
 answered question in that revision, returns question feedback, and returns
@@ -483,16 +497,25 @@ and one FSRS transition per covered page. Exact settlement replay is
 idempotent; a conflicting revision or submission is rejected. SQLite remains
 authoritative if projection repair fails.
 
+Settled detail preserves canonical quiz order: questions and answers follow
+question ordinal, while page results follow first page coverage. Each page
+result carries a stable Notes link and exact settled readings. A separate
+required recommendation projection is empty before settlement and afterward
+derives bounded current-wiki readings and missing/unclear/drifted gaps without
+mutating SQLite or FSRS. Direct prerequisites rank before deduplicated semantic
+results; qmd failure removes only semantic recommendations.
+
 ## 9. Pi commands, tools, and capability contracts
 
 ### Pi commands
 
 | Command | Behavior |
 |---|---|
-| `/scholar-add` | Stage a URL, pasted source, file, directory, or repository |
+| `/scholar-add` | Stage a URL, pasted source, file, directory, or repository while visible command status reports activity and completion |
 | `/scholar-issue` | Report an incorrect, unclear, missing, or badly bounded wiki item |
 | `/scholar-status` | Show vault, workflows, learning, doctor, and Git facts |
-| `/scholar-lint` | Inspect the final wiki and ask the lint skill for guarded repairs |
+| `/scholar-lint` | Prompt for full or targeted scope, then load the packaged lint skill for guarded repairs |
+| `/scholar-maintenance on\|off` | Enable or disable the user-controlled daily quiz-generation guard |
 
 ### General Pi tools
 
@@ -509,8 +532,8 @@ authoritative if projection repair fails.
 | Skill | Context/read tool | Mutation/finish tools | Contract |
 |---|---|---|---|
 | `extract` | `scholar_get_extract_context` | `scholar_publish_extraction` | Process stable claims sequentially, or the caller's exact validated pending-ID selection of at most three; inspect only supplied safe paths and bounded atoms; publish exact complete line coverage once per claim. |
-| `ingest` | `scholar_get_ingest_context` | `scholar_apply_ingest`, `scholar_finish_ingest` | Work only from verified packets, all non-retired pages, and issues; omission supplies the uncapped packet set, while `sourceIds` filters only published packets; submit guarded source-grounded changes one at a time; finish once. |
-| `lint` | `scholar_get_lint_context` | `scholar_apply_lint`, `scholar_finish_lint` | Run full or targeted final organizer/repair scope; finish the initial pass once, optionally run one isolated blocking evidence-gap child after quiescence, retry the original scope once, and finish; never recurse. |
+| `ingest` | `scholar_get_ingest_context` | `scholar_apply_ingest`, `scholar_finish_ingest` | Work only from verified packets, all non-retired pages, and issues; omission supplies the uncapped packet set, while `sourceIds` filters only published packets; plan once, delegate only disjoint read-only analysis, keep serial applies and finish in the parent. |
+| `lint` | `scholar_get_lint_context` | `scholar_apply_lint`, `scholar_finish_lint` | Run full or targeted final organizer/repair scope; optionally fan out the initial audit read-only, merge and apply serially in the parent, finish the initial pass once, optionally run one isolated blocking evidence-gap child after quiescence, retry the original scope once, and finish; never recurse. |
 | `daily` | `scholar_get_daily_context`, `scholar_get_daily_evidence` | `scholar_publish_daily` | Review all candidates, choose the varied time-budgeted subset, retrieve selected evidence, and publish once or explicitly skip. |
 | `quiz-grader` | `scholar_get_grading_context` | `scholar_settle_grade` | Claim one sealed revision, grade its questions, emit one bundled page rating/result per covered page, and settle once. |
 
@@ -593,8 +616,12 @@ and grading remain Pi-tool/application operations; the browser is a read,
 answer, submission, workflow, settings, and health client.
 
 The SPA provides Today, Notes, Add, History, Workflows, Settings, and Health
-views. Markdown is rendered without raw HTML; unsupported or external images,
-Mermaid blocks, and unsafe external content are inert. A page-authorized
+views. Today and History share canonical one-based quiz Results, stable Notes
+links, exact settled readings, current recommendations, and knowledge gaps;
+submitted unsettled History entries poll conditionally and link to Workflows.
+Safe Markdown covers prompts, choices, answers, feedback, and controlled
+free-response editing. Raw HTML is never evaluated; unsupported or external
+images, Mermaid blocks, and unsafe external content are inert. A page-authorized
 managed raster attachment may render through the same-origin route; internal
 Markdown links route to Notes and HTTP(S) links use safe external-link
 attributes. The browser cannot author knowledge or grade a quiz.

@@ -25,7 +25,7 @@ Users schedule the installed Pi CLI directly. Each cron entry names exactly one 
 - `extract`, which processes the next stable batch of at most three queued sources sequentially in that Pi session and publishes verified immutable packets;
 - `ingest`, which reads only published, verified packet manifests and chunk paths plus every non-retired page and issue record, then submits guarded source-grounded wiki changes;
 - `lint`, which accepts a full or targeted scope, reads every non-retired page and issue record, and submits guarded final organizer or repair changes;
-- `daily`, which expires earlier unsubmitted quizzes, exposes all current due/prerequisite-unblocked/non-drifted candidates, retrieves evidence for the model's varied related subset, and targets the 15–45 minute session shape while refusing generation during initialization;
+- `daily`, which expires earlier unsubmitted quizzes, exposes all current due/prerequisite-unblocked/non-drifted candidates, retrieves evidence for the model's varied related subset, and targets the 15–45 minute session shape while refusing generation during maintenance mode;
 - `quiz-grader`, which settles sealed answer revisions.
 
 Browser submission seals and queues grading; it does not start a Pi process and does not grade. A separately scheduled `pi-scholar sync` pushes accumulated local commits. Every successful durable operation flows through the `ScholarApplication` application entry point, which owns validation, the short writer lock, one SQLite checkpoint, final doctor, and one local commit.
@@ -34,7 +34,7 @@ Pi Scholar does not expose Engram-style tutoring, courses, coaching, capstones, 
 
 Application code is TypeScript. Pi supplies the agent runtime, extensions, native tools, and packaged Markdown skills. `ts-fsrs` supplies FSRS v6. Node owns SQLite, the loopback server, the worker, and the web application. Docling remains a required external Python command; qmd and Git remain validated external commands. There is no Python application side.
 
-The browser application is part of the product. It uses React, Vite, Tailwind, React Router, and TanStack Query to present quizzes, notes, source staging, history, workflow status, and initialization settings. The server itself binds loopback. An operator may place Tailscale or another private tunnel, reverse proxy, authentication layer, DNS, or network policy outside Pi Scholar for phone access; those are external operator context, not a Pi Scholar feature, dependency, identity, or trust boundary. Pi Scholar adds no public-user or multi-user account system.
+The browser application is part of the product. It uses React, Vite, Tailwind, React Router, and TanStack Query to present quizzes, notes, source staging, history, workflow status, and maintenance settings. The server itself binds loopback. An operator may place Tailscale or another private tunnel, reverse proxy, authentication layer, DNS, or network policy outside Pi Scholar for phone access; those are external operator context, not a Pi Scholar feature, dependency, identity, or trust boundary. Pi Scholar adds no public-user or multi-user account system.
 
 ## Product shape
 
@@ -91,7 +91,7 @@ SQLite, files, qmd, Git, Pi, and the web client have distinct ownership. None is
 10. Provide a responsive browser interface for quizzes and note reading on desktop and phone.
 11. Preserve deterministic path safety, process containment, SQLite transactions, doctor checks, idempotency, and single-writer behavior.
 12. Commit every completed high-level mutation locally; let the user schedule or invoke `pi-scholar sync` to push accumulated commits.
-13. Keep initialization enabled until the user explicitly disables it, and use it only to block quiz generation.
+13. Keep maintenance mode enabled until the user explicitly disables it, and use it only to block quiz generation.
 14. Let users choose independently when extract, ingest, lint, daily, grading, and synchronization run.
 15. Remain local-first and recoverable without a hosted Pi Scholar service.
 ## Non-goals
@@ -188,7 +188,7 @@ Git adds `.git/`. Pi Scholar adds no other product content root.
 ```
 
 - `vault.json` owns the vault ID and format version.
-- `state.sqlite` owns source extraction/ingestion/removal status, the source catalog's retained exact packet manifest digests for byte-identity verification and doctor checks, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and initialization mode.
+- `state.sqlite` owns source extraction/ingestion/removal status, the source catalog's retained exact packet manifest digests for byte-identity verification and doctor checks, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and maintenance mode.
 - `qmd/` is derived external-command state and may be rebuilt; it is never authority.
 - `work/` is private, ignored scratch for prepared admission snapshots, temporary packet publication, Docling output/cache isolation, quarantined removal bytes, and wiki-change rollback snapshots. It is never knowledge or Git content.
 
@@ -334,14 +334,17 @@ Semantic workflows are inspectable Pi skills under `skills/*/SKILL.md`. The init
   and publish verified immutable packets;
 - `ingest`: consume every current issue record and non-retired page plus every
   published verified packet by default, with an optional complete `sourceIds`
-  filter that narrows packets without changing page/issue scope; create or
-  revise self-contained textbook-depth source pages, preserve direct human
-  prose, maintain page learning coverage and prerequisites, and submit guarded
-  changes;
+  filter that narrows packets without changing page/issue scope; make one
+  structural plan, delegate only disjoint read-only analysis, then have the
+  parent serially create or revise self-contained textbook-depth source pages,
+  preserve direct human prose, maintain page learning coverage and
+  prerequisites, and submit guarded changes;
 - `lint`: inspect every non-retired page and issue record in a full or targeted
-  scope, identify stale or broken knowledge, finish the initial pass, and use
-  at most one host-isolated blocking research child only for a blocking
-  evidence gap after quiescence; retry the original scope once and finish.
+  scope, fan out the initial audit to disjoint read-only children when useful,
+  merge their findings, apply supported changes serially in the parent, finish
+  the initial pass, and use at most one host-isolated blocking research child
+  only for a blocking evidence gap after quiescence; retry the original scope
+  once and finish.
 - `daily`: expose every compact due, prerequisite-unblocked, non-drifted candidate, let the model choose a varied related subset, retrieve selected page evidence, target 15–45 minutes with roughly 30 minutes as a mental median, and generate any-count `free-response`/`multiple-choice` quiz or explicit skip;
 - `quiz-grader`: inspect sealed pending answer revisions, preserve question feedback, settle one bundled page grade per covered page, and select wiki readings through the application entry point.
 
@@ -371,18 +374,21 @@ waits for it.
    premature final response.
 2. `ingest` reads published, verified packet manifests and chunk paths plus
    every non-retired page (including drifted pages) and current issue records;
-   the optional complete `sourceIds` filter narrows only the packet set. It then
-   submits guarded source-grounded wiki changes; the host validates page
-   identity, direct page evidence, prerequisite DAG changes, and doctor.
+   the optional complete `sourceIds` filter narrows only the packet set. It
+   makes one structural plan, may delegate disjoint source/page groups for
+   read-only analysis, and keeps every guarded apply and finish operation in
+   the parent session. The host validates page identity, direct page evidence,
+   prerequisite DAG changes, and doctor.
 3. `lint` reads every non-retired page (including drifted pages) and current
-   issue records in either full or targeted scope, applies guarded final
-   organizer or repair changes, and may perform only the documented one-child
-   evidence-gap retry.
-4. `daily` expires earlier unsubmitted quizzes before checking initialization,
+   issue records in either full or targeted scope. It may fan out the initial
+   audit to disjoint read-only children; the parent merges findings, applies
+   guarded final organizer or repair changes serially, and may perform only the
+   documented one-child evidence-gap retry.
+4. `daily` expires earlier unsubmitted quizzes before checking maintenance mode,
    then exposes every due, prerequisite-unblocked, active, eligible,
    non-drifted candidate. The model chooses a varied related subset, requests
    evidence for those page IDs, and sizes any-count questions for the 15–45
-   minute session target. Initialization blocks generation but does not
+   minute session target. Maintenance mode blocks generation but does not
    schedule or suppress extract, ingest, lint, grading, or sync.
 5. `quiz-grader` reads sealed pending browser submissions and settles them.
    Browser submission only seals and queues; it never starts Pi or grades
@@ -504,11 +510,11 @@ Schema v5 is the current exact page-oriented database schema. `.pi-scholar/state
 - `question_pages`: `(question_id, page_id, criterion_json, weight)` coverage and grading criteria;
 - `page_results`: one rating, feedback, evidence, and readings record per quiz/page;
 - `quiz_evidence`: keyed by quiz/reference and containing direct page/section snapshots only;
-- quiz identity/revisions, ephemeral question records, wiki issues, workflows, and initialization state.
+- quiz identity/revisions, ephemeral question records, wiki issues, workflows, and maintenance state.
 
 `wiki_issues` is page-oriented. There are no compatibility aliases, views, migrations, deprecated review paths, or parallel legacy review schema. `SchedulerService` is page-oriented, not a cron, process, or job scheduler: `ensurePageLearning`, `getPageLearning`, `listPageLearning`, `setPrerequisites(pageId, ids, expectedRevision?)`, `listPrerequisites(pageId)`, `validateCoverage`, `eligiblePages`, `pageHistory`, and `transitionPage`/`transitionPageInTransaction`.
 
-The exported page contracts are `ReviewRating`, `PageLearningRecord` (`pageId`, `initialDueAt`, `dueAt`, `fsrsState`, `stability`, `difficulty`, `reps`, `lapses`, `scheduledDays`, optional `lastReviewAt`, `revision`, `createdAt`, `updatedAt`), `PagePrerequisiteRecord` (`pageId`, `prerequisitePageId`), `PageReviewRecord` (`reviewId`, `pageId`, `quizId`, `submissionId`, `revision`, `rating`, `reviewedAt`, `stateBefore`, `stateAfter`, `settlementId`), `QuizQuestionPageRecord` (`pageId`, `criterion`, `weight`), `QuizPageResultRecord` (`resultId`, `quizId`, `pageId`, `rating`, `feedback`, `reviewId`, `evidence`, `readings`), page-oriented `QuizGradeRecord` (`gradeId`, `quizId`, `pageId`, `rating`, `feedback`, `gradedAt`, optional `reviewId`), and `GradePageInput`.
+The exported page contracts are `ReviewRating`, `PageLearningRecord` (`pageId`, `initialDueAt`, `dueAt`, `fsrsState`, `stability`, `difficulty`, `reps`, `lapses`, `scheduledDays`, optional `lastReviewAt`, `revision`, `createdAt`, `updatedAt`), `PagePrerequisiteRecord` (`pageId`, `prerequisitePageId`), `PageReviewRecord` (`reviewId`, `pageId`, `quizId`, `submissionId`, `revision`, `rating`, `reviewedAt`, `stateBefore`, `stateAfter`, `settlementId`), `QuizQuestionPageRecord` (`pageId`, `criterion`, `weight`), `QuizPageResultRecord` (`resultId`, `quizId`, `pageId`, `rating`, `feedback`, `reviewId`, `evidence`, `readings`, stable `pageLink`), page-oriented `QuizGradeRecord` (`gradeId`, `quizId`, `pageId`, `rating`, `feedback`, `gradedAt`, optional `reviewId`), and `GradePageInput` (`pageId`, `rating`, `feedback`, `evidenceRefs`, `readings`). `QuizResult.recommendations` contains bounded current-wiki `readings` and `gaps`; it is required but empty before settlement.
 
 ### Page prerequisites
 
@@ -516,7 +522,7 @@ Ingest and lint may propose directed prerequisite edges between pages. The host 
 
 ### Selection and page evidence
 
-Whenever the user-scheduled `daily` skill runs, it first expires every earlier unsubmitted quiz as a read-only artifact without changing FSRS. It then refuses quiz generation while initialization is enabled. Otherwise the host exposes every compact candidate whose page is due today or earlier, whose prerequisites are all in FSRS `Review`, whose page is active and quiz-eligible, and whose current bytes are not drifted. The model chooses a varied, related subset; there is no fixed page, question, or synthesis count. If no candidate is available, it creates no quiz sheet and records an explicit no-eligible-pages outcome.
+Whenever the user-scheduled `daily` skill runs, it first expires every earlier unsubmitted quiz as a read-only artifact without changing FSRS. It then refuses quiz generation while maintenance mode is enabled. Otherwise the host exposes every compact candidate whose page is due today or earlier, whose prerequisites are all in FSRS `Review`, whose page is active and quiz-eligible, and whose current bytes are not drifted. The model chooses a varied, related subset; there is no fixed page, question, or synthesis count. If no candidate is available, it creates no quiz sheet and records an explicit no-eligible-pages outcome.
 `QuizContext.candidates` contains exactly `pageId`, `path`, `title`, `description`, and `dueAt`; title and OKF `description` are selection metadata only and never evidence. Selected pages return immutable page/section evidence: YAML frontmatter is excluded, existing headings delimit separate section records, and non-whitespace body before the first heading (including a wholly headingless body) yields one page-level record with anchor `""` and no heading; page-level reading hrefs omit the fragment. Page ID remains the sole FSRS and grading unit.
 
 After the model chooses page IDs, it requests direct evidence for those pages through the application entry point. `quiz_evidence` stores the page/section snapshots keyed by quiz/reference; the Markdown sheet never carries page, source, evidence, rubric, answer-key, or FSRS metadata. The session target is 15–45 minutes with roughly 30 minutes as a mental median, subject to technical context and transport bounds rather than a pedagogical item cap.
@@ -534,18 +540,18 @@ The only question kinds are:
 
 ### Quiz sheet and submission
 
-The dated sheet under `quizzes/` is the primary inspectable learning artifact, not a secondary export. The web client renders the same canonical question and revision data.
+The dated sheet under `quizzes/` is the primary inspectable learning artifact, not a secondary export. The web client renders the same canonical question and revision data. Today and History display questions from one, render safe Markdown in prompts, choices, answers, and feedback, and use a controlled Markdown editor for free responses.
 
 - A quiz contains ephemeral prompts, blank answer regions, and numeric visible headings only.
 - The only generated identity comments are `<!-- pi-scholar:quiz format=1 id=<opaque> revision=<n> -->` and `<!-- pi-scholar:question id=<opaque> -->`.
 - Those comments contain no page, source, evidence, rubric, answer-key, or FSRS metadata.
 - Browser autosaves are revision-checked local state, not separate Git commits.
 - Final submission validates every displayed question, distinctness, expected revision, and answer visibility.
-- A dated quiz is generated once and reused during that scheduled day; missed dates do not synthesize retroactive quizzes.
+- A dated quiz is generated once and reused during that scheduled day; missed dates do not synthesize retroactive quizzes. Debugging a second run on the same local date requires a reset or new disposable vault, not an overwrite path.
 - At the next scheduled invocation, every earlier unsubmitted quiz becomes an expired read-only artifact. Expiration records no grade and changes no FSRS state.
 - Results and readings are absent until grading has committed them.
 
-`QuizContext.candidates` contains every compact due/prerequisite-unblocked/non-drifted candidate summary. `QuizDetailRecord` exposes `pageResults`, never a second per-artifact result collection.
+`QuizContext.candidates` contains every compact due/prerequisite-unblocked/non-drifted candidate summary. `QuizDetailRecord` exposes one canonical `pageResults` collection with stable Notes links and never exposes a second per-artifact result collection. The enclosing `QuizResult` requires recommendations.
 
 ### Grading and scheduling
 
@@ -559,28 +565,36 @@ One identity-bearing SQLite transaction writes question feedback, one `page_resu
 
 After grading, the web application shows:
 
-- the result for each ephemeral question;
-- one bundled result for each covered page;
-- concise source-grounded corrections;
-- the exact relevant wiki pages and headings;
-- a small reading list for immediate review.
+- canonical question results in original quiz order;
+- one bundled result for each covered page in first-coverage order;
+- concise source-grounded corrections rendered as safe Markdown;
+- stable Notes links plus the exact settled wiki pages and headings;
+- bounded current-wiki recommendations labeled separately from exact readings;
+- bounded current missing, unclear, and drifted knowledge gaps.
 
-A miss schedules future retrieval for that page through FSRS. There is no tutor conversation, confidence workflow, capstone, transfer claim, coaching report, or separate same-day learning product.
+Exact feedback and readings remain tied to the settled quiz. Recommendations
+are a read-only current-wiki projection: direct prerequisites rank first,
+semantic results follow with deterministic ties and deduplication, retired,
+drifted, unreadable, already graded, and exact-reading pages are excluded, and
+qmd failure removes only semantic results. A miss schedules future retrieval
+for that page through FSRS. There is no tutor conversation, confidence
+workflow, capstone, transfer claim, coaching report, or separate same-day
+learning product.
 
 ## Web application
 
-The same TypeScript server serves a built React application. The frontend uses Vite, Tailwind, React Router, and TanStack Query. Next.js is deliberately excluded because the private local application needs neither SSR nor a second server runtime.
+The same TypeScript server serves a built React application. The frontend uses Vite, Tailwind, React Router, TanStack Query, and `@uiw/react-md-editor` for the controlled free-response editor. Next.js is deliberately excluded because the private local application needs neither SSR nor a second server runtime.
 
 Primary navigation:
 
 | Page | Behavior |
 |---|---|
-| **Today** | Current quiz with proper controls, autosave, explicit final submission, Results, and linked readings; otherwise a textual status explaining no eligible pages, quiz blocked by initialization, not yet run, or generation failure |
+| **Today** | Current quiz with one-based progress, Markdown-aware choices, a controlled Markdown free-response editor, autosave, explicit final submission, canonical Results, exact linked readings, current recommendations, and knowledge gaps; otherwise a textual status explaining no eligible pages, quiz blocked by maintenance mode, not yet run, or generation failure |
 | **Notes** | Browse and search read-only wiki pages, inspect the collapsed page-learning/prerequisites panel, raise issues, and resolve detected direct-edit drift through the two bounded restore choices |
 | **Add** | Upload or inspect sources, submit URLs or pasted text, preview source-removal impact, and explicitly confirm or cancel removal |
-| **History** | Browse dated quiz sheets and Results; expired unsubmitted sheets reopen read-only |
+| **History** | Browse dated quiz sheets and the same canonical Results; submitted unsettled quizzes poll while a grading banner links to Workflows, and expired unsubmitted sheets reopen read-only |
 
-Secondary pages expose Workflows, Settings, and Health without making internal scheduler concepts part of the common path. Settings shows initialization mode, last ingest/lint result, inbox and issue counts, recent changes, Git synchronization state, and the user-only mode control; Pi Scholar makes no readiness judgment.
+Secondary pages expose Workflows, Settings, and Health without making internal scheduler concepts part of the common path. Settings shows maintenance mode, last ingest/lint result, inbox and issue counts, recent changes, Git synchronization state, and the user-only mode control; Pi Scholar makes no readiness judgment.
 
 Notes are read-only in the browser initially. Pi remains the authoring and synthesis interface. The web app may render safe Markdown, KaTeX, and inert Mermaid source; it never evaluates raw HTML or scripts.
 
@@ -594,10 +608,11 @@ Users normally speak to Pi. The extension exposes a small interface:
 
 | Surface | Behavior |
 |---|---|
-| `/scholar-add` | Convenience picker for one URL, pasted `text:`, or one or more filesystem paths (including directories and native glob patterns), such as `/scholar-add books/*.pdf`, `/scholar-add books/`, or `/scholar-add books/book1.pdf books/book2.pdf`; each matched path becomes a normal staged inbox input, while a directory remains one source |
+| `/scholar-add` | Convenience picker for one URL, pasted `text:`, or one or more filesystem paths (including directories and native glob patterns), such as `/scholar-add books/*.pdf`, `/scholar-add books/`, or `/scholar-add books/book1.pdf books/book2.pdf`; each matched path becomes a normal staged inbox input, while a directory remains one source; visible command status remains active until staging succeeds or fails |
 | `/scholar-issue` | Report an incorrect, unclear, missing, or badly bounded wiki page or heading for agent resolution |
-| `/scholar-status` | Show vault, workflow, open issues, initialization mode, due pages, recent ingest/lint, doctor, and Git state |
-| `/scholar-lint` | Inspect the final wiki and propose guarded organizer or repair changes; an evidence gap may permit the lint skill's one bounded, quiescence-checked isolated child retry |
+| `/scholar-status` | Show vault, workflow, open issues, maintenance mode, due pages, recent ingest/lint, doctor, and Git state |
+| `/scholar-lint` | Prompt for full or targeted scope, load the packaged lint skill, and request guarded organizer or repair changes; an evidence gap may permit the lint skill's one bounded, quiescence-checked isolated child retry |
+| `/scholar-maintenance on\|off` | Enable or disable the user-owned quiz-generation guard without labeling the vault ready |
 | `scholar_add` tool | Materialize a typed external input in the automatic inbox queue |
 | `scholar_note` tool | Create or update a guarded product-authored wiki note |
 | `scholar_remove_source` tool | Prepare a dependency impact preview; the extension executes removal only after the user accepts its confirmation UI |
@@ -610,7 +625,7 @@ Pi's native tools remain available for exact reads and lexical navigation. Packa
 
 | Command | Behavior |
 |---|---|
-| `pi-scholar init [path]` | Create the five-root vault, SQLite schema, qmd collection, Git repository, ignore rules, and user-controlled initialization mode |
+| `pi-scholar init [path]` | Create the five-root vault, SQLite schema, qmd collection, Git repository, ignore rules, and user-controlled maintenance mode |
 | `pi-scholar doctor [path]` | Run the sole read-only structural, dependency, integrity, source, wiki, quiz, page-learning, qmd, workflow, and Git check |
 | `pi-scholar serve` | Start the loopback API, static web application, and small in-process browser-job worker |
 | `pi-scholar sync` | Push accumulated local commits without running semantic work |
@@ -651,9 +666,9 @@ GET    /api/v1/settings
 PUT    /api/v1/settings
 ```
 
-The API exposes source staging and confirmation-bound removal, note reads/search/issues, issue reopening, the two bounded drift-resolution actions, dated quiz outcomes, revision-safe draft answers and final submission, read-only workflow progress, and initialization settings. It exposes no browser-triggered semantic workflow runner, learning-plan editor, raw FSRS mutation, arbitrary shell, qmd administration, Git reset, force-push, database, source-byte, or generic recovery endpoint.
+The API exposes source staging and confirmation-bound removal, note reads/search/issues, issue reopening, the two bounded drift-resolution actions, dated quiz outcomes, revision-safe draft answers and final submission, read-only workflow progress, and maintenance settings. It exposes no browser-triggered semantic workflow runner, learning-plan editor, raw FSRS mutation, arbitrary shell, qmd administration, Git reset, force-push, database, source-byte, or generic recovery endpoint.
 
-Only an explicit user action through Settings may disable initialization. Scheduled workflows and ingest/lint agents can report facts—pending sources, issues, recent changes, lint, doctor, and Git state—but never label the vault ready or change the mode.
+Only an explicit user action through Settings or `/scholar-maintenance off` may disable maintenance mode. Scheduled workflows and ingest/lint agents can report facts—pending sources, issues, recent changes, lint, doctor, and Git state—but never label the vault ready or change the mode.
 
 `POST /api/v1/sources`, `/scholar-add`, and `scholar_add` all stage the same inbox representation. For `/scholar-add`, each resolved filesystem match becomes a normal staged inbox input; a directory remains one directory source, while a URL or pasted `text:` input remains one source. Direct filesystem drops bypass those convenience surfaces and are discovered by the next user-scheduled `extract` run. Removal preview returns the current impact and a confirmation identity. A user-confirmed removal call recomputes that impact; if it changed, the application refuses removal and presents the new preview rather than applying stale consent.
 
@@ -672,7 +687,7 @@ CRON_TZ=Etc/UTC
 13 02 * * 2 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/extract/SKILL.md --no-context-files --no-session -p "Process every source in the current extract batch of at most three and publish each immutable source packet through Scholar tools; do not stop early." >> /absolute/path/to/pi-scholar-logs/extract.log 2>&1
 27 03 * * 2 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/ingest/SKILL.md --no-context-files --no-session -p "Review the current ingest context, including verified packet manifests and chunk paths plus every non-retired wiki page and issue, and submit guarded source-grounded changes through Scholar tools." >> /absolute/path/to/pi-scholar-logs/ingest.log 2>&1
 41 05 * * 4 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/lint/SKILL.md --no-context-files --no-session -p "Inspect the final wiki and issue context in full or targeted scope and submit guarded organizer or repair changes through Scholar tools." >> /absolute/path/to/pi-scholar-logs/lint.log 2>&1
-07 11 * * 1 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Use today's local-date daily context to expose every eligible candidate, choose a varied related subset, retrieve evidence, and publish a 15–45 minute any-count quiz or explicit skip unless initialization blocks generation through Scholar tools." >> /absolute/path/to/pi-scholar-logs/daily.log 2>&1
+07 11 * * 1 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/daily/SKILL.md --no-context-files --no-session -p "Use today's local-date daily context to expose every eligible candidate, choose a varied related subset, retrieve evidence, and publish a 15–45 minute any-count quiz or explicit skip unless maintenance mode blocks generation through Scholar tools." >> /absolute/path/to/pi-scholar-logs/daily.log 2>&1
 29 16 * * 6 cd /absolute/path/to/vault && /absolute/path/to/pi --no-extensions -e /absolute/path/to/pi-scholar/pi/extension.ts --no-skills --skill /absolute/path/to/pi-scholar/skills/quiz-grader/SKILL.md --no-context-files --no-session -p "Settle sealed pending quiz submissions through Scholar tools." >> /absolute/path/to/pi-scholar-logs/quiz-grader.log 2>&1
 53 23 * * 0 cd /absolute/path/to/vault && /absolute/path/to/pi-scholar sync >> /absolute/path/to/pi-scholar-logs/sync.log 2>&1
 ```
@@ -686,15 +701,15 @@ The entries are independent:
 | `extract` | Snapshot the next stable batch of at most three queued sources and publish every entry sequentially with per-source host idempotency and failure isolation |
 | `ingest` | Build guarded source-grounded wiki changes from published verified packet manifests and chunk paths plus every non-retired page and issue record |
 | `lint` | Inspect the final wiki and issue context in full or targeted scope and propose guarded organizer or repair changes |
-| `daily` | Expire earlier unsubmitted quizzes, enforce initialization, expose every compact due, prerequisite-unblocked, non-drifted candidate, choose a varied related subset, and publish a 15–45 minute any-count quiz or explicit skip |
+| `daily` | Expire earlier unsubmitted quizzes, enforce maintenance mode, expose every compact due, prerequisite-unblocked, non-drifted candidate, choose a varied related subset, and publish a 15–45 minute any-count quiz or explicit skip |
 | `quiz-grader` | Settle sealed pending browser submissions with one identity-bearing transaction per submission |
 | `pi-scholar sync` | Push accumulated local commits and perform no semantic work |
 
 If an entry is not scheduled, that workflow does not run. New inbox entries arriving after an extract snapshot wait for a later extract invocation. User schedules must serialize Pi skill sessions per vault; Pi Scholar does not add a process launcher or global run guard. The loopback server and explicit CLI operations may still contend with a Pi session on the sibling writer lock, and each operation revalidates identities and revisions. A user may schedule `pi-scholar doctor` separately and should inspect its read-only result before enabling or troubleshooting a workflow. The loopback `pi-scholar serve` process is a separate prerequisite for browser use; it does not run semantic skills.
 
-### Initialization mode
+### Maintenance mode
 
-Initialization starts enabled. Only an explicit user action through Settings may disable it. Every `daily` invocation expires earlier unsubmitted quizzes, then checks the mode and refuses quiz generation while it remains enabled. Initialization does not choose, delay, or suppress `extract`, `ingest`, `lint`, `quiz-grader`, or `sync` schedules. Pi Scholar does not compute or display a “ready” state. Settings and status expose only facts—pending inbox entries, open issues, the last ingest/lint result, page-coverage gaps, lint, doctor, qmd, and Git state—so the user makes the judgment.
+Maintenance mode starts enabled. Only an explicit user action through Settings or `/scholar-maintenance off` may disable it. Every `daily` invocation expires earlier unsubmitted quizzes, then checks the mode and refuses quiz generation while it remains enabled. Maintenance mode does not choose, delay, or suppress `extract`, `ingest`, `lint`, `quiz-grader`, or `sync` schedules. Pi Scholar does not compute or display a “ready” state. Settings and status expose only facts—pending inbox entries, open issues, the last ingest/lint result, page-coverage gaps, lint, doctor, qmd, and Git state—so the user makes the judgment.
 
 ## Git synchronization and recovery
 
@@ -848,10 +863,10 @@ pi-scholar/
 12. Every eligible stable knowledge-bearing page has one `page_learning` FSRS record; control pages and explicitly skipped pages are not selected.
 13. Page prerequisites form a validated DAG, and both new and due pages remain blocked until every prerequisite is in FSRS `Review`.
 14. Page creation/rename preserves the stable page ID; drift and retirement exclude selection while preserving page learning and review history.
-15. `daily` expires earlier unsubmitted quizzes, refuses generation during initialization, creates no sheet when no page is eligible, exposes every compact due/prerequisite-unblocked/non-drifted candidate, lets the model choose a varied related subset and retrieve direct evidence, targets 15–45 minutes with roughly 30 minutes as a mental median, permits any question count including multiple questions per page, and supports only `free-response` and `multiple-choice`.
+15. `daily` expires earlier unsubmitted quizzes, refuses generation during maintenance mode, creates no sheet when no page is eligible, exposes every compact due/prerequisite-unblocked/non-drifted candidate, lets the model choose a varied related subset and retrieve direct evidence, targets 15–45 minutes with roughly 30 minutes as a mental median, permits any question count including multiple questions per page, and supports only `free-response` and `multiple-choice`.
 16. A user-scheduled `extract` invocation processes at most three stable queued sources sequentially in canonical order; the extension continues an agent that stops before every claimed entry has a publication attempt, while host claims, idempotency, and per-source failure isolation ensure one malformed entry does not block its siblings.
 17. `extract`, `ingest`, `lint`, `daily`, and `quiz-grader` have independent user-owned cron entries; no weekday/time policy, ordering rule, process planner, or package-launched Pi process exists.
-18. Initialization starts enabled, only the user can disable it, and it blocks quiz generation without selecting or changing extract, ingest, lint, grading, or sync schedules.
+18. Maintenance mode starts enabled, only the user can disable it, and it blocks quiz generation without selecting or changing extract, ingest, lint, grading, or sync schedules.
 19. Every direct Pi cron entry uses the installed `pi` executable with `--no-extensions -e <package>/pi/extension.ts --no-skills --skill <one SKILL.md> --no-context-files --no-session -p <static prompt>` and passes no source, learner, or secret argv.
 20. Quiz sheets are canonical human-readable artifacts under `quizzes/YYYY/MM/` and contain no answer key.
 21. Multiple-choice questions render as selectable controls rather than requiring typed option letters.

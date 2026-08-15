@@ -1024,9 +1024,63 @@ describe("server browser boundary", () => {
 
   it("projects quiz list and detail responses without rubric or answer material", async () => {
     const internal = publicQuizFixture();
+    const detail = {
+      ...internal,
+      answers: [{ questionId: "question-1", answer: "A **Markdown** answer." }],
+      questionResults: [
+        {
+          resultId: "question-result-1",
+          quizId: internal.quizId,
+          questionId: "question-1",
+          answerRevision: 1,
+          feedback: "Question **feedback**.",
+          gradedAt: new Date(0).toISOString(),
+        },
+      ],
+      pageResults: [
+        {
+          resultId: "page-result-1",
+          quizId: internal.quizId,
+          pageId: "page-1",
+          pageLink: {
+            pageId: "page-1",
+            path: "guide.md",
+            href: "/notes?pageId=page-1#note-content",
+          },
+          rating: "Good",
+          feedback: "Page **feedback**.",
+          reviewId: "review-1",
+          evidence: ["evidence-1"],
+          readings: [{ pageId: "page-1", path: "guide.md", href: "/notes?pageId=page-1" }],
+        },
+      ],
+      grades: [],
+      readings: [{ pageId: "page-1", path: "guide.md", href: "/notes?pageId=page-1" }],
+    };
+    const recommendations = {
+      readings: [
+        {
+          pageId: "page-2",
+          path: "related.md",
+          title: "Related",
+          href: "/notes?pageId=page-2#note-content",
+          reason: "related",
+        },
+      ],
+      gaps: [
+        {
+          pageId: "page-3",
+          path: "gap.md",
+          title: "Gap",
+          href: "/notes?pageId=page-3#note-content",
+          kind: "missing",
+        },
+      ],
+    };
     const target = {
       quiz: { list: () => [internal], get: () => internal, readSettledResult: () => undefined },
-      quizDetail: async () => internal,
+      quizDetail: async () => detail,
+      quizRecommendations: async () => recommendations,
       db: { all: () => [], get: () => undefined },
     };
     const application = {
@@ -1042,7 +1096,11 @@ describe("server browser boundary", () => {
         const envelope = (await response.json()) as {
           data: {
             quizzes?: Array<{ questions: Array<Record<string, unknown>> }>;
-            quiz?: { questions: Array<Record<string, unknown>> };
+            quiz?: {
+              questions: Array<Record<string, unknown>>;
+              pageResults?: Array<Record<string, unknown>>;
+            };
+            recommendations?: typeof recommendations;
           };
         };
         const questions = envelope.data.quizzes?.[0]?.questions ?? envelope.data.quiz?.questions ?? [];
@@ -1054,6 +1112,10 @@ describe("server browser boundary", () => {
         assert.equal("weight" in questions[0]!, false);
         assert.equal("answerKey" in questions[0]!, false);
         assert.equal("sourceRefs" in questions[0]!, false);
+        if (path.endsWith("/2026-08-09")) {
+          assert.deepEqual(envelope.data.quiz?.pageResults?.[0]?.pageLink, detail.pageResults[0]!.pageLink);
+          assert.deepEqual(envelope.data.recommendations, recommendations);
+        }
       }
       assert.equal(internal.questions[0]!.pages[0]!.criterion, "secret rubric");
     });
