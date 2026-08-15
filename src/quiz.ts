@@ -1536,7 +1536,7 @@ export class QuizService {
     }
 
     const pages: SettledPageResult[] = [];
-    const resultByPage = new Map<string, Record<string, unknown>>();
+    const resultByPage = new Map<string, SettledPageResult>();
     for (const row of pageRows) {
       const pageId = String(row.page_id ?? "");
       const reviewId = String(row.review_id ?? "");
@@ -1560,8 +1560,7 @@ export class QuizService {
         throw new ValidationError("Committed grade page rating is inconsistent");
       const feedback = String(row.feedback ?? "");
       this.validateFeedback(feedback, hiddenTokens);
-      resultByPage.set(pageId, row);
-      pages.push({
+      resultByPage.set(pageId, {
         gradeId: reviewId,
         quizId: quiz.quizId,
         pageId,
@@ -1576,6 +1575,7 @@ export class QuizService {
     for (const pageId of expectedPageIds) {
       if (!resultByPage.has(pageId) || !reviewByPage.has(pageId))
         throw new ValidationError("Committed grade is missing a page Result");
+      pages.push(resultByPage.get(pageId)!);
     }
     return { quiz, questions, pages };
   }

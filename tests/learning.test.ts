@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, test } from "vitest";
@@ -550,6 +550,65 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
   assert.equal(scheduler.getPageLearning("p1").reps, 1);
   assert.equal(scheduler.getPageLearning("p2").reps, 1);
+  db.close();
+});
+
+test("persisted grading keeps page reviews in durable question order", () => {
+  const { db, scheduler, date } = setup();
+  const pageIds = ["page-b", "page-a"] as const;
+  for (const pageId of pageIds) addPage(db, pageId);
+  const quiz = new QuizService(
+    db,
+    { wiki: LEARNING_WIKI_ROOT, quizzesRoot: join(LEARNING_WIKI_ROOT, "quizzes") },
+    scheduler,
+  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: pageIds,
+    questionSpecs: pageIds.map((pageId, index) => question(pageId, `Explain page ${index + 1}`)),
+  });
+  const draft = quiz.saveDraft({
+    date,
+    revision: generated.revision,
+    answers: Object.fromEntries(generated.questions.map((item) => [item.questionId, "answer"])),
+  });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed);
+  const grade = {
+    requestId: "page-order-request",
+    date,
+    revision: sealed.revision,
+    submissionId: "page-order-submission",
+    questions: generated.questions.map((item, index) => ({
+      questionId: item.questionId,
+      feedback: `Question ${index + 1} feedback`,
+    })),
+    pages: pageIds.map((pageId, index) => {
+      const authorized = evidence.find((item) => item.pageId === pageId)!;
+      return {
+        pageId,
+        rating: "Good" as const,
+        feedback: `${index === 0 ? "First" : "Second"} page feedback`,
+        evidence: [authorized.reference],
+        readings: [{ pageId, anchor: authorized.anchor }],
+      };
+    }),
+  };
+
+  const settled = quiz.settleGrade(grade);
+  const storedSheet = readFileSync(settled.quiz.sheetPath!, "utf8");
+  assert.equal(quiz.parseSheet(storedSheet).quizId, generated.quizId);
+  assert.deepEqual(
+    settled.pages.map((page) => page.pageId),
+    pageIds,
+  );
+  assert.ok(storedSheet.indexOf("First page feedback") < storedSheet.indexOf("Second page feedback"));
+
+  const replay = quiz.settleGrade(grade);
+  assert.deepEqual(
+    replay.pages.map((page) => page.pageId),
+    pageIds,
+  );
   db.close();
 });
 
