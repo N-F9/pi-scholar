@@ -19,13 +19,14 @@ import type {
   WorkflowRecord,
 } from "./contracts.js";
 import { transaction as databaseTransaction } from "./database.js";
-import type { SqlDatabase, SqlDatabaseSource, VaultPathsLike } from "./scheduler.js";
+import type { Clock, SqlDatabase, SqlDatabaseSource, VaultPathsLike } from "./scheduler.js";
 import {
   localDate,
   RATINGS,
   RevisionConflictError,
   SchedulerService,
   SEALED_QUIZ_REVIEW,
+  SYSTEM_CLOCK,
   ValidationError,
 } from "./scheduler.js";
 import { atomicWriteFile, readFileNoFollow, safeRelativePath } from "./vault.js";
@@ -218,8 +219,8 @@ export function validateQuizVisibleText(value: string, hiddenTokens: readonly Qu
   }
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
+function nowIso(clock: Clock): string {
+  return clock.now().toISOString();
 }
 
 function json(value: unknown): string {
@@ -364,13 +365,20 @@ export class QuizService {
   readonly db: SqlDatabase;
   readonly paths?: VaultPathsLike;
   readonly scheduler: SchedulerService;
+  readonly clock: Clock;
   private readonly source: SqlDatabaseSource;
 
-  constructor(source: SqlDatabaseSource, paths?: VaultPathsLike, scheduler?: SchedulerService) {
+  constructor(
+    source: SqlDatabaseSource,
+    paths?: VaultPathsLike,
+    scheduler?: SchedulerService,
+    clock: Clock = scheduler?.clock ?? SYSTEM_CLOCK,
+  ) {
     this.source = source;
     this.db = adaptDatabase(source);
     this.paths = paths;
-    this.scheduler = scheduler ?? new SchedulerService(source, paths);
+    this.clock = clock;
+    this.scheduler = scheduler ?? new SchedulerService(source, paths, clock);
   }
 
   get(dateOrQuizId: string | Date): QuizRecord | undefined {
@@ -442,6 +450,7 @@ export class QuizService {
     const date = localDate(typeof input === "object" && !(input instanceof Date) ? input.date : input);
     const existing = this.get(date);
     if (existing) return existing;
+    const generatedAt = nowIso(this.clock);
     const selectedPageIds = typeof input === "object" && !(input instanceof Date) ? input.selectedPageIds : undefined;
     const selectedPages = this.selectedPagesFor(date, selectedPageIds);
     const quizId = randomUUID();
@@ -453,7 +462,7 @@ export class QuizService {
           "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'skipped', NULL, ?, NULL, ?, NULL)",
           quizId,
           date,
-          nowIso(),
+          generatedAt,
           "skipped-no-eligible-pages",
         );
       });
@@ -492,7 +501,7 @@ export class QuizService {
             quizId,
             date,
             sheetPath ?? null,
-            nowIso(),
+            generatedAt,
           );
           for (const item of evidence) {
             this.db.run(
@@ -545,7 +554,7 @@ export class QuizService {
           "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'failed', NULL, ?, NULL, ?, ?)",
           quizId,
           date,
-          nowIso(),
+          generatedAt,
           "generation-failed",
           message,
         );
@@ -583,6 +592,7 @@ export class QuizService {
     const preview: QuizRecord = { ...quiz, revision: nextRevision };
     const rendered = this.renderSheet(preview, answers);
     this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview));
+    const savedAt = nowIso(this.clock);
     const result = this.replaceSheet(preview.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
       transaction(this.source, () => {
         for (const [questionId, answer] of Object.entries(input.answers)) {
@@ -592,7 +602,7 @@ export class QuizService {
             questionId,
             nextRevision,
             json(normalizedAnswer(answer)),
-            nowIso(),
+            savedAt,
           );
         }
         this.db.run(
@@ -760,7 +770,7 @@ export class QuizService {
       throw new ValidationError("The sealed quiz answers do not match the committed revision");
     }
     const prepared = this.prepareGradeSubmission(quiz, input);
-    const settledAt = nowIso();
+    const settledAt = nowIso(this.clock);
     const previewResults: SettledQuestionResult[] = prepared.questions.map((questionGrade) => ({
       questionId: questionGrade.question.questionId,
       feedback: questionGrade.feedback,
@@ -1066,7 +1076,7 @@ export class QuizService {
     if (input.revision !== quiz.revision) throw new RevisionConflictError("The quiz submission revision is stale");
     const answers = input.answers ?? this.answerMap(quiz.quizId);
     this.validateCompleteAnswers(quiz, answers);
-    const submittedAt = nowIso();
+    const submittedAt = nowIso(this.clock);
     const preview: QuizRecord = { ...quiz, status: "submitted", submittedAt };
     const rendered = this.renderSheet(preview, answers);
     this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview));

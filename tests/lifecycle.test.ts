@@ -423,6 +423,7 @@ describe("Pi package lifecycle", () => {
       doctor: "fail",
       settings: {
         maintenanceEnabled: true,
+        simulatedDate: "2026-08-20",
         timezone: "America/New_York",
         port: 4816,
         host: "127.0.0.1",
@@ -488,6 +489,7 @@ describe("Pi package lifecycle", () => {
     assert.doesNotMatch(notification!, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u);
     assert.match(notification!, /^Pi Scholar: degraded\nVersion: 1\.2\.3 candidate\nVault: vault id\nDoctor: fail/mu);
     assert.match(notification!, /Date: 2026-08-14 \(America\/New_York\)/u);
+    assert.match(notification!, /Simulated date: 2026-08-20/u);
     assert.match(notification!, /Maintenance: enabled/u);
     assert.match(notification!, /Inbox: 2 pending\nIssues: 3 open/u);
     assert.match(notification!, /Git: release branch, dirty, upstream origin\/release, 1 ahead, 2 behind, diverged/u);
@@ -664,6 +666,17 @@ describe("Pi package lifecycle", () => {
       ),
       /daily context is required/u,
     );
+  });
+
+  it("accepts developer tools only for serve", () => {
+    assert.deepEqual(parseCliArgs(["serve", "--dev-tools"]), {
+      command: "serve",
+      positional: [],
+      developerTools: true,
+    });
+    assert.deepEqual(parseCliArgs(["serve"]), { command: "serve", positional: [] });
+    for (const command of ["init", "doctor", "sync"] as const)
+      assert.throws(() => parseCliArgs([command, "--dev-tools"]), /--dev-tools is only valid for serve/u);
   });
 
   it("has no runner, weekday planner, or child-process orchestration", () => {
@@ -1058,7 +1071,10 @@ describe("Pi package lifecycle", () => {
     const fixture = fakeLifecycleApp({ claims: [only] }, async () => {
       publicationCalls += 1;
       if (publicationCalls === 1)
-        throw Object.assign(new Error("applied publication finalization failure"), { details: { applied: true } });
+        throw Object.assign(new Error("applied publication finalization failure"), {
+          publicationApplied: true,
+          details: { applied: true },
+        });
       return publication;
     });
     const input = { ...only, endpoints: [1] };
@@ -1069,6 +1085,8 @@ describe("Pi package lifecycle", () => {
       /applied publication finalization failure/u,
     );
     assert.deepEqual(fixture.app.finishes, []);
+    await fixture.endAgent();
+    assert.deepEqual(fixture.followUps, []);
     const retry = (await invoke(fixture.tools, "scholar_publish_extraction", input, fixture.root)) as {
       readonly details: unknown;
     };
@@ -1077,6 +1095,61 @@ describe("Pi package lifecycle", () => {
     assert.deepEqual(
       fixture.app.finishes.map(({ status }) => status),
       ["succeeded"],
+    );
+  });
+
+  it("does not continue a fully attempted batch after applied publication failures", async () => {
+    const claims = [
+      claim("claim-applied-first", "prepared-applied-first"),
+      claim("claim-applied-second", "prepared-applied-second"),
+      claim("claim-applied-third", "prepared-applied-third"),
+    ];
+    const failed = new Set<string>();
+    const fixture = fakeLifecycleApp({ claims }, async (input) => {
+      const claimId = (input as { readonly claimId: string }).claimId;
+      if (!failed.has(claimId)) {
+        failed.add(claimId);
+        throw Object.assign(new Error(`applied publication finalization failure: ${claimId}`), {
+          publicationApplied: true,
+          details: { applied: true },
+        });
+      }
+      return { sourceId: claimId, manifest: {}, removedInbox: true };
+    });
+
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    for (const value of claims)
+      await assert.rejects(
+        invoke(fixture.tools, "scholar_publish_extraction", { ...value, endpoints: [1] }, fixture.root),
+        /applied publication finalization failure/u,
+      );
+    await fixture.endAgent();
+    assert.deepEqual(fixture.followUps, []);
+    assert.deepEqual(fixture.app.finishes, []);
+
+    await invoke(fixture.tools, "scholar_publish_extraction", { ...claims[0], endpoints: [1] }, fixture.root);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["succeeded"],
+    );
+  });
+
+  it("counts applied failure-record finalization as a failed extraction attempt", async () => {
+    const only = claim("claim-applied-failure-record", "prepared-applied-failure-record");
+    const fixture = fakeLifecycleApp({ claims: [only] }, async () => {
+      throw Object.assign(new Error("applied failure-record finalization failure"), { details: { applied: true } });
+    });
+
+    await invoke(fixture.tools, "scholar_get_extract_context", {}, fixture.root);
+    await assert.rejects(
+      invoke(fixture.tools, "scholar_publish_extraction", { ...only, endpoints: [1] }, fixture.root),
+      /applied failure-record finalization failure/u,
+    );
+    await fixture.endAgent();
+    assert.deepEqual(fixture.followUps, []);
+    assert.deepEqual(
+      fixture.app.finishes.map(({ status }) => status),
+      ["failed"],
     );
   });
 

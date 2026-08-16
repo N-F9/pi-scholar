@@ -9,6 +9,7 @@ import {
   isQuizListResult,
   isQuizResult,
   isQuizSubmissionResult,
+  isSettingsResult,
   isSourceListResult,
   isSourceRemovalPreviewResult,
   isWikiPageResult,
@@ -95,6 +96,41 @@ describe("api response boundary", () => {
     const multipartHeaders = new Headers(multipartRequest.headers);
     assert.equal(multipartHeaders.get("X-Pi-Scholar-Request"), "1");
     assert.equal(multipartHeaders.get("Content-Type"), null);
+  });
+
+  it("accepts only public settings metadata and valid simulated dates", () => {
+    const result = {
+      developerToolsEnabled: true,
+      settings: {
+        maintenanceEnabled: false,
+        simulatedDate: "2026-08-15",
+        timezone: "America/New_York",
+        host: "127.0.0.1",
+        port: 4816,
+        updatedAt: new Date(0).toISOString(),
+        facts: {
+          localDate: "2026-08-15",
+          pendingInboxCount: 1,
+          openIssueCount: 2,
+          recentChanges: [],
+          git: { clean: true, ahead: 0, behind: 0, diverged: false },
+        },
+      },
+    };
+    assert.equal(isSettingsResult(result), true);
+    const { simulatedDate: _simulatedDate, ...realSettings } = result.settings;
+    assert.equal(isSettingsResult({ ...result, settings: realSettings }), true);
+    assert.equal(isSettingsResult({ ...result, developerToolsEnabled: "yes" }), false);
+    assert.equal(isSettingsResult({ ...result, settings: { ...result.settings, simulatedDate: null } }), false);
+    assert.equal(isSettingsResult({ ...result, settings: { ...result.settings, simulatedDate: "2026-02-30" } }), false);
+    assert.equal(isSettingsResult({ ...result, databasePath: "/private/state.sqlite" }), false);
+    assert.equal(
+      isSettingsResult({
+        ...result,
+        settings: { ...result.settings, facts: { ...result.settings.facts, workflowLease: "private" } },
+      }),
+      false,
+    );
   });
 
   it("rejects quiz responses carrying private quiz metadata", () => {

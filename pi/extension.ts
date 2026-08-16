@@ -511,6 +511,11 @@ function workflowFinalizationApplied(error: unknown): boolean {
   return details !== null && typeof details === "object" && "applied" in details && details.applied === true;
 }
 
+function publicationFinalizationApplied(error: unknown): boolean {
+  if (!workflowFinalizationApplied(error) || !error || typeof error !== "object") return false;
+  return "publicationApplied" in error && error.publicationApplied === true;
+}
+
 async function persistExtractAttempt(
   app: ScholarApplication,
   key: string,
@@ -690,8 +695,9 @@ async function lifecycleFinal<T>(
     if (kind === "ingest" || kind === "lint") {
       workflowStates.set(key, state);
     } else if (kind === "extract") {
-      if (workflowFinalizationApplied(error)) {
-        workflowStates.set(key, state);
+      if (publicationFinalizationApplied(error)) {
+        const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, true);
+        workflowStates.set(key, attempt.state);
       } else {
         const attempt = recordExtractAttempt(state as ExtractWorkflowState, claimKey, false);
         if (attempt.accepted) {
@@ -1030,6 +1036,7 @@ export function formatApplicationStatus(status: ApplicationStatus): string {
     `Vault: ${statusLabel(status.vaultId)}`,
     `Doctor: ${status.doctor ?? "unknown"}`,
     `Date: ${statusLabel(facts.localDate)} (${statusLabel(status.settings.timezone)})`,
+    ...(status.settings.simulatedDate ? [`Simulated date: ${statusLabel(status.settings.simulatedDate)}`] : []),
     `Maintenance: ${status.settings.maintenanceEnabled ? "enabled" : "disabled"}`,
     `Inbox: ${facts.pendingInboxCount} pending`,
     `Issues: ${facts.openIssueCount} open`,

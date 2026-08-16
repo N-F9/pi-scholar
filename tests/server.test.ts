@@ -26,7 +26,7 @@ async function withServer(
   application: ScholarApplication,
   run: (base: string) => Promise<void>,
   staticRoot?: string,
-  serverOptions: Pick<ServerOptions, "maxMultipartBytes"> = {},
+  serverOptions: Pick<ServerOptions, "maxMultipartBytes" | "developerTools"> = {},
 ): Promise<void> {
   const server = await startServer({
     application,
@@ -1119,5 +1119,86 @@ describe("server browser boundary", () => {
       }
       assert.equal(internal.questions[0]!.pages[0]!.criterion, "secret rubric");
     });
+  });
+  it("gates simulated-date settings behind developer tools and reports capability", async () => {
+    const settings = {
+      maintenanceEnabled: true,
+      simulatedDate: "2026-08-15",
+      timezone: "local",
+      port: 4816,
+      host: "127.0.0.1",
+      updatedAt: "2026-08-15T12:00:00.000Z",
+      facts: {
+        localDate: "2026-08-15",
+        pendingInboxCount: 0,
+        openIssueCount: 0,
+        recentChanges: [],
+        git: { clean: true, ahead: 0, behind: 0, diverged: false },
+      },
+    };
+    const updates: Array<{ readonly input: unknown; readonly context: unknown }> = [];
+    const application = {
+      getSettings: async () => ({ settings }),
+      updateSettings: async (input: unknown, context: unknown) => {
+        updates.push({ input, context });
+        return { settings: { ...settings, ...(input as object) } };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    const put = (base: string, body: unknown) =>
+      fetch(`${base}/api/v1/settings`, {
+        method: "PUT",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify(body),
+      });
+
+    await withServer(application, async (base) => {
+      const get = await fetch(`${base}/api/v1/settings`);
+      assert.equal(get.status, 200);
+      const payload = (await get.json()) as { data: { developerToolsEnabled: boolean; settings: typeof settings } };
+      assert.equal(payload.data.developerToolsEnabled, false);
+      assert.equal(payload.data.settings.simulatedDate, "2026-08-15");
+
+      const denied = await put(base, { simulatedDate: "2026-08-16" });
+      assert.equal(denied.status, 403);
+      assert.equal(updates.length, 0);
+
+      const ordinary = await put(base, { maintenanceEnabled: false });
+      assert.equal(ordinary.status, 200);
+      assert.deepEqual(updates[0]?.context, { origin: "browser" });
+      const ordinaryPayload = (await ordinary.json()) as { data: { developerToolsEnabled: boolean } };
+      assert.equal(ordinaryPayload.data.developerToolsEnabled, false);
+    });
+
+    await withServer(
+      application,
+      async (base) => {
+        const get = await fetch(`${base}/api/v1/settings`);
+        const payload = (await get.json()) as { data: { developerToolsEnabled: boolean } };
+        assert.equal(payload.data.developerToolsEnabled, true);
+
+        const date = await put(base, { simulatedDate: "2026-08-16" });
+        assert.equal(date.status, 200);
+        assert.deepEqual(updates[1], {
+          input: { simulatedDate: "2026-08-16" },
+          context: { origin: "browser", developerToolsEnabled: true },
+        });
+
+        const cleared = await put(base, { simulatedDate: null });
+        assert.equal(cleared.status, 200);
+        assert.deepEqual(updates[2], {
+          input: { simulatedDate: null },
+          context: { origin: "browser", developerToolsEnabled: true },
+        });
+
+        for (const body of [{ simulatedDate: "2026-02-29" }, { simulatedDate: 42 }, { unexpected: true }]) {
+          const response = await put(base, body);
+          assert.equal(response.status, 400);
+        }
+        assert.equal(updates.length, 3);
+      },
+      undefined,
+      { developerTools: true },
+    );
   });
 });

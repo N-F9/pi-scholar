@@ -563,20 +563,23 @@ The user-scheduled `quiz-grader` skill reads sealed pending submissions in a fre
 
 One identity-bearing SQLite transaction writes question feedback, one `page_results` row per quiz/page with rating, feedback, evidence, and readings, one `page_reviews` transition per quiz/page/submission revision, and the corresponding `page_learning` FSRS transition. Repeated grader invocations reuse the sealed submission identity and cannot settle it twice. A grader failure preserves the sealed answer and leaves every page schedule unchanged.
 
-After grading, the web application shows:
+After submission, the web application immediately shows stable Notes links for
+the covered pages, bounded current-wiki recommendations, and bounded current
+missing, unclear, and drifted knowledge gaps while grading remains pending.
+After grading, it additionally shows:
 
 - canonical question results in original quiz order;
 - one bundled result for each covered page in first-coverage order;
 - concise source-grounded corrections rendered as safe Markdown;
-- stable Notes links plus the exact settled wiki pages and headings;
-- bounded current-wiki recommendations labeled separately from exact readings;
-- bounded current missing, unclear, and drifted knowledge gaps.
+- the exact settled wiki pages and headings.
 
 Exact feedback and readings remain tied to the settled quiz. Recommendations
-are a read-only current-wiki projection: direct prerequisites rank first,
-semantic results follow with deterministic ties and deduplication, retired,
-drifted, unreadable, already graded, and exact-reading pages are excluded, and
-qmd failure removes only semantic results. A miss schedules future retrieval
+are a read-only current-wiki projection available from submission: direct
+prerequisites rank first, and semantic results follow with deterministic ties
+and deduplication. Before settlement, covered pages are excluded; afterward,
+graded and exact-reading pages are excluded. Retired, drifted, and unreadable
+pages are always excluded. qmd failure removes only semantic results. A miss
+schedules future retrieval
 for that page through FSRS. There is no tutor conversation, confidence
 workflow, capstone, transfer claim, coaching report, or separate same-day
 learning product.
@@ -594,7 +597,7 @@ Primary navigation:
 | **Add** | Upload or inspect sources, submit URLs or pasted text, preview source-removal impact, and explicitly confirm or cancel removal |
 | **History** | Browse dated quiz sheets and the same canonical Results; submitted unsettled quizzes poll while a grading banner links to Workflows, and expired unsubmitted sheets reopen read-only |
 
-Secondary pages expose Workflows, Settings, and Health without making internal scheduler concepts part of the common path. Settings shows maintenance mode, last ingest/lint result, inbox and issue counts, recent changes, Git synchronization state, and the user-only mode control; Pi Scholar makes no readiness judgment.
+Secondary pages expose Workflows, Settings, and Health without making internal scheduler concepts part of the common path. Settings shows maintenance mode, last ingest/lint result, inbox and issue counts, recent changes, Git synchronization state, and the user-only mode control; when `serve --dev-tools` is active it also shows the simulated-date editor. An active simulated date produces a route-wide warning even when that server cannot edit it. Pi Scholar makes no readiness judgment.
 
 Notes are read-only in the browser initially. Pi remains the authoring and synthesis interface. The web app may render safe Markdown, KaTeX, and inert Mermaid source; it never evaluates raw HTML or scripts.
 
@@ -627,7 +630,7 @@ Pi's native tools remain available for exact reads and lexical navigation. Packa
 |---|---|
 | `pi-scholar init [path]` | Create the five-root vault, SQLite schema, qmd collection, Git repository, ignore rules, and user-controlled maintenance mode |
 | `pi-scholar doctor [path]` | Run the sole read-only structural, dependency, integrity, source, wiki, quiz, page-learning, qmd, workflow, and Git check |
-| `pi-scholar serve` | Start the loopback API, static web application, and small in-process browser-job worker |
+| `pi-scholar serve [--dev-tools]` | Start the loopback API, static web application, and small in-process browser-job worker; the one-time flag permits simulated-date mutations from that server |
 | `pi-scholar sync` | Push accumulated local commits without running semantic work |
 
 There is no scheduled-run command. The CLI is bootstrap, diagnostics, serving, and synchronization; semantic workflows run only from interactive Pi or a user-owned direct Pi cron entry.
@@ -710,6 +713,12 @@ If an entry is not scheduled, that workflow does not run. New inbox entries arri
 ### Maintenance mode
 
 Maintenance mode starts enabled. Only an explicit user action through Settings or `/scholar-maintenance off` may disable it. Every `daily` invocation expires earlier unsubmitted quizzes, then checks the mode and refuses quiz generation while it remains enabled. Maintenance mode does not choose, delay, or suppress `extract`, `ingest`, `lint`, `quiz-grader`, or `sync` schedules. Pi Scholar does not compute or display a “ready” state. Settings and status expose only facts—pending inbox entries, open issues, the last ingest/lint result, page-coverage gaps, lint, doctor, qmd, and Git state—so the user makes the judgment.
+
+### Simulated learning date
+
+`pi-scholar serve --dev-tools` enables the existing Settings route to apply a date, move to the previous or next day with UTC calendar arithmetic, or return to real time without restarting. The optional date lives in the SQLite `settings` table. Every process reads and respects an active value even without the flag, but only a developer-tools-enabled server may mutate it; a disabled Settings surface instead gives restart guidance, and every route retains the warning. The shared simulated clock governs application local date, scheduler learning timestamps and due defaults, quiz lifecycle timestamps, and FSRS review instants. Workflow leases/results, source/wiki/settings/Git/doctor timestamps, and locks continue to use the real wall clock. `/scholar-status` annotates an active simulation and `doctor` warns; malformed persisted dates fail doctor rather than becoming authoritative.
+
+This capability is only for month-long manual rehearsal in a disposable vault. Clear the setting to return to real time, then discard or reset the vault before another rehearsal or real use because synthetic learning history remains; repeating a date also still requires reset under the one-durable-quiz-per-local-date invariant.
 
 ## Git synchronization and recovery
 

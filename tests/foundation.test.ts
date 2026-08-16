@@ -68,6 +68,35 @@ describe("vault foundation", () => {
     assert.equal(discovered.vaultId, paths.vaultId);
   });
 
+  it("validates persisted simulated-date settings without failing active simulations", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-settings-"));
+    const paths = initVault(join(root, "vault"));
+    const settingsCheck = () => doctor(paths.vaultRoot).checks.find((item) => item.name === "settings");
+
+    assert.equal(settingsCheck()?.status, "pass");
+
+    let db = openDatabase(paths);
+    db.run(
+      "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+      ["simulatedDate", JSON.stringify("2026-08-20"), new Date().toISOString()],
+    );
+    db.close();
+    const active = settingsCheck();
+    assert.equal(active?.status, "warn");
+    assert.match(active?.message ?? "", /2026-08-20/u);
+    assert.equal(doctor(paths.vaultRoot).ok, true);
+
+    for (const value of ['{"malformed"', "42", JSON.stringify("2026-02-29")]) {
+      db = openDatabase(paths);
+      db.run("UPDATE settings SET value_json = ?, updated_at = ? WHERE key = 'simulatedDate'", [
+        value,
+        new Date().toISOString(),
+      ]);
+      db.close();
+      assert.equal(settingsCheck()?.status, "fail");
+    }
+  });
+
   it("checks qmd collection metadata against the physical wiki root", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = initVault(join(root, "vault"));

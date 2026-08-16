@@ -13,7 +13,7 @@ import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { QuizService } from "../src/quiz.js";
-import { localDate, SchedulerService } from "../src/scheduler.js";
+import { type Clock, localDate, SchedulerService } from "../src/scheduler.js";
 import { acquireWriterLock, initVault, LockBusyError } from "../src/vault.js";
 import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
@@ -62,7 +62,9 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?: boolean } = {}) {
+function fixture(
+  options: { readonly maintenance?: boolean; readonly realDoctor?: boolean; readonly clock?: Clock } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
@@ -81,6 +83,7 @@ function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?
     paths,
     db,
     adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
+    clock: options.clock,
     doctor: options.realDoctor
       ? doctor
       : () => {
@@ -307,7 +310,17 @@ describe("durable application writes", () => {
       if (stage === "doctor") {
         (app as unknown as { doctorFn: () => unknown }).doctorFn = () => {
           calls.push("doctor");
-          return { ok: false, checkedAt: new Date().toISOString(), checks: [] };
+          return {
+            ok: false,
+            checkedAt: new Date().toISOString(),
+            checks: [
+              {
+                name: "source-packets",
+                status: "fail",
+                message: "Source catalog provenance/linkage is invalid: source-id",
+              },
+            ],
+          };
         };
       }
       if (stage === "commit") {
@@ -327,8 +340,14 @@ describe("durable application writes", () => {
             "test:write",
           ),
           (error: unknown) => {
-            assert.equal((error as { code?: string }).code, "MUTATION_APPLIED_FINALIZATION_FAILED");
-            assert.deepEqual((error as { details?: unknown }).details, { applied: true, retryable: false, stage });
+            const finalizationError = error as Error & { code?: string; details?: unknown };
+            assert.equal(finalizationError.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+            assert.deepEqual(finalizationError.details, { applied: true, retryable: false, stage });
+            if (stage === "doctor")
+              assert.equal(
+                finalizationError.message,
+                "mutation applied but doctor failed: source-packets: Source catalog provenance/linkage is invalid: source-id",
+              );
             return true;
           },
         );
@@ -368,9 +387,17 @@ describe("durable application writes", () => {
       if (!claim) throw new Error("admission claim is missing");
       const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest, endpoints: [1] };
       const appliedCheckpointFailure = (error: unknown): boolean => {
-        if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
+        if (
+          error === null ||
+          typeof error !== "object" ||
+          !("code" in error) ||
+          !("details" in error) ||
+          !("publicationApplied" in error)
+        )
+          return false;
         assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
         assert.deepEqual(error.details, { applied: true, retryable: false, stage: "checkpoint" });
+        assert.equal(error.publicationApplied, true);
         return true;
       };
       (db as unknown as { checkpoint: () => void }).checkpoint = () => {
@@ -1709,12 +1736,15 @@ function gradeFor(context: GradingContext, pageId: string, questionId: string, e
 }
 
 describe("quiz grading workflow lifecycle", () => {
-  it("derives bounded whole-wiki readings only after settlement", async () => {
+  it("derives covered pages and bounded whole-wiki readings before and after settlement", async () => {
     const { app, db, date, pageId, questionId, draft, scheduler, wiki, paths } = await gradingFixture({
       maintenance: true,
     });
     const owner = randomUUID();
     try {
+      const open = await app.getQuiz(date);
+      assert.deepEqual(open.readings, []);
+      assert.deepEqual(open.recommendations, { readings: [], gaps: [] });
       const prerequisite = await app.createNote({
         path: "recommendation-prerequisite.md",
         title: "Recommendation prerequisite",
@@ -1758,8 +1788,32 @@ describe("quiz grading workflow lifecycle", () => {
       });
       await fs.appendFile(join(paths.wikiRoot, drifted.page.relativePath), "\nDirect edit.\n");
 
+      const coveredPath = (await app.getWiki(pageId)).page.relativePath;
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
-      assert.deepEqual((await app.getQuiz(date)).recommendations, { readings: [], gaps: [] });
+      assert.deepEqual(sealed.readings, [{ pageId, path: coveredPath, href: `/notes?pageId=${pageId}#note-content` }]);
+      assert.deepEqual(sealed.quiz.readings, sealed.readings);
+      assert.equal(sealed.quiz.questionResults.length, 0);
+      assert.equal(sealed.quiz.pageResults.length, 0);
+      assert.equal(sealed.grades.length, 0);
+      assert.deepEqual(
+        sealed.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [[prerequisite.page.pageId, "prerequisite"]],
+      );
+      assert.equal(
+        sealed.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.deepEqual(
+        sealed.recommendations.gaps.map(({ pageId: id, kind }) => [id, kind]),
+        [
+          [related[0]!.page.pageId, "missing"],
+          [related[1]!.page.pageId, "unclear"],
+          [drifted.page.pageId, "drifted"],
+        ],
+      );
+      const pending = await app.getQuiz(date);
+      assert.deepEqual(pending.readings, sealed.readings);
+      assert.deepEqual(pending.recommendations, sealed.recommendations);
       const context = await app.getGradingContext({ date }, owner);
       const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
@@ -1784,6 +1838,13 @@ describe("quiz grading workflow lifecycle", () => {
         { path: drifted.page.relativePath, score: 3 },
       ];
       const result = await app.getQuiz(date);
+      assert.ok(result.quiz);
+      assert.deepEqual(result.readings, [{ pageId, path: gradedPath, href: `wiki/${gradedPath}#section` }]);
+      assert.deepEqual(result.quiz.readings, result.readings);
+      assert.equal(
+        result.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
       assert.deepEqual(
         result.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
         [

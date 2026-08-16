@@ -212,6 +212,8 @@ The tables are:
   projections, sealed evidence, question feedback, and one bundled page result
   per covered page.
 
+The `settings` table may hold `simulatedDate` as one validated ISO calendar date. Absence means real time; clearing the setting deletes it rather than storing `null`.
+
 Stable page IDs survive renames; paths and revisions change. Self-edges,
 missing/ineligible prerequisite pages, and cycles are rejected. A due page is
 eligible only when its active prerequisites have reached FSRS `Review`.
@@ -222,6 +224,8 @@ eligible only when its active prerequisites have reached FSRS `Review`.
 server, Pi extension, skills, and CLI all use it for durable operations. The
 extension caches one instance per resolved vault; the server injects one
 instance; `sync` uses the entry point and the writer lock.
+
+Application learning time comes from one shared `Clock` whose only operation is `now(): Date`. `ScholarApplication` wraps its base system clock with a database-backed clock that reads `simulatedDate` on every call and resolves it as deterministic local noon in the persisted timezone, including `local`. The same instance supplies the default scheduler and quiz service. Application local date, scheduler learning timestamps and due defaults, quiz generated/saved/submitted/graded timestamps, and FSRS review instants use that clock. Workflow leases/results, source/wiki/settings/Git/doctor timestamps, and locks deliberately remain on the real wall clock.
 
 The normal durable path is:
 
@@ -443,6 +447,8 @@ publication on the same date for debugging requires resetting or creating a
 disposable vault; no overwrite or regeneration path bypasses the date and
 revision guards.
 
+Month-long manual rehearsal may advance the simulated learning date without restarting, but only in a disposable vault. Clearing the date does not remove synthetic learning history; discard or reset the vault before another rehearsal or real use, and reset before repeating any already-published date.
+
 ```mermaid
 flowchart TD
   DailyOperator["Operator schedules daily"] --> DailySkill["daily skill"]
@@ -576,13 +582,14 @@ the operator outside an automatic Scholar mutation.
 ```text
 pi-scholar init [path]
 pi-scholar doctor [path]
-pi-scholar serve [--vault <path>] [--port <1..65535>]
+pi-scholar serve [--vault <path>] [--port <1..65535>] [--dev-tools]
 pi-scholar sync [--vault <path>]
 ```
 
 `init` creates/validates the vault, v5 database, OKF projections, Git
 repository, and private roots. `doctor` is read-only. `serve` binds the
-loopback HTTP server and drains the application on shutdown. `sync` performs
+loopback HTTP server and drains the application on shutdown; `--dev-tools`
+permits simulated-date mutations for that server process only. `sync` performs
 only the explicit safe push described above. Unknown options, extra
 positionals, invalid ports, unsupported roots, and unsupported schema versions
 are rejected.
@@ -616,9 +623,12 @@ and grading remain Pi-tool/application operations; the browser is a read,
 answer, submission, workflow, settings, and health client.
 
 The SPA provides Today, Notes, Add, History, Workflows, Settings, and Health
-views. Today and History share canonical one-based quiz Results, stable Notes
-links, exact settled readings, current recommendations, and knowledge gaps;
-submitted unsettled History entries poll conditionally and link to Workflows.
+views. After submission, Today and History immediately show covered-page Notes
+links, current recommendations, and knowledge gaps while exact readings and
+feedback remain unavailable until settlement. Settled Results use canonical
+one-based order; submitted unsettled History entries poll conditionally and
+link to Workflows.
+Settings exposes a native date control with Apply, previous-day, next-day, and real-date actions only when the server has developer tools enabled. An active simulation remains visible as a route-wide dated warning; a server without mutation capability shows read-only restart guidance instead of hiding the state.
 Safe Markdown covers prompts, choices, answers, feedback, and controlled
 free-response editing. Raw HTML is never evaluated; unsupported or external
 images, Mermaid blocks, and unsafe external content are inert. A page-authorized
@@ -639,8 +649,10 @@ state.
 v5/integrity/foreign keys, source packet manifests/digests/chunk coverage,
 workflow bindings and timestamps, OKF pages/snapshots/index/log, prerequisite
 coverage, quiz projections/evidence/settlement consistency, Git state, qmd
-scope, and Docling identity. qmd is derived and can be rebuilt; a qmd failure
-never makes qmd canonical.
+scope, Docling identity, and the optional simulated date. A valid active
+simulation is a warning; an invalid persisted date fails the check rather than
+becoming authoritative. qmd is derived and can be rebuilt; a qmd failure never
+makes qmd canonical.
 
 Recovery is deliberately narrow: inspect `doctor`, rerun the affected
 idempotent skill or operation through `ScholarApplication`, and run explicit

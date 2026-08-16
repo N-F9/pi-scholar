@@ -146,6 +146,7 @@ export function QuizResults({
     !recommendations.gaps.length
   )
     return null;
+  const settled = Boolean(questionResults.length || pageResults.length || grades.length);
   const displayQuestions = [...questions].sort((left, right) => left.ordinal - right.ordinal);
   const questionPositions = new Map(
     displayQuestions.map((question, index) => [question.questionId, index + 1] as const),
@@ -155,9 +156,9 @@ export function QuizResults({
   return (
     <section className="space-y-8" aria-labelledby="results-heading">
       <div>
-        <p className="eyebrow">Settled review</p>
+        <p className="eyebrow">{settled ? "Settled review" : "Submitted guidance"}</p>
         <h2 className="mt-2 font-serif text-3xl font-semibold" id="results-heading">
-          Results
+          {settled ? "Results" : "While grading is pending"}
         </h2>
       </div>
 
@@ -236,9 +237,13 @@ export function QuizResults({
 
       {readings.length ? (
         <Card className="border-accent/50 bg-accent/10 shadow-none">
-          <h3 className="font-serif text-2xl font-semibold">Read next</h3>
+          <h3 className="font-serif text-2xl font-semibold">
+            {settled ? "Review these sections" : "Pages in this quiz"}
+          </h3>
           <p className="mt-2 text-sm text-muted">
-            Exact pages and headings selected from the evidence used for this grade.
+            {settled
+              ? "Exact pages and headings selected from the evidence used for this grade."
+              : "These are the pages used by your submitted quiz."}
           </p>
           <ul className="mt-4 grid gap-2">
             {readings.map((reading) => (
@@ -263,7 +268,9 @@ export function QuizResults({
         <Card className="shadow-none">
           <h3 className="font-serif text-2xl font-semibold">Continue learning</h3>
           <p className="mt-2 text-sm text-muted">
-            Current whole-wiki guidance, separate from the grading evidence above.
+            {settled
+              ? "Current whole-wiki guidance, separate from the grading evidence above."
+              : "Current whole-wiki guidance related to these quiz pages while grading is pending."}
           </p>
           <ul className="mt-4 grid gap-2">
             {recommendations.readings.map((reading) => (

@@ -594,6 +594,7 @@ export interface SettingsRecord {
   readonly port: number;
   readonly host: string;
   readonly updatedAt: IsoDateTime;
+  readonly simulatedDate?: LocalDate;
   readonly facts: SettingsFacts;
 }
 export interface ApiError {
@@ -749,6 +750,7 @@ export interface WorkflowListResult {
 
 export interface SettingsResult {
   readonly settings: SettingsRecord;
+  readonly developerToolsEnabled: boolean;
 }
 
 export interface SettingsUpdateRequest {
@@ -756,6 +758,7 @@ export interface SettingsUpdateRequest {
   readonly timezone?: string;
   readonly port?: number;
   readonly host?: string;
+  readonly simulatedDate?: LocalDate | null;
 }
 
 export interface DoctorCheck {

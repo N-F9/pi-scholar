@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterAll, test } from "vitest";
 import { openDatabase, type ScholarDatabase } from "../src/database.js";
 import { QuizConflictError, QuizService, validateQuizVisibleText } from "../src/quiz.js";
-import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
+import { type Clock, localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
 import { parseWikiBodySections, parseWikiDocumentSections } from "../src/wiki-sections.js";
 
 const LEARNING_WIKI_ROOT = mkdtempSync(join(tmpdir(), "pi-scholar-learning-"));
@@ -75,6 +75,58 @@ test("due eligibility uses the persisted timezone for both day and due timestamp
     ["timezone-page"],
   );
   assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
+  db.close();
+});
+test("injected learning clocks stamp due, quiz, and FSRS writes consistently", () => {
+  const { db } = setup();
+  const instant = "2026-08-15T12:00:00.000Z";
+  const clock: Clock = { now: () => new Date(instant) };
+  const scheduler = new SchedulerService(db, undefined, clock);
+  scheduler.ensurePageLearning("p1");
+  const learning = scheduler.getPageLearning("p1");
+  assert.equal(learning.initialDueAt, instant);
+  assert.equal(learning.createdAt, instant);
+  assert.equal(learning.updatedAt, instant);
+
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler, clock);
+  const generated = quiz.createDailyQuiz({
+    date: "2026-08-15",
+    selectedPageIds: ["p1"],
+    questionSpecs: [question("p1")],
+  });
+  assert.equal(generated.generatedAt, instant);
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({
+    date: generated.date,
+    revision: generated.revision,
+    answers: { [questionId]: "answer" },
+  });
+  assert.equal(
+    db.get<{ saved_at: string }>("SELECT saved_at FROM quiz_answers WHERE quiz_id = ?", generated.quizId)?.saved_at,
+    instant,
+  );
+  const sealed = quiz.sealSubmission({ date: generated.date, revision: draft.revision });
+  assert.equal(sealed.submittedAt, instant);
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  const settled = quiz.settleGrade({
+    date: sealed.date,
+    revision: sealed.revision,
+    submissionId: "clock-submission",
+    questions: [{ questionId, feedback: "Good." }],
+    pages: [{ pageId: "p1", rating: "Good", evidence: [evidence.reference] }],
+  });
+  assert.equal(settled.pages[0]!.gradedAt, instant);
+  assert.equal(
+    db.get<{ graded_at: string }>("SELECT graded_at FROM question_results WHERE quiz_id = ?", sealed.quizId)?.graded_at,
+    instant,
+  );
+  assert.equal(
+    db.get<{ reviewed_at: string }>("SELECT reviewed_at FROM page_reviews WHERE quiz_id = ?", sealed.quizId)
+      ?.reviewed_at,
+    instant,
+  );
+  assert.equal(scheduler.getPageLearning("p1").lastReviewAt, instant);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", sealed.quizId).length, 1);
   db.close();
 });
 test("section parsers keep headed preambles and exclude OKF frontmatter", () => {

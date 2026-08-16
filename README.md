@@ -40,9 +40,13 @@ Start the same-origin loopback API and web client only after initialization:
 
 ```sh
 pi-scholar serve --vault /absolute/path/to/vault --port 4816
+# Disposable rehearsal only:
+pi-scholar serve --vault /absolute/path/to/vault --port 4816 --dev-tools
 ```
 
 The server binds `127.0.0.1:4816` by default. It is not a public authentication or CORS boundary. If phone access is needed, use a separately managed private tunnel such as Tailscale; tunnels, reverse proxies, authentication, DNS, and network policy remain operator-owned external context, not Pi Scholar integration, identity, trust boundary, dependency, or feature. HTTP(S) source URLs may target local, private, or Tailscale destinations when allowed by local-user/model trust; timeout, redirect, and streaming protections still apply. Server output belongs in an operator-owned log outside the vault.
+
+`--dev-tools` is a one-time server capability for month-long manual rehearsal in a disposable vault. Settings can apply a calendar date, move one day backward or forward, or return to real time without a restart. The optional date is stored in SQLite, so every Pi Scholar process respects an active simulation even when its server was not started with developer tools; in that case Settings shows read-only restart guidance. Every browser route shows the effective simulated date, `/scholar-status` annotates it, and `doctor` warns while it is active. Simulation changes learning dates, quiz timestamps, due defaults, and FSRS review instants; workflow leases/results, source/wiki/settings/Git/doctor timestamps, and locks remain on the real wall clock. Use this only with a disposable vault, and discard or reset that vault before another rehearsal or any real use; clearing the setting does not erase simulated learning history, and the one-quiz-per-local-date rule still requires a reset before repeating a date.
 
 ## Pi commands
 
@@ -137,10 +141,12 @@ Source removal begins with an explicit operator request, a fresh preview, and co
 
 Today and History number displayed questions from one, render safe Markdown in
 prompts, choices, answers, and feedback, and use a controlled Markdown editor
-for free responses. Settled Results preserve canonical quiz order and stable
-Notes links. Exact page/section readings and feedback describe the settled
-quiz; separate bounded recommendations and knowledge gaps are derived from the
-current non-retired wiki. Missing qmd removes only semantic recommendations,
-not exact results, prerequisites, or gaps.
+for free responses. After submission, covered-page links and current whole-wiki
+recommendations appear while grading is pending. Settled Results preserve
+canonical quiz order and stable Notes links. Exact page/section readings and
+feedback appear only after settlement; separate bounded recommendations and
+knowledge gaps are derived from the current non-retired wiki. Missing qmd
+removes only semantic recommendations, not exact results, prerequisites, or
+gaps.
 
 Pi tools, the browser API, and the FIFO browser worker call the same `ScholarApplication` application entry point. No public user/auth system, arbitrary HTTP shell, second persistence layer, custom Pi runner, or alternate writer is provided. Private tunnels, including Tailscale, remain external operator context.

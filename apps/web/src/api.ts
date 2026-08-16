@@ -64,6 +64,12 @@ function isEnum(value: unknown, values: readonly string[]): boolean {
   return typeof value === "string" && values.includes(value);
 }
 
+function isLocalDate(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0, 10) === value;
+}
+
 function isAnswer(value: unknown): boolean {
   return (
     isRecord(value) &&
@@ -438,12 +444,31 @@ export const isWorkflowListResult: ResultGuard<WorkflowListResult> = (value): va
 
 export const isSettingsResult: ResultGuard<SettingsResult> = (value): value is SettingsResult =>
   isRecord(value) &&
+  Object.keys(value).every((field) => ["settings", "developerToolsEnabled"].includes(field)) &&
+  typeof value.developerToolsEnabled === "boolean" &&
   isRecord(value.settings) &&
+  Object.keys(value.settings).every((field) =>
+    ["maintenanceEnabled", "simulatedDate", "timezone", "host", "port", "updatedAt", "facts"].includes(field),
+  ) &&
   typeof value.settings.maintenanceEnabled === "boolean" &&
+  (value.settings.simulatedDate === undefined || isLocalDate(value.settings.simulatedDate)) &&
   hasStrings(value.settings, ["timezone", "host", "updatedAt"]) &&
   typeof value.settings.port === "number" &&
   isRecord(value.settings.facts) &&
-  typeof value.settings.facts.localDate === "string" &&
+  Object.keys(value.settings.facts).every((field) =>
+    [
+      "localDate",
+      "pendingInboxCount",
+      "openIssueCount",
+      "lastIngestAt",
+      "lastIngestResult",
+      "lastLintAt",
+      "lastLintResult",
+      "recentChanges",
+      "git",
+    ].includes(field),
+  ) &&
+  isLocalDate(value.settings.facts.localDate) &&
   typeof value.settings.facts.pendingInboxCount === "number" &&
   typeof value.settings.facts.openIssueCount === "number" &&
   (value.settings.facts.lastIngestAt === undefined || typeof value.settings.facts.lastIngestAt === "string") &&
@@ -452,10 +477,16 @@ export const isSettingsResult: ResultGuard<SettingsResult> = (value): value is S
   (value.settings.facts.lastLintResult === undefined || typeof value.settings.facts.lastLintResult === "string") &&
   isStringArray(value.settings.facts.recentChanges) &&
   isRecord(value.settings.facts.git) &&
+  Object.keys(value.settings.facts.git).every((field) =>
+    ["branch", "clean", "ahead", "behind", "diverged", "upstream", "message"].includes(field),
+  ) &&
+  (value.settings.facts.git.branch === undefined || typeof value.settings.facts.git.branch === "string") &&
   typeof value.settings.facts.git.clean === "boolean" &&
   typeof value.settings.facts.git.ahead === "number" &&
   typeof value.settings.facts.git.behind === "number" &&
-  typeof value.settings.facts.git.diverged === "boolean";
+  typeof value.settings.facts.git.diverged === "boolean" &&
+  (value.settings.facts.git.upstream === undefined || typeof value.settings.facts.git.upstream === "string") &&
+  (value.settings.facts.git.message === undefined || typeof value.settings.facts.git.message === "string");
 
 export async function api<T>(
   path: `/api/v1/${string}` | "/healthz",

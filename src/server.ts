@@ -60,6 +60,7 @@ export interface ServerOptions {
   readonly version?: string;
   readonly maxJsonBytes?: number;
   readonly maxMultipartBytes?: number;
+  readonly developerTools?: boolean;
 }
 
 export interface ScholarServer extends Server {
@@ -70,6 +71,7 @@ interface RequestOptions {
   readonly host: string;
   readonly maxJsonBytes: number;
   readonly maxMultipartBytes?: number;
+  readonly developerTools?: boolean;
 }
 
 interface MultipartUpload {
@@ -95,6 +97,14 @@ function stringField(value: Record<string, unknown>, key: string, required = fal
   const result = value[key];
   if (result === undefined && !required) return undefined;
   if (typeof result !== "string" || !result.trim()) throw new ValidationError(`${key} must be a nonempty string`);
+  return result;
+}
+function simulatedDateField(value: Record<string, unknown>, key: string): string | null | undefined {
+  const result = value[key];
+  if (result === undefined) return undefined;
+  if (result === null) return null;
+  if (typeof result !== "string" || !DATE.test(result) || localDate(result) !== result)
+    throw new ValidationError(`${key} must be null or a valid calendar date`);
   return result;
 }
 function integerField(value: Record<string, unknown>, key: string): number {
@@ -855,12 +865,24 @@ async function apiRoute(
   if (path === "/api/v1/settings") {
     if (method === "GET") {
       queryOnly(url, []);
-      sendJson(res, 200, await app.getSettings(), requestId);
+      sendJson(
+        res,
+        200,
+        { ...(await app.getSettings()), developerToolsEnabled: options.developerTools === true },
+        requestId,
+      );
       return;
     }
     const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-    if (!keysExactly(value, ["maintenanceEnabled", "timezone", "port", "host"]))
+    const simulatedDateRequested = Object.hasOwn(value, "simulatedDate");
+    if (simulatedDateRequested && options.developerTools !== true)
+      throw Object.assign(new Error("developer tools are required to change simulatedDate"), {
+        code: "DEVELOPER_TOOLS_REQUIRED",
+        status: 403,
+      });
+    if (!keysExactly(value, ["maintenanceEnabled", "timezone", "port", "host", "simulatedDate"]))
       throw new ValidationError("settings request has unsupported fields");
+    const simulatedDate = simulatedDateField(value, "simulatedDate");
     const input: SettingsUpdateRequest = {
       ...(value.maintenanceEnabled === undefined
         ? {}
@@ -868,8 +890,17 @@ async function apiRoute(
       ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
       ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
       ...(value.host === undefined ? {} : { host: stringField(value, "host") }),
+      ...(simulatedDate === undefined ? {} : { simulatedDate }),
     };
-    sendJson(res, 200, await app.updateSettings(input, { origin: "browser" }), requestId);
+    const context = simulatedDateRequested
+      ? { origin: "browser" as const, developerToolsEnabled: true }
+      : { origin: "browser" as const };
+    sendJson(
+      res,
+      200,
+      { ...(await app.updateSettings(input, context)), developerToolsEnabled: options.developerTools === true },
+      requestId,
+    );
     return;
   }
   throw Object.assign(new Error("route not found"), { code: "ROUTE_NOT_FOUND", status: 404 });
@@ -970,6 +1001,7 @@ export function createServer(options: ServerOptions = {}): ScholarServer {
     host,
     maxJsonBytes: options.maxJsonBytes ?? MAX_JSON_BYTES,
     ...(options.maxMultipartBytes === undefined ? {} : { maxMultipartBytes: options.maxMultipartBytes }),
+    ...(options.developerTools === undefined ? {} : { developerTools: options.developerTools }),
   };
   const server = nodeCreateServer((req, res) => {
     void handleRequest(req, res, application, staticRoot, requestOptions);

@@ -80,10 +80,13 @@ import {
 } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
 import {
+  type Clock,
   localDate,
+  localNoon,
   persistedTimezone,
   RevisionConflictError,
   SchedulerService,
+  SYSTEM_CLOCK,
   ValidationError,
 } from "../scheduler.js";
 import {
@@ -155,10 +158,26 @@ import {
 
 const EXTRACT_BATCH_SIZE = 3;
 const UUID_SOURCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-const PENDING_SOURCE_ID = /^pending-[0-9a-f]{32}$/iu;
+class DatabaseBackedClock implements Clock {
+  constructor(
+    private readonly db: ScholarDatabase,
+    private readonly base: Clock,
+  ) {}
 
+  now(): Date {
+    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [
+      "simulatedDate",
+    ]);
+    const value = jsonValue(row?.value_json);
+    if (value === undefined || value === null) return this.base.now();
+    if (typeof value !== "string") throw new ValidationError("simulatedDate is invalid");
+    return localNoon(value, persistedTimezone(this.db));
+  }
+}
+const PENDING_SOURCE_ID = /^pending-[0-9a-f]{32}$/iu;
 export interface ApplicationMutationContext {
   readonly origin?: "browser" | "pi" | "cli" | "internal";
+  readonly developerToolsEnabled?: boolean;
 }
 export interface ApplicationAdapters {
   readonly sources?: SourceAdapters;
@@ -176,6 +195,7 @@ export interface ApplicationOptions {
   readonly commit?: (paths: VaultPaths, subject: string, excludedPaths?: readonly string[]) => GitCheckpointResult;
   readonly push?: (paths: VaultPaths) => GitPushResult;
   readonly version?: string;
+  readonly clock?: Clock;
 }
 export interface ApplicationStatus extends HealthResult {
   readonly settings: SettingsRecord;
@@ -390,6 +410,7 @@ export class ScholarApplication {
   private readonly wiki: WikiService;
   private readonly scheduler: SchedulerService;
   private readonly quiz: QuizService;
+  private readonly clock: Clock;
   private readonly workflows: WorkflowCoordinator;
   private readonly worker: BrowserMutationWorker;
   readonly version: string;
@@ -413,13 +434,14 @@ export class ScholarApplication {
     this.paths = typeof input.paths === "string" ? resolveVault(input.paths) : input.paths;
     this.db = input.db ?? openDatabase(this.paths);
     this.ownsDatabase = !input.db;
+    this.clock = new DatabaseBackedClock(this.db, input.clock ?? SYSTEM_CLOCK);
     this.sources =
       input.sourceService ??
       new SourceService(this.db, this.paths, defaultSourceAdapters(this.paths, input.adapters?.sources));
     this.wiki =
       input.wikiService ?? new WikiService(this.db, this.paths, defaultWikiAdapters(this.paths, input.adapters?.wiki));
-    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths);
-    this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
+    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths, this.clock);
+    this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler, this.clock);
     this.worker = new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
     this.doctorFn = input.doctor ?? doctor;
@@ -452,12 +474,17 @@ export class ScholarApplication {
         let report: DoctorReport;
         try {
           report = this.doctorFn(this.paths.vaultRoot);
-          if (!report.ok) {
-            const error = new Error("doctor checks failed");
-            if (!rollback) throw mutationFinalizationError("doctor", error);
-            throw error;
-          }
         } catch (error) {
+          if (!rollback) throw mutationFinalizationError("doctor", error);
+          throw error;
+        }
+        if (!report.ok) {
+          const failures = report.checks.filter((check) => check.status === "fail");
+          const error = new Error(
+            failures.length > 0
+              ? failures.map((check) => `${check.name}: ${check.message}`).join("; ")
+              : "doctor checks failed",
+          );
           if (!rollback) throw mutationFinalizationError("doctor", error);
           throw error;
         }
@@ -628,12 +655,7 @@ export class ScholarApplication {
     }
   }
   private async currentLocalDate(): Promise<string> {
-    const timezone = persistedTimezone(this.db);
-    try {
-      return localDate(new Date(), timezone);
-    } catch {
-      return localDate(new Date());
-    }
+    return localDate(this.clock.now(), persistedTimezone(this.db));
   }
   private pendingSourceId(entry: InboxEntry): string {
     return `pending-${sha256(`${entry.relativePath}:${JSON.stringify(entry.identity)}`).slice(0, 32)}`;
@@ -745,9 +767,14 @@ export class ScholarApplication {
     const completed = this.completedExtractions.get(resultKey);
     if (completed) {
       if (!completed.pendingFinalization) return completed.result;
-      const result = await this.durableDirect(() => completed.result, "source:extract");
-      cacheResult(result);
-      return result;
+      try {
+        const result = await this.durableDirect(() => completed.result, "source:extract");
+        cacheResult(result);
+        return result;
+      } catch (error) {
+        if (isAppliedFinalizationFailure(error)) Object.assign(error as object, { publicationApplied: true });
+        throw error;
+      }
     }
     const pending = this.extractionClaims.get(decoded.claimId);
     if (!pending || pending.prepared.preparedId !== decoded.preparedId || pending.prepared.digest !== decoded.digest)
@@ -777,6 +804,7 @@ export class ScholarApplication {
       if (appliedResult && isAppliedFinalizationFailure(error)) {
         cacheResult(appliedResult, true);
         this.extractionClaims.delete(decoded.claimId);
+        Object.assign(error as object, { publicationApplied: true });
         throw error;
       }
       let recordingError: unknown;
@@ -953,13 +981,23 @@ export class ScholarApplication {
       gradedAt: page.gradedAt,
       reviewId: page.reviewId,
     }));
-    const readings = [
-      ...new Map(
-        internalPageResults
-          .flatMap((page) => page.readings)
-          .map((reading): readonly [string, ReadingLink] => [`${reading.pageId}#${reading.anchor}`, reading]),
-      ).values(),
-    ].map(publicReading);
+    const readings = settled
+      ? [
+          ...new Map(
+            internalPageResults
+              .flatMap((page) => page.readings)
+              .map((reading): readonly [string, ReadingLink] => [`${reading.pageId}#${reading.anchor}`, reading]),
+          ).values(),
+        ].map(publicReading)
+      : quiz.status === "submitted"
+        ? [...new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)))].map(
+            (pageId): QuizReadingRecord => ({
+              pageId,
+              path: pagePath(pageId),
+              href: notesPageHref(pageId),
+            }),
+          )
+        : [];
     return { ...quiz, answers, ...(draft ? { draft } : {}), questionResults, pageResults, grades, readings };
   }
 
@@ -1112,12 +1150,13 @@ export class ScholarApplication {
     return { quizzes: this.quiz.list().map(publicQuiz) };
   }
   private async quizRecommendations(detail: QuizDetailRecord): Promise<QuizRecommendations> {
-    if (!detail.pageResults.length) return { readings: [], gaps: [] };
+    if (detail.status !== "submitted") return { readings: [], gaps: [] };
+    const coveredPageIds = detail.pageResults.length
+      ? [...new Set(detail.pageResults.map((result) => result.pageId))]
+      : [...new Set(detail.questions.flatMap((question) => question.pages.map((page) => page.pageId)))];
+    if (!coveredPageIds.length) return { readings: [], gaps: [] };
 
-    const excluded = new Set([
-      ...detail.pageResults.map((result) => result.pageId),
-      ...detail.readings.map((reading) => reading.pageId),
-    ]);
+    const excluded = new Set([...coveredPageIds, ...detail.readings.map((reading) => reading.pageId)]);
     const currentPages = await Promise.all(
       (await this.wiki.list())
         .filter((page) => page.status !== "retired")
@@ -1141,8 +1180,8 @@ export class ScholarApplication {
         .map(({ page }) => [page.pageId, page]),
     );
     const prerequisiteIds = new Set(
-      detail.pageResults.flatMap((result) =>
-        this.scheduler.listPrerequisites(result.pageId).map((edge) => edge.prerequisitePageId),
+      coveredPageIds.flatMap((pageId) =>
+        this.scheduler.listPrerequisites(pageId).map((edge) => edge.prerequisitePageId),
       ),
     );
     const prerequisites = [...prerequisiteIds]
@@ -1276,7 +1315,7 @@ export class ScholarApplication {
           "SELECT saved_at FROM quiz_answers WHERE quiz_id = ? ORDER BY saved_at DESC LIMIT 1",
           [result.quizId],
         )?.saved_at;
-        return { revision: result.revision, savedAt: String(savedAt ?? new Date().toISOString()), answers };
+        return { revision: result.revision, savedAt: String(savedAt ?? this.clock.now().toISOString()), answers };
       }),
     );
   }
@@ -1313,7 +1352,7 @@ export class ScholarApplication {
           quiz: publicQuizDetail(detail),
           grades: detail.grades,
           readings: detail.readings,
-          recommendations: { readings: [], gaps: [] },
+          recommendations: await this.quizRecommendations(detail),
         };
       }, "quiz:seal"),
     );
@@ -1398,6 +1437,8 @@ export class ScholarApplication {
     const timezone = await this.readSetting("timezone", "local");
     const port = await this.readSetting("port", DEFAULT_VAULT_PORT);
     const host = await this.readSetting("host", DEFAULT_VAULT_HOST);
+    const simulatedDateValue = await this.readSetting<unknown>("simulatedDate", undefined);
+    const simulatedDate = typeof simulatedDateValue === "string" ? simulatedDateValue : undefined;
     const pendingInboxCount = (await this.sources.discover()).length;
     const openIssueCount = Number(
       this.db.get<Record<string, unknown>>(
@@ -1462,6 +1503,7 @@ export class ScholarApplication {
           this.db.get<Record<string, unknown>>("SELECT MAX(updated_at) AS updated_at FROM settings")?.updated_at ??
             new Date().toISOString(),
         ),
+        ...(simulatedDate === undefined ? {} : { simulatedDate }),
         facts,
       },
     };
@@ -1472,12 +1514,23 @@ export class ScholarApplication {
   ): Promise<{ readonly settings: SettingsRecord }> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        if (input.simulatedDate !== undefined && context?.developerToolsEnabled !== true)
+          throw new ValidationError("developer tools are required to change simulatedDate");
         const now = new Date().toISOString();
         const updates: [string, unknown][] = [];
         if (input.maintenanceEnabled !== undefined) {
           if (typeof input.maintenanceEnabled !== "boolean")
             throw new ValidationError("maintenanceEnabled must be boolean");
           updates.push(["maintenanceEnabled", input.maintenanceEnabled]);
+        }
+        if (input.simulatedDate !== undefined && input.simulatedDate !== null) {
+          if (
+            typeof input.simulatedDate !== "string" ||
+            !/^\d{4}-\d{2}-\d{2}$/u.test(input.simulatedDate) ||
+            localDate(input.simulatedDate) !== input.simulatedDate
+          )
+            throw new ValidationError("simulatedDate must be a valid calendar date");
+          updates.push(["simulatedDate", input.simulatedDate]);
         }
         if (input.timezone !== undefined) {
           if (typeof input.timezone !== "string" || !input.timezone.trim() || input.timezone.length > 100)
@@ -1505,6 +1558,7 @@ export class ScholarApplication {
               "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
               [key, JSON.stringify(value), now],
             );
+          if (input.simulatedDate === null) this.db.run("DELETE FROM settings WHERE key = ?", ["simulatedDate"]);
         });
         return this.getSettings();
       }, "settings:update"),

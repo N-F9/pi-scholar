@@ -13,6 +13,7 @@ export interface CliArgs {
   readonly positional: readonly string[];
   readonly vaultPath?: string;
   readonly port?: number;
+  readonly developerTools?: boolean;
 }
 
 function usage(): string {
@@ -20,7 +21,7 @@ function usage(): string {
     "Usage:",
     "  pi-scholar init [path]",
     "  pi-scholar doctor [path]",
-    "  pi-scholar serve [--vault path] [--port port]",
+    "  pi-scholar serve [--vault path] [--port port] [--dev-tools]",
     "  pi-scholar sync [--vault path]",
   ].join("\n");
 }
@@ -31,6 +32,7 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
   const positional: string[] = [];
   let vaultPath: string | undefined;
   let port: number | undefined;
+  let developerTools = false;
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === undefined) throw new Error("CLI argument is missing");
@@ -44,12 +46,15 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
       if (!next || !Number.isInteger(parsed) || parsed < 1 || parsed > 65_535)
         throw new Error("--port must be an integer between 1 and 65535");
       port = parsed;
+    } else if (value === "--dev-tools") {
+      developerTools = true;
     } else if (value.startsWith("-")) {
       throw new Error(`Unknown option: ${value}`);
     } else {
       positional.push(value);
     }
   }
+  if (developerTools && command !== "serve") throw new Error("--dev-tools is only valid for serve");
   if (port !== undefined && command !== "serve") throw new Error("--port is only valid for serve");
   if (vaultPath !== undefined && command !== "serve" && command !== "sync")
     throw new Error(`--vault is not used with ${command}; pass [path]`);
@@ -65,6 +70,7 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
     positional,
     ...(positionalPath ? { vaultPath: positionalPath } : vaultPath ? { vaultPath } : {}),
     ...(port === undefined ? {} : { port }),
+    ...(developerTools ? { developerTools: true } : {}),
   };
 }
 
@@ -161,7 +167,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (parsed.command === "serve") {
     // Keep non-server CLI commands from loading the HTTP and browser runtime.
     const { startServer } = await import("./server.js");
-    const server = await startServer({ paths, ...(parsed.port === undefined ? {} : { port: parsed.port }) });
+    const server = await startServer({
+      paths,
+      ...(parsed.port === undefined ? {} : { port: parsed.port }),
+      ...(parsed.developerTools ? { developerTools: true } : {}),
+    });
     await waitForServerShutdown(server);
     return 0;
   }
