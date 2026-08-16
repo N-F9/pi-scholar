@@ -50,6 +50,14 @@ In practical terms, the system tries to:
 
 For v0.0.1, the main goal is to make this loop reliable enough that it genuinely reduces the friction of studying. Later versions will focus more heavily on improving the learning process and increasing the reliability of the wiki system.
 
+### Learning foundation
+
+The learning side of Pi Scholar began with Dunlosky et al.’s 2013 review, *Improving Students’ Learning With Effective Learning Techniques*. The paper evaluates various common learning techniques across different learners, materials, learning conditions, and types of assessment.
+
+The authors rated **practice testing** and **distributed practice** as high-utility techniques because their benefits generalized across a wide range of conditions. Those findings shaped Pi Scholar’s central decisions: learners regularly retrieve knowledge through quizzes, and wiki pages are scheduled for review over time rather than simply reread.
+
+> John Dunlosky, Katherine A. Rawson, Elizabeth J. Marsh, Mitchell J. Nathan, and Daniel T. Willingham, [“Improving Students’ Learning With Effective Learning Techniques: Promising Directions From Cognitive and Educational Psychology”](https://www.wku.edu/senate/documents/improving_student_learning_dunlosky_2013.pdf), *Psychological Science in the Public Interest* 14, no. 1 (2013): 4–58. [DOI: 10.1177/1529100612453266](https://doi.org/10.1177/1529100612453266)
+
 ## What Pi Scholar can do today
 
 Pi Scholar is still early, but the full source-to-review path already exists:
