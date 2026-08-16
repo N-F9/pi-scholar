@@ -17,7 +17,7 @@ Requirements:
 
 - Node.js `>=22.19.0`.
 - Pi coding agent with the `@earendil-works/pi-coding-agent` and `typebox` peer packages available to the Pi runtime.
-- Git and Docling on `PATH` for the vault's required version checks and supported source extraction; qmd on `PATH` for semantic ranking.
+- Git, qpdf, and Docling on `PATH` for the vault's version checks and supported source extraction; qmd on `PATH` for semantic ranking.
 - A provider configured through Pi's normal provider environment (for example, set only the provider key required by the selected Pi model, such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). Keep credentials in the service environment; never put them in vault files, arguments, cron text, or logs.
 
 Install the package and initialize a vault:
@@ -29,9 +29,9 @@ pi-scholar init /absolute/path/to/vault
 pi-scholar doctor /absolute/path/to/vault
 ```
 
-`doctor` is read-only. It validates the schema (v5), the strict OKF v0.2 wiki, and path prerequisites. Fix reported failing prerequisites before running Pi skills; a qmd warning disables semantic search while exact and lexical paths remain available.
+`doctor` is read-only. It validates the schema (v5), the strict OKF v0.2 wiki, and path prerequisites. Fix reported failing prerequisites before running Pi skills. A qpdf or Docling warning leaves native text/code adapters available but means dependent document conversion may fail; a qmd warning disables semantic search while exact and lexical paths remain available.
 
-Source capture accepts documents, URLs, pasted text, code, directories, and repositories without a fixed product source-size limit. Handling is streamed or disk-backed and bounded by available free space, operation time, and model/context limits. Derived Markdown normalizes blank-line runs fence-aware while preserving original bytes. Direct notes use the guarded wiki mutation path and do not become source packets.
+Source capture accepts documents, URLs, pasted text, code, directories, and repositories without a fixed product source-size limit. Handling is streamed or disk-backed and bounded by available free space, operation time, and model/context limits. PDFs over 256 pages remain one source tied to the original digest: qpdf splits private temporary parts, Docling converts those parts sequentially, and Pi Scholar streams attachment-path rewriting and Markdown combination before the existing single normalization and chunk-planning pass. The source publishes atomically only after every part succeeds. Derived Markdown normalizes blank-line runs fence-aware while preserving original bytes. Direct notes use the guarded wiki mutation path and do not become source packets.
 Ordinary files and directories may be copied directly into `inbox/`. `/scholar-add` instead creates an internal directory containing a `.pi-scholar-source.json` envelope and its payload; keep that directory intact while it is queued or extracting. Imperfect OCR may orient later work, but garbled or absent formulas and facts are omitted or recorded as issues until an immutable chunk from a better source supports them.
 
 ## Local server
@@ -64,7 +64,7 @@ Commands and skills use ScholarApplication for durable operations; they do not c
 
 Pi Scholar never plans weekdays, launches Pi, or edits a user's crontab. Choose the minute, hour, day-of-month, month, and weekday fields for each skill independently. The examples below are valid starting points; edit the first five fields on every line to fit the operator's schedule.
 
-Create an operator-owned environment file such as `/absolute/path/to/pi-scholar.env`, mode `0600`, containing the provider variables Pi needs and a fixed absolute `PATH` that reaches Node.js, Git, qmd, and Docling (for example `export PATH=/absolute/path/to/node-bin:/absolute/path/to/qmd-bin:/absolute/path/to/docling-bin:/usr/bin`). Do not put secrets in these cron lines. Use the absolute path to the installed `pi` executable, package checkout/install, vault, and log directory.
+Create an operator-owned environment file such as `/absolute/path/to/pi-scholar.env`, mode `0600`, containing the provider variables Pi needs and a fixed absolute `PATH` that reaches Node.js, Git, qmd, qpdf, and Docling (for example `export PATH=/absolute/path/to/node-bin:/absolute/path/to/qmd-bin:/absolute/path/to/docling-bin:/usr/bin`). Do not put secrets in these cron lines. Use the absolute path to the installed `pi` executable, package checkout/install, vault, and log directory.
 
 For a package checkout, run `npm install && npm run build && npm run build:web` before pointing cron at it. Published npm installs run the same build during packaging.
 
@@ -135,7 +135,7 @@ there is no overwrite or regeneration backdoor.
 
 Run `pi-scholar doctor /absolute/path/to/vault` after an interrupted command or dependency change. Before retrying a skill after a crash, start no competing Pi session for that vault; the retry first records abandoned running workflows as interrupted. Source extraction is idempotent by claimed physical identity and digest, quiz grading by sealed submission identity, and Git synchronization by the repository's own object state.
 
-`.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and Docling scratch. It is never Git content or authority. `sources/` contains immutable published packets and must not be hand-edited. Successful operations clean their scratch; failures use rollback data; crash remnants do not override SQLite or durable packets, wiki, or quiz artifacts. Recovery stays behind ScholarApplication: use `doctor`, then retry the affected operation rather than treating work files as state. Shared I/O accepts regular files and directories only; symlinks are unsupported at that boundary.
+`.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and qpdf/Docling scratch. It is never Git content or authority. `sources/` contains immutable published packets and must not be hand-edited. Successful operations clean their scratch; failures use rollback data; crash remnants do not override SQLite or durable packets, wiki, or quiz artifacts. Recovery stays behind ScholarApplication: use `doctor`, then retry the affected operation rather than treating work files as state. Shared I/O accepts regular files and directories only; symlinks are unsupported at that boundary.
 
 Source removal begins with an explicit operator request, a fresh preview, and confirmation. It deletes current dependent artifacts without erasing Git history; recover a prior version from Git when necessary. Browser drafts and inbox staging are intentionally not commits until the corresponding durable operation succeeds. The wiki is strict OKF v0.2, and qmd remains derived rather than canonical.
 

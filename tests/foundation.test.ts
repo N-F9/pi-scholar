@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -14,13 +15,20 @@ import {
 } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join, relative } from "node:path";
+import { basename, delimiter, dirname, join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { main } from "../src/cli.js";
 import { openDatabase, SCHEMA_SQL, transaction, validateSchema } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
-import { doclingArgs, doclingDependencyIdentity, doclingEnvironment } from "../src/external/docling.js";
+import {
+  convertWithDocling,
+  doclingArgs,
+  doclingDependencyIdentity,
+  doclingEnvironment,
+  PDF_BATCH_PAGES,
+  qpdfDependencyIdentity,
+} from "../src/external/docling.js";
 import { gitDependencyIdentity, localCheckpointCommit, runGit, runGitSync } from "../src/external/git.js";
 import { runChild, runChildSync } from "../src/external/process.js";
 import {
@@ -278,6 +286,16 @@ describe("vault foundation", () => {
       stderr: "",
     }));
     assert.deepEqual(docling, { executable: "/pinned/docling", version: "Docling version 2.4.1" });
+    const qpdf = qpdfDependencyIdentity(paths, (_paths, args) => ({
+      executable: "/pinned/qpdf",
+      args: [...args],
+      code: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "qpdf version 11.9.0",
+      stderr: "",
+    }));
+    assert.deepEqual(qpdf, { executable: "/pinned/qpdf", version: "qpdf version 11.9.0" });
     for (const result of [
       { code: 1, signal: null, timedOut: false },
       { code: 0, signal: "SIGTERM" as const, timedOut: false },
@@ -298,6 +316,15 @@ describe("vault foundation", () => {
           args: [...args],
           ...result,
           stdout: "Docling version 2.4.1",
+          stderr: "",
+        })),
+      );
+      assert.throws(() =>
+        qpdfDependencyIdentity(paths, (_paths, args) => ({
+          executable: "/pinned/qpdf",
+          args: [...args],
+          ...result,
+          stdout: "qpdf version 11.9.0",
           stderr: "",
         })),
       );
@@ -324,6 +351,226 @@ describe("vault foundation", () => {
         stderr: "",
       })),
     );
+    assert.throws(() =>
+      qpdfDependencyIdentity(paths, (_paths, args) => ({
+        executable: "/pinned/qpdf",
+        args: [...args],
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "not qpdf",
+        stderr: "",
+      })),
+    );
+  });
+
+  it("converts oversized PDFs sequentially and combines namespaced output", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi scholar (docling batches)-"));
+    const paths = initVault(join(root, "vault"));
+    const input = join(paths.workRoot, "network.pdf");
+    writeFileSync(input, "original PDF");
+    const calls: string[] = [];
+    let activeConversions = 0;
+    let maximumActiveConversions = 0;
+    const runner = async (executable: string, args: readonly string[]) => {
+      calls.push(`${executable}:${args[0]}`);
+      const success = (stdout = "") => ({
+        executable: `/pinned/${executable}`,
+        args: [...args],
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout,
+        stderr: "",
+      });
+      if (executable === "qpdf" && args[0] === "--show-npages") return success("513\n");
+      if (executable === "qpdf" && args[0] === `--split-pages=${PDF_BATCH_PAGES}`) {
+        const directory = dirname(args.at(-1)!);
+        for (const name of ["part-001-256.pdf", "part-257-512.pdf", "part-513.pdf"])
+          writeFileSync(join(directory, name), name);
+        return success();
+      }
+      assert.equal(executable, "docling");
+      const stem = basename(args.at(-1)!, ".pdf");
+      const part = /^pages-(\d+)-(\d+)-docling-batches-.+$/u.exec(stem);
+      assert.ok(part);
+      const range = `${Number(part[1])}-${Number(part[2])}`;
+      const outputIndex = args.indexOf("--output") + 1;
+      const output = args[outputIndex]!;
+      activeConversions++;
+      maximumActiveConversions = Math.max(maximumActiveConversions, activeConversions);
+      try {
+        await delay(5);
+        const artifacts = join(output, `${stem}_artifacts`);
+        mkdirSync(artifacts, { recursive: true });
+        writeFileSync(join(artifacts, "image.png"), `image ${range}`);
+        const heading = `# Pages ${range}\n\n`;
+        const absoluteOpening = "\n\n![Image](";
+        const padding =
+          range === "1-256" ? "x".repeat(65_532 - Buffer.byteLength(heading) - Buffer.byteLength(absoluteOpening)) : "";
+        writeFileSync(
+          join(output, `${stem}.md`),
+          `${heading}${padding}${absoluteOpening}${join(artifacts, "image.png")})\n\n![Relative](${stem}_artifacts/image.png)\n\nLiteral document_artifacts/image.png stays.\n`,
+        );
+      } finally {
+        activeConversions--;
+      }
+      return success();
+    };
+    try {
+      const result = await convertWithDocling(
+        paths,
+        {
+          inputRelativePath: "network.pdf",
+          outputRelativeDirectory: "docling-output",
+          mediaType: "application/pdf",
+        },
+        {
+          run: runner,
+          dependencyIdentity: () => ({ executable: "/pinned/docling", version: "Docling version 2.4.1" }),
+        },
+      );
+      assert.equal(maximumActiveConversions, 1);
+      assert.deepEqual(calls, [
+        "qpdf:--show-npages",
+        `qpdf:--split-pages=${PDF_BATCH_PAGES}`,
+        "docling:convert",
+        "docling:convert",
+        "docling:convert",
+      ]);
+      assert.deepEqual(readdirSync(result.outputDirectory).sort(), [
+        "combined.md",
+        "pages-1-256",
+        "pages-257-512",
+        "pages-513-513",
+      ]);
+      const combined = readFileSync(join(result.outputDirectory, "combined.md"), "utf8");
+      let previousHeading = -1;
+      for (const heading of ["# Pages 1-256", "# Pages 257-512", "# Pages 513-513"]) {
+        const offset = combined.indexOf(heading);
+        assert.ok(offset > previousHeading);
+        previousHeading = offset;
+      }
+      for (const range of ["1-256", "257-512", "513-513"]) {
+        const target = join(result.outputDirectory, `pages-${range}`, "image.png").replaceAll("\\", "/");
+        assert.equal(combined.split(target).length - 1, 2);
+      }
+      assert.doesNotMatch(combined, /docling-batches-/u);
+      assert.equal(combined.match(/Literal document_artifacts\/image\.png stays\./gu)?.length, 3);
+      assert.equal(readFileSync(input, "utf8"), "original PDF");
+      assert.equal(
+        readdirSync(paths.workRoot).some((name) => name.startsWith("docling-batches-")),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the failed page range and removes batched intermediates", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-docling-failure-"));
+    const paths = initVault(join(root, "vault"));
+    writeFileSync(join(paths.workRoot, "network.pdf"), "original PDF");
+    const runner = async (executable: string, args: readonly string[]) => {
+      const result = {
+        executable: `/pinned/${executable}`,
+        args: [...args],
+        code: 0,
+        signal: null as NodeJS.Signals | null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      };
+      if (executable === "qpdf" && args[0] === "--show-npages") return { ...result, stdout: "300\n" };
+      if (executable === "qpdf") {
+        const directory = dirname(args.at(-1)!);
+        writeFileSync(join(directory, "part-001-256.pdf"), "first");
+        writeFileSync(join(directory, "part-257-300.pdf"), "second");
+        return result;
+      }
+      if (basename(args.at(-1)!, ".pdf").startsWith("pages-257-300-"))
+        return { ...result, code: null, signal: "SIGKILL" as const };
+      const output = args[args.indexOf("--output") + 1]!;
+      mkdirSync(output, { recursive: true });
+      writeFileSync(join(output, "document.md"), "# First\n");
+      return result;
+    };
+    try {
+      await assert.rejects(
+        convertWithDocling(
+          paths,
+          {
+            inputRelativePath: "network.pdf",
+            outputRelativeDirectory: "docling-output",
+            mediaType: "application/pdf",
+          },
+          {
+            run: runner,
+            dependencyIdentity: () => ({ executable: "/pinned/docling", version: "Docling version 2.4.1" }),
+          },
+        ),
+        /Docling conversion for pages 257-300 terminated by signal SIGKILL/u,
+      );
+      assert.equal(existsSync(join(paths.workRoot, "docling-output")), false);
+      assert.equal(
+        readdirSync(paths.workRoot).some((name) => name.startsWith("docling-batches-")),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects incomplete qpdf ranges without starting Docling", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-docling-ranges-"));
+    const paths = initVault(join(root, "vault"));
+    writeFileSync(join(paths.workRoot, "network.pdf"), "original PDF");
+    let doclingStarted = false;
+    const runner = async (executable: string, args: readonly string[]) => {
+      const result = {
+        executable: `/pinned/${executable}`,
+        args: [...args],
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      };
+      if (executable === "qpdf" && args[0] === "--show-npages") return { ...result, stdout: "513\n" };
+      if (executable === "qpdf") {
+        const directory = dirname(args.at(-1)!);
+        writeFileSync(join(directory, "part-001-256.pdf"), "first");
+        writeFileSync(join(directory, "part-258-513.pdf"), "gap");
+        return result;
+      }
+      doclingStarted = true;
+      return result;
+    };
+    try {
+      await assert.rejects(
+        convertWithDocling(
+          paths,
+          {
+            inputRelativePath: "network.pdf",
+            outputRelativeDirectory: "docling-output",
+            mediaType: "application/pdf",
+          },
+          {
+            run: runner,
+            dependencyIdentity: () => ({ executable: "/pinned/docling", version: "Docling version 2.4.1" }),
+          },
+        ),
+        /qpdf split page ranges are incomplete or invalid/u,
+      );
+      assert.equal(doclingStarted, false);
+      assert.equal(existsSync(join(paths.workRoot, "docling-output")), false);
+      assert.equal(
+        readdirSync(paths.workRoot).some((name) => name.startsWith("docling-batches-")),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects traversal, control characters, and symlinks", () => {

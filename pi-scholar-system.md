@@ -97,7 +97,7 @@ flowchart TD
 | `src/quiz.ts` | Daily quiz records, drafts, sealing, grading settlement, evidence, page results, and projections |
 | `src/okf.ts` | Strict OKF concept/index/log parsing, serialization, citation handling, and projection validation |
 | `src/workflows.ts` | Durable workflow rows and the in-process browser mutation FIFO |
-| `src/doctor.ts` | Read-only vault, schema, packet, wiki, quiz, workflow, Git, qmd, and Docling checks |
+| `src/doctor.ts` | Read-only vault, schema, packet, wiki, quiz, workflow, Git, qmd, qpdf, and Docling checks |
 | `src/server.ts` | Loopback Node HTTP API and static SPA server |
 | `src/cli.ts` | `init`, `doctor`, `serve`, and `sync` |
 | `src/index.ts` | Package exports |
@@ -109,7 +109,7 @@ flowchart TD
 | `src/external/process.ts` | Shell-free executable resolution, closed argv/environment, timeouts, output bounds, and process termination |
 | `src/external/git.ts` | Repository initialization, local checkpoint commits, status, and safe push |
 | `src/external/qmd.ts` | Vault-scoped derived semantic index and search |
-| `src/external/docling.ts` | Work-relative isolated document conversion and executable identity checks |
+| `src/external/docling.ts` | Work-relative isolated document conversion, qpdf PDF batching, and executable identity checks |
 | `pi/extension.ts` | Pi commands/tools, per-vault application cache, and skill lifecycle calls |
 | `skills/extract/SKILL.md` | Extract contract |
 | `skills/ingest/SKILL.md` | Ingest contract |
@@ -153,7 +153,7 @@ remain outside the vault.
 │   ├── vault.json
 │   ├── state.sqlite
 │   ├── qmd/                      # private derived qmd home/cache; ignored
-│   ├── work/                     # private transient/rollback/Docling scratch; ignored
+│   ├── work/                     # private transient/rollback/qpdf/Docling scratch; ignored
 │   └── snapshots/wiki/            # durable product-authored page snapshots
 ├── inbox/                         # unaccepted staged inputs; ignored
 ├── sources/<source-id>/
@@ -317,7 +317,11 @@ revision, and rejects an input that changes while it is being captured. It
 copies accepted originals into a private work claim, uses native extraction
 for textual inputs and isolated Docling for documents, collects bounded
 attachments, and exposes only safe work-relative paths plus coarse atom ranges
-to the model.
+to the model. PDFs over 256 pages remain one source: qpdf creates temporary
+ranges of at most 256 pages, fresh Docling children convert the ranges
+sequentially, range-namespaced attachments and rewritten image references are
+combined in page order through bounded-memory path rewriting, and the existing
+normalization and chunk path runs once.
 Imperfect OCR may provide orientation and context for later boundary choices,
 but garbled or absent formulas and facts are not evidence. The extraction or
 ingest workflow omits them or records an issue until an immutable chunk from a
@@ -640,16 +644,16 @@ attributes. The browser cannot author knowledge or grade a quiz.
 
 External programs run without a shell. Executables, argv, environment, work
 directory, output, and time are bounded. Git disables hooks and terminal
-prompting, qmd receives a host-constructed vault-scoped collection/root, and
-Docling receives only a validated work-relative input/output under an isolated
-home/cache. External output is untrusted and is checked before it affects
-state.
+prompting, qmd receives a host-constructed vault-scoped collection/root, qpdf
+receives only a validated PDF and private work output, and Docling receives only
+a validated work-relative input/output under an isolated home/cache. External
+output is untrusted and is checked before it affects state.
 
 `doctor` is read-only and checks vault roots and no-follow paths, exact schema
 v5/integrity/foreign keys, source packet manifests/digests/chunk coverage,
 workflow bindings and timestamps, OKF pages/snapshots/index/log, prerequisite
 coverage, quiz projections/evidence/settlement consistency, Git state, qmd
-scope, Docling identity, and the optional simulated date. A valid active
+scope, qpdf identity, Docling identity, and the optional simulated date. A valid active
 simulation is a warning; an invalid persisted date fails the check rather than
 becoming authoritative. qmd is derived and can be rebuilt; a qmd failure never
 makes qmd canonical.

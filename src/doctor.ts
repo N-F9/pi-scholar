@@ -14,7 +14,7 @@ import {
 import { delimiter, join, resolve } from "node:path";
 import type { DoctorCheck, DoctorReport, JsonValue } from "./contracts.js";
 import { openDatabase, SCHEMA_VERSION, type ScholarDatabase, validateSchema } from "./database.js";
-import { doclingDependencyIdentity } from "./external/docling.js";
+import { doclingDependencyIdentity, qpdfDependencyIdentity } from "./external/docling.js";
 import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import {
@@ -1421,6 +1421,7 @@ function checkDependencies(paths: VaultPaths): DoctorCheck[] {
     ["git", () => gitDependencyIdentity(paths)],
     ["qmd", () => qmdDependencyIdentity(paths)],
     ["docling", () => doclingDependencyIdentity(paths)],
+    ["qpdf", () => qpdfDependencyIdentity(paths)],
   ];
   for (const [name, probe] of probes) {
     const fingerprint = dependencyFingerprint(name);

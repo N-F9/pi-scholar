@@ -350,7 +350,7 @@ function isAppliedFinalizationFailure(error: unknown): boolean {
 function defaultSourceAdapters(paths: VaultPaths, overrides?: SourceAdapters): SourceAdapters {
   const docling =
     overrides?.docling ??
-    (async ({ originalPath }: { readonly originalPath: string }) => {
+    (async ({ originalPath, mediaType }: { readonly originalPath: string; readonly mediaType?: string }) => {
       const inputRelativePath = relative(paths.workRoot, originalPath).replaceAll("\\", "/");
       const originalMarker = "/original/";
       const marker = inputRelativePath.indexOf(originalMarker);
@@ -359,6 +359,7 @@ function defaultSourceAdapters(paths: VaultPaths, overrides?: SourceAdapters): S
       return convertWithDocling(paths, {
         inputRelativePath,
         outputRelativeDirectory: join(preparedRelativeRoot, "docling-output"),
+        mediaType,
       });
     });
   return { ...overrides, docling };

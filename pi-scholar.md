@@ -32,7 +32,7 @@ Browser submission seals and queues grading; it does not start a Pi process and 
 
 Pi Scholar does not expose Engram-style tutoring, courses, coaching, capstones, transfer exercises, learner-model controls, threshold explorables, or generated learning diagrams. It borrows only the useful learning policies: retrieval practice, distributed practice, interleaving, source-grounded questions, and isolated grading.
 
-Application code is TypeScript. Pi supplies the agent runtime, extensions, native tools, and packaged Markdown skills. `ts-fsrs` supplies FSRS v6. Node owns SQLite, the loopback server, the worker, and the web application. Docling remains a required external Python command; qmd and Git remain validated external commands. There is no Python application side.
+Application code is TypeScript. Pi supplies the agent runtime, extensions, native tools, and packaged Markdown skills. `ts-fsrs` supplies FSRS v6. Node owns SQLite, the loopback server, the worker, and the web application. Docling remains a required external Python command; qpdf supplies bounded PDF page counting and splitting; qmd and Git remain validated external commands. There is no Python application side.
 
 The browser application is part of the product. It uses React, Vite, Tailwind, React Router, and TanStack Query to present quizzes, notes, source staging, history, workflow status, and maintenance settings. The server itself binds loopback. An operator may place Tailscale or another private tunnel, reverse proxy, authentication layer, DNS, or network policy outside Pi Scholar for phone access; those are external operator context, not a Pi Scholar feature, dependency, identity, or trust boundary. Pi Scholar adds no public-user or multi-user account system.
 
@@ -190,7 +190,7 @@ Git adds `.git/`. Pi Scholar adds no other product content root.
 - `vault.json` owns the vault ID and format version.
 - `state.sqlite` owns source extraction/ingestion/removal status, the source catalog's retained exact packet manifest digests for byte-identity verification and doctor checks, the page catalog and stable page IDs, wiki issue reports, page learning and prerequisite records, page review history, daily quiz outcomes and revisions, ephemeral question records, page results, workflow progress/errors, and maintenance mode.
 - `qmd/` is derived external-command state and may be rebuilt; it is never authority.
-- `work/` is private, ignored scratch for prepared admission snapshots, temporary packet publication, Docling output/cache isolation, quarantined removal bytes, and wiki-change rollback snapshots. It is never knowledge or Git content.
+- `work/` is private, ignored scratch for prepared admission snapshots, temporary packet publication, qpdf split PDFs, Docling output/cache isolation, quarantined removal bytes, and wiki-change rollback snapshots. It is never knowledge or Git content.
 
 A derived sibling operating-system lock coordinates writers beside the physical vault. It is held only for short validated SQLite/file mutations, final doctor, Git checkpointing, and the independently scheduled sync push—not while Pi skills or Docling perform long semantic work. After acquiring it, the application revalidates every relevant identity and revision before writing. The lock is not a vault artifact or recovery input.
 
@@ -419,7 +419,7 @@ Mechanics contains no prompts or semantic judgment. `node:sqlite` is hidden behi
 
 | Input | Adapter |
 |---|---|
-| PDF, EPUB, DOCX, PPTX, XLSX, HTML, images, and other supported document formats | Guarded Docling conversion |
+| PDF, EPUB, DOCX, PPTX, XLSX, HTML, images, and other supported document formats | Guarded Docling conversion; PDFs over 256 pages are first split by qpdf into temporary ordered ranges |
 | URL | HTTP(S) fetch that accepts local, private, loopback, link-local, metadata, and Tailscale destinations under local-user/model trust, with timeout, redirect, streaming, and disk-backed transport mechanics, followed by the appropriate document or textual adapter |
 | Markdown, plain text, XML, JSON, and pasted source text | Lossless textual extraction |
 | Direct note | Guarded write to `wiki/`; no fake source packet |
@@ -434,7 +434,7 @@ Repository extraction has no product-level source-size cap. It uses streaming or
 2. Copy it through validated no-follow streaming or disk-backed reads into private work, compute its complete file/tree manifest and digest, and claim that snapshot.
 3. Validate the snapshot's type, containment, authorization, available space, and operational time bounds.
 4. Retain the original bytes or repository tree in a prepared packet.
-5. Convert document formats through Docling; preserve already-textual inputs natively.
+5. Convert document formats through Docling; preserve already-textual inputs natively. A PDF over 256 pages remains one logical source: qpdf creates private ranges of at most 256 pages, fresh Docling children convert them sequentially, and range-namespaced attachments plus streaming path rewriting combine the Markdown in page order with blank-line separators; only then does the existing single normalization/atom/chunk path run.
 Imperfect OCR may supply orientation and context, but garbled or absent formulas and facts are not evidence: omit them or record an issue until an immutable chunk from a better source supports them.
 6. Reject empty, truncated, timed-out, malformed, or unsupported conversion without removing the pending input.
 7. Atomize the complete extracted representation into ordered host-owned evidence atoms.
@@ -752,7 +752,7 @@ Recovery stays operation-specific and idempotent: source publication reuses its 
 2. Paths reject absolute input, traversal, normalization aliases, control characters, wrong types, and symlinks; symlinks are unsupported at the shared I/O boundary.
 3. Native operations revalidate physical containment and file identity at use time.
 4. Source, note, learner, and model text never appears in cron command arguments, shell command strings, or logs.
-5. Docling, qmd, Git, and Git-LFS commands use validated argv, closed environments, pinned executable identity, `.pi-scholar/work/` private scratch, finite timeouts, process-tree termination, and bounded diagnostics.
+5. qpdf, Docling, qmd, Git, and Git-LFS commands use validated argv, closed environments, pinned executable identity, `.pi-scholar/work/` private scratch, finite timeouts, process-tree termination, and bounded diagnostics.
 6. Every direct Pi cron invocation supplies `--no-extensions -e <package>/pi/extension.ts --no-skills --skill <one SKILL.md> --no-context-files --no-session -p <static prompt>`; no package component starts or supervises another Pi process.
 7. Secrets never enter the vault, HTTP output, cron arguments, quiz sheets, test artifacts, or Git history.
 8. Imported source text is evidence, not executable instruction.
@@ -774,7 +774,7 @@ Recovery stays operation-specific and idempotent: source publication reuses its 
 
 - **No vault:** show the exact `pi-scholar init` command; never create one silently.
 - **Doctor failure:** report exact failing artifacts and block only dependent mutation; doctor never repairs them.
-- **Docling unavailable:** document conversion fails visibly; textual, code, note, and exact-read paths remain distinct.
+- **qpdf or Docling unavailable:** dependent PDF/document conversion fails visibly; textual, code, note, and exact-read paths remain distinct. A failed split or page-range conversion identifies the operation and range where applicable, removes its intermediates, and publishes no packet.
 - **Unsupported or failed extraction:** retain that pending entry and its diagnostics, continue other independent stable entries in the current extract session, and publish no packet for the failed entry.
 - **Partial chunk plan:** reject unless every atom is covered exactly once and in order.
 - **qmd unavailable or malformed:** semantic search fails visibly; native exact and lexical navigation remains available.
@@ -862,7 +862,7 @@ pi-scholar/
 2. `init` creates exactly `.pi-scholar/`, `inbox/`, `sources/`, `wiki/`, and `quizzes/` plus Git infrastructure.
 3. No standalone readiness command or judgment, path-identity repair command, Python application, Next.js server, donor runtime, donor importer, or compatibility mode ships.
 4. Documents, URLs, pasted source text, notes, code files, directories, and Git repositories enter through the correct extraction or guarded-note boundary; bulk inbox drops require no command, use private stable snapshots, and process idempotently.
-5. Docling handles supported documents; native adapters preserve text, code, paths, and repository revision without fake conversion.
+5. qpdf bounds PDFs over 256 pages into sequential temporary Docling conversions while preserving one original source, combined extraction, attachment namespace, manifest, and ordered chunk stream; Docling handles other supported documents, and native adapters preserve text, code, paths, and repository revision without fake conversion.
 6. Source packets retain original bytes, complete extraction, attachments, provenance, and ordered chunks.
 7. Chunks reconstruct the complete extraction; long sources are never truncated to fit one model call.
 8. User-confirmed source removal previews and updates all current dependents atomically while stating that ordinary deletion does not purge Git history.

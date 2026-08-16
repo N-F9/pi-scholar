@@ -33,10 +33,10 @@ Use a newly initialized disposable vault; this mode is not valid against a real 
 
 ## End-to-end product validation
 
-Use real Git, qmd, Docling, and a configured Pi provider with a source whose correct facts are known.
+Use real Git, qmd, qpdf, Docling, and a configured Pi provider with a source whose correct facts are known.
 
 1. Initialize the disposable vault and run `pi-scholar doctor`. Require the exact schema v5, the strict OKF v0.2 wiki, regular-file path safety, and no compatibility schema or migration path.
-2. Stage a representative source with `/scholar-add` or by copying an ordinary file or directory directly into `inbox/`. Confirm `/scholar-add` materializes one internal directory containing `.pi-scholar-source.json` plus its payload and that moving or splitting that directory while queued or extracting is unsupported. Exercise streamed or disk-backed capture with a source large enough to use those paths; verify there is no fixed product source-size cutoff, only free-space, operation-time, model/context, and transport bounds. Preserve the original bytes.
+2. Stage a representative source with `/scholar-add` or by copying an ordinary file or directory directly into `inbox/`. Confirm `/scholar-add` materializes one internal directory containing `.pi-scholar-source.json` plus its payload and that moving or splitting that directory while queued or extracting is unsupported. Exercise streamed or disk-backed capture with a source large enough to use those paths; verify there is no fixed product source-size cutoff, only free-space, operation-time, model/context, and transport bounds. For a PDF over 256 pages, require qpdf page counting and temporary ordered ranges of at most 256 pages, sequential fresh Docling children, range-namespaced attachments with resolving Markdown references, one combined extraction normalized and chunked once, exact original-byte/digest retention, and cleanup of every split/output intermediate. Preserve the original bytes.
 3. Stage five sources, run `extract`, and confirm the first invocation snapshots the first three stable entries in canonical order, processes the entire batch sequentially, and leaves two queued. Attempt a premature final response after the first publication and confirm the extension continues the agent until all three claims have publication attempts. Run `extract` again and confirm it processes the remaining two. Check manifest identity/provenance/digests, the retained exact packet manifest digest in the source catalog for byte-identity verification and doctor checks, lossless complete chunk coverage, exact packet/chunk paths, and fence-aware blank-line normalization in derived Markdown while originals remain unchanged.
    Confirm published `sources/` packets are treated as immutable and never hand-edited. With imperfect OCR, confirm readable orientation may guide extraction but garbled or missing formulas and facts are omitted or recorded as issues until a better immutable source chunk supports them.
 4. Exercise an HTTP(S) source on a destination allowed by local-user/model trust, including a local, private, or operator-routed Tailscale destination. Confirm timeout, redirect, and streaming protections still apply; the tunnel or network route is external operator context, not a Pi Scholar integration.
@@ -97,7 +97,7 @@ ingest, lint, grading, status, doctor, and sync remain available. Re-enable it
 with `/scholar-maintenance on` and confirm no readiness label or implicit mode
 change occurs.
 
-Verify `.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and Docling scratch, never Git content or authority. Verify `sources/` contains immutable published packets and rejects hand-edit assumptions. Successful operations clean scratch; failures use rollback data; crash remnants cannot override SQLite or durable packets, wiki, or quizzes. Recovery must go through ScholarApplication, `doctor`, and a safe retry rather than reading work files as state.
+Verify `.pi-scholar/work/` is ignored private transient storage for request files, rollback data, and qpdf/Docling scratch, never Git content or authority. Verify `sources/` contains immutable published packets and rejects hand-edit assumptions. Successful operations clean scratch; failures use rollback data; crash remnants cannot override SQLite or durable packets, wiki, or quizzes. Recovery must go through ScholarApplication, `doctor`, and a safe retry rather than reading work files as state.
 
 ## Failure and safety validation
 
@@ -109,6 +109,8 @@ Confirm each boundary fails safely:
 - Overlapping writers report a conflict without partial writes.
 - After interrupting or crashing a Pi session, start the next serialized Pi session and confirm it marks pre-existing running workflows failed as interrupted before accepting tool work, leaves queued and terminal rows unchanged, stops the Workflows UI from polling abandoned rows, and permits a safe operation-specific retry.
 - Missing qmd disables semantic search without disabling exact or lexical search.
+- Missing qpdf fails PDF conversion visibly without publishing a packet; native textual and code extraction remain available.
+- A qpdf or Docling timeout, signal, malformed range, or failed PDF part identifies the failing operation and page range where applicable, cleans every split/output intermediate, and publishes nothing.
 - Symlinks at the shared I/O boundary are unsupported and cannot enter canonical state.
 - Stale or unauthorized direct page evidence rejects quiz generation or grading without changing page learning.
 - Invalid quiz and grading payloads, including incomplete page coverage or conflicting page ratings, leave no partial state.
@@ -117,4 +119,4 @@ Confirm each boundary fails safely:
 - Provider credentials never appear in vault files, Git commits, command arguments, or logs.
 - Tailscale, private tunnels, reverse proxies, authentication, DNS, and network policy remain operator-owned external context rather than product integration, identity, trust boundary, dependency, or feature.
 
-A release is valid when grounding, streamed source handling, URL trust, strict OKF v0.2, daily candidate/evidence/publication behavior, independent scheduling, work-directory recovery, persistence, and safety pass with the disposable vault.
+A release is valid when grounding, streamed and bounded PDF source handling, URL trust, strict OKF v0.2, daily candidate/evidence/publication behavior, independent scheduling, work-directory recovery, persistence, and safety pass with the disposable vault.
