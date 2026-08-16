@@ -565,7 +565,7 @@ describe("Pi package lifecycle", () => {
       false,
     );
   });
-  it("disables maintenance mode only through scholar-maintenance off", async () => {
+  it("controls maintenance mode through scholar-maintenance on and off", async () => {
     const commands = new Map<string, CommandHandler>();
     const fixture = fakeLifecycleApp({}, async () => ({}), undefined, commands);
     const notifications: string[] = [];
@@ -578,13 +578,15 @@ describe("Pi package lifecycle", () => {
     };
 
     await handler("", context);
-    await handler("on", context);
+    await handler("invalid", context);
     assert.deepEqual(fixture.app.updates, []);
+    await handler(" on ", context);
     await handler(" off ", context);
-    assert.deepEqual(fixture.app.updates, [{ maintenanceEnabled: false }]);
+    assert.deepEqual(fixture.app.updates, [{ maintenanceEnabled: true }, { maintenanceEnabled: false }]);
     assert.deepEqual(notifications, [
-      "Usage: /scholar-maintenance off",
-      "Usage: /scholar-maintenance off",
+      "Usage: /scholar-maintenance on|off",
+      "Usage: /scholar-maintenance on|off",
+      "Maintenance mode enabled; daily quiz publishing is paused",
       "Maintenance mode disabled; daily quiz publishing is enabled",
     ]);
   });

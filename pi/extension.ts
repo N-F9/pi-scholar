@@ -1059,15 +1059,22 @@ async function handleStatusCommand(_args: string, ctx: ExtensionCommandContext):
   ctx.ui.notify(formatApplicationStatus(await app.status()), "info");
 }
 async function handleMaintenanceCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-  if (args.trim() !== "off") {
-    ctx.ui.notify("Usage: /scholar-maintenance off", "error");
+  const mode = args.trim();
+  const maintenanceEnabled = mode === "on" ? true : mode === "off" ? false : undefined;
+  if (maintenanceEnabled === undefined) {
+    ctx.ui.notify("Usage: /scholar-maintenance on|off", "error");
     return;
   }
   cancelled(ctx.signal);
   const app = await applicationFor(ctx);
   cancelled(ctx.signal);
-  await app.updateSettings({ maintenanceEnabled: false });
-  ctx.ui.notify("Maintenance mode disabled; daily quiz publishing is enabled", "info");
+  await app.updateSettings({ maintenanceEnabled });
+  ctx.ui.notify(
+    maintenanceEnabled
+      ? "Maintenance mode enabled; daily quiz publishing is paused"
+      : "Maintenance mode disabled; daily quiz publishing is enabled",
+    "info",
+  );
 }
 
 async function handleLintCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -1107,7 +1114,7 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("scholar-maintenance", {
-    description: "Disable maintenance mode and enable daily quiz publishing",
+    description: "Enable or disable maintenance mode and daily quiz publishing",
     handler: handleMaintenanceCommand,
   });
   pi.registerTool({

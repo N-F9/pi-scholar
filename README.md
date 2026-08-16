@@ -161,7 +161,7 @@ Run `/skill:daily`, complete the quiz in **Today**, and then run `/skill:quiz-gr
 
 ### Sunday: maintain the wiki
 
-On Sunday, run `/skill:ingest` to incorporate the sources extracted during the week, followed by `/skill:lint` to inspect the final wiki and repair accepted issues. Check **Health** when the maintenance work is complete.
+On Sunday, turn maintenance mode on with `/scholar-maintenance on`, run `/skill:ingest` to incorporate the sources extracted during the week, and then run `/skill:lint` to inspect the final wiki and repair accepted issues. Check **Health** when the maintenance work is complete, then use `/scholar-maintenance off` to resume daily quiz publishing.
 
 If extraction runs every day, the three-source limit can prepare as many as 21 sources in one week. Ingestion itself does not have the same hard cap. Twenty-one sources is still a manageable weekly batch when Oh My Pi fans independent work out to subagents, while the daily limit keeps the individual extraction jobs small.
 
@@ -189,7 +189,7 @@ Imported material is always treated as untrusted data and never as executable in
 | `/scholar-status` | Show vault, workflow, learning, health, and Git facts |
 | `/scholar-issue` | Report an incorrect, unclear, missing, or badly bounded wiki item |
 | `/scholar-lint` | Inspect the wiki and propose guarded repairs |
-| `/scholar-maintenance off` | Disable maintenance mode and permit daily quiz publishing |
+| `/scholar-maintenance on\|off` | Pause or permit daily quiz publishing |
 | `/skill:extract` | Convert and publish stable source chunks |
 | `/skill:ingest` | Create guarded, source-grounded wiki knowledge |
 | `/skill:lint` | Inspect the final wiki and repair accepted issues |
