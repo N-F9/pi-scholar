@@ -129,10 +129,14 @@ async function splitPdf(
   workspace: string,
   runner: DoclingAsyncRunner,
 ): Promise<readonly PdfPart[]> {
-  const result = await runner("qpdf", [`--split-pages=${PDF_BATCH_PAGES}`, inputPath, join(workspace, "part.pdf")], {
-    cwd: paths.workRoot,
-    timeoutMs: QPDF_TIMEOUT_MS,
-  });
+  const result = await runner(
+    "qpdf",
+    [`--split-pages=${PDF_BATCH_PAGES}`, "--warning-exit-0", inputPath, join(workspace, "part.pdf")],
+    {
+      cwd: paths.workRoot,
+      timeoutMs: QPDF_TIMEOUT_MS,
+    },
+  );
   assertSuccessful("qpdf PDF split", result, QPDF_TIMEOUT_MS);
   const entries = await fs.readdir(workspace, { withFileTypes: true });
   const parts = await Promise.all(

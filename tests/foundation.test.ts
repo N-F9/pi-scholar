@@ -385,6 +385,7 @@ describe("vault foundation", () => {
       });
       if (executable === "qpdf" && args[0] === "--show-npages") return success("513\n");
       if (executable === "qpdf" && args[0] === `--split-pages=${PDF_BATCH_PAGES}`) {
+        assert.ok(args.includes("--warning-exit-0"));
         const directory = dirname(args.at(-1)!);
         for (const name of ["part-001-256.pdf", "part-257-512.pdf", "part-513.pdf"])
           writeFileSync(join(directory, name), name);
