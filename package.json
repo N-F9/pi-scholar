@@ -19,10 +19,10 @@
   "files": [
     "dist",
     "apps/web/dist",
+    "assets",
     "skills",
     "pi",
-    "README.md",
-    "THIRD_PARTY_NOTICES"
+    "README.md"
   ],
   "pi": {
     "extensions": [
