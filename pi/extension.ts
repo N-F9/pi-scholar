@@ -153,6 +153,8 @@ const sourceInput = Type.Object({
   originalName: Type.Optional(Type.String()),
   mediaType: Type.Optional(Type.String()),
 });
+const WIKI_MARKDOWN_AUTHORING =
+  "For model-authored Markdown, use $...$ for inline LaTeX and put opening and closing $$ delimiters on separate lines around display LaTeX; never wrap formulas in backticks or use \\(...\\) or \\[...\\]. Put every code, pseudocode, or command example in a fenced code block with an accurate language tag; inline code is only for a single literal identifier, path, command name, or token. Include a fenced Mermaid diagram only when it materially clarifies a relationship, process, state transition, architecture, data flow, or algorithm; keep it focused, cite source-grounded claims nearby, and never add diagrams by quota, for decoration, or to repeat prose, tables, equations, or another diagram.";
 const noteInput = Type.Object({
   pageId: Type.Optional(Type.String({ minLength: 1 })),
   path: Type.Optional(Type.String()),
@@ -166,14 +168,12 @@ const noteInput = Type.Object({
   ),
   body: Type.Optional(
     Type.String({
-      description:
-        "Complete Markdown body. Preserve user-authored prose; model-authored source notes must be self-contained textbook-style exposition with nearby source-chunk citations. An eligible page must have a renderable body.",
+      description: `Complete Markdown body. Preserve user-authored prose; model-authored source notes must be self-contained textbook-style exposition with nearby source-chunk citations. An eligible page must have a renderable body. ${WIKI_MARKDOWN_AUTHORING}`,
     }),
   ),
   content: Type.Optional(
     Type.String({
-      description:
-        "Alias for body. Preserve user-authored prose; model-authored source notes must teach the topic in depth rather than summarize it. An eligible page must have a renderable body.",
+      description: `Alias for body. Preserve user-authored prose; model-authored source notes must teach the topic in depth rather than summarize it. An eligible page must have a renderable body. ${WIKI_MARKDOWN_AUTHORING}`,
     }),
   ),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
@@ -227,8 +227,7 @@ const wikiChangeIssuePageInput = Type.Object({
   ),
   body: Type.Optional(
     Type.String({
-      description:
-        "Replacement Markdown body. When resolve-issue leaves or makes the page eligible, the resulting page must have a renderable body.",
+      description: `Replacement Markdown body. When resolve-issue leaves or makes the page eligible, the resulting page must have a renderable body. ${WIKI_MARKDOWN_AUTHORING}`,
     }),
   ),
   quizWorthiness: Type.Optional(Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")])),
@@ -247,8 +246,7 @@ const wikiChangeInput = Type.Union([
       }),
     ),
     body: Type.String({
-      description:
-        "Complete Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks. An eligible page must have a renderable body.",
+      description: `Complete Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks. An eligible page must have a renderable body. ${WIKI_MARKDOWN_AUTHORING}`,
     }),
     quizWorthiness: Type.Optional(
       Type.Union([Type.Literal("eligible"), Type.Literal("skip"), Type.Literal("unknown")]),
@@ -268,8 +266,7 @@ const wikiChangeInput = Type.Union([
     ),
     body: Type.Optional(
       Type.String({
-        description:
-          "Complete replacement Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks. An eligible resulting page must have a renderable body.",
+        description: `Complete replacement Markdown body; model-authored source pages must teach at textbook depth and cite supporting source chunks. An eligible resulting page must have a renderable body. ${WIKI_MARKDOWN_AUTHORING}`,
       }),
     ),
     quizWorthiness: Type.Optional(

@@ -68,6 +68,23 @@ mutation is parent-owned and serial even when analysis was parallel.
 - Imperfect OCR may orient the analysis, but omit garbled or absent formulas and
   facts or preserve an actionable issue until a supplied immutable chunk from a
   better source supports them.
+- Format every model-authored page body as portable Markdown:
+  - Write all mathematical notation as LaTeX. Use `$...$` for inline math and
+    put the opening and closing `$$` delimiters on separate lines around display
+    math. Never wrap formulas in inline-code backticks or fenced code, and never
+    use `\(...\)` or `\[...\]`.
+  - Put every code, pseudocode, or command example, including a one-line
+    example, in a fenced code block with an accurate language tag (`text` when
+    no language applies). Inline code is only for a single literal identifier,
+    path, command name, or token, never mathematical notation or an executable
+    snippet.
+  - Include a fenced `mermaid` diagram when it materially clarifies a
+    relationship, process, state transition, architecture, data flow, or
+    algorithm. Introduce it in prose, keep it focused, and cite source-grounded
+    claims nearby.
+  - Mermaid has no quota. Never add diagrams for decoration, merely because a
+    page has none, or to repeat nearby prose, tables, equations, or another
+    diagram.
 - Base each proposal on supplied evidence without widening source scope. Submit
   only fields defined by the guarded operation, including exact IDs, paths,
   expected digests or revisions, and citations in source-grounded page bodies.

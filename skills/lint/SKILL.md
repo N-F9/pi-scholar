@@ -76,6 +76,24 @@ a renderable body; eligible updates/resolutions may omit `description` only to
 preserve an existing valid summary. Compose split/merge plans from separate
 guarded operations; there is no batch API.
 
+During every content audit and repair, treat violations of this portable
+Markdown contract in model-authored prose as defects:
+
+- Write all mathematical notation as LaTeX. Use `$...$` for inline math and put
+  the opening and closing `$$` delimiters on separate lines around display math.
+  Never wrap formulas in inline-code backticks or fenced code, and never use
+  `\(...\)` or `\[...\]`.
+- Put every code, pseudocode, or command example, including a one-line example,
+  in a fenced code block with an accurate language tag (`text` when no language
+  applies). Inline code is only for a single literal identifier, path, command
+  name, or token, never mathematical notation or an executable snippet.
+- Include a fenced `mermaid` diagram when it materially clarifies a relationship,
+  process, state transition, architecture, data flow, or algorithm. Introduce it
+  in prose, keep it focused, and cite source-grounded claims nearby.
+- Mermaid has no quota. A page without one is not defective. Never add diagrams
+  for decoration or to repeat nearby prose, tables, equations, or another
+  diagram.
+
 Return concise status for each proposal and applied/rejected counts, plus any
 unresolved evidence gap. Do not edit Markdown or state directly, run Git,
 access SQLite, call unapproved external services, or put secrets or learner

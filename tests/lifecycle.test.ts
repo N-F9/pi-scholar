@@ -85,11 +85,13 @@ let lifecycleTestNumber = 0;
 function registerLifecycleTools(
   commands?: Map<string, CommandHandler>,
   hooks?: LifecycleHooks,
+  parameters?: Map<string, unknown>,
 ): Map<string, ToolExecutor> {
   const tools = new Map<string, ToolExecutor>();
   const pi = {
-    registerTool: (tool: { readonly name: string; readonly execute: ToolExecutor }) => {
+    registerTool: (tool: { readonly name: string; readonly execute: ToolExecutor; readonly parameters?: unknown }) => {
       tools.set(tool.name, tool.execute);
+      parameters?.set(tool.name, tool.parameters);
     },
     registerCommand: (name: string, command: { readonly handler?: CommandHandler }) => {
       if (command.handler) commands?.set(name, command.handler);
@@ -217,6 +219,39 @@ describe("Pi package lifecycle", () => {
         .sort(),
       ["daily", "extract", "ingest", "lint", "quiz-grader"],
     );
+  });
+
+  it("ships the portable wiki Markdown authoring contract", () => {
+    const skillRequirements = [
+      "`$...$`",
+      "opening and closing `$$` delimiters",
+      "`\\(...\\)`",
+      "`\\[...\\]`",
+      "fenced code block",
+      "fenced `mermaid` diagram",
+      "Mermaid has no quota",
+    ];
+    for (const skill of ["ingest", "lint"]) {
+      const prompt = readFileSync(join(repositoryRoot, "skills", skill, "SKILL.md"), "utf8");
+      for (const requirement of skillRequirements)
+        assert.equal(prompt.includes(requirement), true, `${skill} is missing ${requirement}`);
+    }
+
+    const parameters = new Map<string, unknown>();
+    registerLifecycleTools(undefined, undefined, parameters);
+    const schemaRequirements = [
+      "$...$",
+      "$$ delimiters",
+      "wrap formulas in backticks",
+      "fenced code block",
+      "fenced Mermaid diagram",
+      "diagrams by quota",
+    ];
+    for (const tool of ["scholar_note", "scholar_apply_ingest", "scholar_apply_lint"]) {
+      const schema = JSON.stringify(parameters.get(tool));
+      for (const requirement of schemaRequirements)
+        assert.equal(schema.includes(requirement), true, `${tool} is missing ${requirement}`);
+    }
   });
 
   it("executes the built CLI entrypoint", () => {
