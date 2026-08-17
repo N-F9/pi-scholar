@@ -1120,7 +1120,7 @@ describe("server browser boundary", () => {
       assert.equal(internal.questions[0]!.pages[0]!.criterion, "secret rubric");
     });
   });
-  it("gates simulated-date settings behind developer tools and reports capability", async () => {
+  it("keeps maintenance read-only and gates simulated-date settings behind developer tools", async () => {
     const settings = {
       maintenanceEnabled: true,
       simulatedDate: "2026-08-15",
@@ -1163,9 +1163,16 @@ describe("server browser boundary", () => {
       assert.equal(denied.status, 403);
       assert.equal(updates.length, 0);
 
-      const ordinary = await put(base, { maintenanceEnabled: false });
+      const maintenance = await put(base, { maintenanceEnabled: false });
+      assert.equal(maintenance.status, 400);
+      assert.equal(updates.length, 0);
+
+      const ordinary = await put(base, { timezone: "local" });
       assert.equal(ordinary.status, 200);
-      assert.deepEqual(updates[0]?.context, { origin: "browser" });
+      assert.deepEqual(updates[0], {
+        input: { timezone: "local" },
+        context: { origin: "browser" },
+      });
       const ordinaryPayload = (await ordinary.json()) as { data: { developerToolsEnabled: boolean } };
       assert.equal(ordinaryPayload.data.developerToolsEnabled, false);
     });

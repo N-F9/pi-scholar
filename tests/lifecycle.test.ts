@@ -34,11 +34,10 @@ type LifecycleHooks = {
 type FakeLifecycleApp = {
   readonly paths: { readonly vaultRoot: string };
   readonly finishes: { readonly requestId: string; readonly status: string; readonly options: unknown }[];
-  readonly updates: readonly unknown[];
   readonly order: readonly string[];
+  readonly updates: readonly unknown[];
   recoverAbandonedWorkflows: () => Promise<unknown>;
   status: () => Promise<unknown>;
-  updateSettings: (input: unknown) => Promise<unknown>;
   beginWorkflow: (kind: string) => Promise<{ readonly workflow: { readonly requestId: string } }>;
   getExtractContext: (
     input?: { readonly pendingSourceIds?: readonly string[] },
@@ -126,17 +125,13 @@ function fakeLifecycleApp(
   const app: FakeLifecycleApp = {
     paths: { vaultRoot: root },
     finishes,
-    updates,
     order,
+    updates,
     recoverAbandonedWorkflows: async () => {
       order.push("recover");
       return {};
     },
     status: async () => ({}),
-    updateSettings: async (input) => {
-      updates.push(input);
-      return {};
-    },
     beginWorkflow: async (kind) => {
       order.push(`begin:${kind}`);
       return { workflow: { requestId: `${kind}-${root}` } };
@@ -324,13 +319,7 @@ describe("Pi package lifecycle", () => {
     );
     assert.equal(toolModes.get("scholar_search"), undefined);
     assert.equal(toolModes.get("scholar_status"), undefined);
-    assert.deepEqual([...commands].sort(), [
-      "scholar-add",
-      "scholar-issue",
-      "scholar-lint",
-      "scholar-maintenance",
-      "scholar-status",
-    ]);
+    assert.deepEqual([...commands].sort(), ["scholar-add", "scholar-issue", "scholar-lint", "scholar-status"]);
     assert.deepEqual(events, ["agent_end", "session_shutdown"]);
   });
 
@@ -600,31 +589,6 @@ describe("Pi package lifecycle", () => {
       false,
     );
   });
-  it("controls maintenance mode through scholar-maintenance on and off", async () => {
-    const commands = new Map<string, CommandHandler>();
-    const fixture = fakeLifecycleApp({}, async () => ({}), undefined, commands);
-    const notifications: string[] = [];
-    const handler = commands.get("scholar-maintenance");
-    if (!handler) throw new Error("scholar-maintenance command was not registered");
-    const context = {
-      cwd: fixture.root,
-      signal: undefined,
-      ui: { notify: (message: string) => notifications.push(message) },
-    };
-
-    await handler("", context);
-    await handler("invalid", context);
-    assert.deepEqual(fixture.app.updates, []);
-    await handler(" on ", context);
-    await handler(" off ", context);
-    assert.deepEqual(fixture.app.updates, [{ maintenanceEnabled: true }, { maintenanceEnabled: false }]);
-    assert.deepEqual(notifications, [
-      "Usage: /scholar-maintenance on|off",
-      "Usage: /scholar-maintenance on|off",
-      "Maintenance mode enabled; daily quiz publishing is paused",
-      "Maintenance mode disabled; daily quiz publishing is enabled",
-    ]);
-  });
   it("keeps the daily publish action available after context and evidence reads", async () => {
     const calls: string[] = [];
     const fixture = fakeLifecycleApp({ maintenanceEnabled: false }, async () => ({}));
@@ -705,6 +669,17 @@ describe("Pi package lifecycle", () => {
     );
   });
 
+  it("parses maintenance mode and its optional vault", () => {
+    assert.deepEqual(parseCliArgs(["maintenance"]), { command: "maintenance", positional: [] });
+    assert.deepEqual(parseCliArgs(["maintenance", "off", "--vault", "/tmp/vault"]), {
+      command: "maintenance",
+      positional: ["off"],
+      vaultPath: "/tmp/vault",
+    });
+    assert.throws(() => parseCliArgs(["maintenance", "invalid"]), /mode must be on or off/u);
+    assert.throws(() => parseCliArgs(["maintenance", "on", "off"]), /at most one mode/u);
+  });
+
   it("accepts developer tools only for serve", () => {
     assert.deepEqual(parseCliArgs(["serve", "--dev-tools"]), {
       command: "serve",
@@ -712,7 +687,7 @@ describe("Pi package lifecycle", () => {
       developerTools: true,
     });
     assert.deepEqual(parseCliArgs(["serve"]), { command: "serve", positional: [] });
-    for (const command of ["init", "doctor", "sync"] as const)
+    for (const command of ["init", "doctor", "maintenance", "sync"] as const)
       assert.throws(() => parseCliArgs([command, "--dev-tools"]), /--dev-tools is only valid for serve/u);
   });
 
@@ -721,7 +696,7 @@ describe("Pi package lifecycle", () => {
     const cli = readFileSync(join(repositoryRoot, "src", "cli.ts"), "utf8");
     const extension = readFileSync(join(repositoryRoot, "pi", "extension.ts"), "utf8");
     assert.throws(() => parseCliArgs(["run", "scheduled"]), /Usage:/);
-    assert.match(cli, /command: "init" \| "doctor" \| "serve" \| "sync"/u);
+    assert.match(cli, /command: "init" \| "doctor" \| "maintenance" \| "serve" \| "sync"/u);
     assert.doesNotMatch(cli, /runScheduled|planScheduledRun|tryAcquireRunGuard|child_process|spawn\(/u);
     assert.doesNotMatch(extension, /child_process|spawn\(|execFile\(|node:child_process/u);
     assert.doesNotMatch(extension, /\.\.\/src\/(application|vault)\.js/u);

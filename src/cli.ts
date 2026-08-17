@@ -9,7 +9,7 @@ import type { ScholarServer } from "./server.js";
 import { initVault, NoVaultError, resolveVault } from "./vault.js";
 
 export interface CliArgs {
-  readonly command: "init" | "doctor" | "serve" | "sync";
+  readonly command: "init" | "doctor" | "maintenance" | "serve" | "sync";
   readonly positional: readonly string[];
   readonly vaultPath?: string;
   readonly port?: number;
@@ -21,6 +21,7 @@ function usage(): string {
     "Usage:",
     "  pi-scholar init [path]",
     "  pi-scholar doctor [path]",
+    "  pi-scholar maintenance [on|off] [--vault path]",
     "  pi-scholar serve [--vault path] [--port port] [--dev-tools]",
     "  pi-scholar sync [--vault path]",
   ].join("\n");
@@ -28,7 +29,14 @@ function usage(): string {
 
 export function parseCliArgs(argv: readonly string[]): CliArgs {
   const command = argv[0];
-  if (command !== "init" && command !== "doctor" && command !== "serve" && command !== "sync") throw new Error(usage());
+  if (
+    command !== "init" &&
+    command !== "doctor" &&
+    command !== "maintenance" &&
+    command !== "serve" &&
+    command !== "sync"
+  )
+    throw new Error(usage());
   const positional: string[] = [];
   let vaultPath: string | undefined;
   let port: number | undefined;
@@ -56,10 +64,13 @@ export function parseCliArgs(argv: readonly string[]): CliArgs {
   }
   if (developerTools && command !== "serve") throw new Error("--dev-tools is only valid for serve");
   if (port !== undefined && command !== "serve") throw new Error("--port is only valid for serve");
-  if (vaultPath !== undefined && command !== "serve" && command !== "sync")
+  if (vaultPath !== undefined && command !== "maintenance" && command !== "serve" && command !== "sync")
     throw new Error(`--vault is not used with ${command}; pass [path]`);
   if ((command === "serve" || command === "sync") && positional.length > 0)
     throw new Error(`${command} accepts no positional arguments`);
+  if (command === "maintenance" && positional.length > 1) throw new Error("maintenance accepts at most one mode");
+  if (command === "maintenance" && positional[0] !== undefined && positional[0] !== "on" && positional[0] !== "off")
+    throw new Error("maintenance mode must be on or off");
   if ((command === "init" || command === "doctor") && positional.length > 1)
     throw new Error(`${command} accepts at most one path`);
   if ((command === "init" || command === "doctor") && vaultPath !== undefined)
@@ -164,6 +175,25 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
   if (parsed.command === "doctor") return reportDoctor(parsed.positional[0]);
   const paths = resolveVault(parsed.vaultPath);
+  if (parsed.command === "maintenance") {
+    const application = createApplication(paths);
+    try {
+      const mode = parsed.positional[0];
+      const result =
+        mode === undefined
+          ? await application.getSettings()
+          : await application.updateSettings({ maintenanceEnabled: mode === "on" }, { origin: "cli" });
+      const maintenanceEnabled = result.settings.maintenanceEnabled;
+      print({
+        ok: true,
+        maintenanceEnabled,
+        quizPublishing: maintenanceEnabled ? "paused" : "enabled",
+      });
+      return 0;
+    } finally {
+      await application.close();
+    }
+  }
   if (parsed.command === "serve") {
     // Keep non-server CLI commands from loading the HTTP and browser runtime.
     const { startServer } = await import("./server.js");

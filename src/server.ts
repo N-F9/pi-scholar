@@ -89,10 +89,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function keysExactly(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
 }
-function booleanField(value: Record<string, unknown>, key: string): boolean {
-  if (typeof value[key] !== "boolean") throw new ValidationError(`${key} must be boolean`);
-  return value[key];
-}
 function stringField(value: Record<string, unknown>, key: string, required = false): string | undefined {
   const result = value[key];
   if (result === undefined && !required) return undefined;
@@ -880,13 +876,10 @@ async function apiRoute(
         code: "DEVELOPER_TOOLS_REQUIRED",
         status: 403,
       });
-    if (!keysExactly(value, ["maintenanceEnabled", "timezone", "port", "host", "simulatedDate"]))
+    if (!keysExactly(value, ["timezone", "port", "host", "simulatedDate"]))
       throw new ValidationError("settings request has unsupported fields");
     const simulatedDate = simulatedDateField(value, "simulatedDate");
     const input: SettingsUpdateRequest = {
-      ...(value.maintenanceEnabled === undefined
-        ? {}
-        : { maintenanceEnabled: booleanField(value, "maintenanceEnabled") }),
       ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
       ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
       ...(value.host === undefined ? {} : { host: stringField(value, "host") }),

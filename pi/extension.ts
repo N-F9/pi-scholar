@@ -85,7 +85,6 @@ type VaultPaths = { readonly vaultRoot: string };
 type ScholarApplication = {
   readonly paths: VaultPaths;
   readonly status: () => Promise<ApplicationStatus>;
-  readonly updateSettings: (input: { readonly maintenanceEnabled?: boolean }) => Promise<unknown>;
   readonly stageSource: (request: SourceRequest) => Promise<unknown>;
   readonly createNote: (input: WikiNoteInput) => Promise<unknown>;
   readonly updateNote: (pageId: string, input: WikiNoteUpdateInput) => Promise<unknown>;
@@ -1055,24 +1054,6 @@ async function handleStatusCommand(_args: string, ctx: ExtensionCommandContext):
   cancelled(ctx.signal);
   ctx.ui.notify(formatApplicationStatus(await app.status()), "info");
 }
-async function handleMaintenanceCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-  const mode = args.trim();
-  const maintenanceEnabled = mode === "on" ? true : mode === "off" ? false : undefined;
-  if (maintenanceEnabled === undefined) {
-    ctx.ui.notify("Usage: /scholar-maintenance on|off", "error");
-    return;
-  }
-  cancelled(ctx.signal);
-  const app = await applicationFor(ctx);
-  cancelled(ctx.signal);
-  await app.updateSettings({ maintenanceEnabled });
-  ctx.ui.notify(
-    maintenanceEnabled
-      ? "Maintenance mode enabled; daily quiz publishing is paused"
-      : "Maintenance mode disabled; daily quiz publishing is enabled",
-    "info",
-  );
-}
 
 async function handleLintCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
   const description =
@@ -1108,11 +1089,6 @@ export default function piScholarExtension(pi: ExtensionAPI): void {
   pi.registerCommand("scholar-lint", {
     description: "Inspect the final wiki and propose guarded repairs",
     handler: async (args, ctx) => handleLintCommand(pi, args, ctx),
-  });
-
-  pi.registerCommand("scholar-maintenance", {
-    description: "Enable or disable maintenance mode and daily quiz publishing",
-    handler: handleMaintenanceCommand,
   });
   pi.registerTool({
     name: "scholar_add",

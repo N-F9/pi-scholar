@@ -1,4 +1,5 @@
-import { type ComponentPropsWithoutRef, isValidElement, type ReactNode, useState } from "react";
+import type { Mermaid } from "mermaid";
+import { type ComponentPropsWithoutRef, isValidElement, type ReactNode, useEffect, useId, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
@@ -69,20 +70,76 @@ function safeHref(href: string | undefined, pagePath: string): string | undefine
   }
 }
 
-type MarkdownCodeProps = ComponentPropsWithoutRef<"code"> & { node?: unknown };
+let mermaidPromise: Promise<Mermaid> | undefined;
 
-function InertCode({ className, children, node: _node, ...props }: MarkdownCodeProps) {
-  const mermaid = className?.split(" ").includes("language-mermaid");
-  return (
-    <code
-      className={mermaid ? `${className} mermaid-source` : className}
-      data-diagram={mermaid ? "inert" : undefined}
-      {...props}
-    >
-      {children}
-    </code>
-  );
+function loadMermaid(): Promise<Mermaid> {
+  if (!mermaidPromise) {
+    mermaidPromise = import("mermaid").then(({ default: mermaid }) => {
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        htmlLabels: false,
+        suppressErrorRendering: true,
+        secure: [
+          "secure",
+          "securityLevel",
+          "startOnLoad",
+          "maxTextSize",
+          "suppressErrorRendering",
+          "maxEdges",
+          "htmlLabels",
+        ],
+      });
+      return mermaid;
+    });
+  }
+  return mermaidPromise;
 }
+
+function MermaidDiagram({ source }: { source: string }) {
+  const id = `mermaid-${useId().replace(/[^A-Za-z0-9_-]/gu, "")}`;
+  const [result, setResult] = useState<{ source: string; svg?: string; failed?: boolean }>();
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadMermaid()
+      .then((mermaid) => mermaid.render(id, source))
+      .then(({ svg }) => {
+        if (!cancelled) setResult({ source, svg });
+      })
+      .catch(() => {
+        if (!cancelled) setResult({ source, failed: true });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, source]);
+
+  if (result?.source !== source) {
+    return (
+      <div aria-busy="true" className="mermaid-diagram">
+        Rendering diagram…
+      </div>
+    );
+  }
+  if (result.failed) {
+    return (
+      <div className="code-block">
+        <div className="code-toolbar">
+          <span>mermaid</span>
+          <span role="alert">Diagram unavailable</span>
+        </div>
+        <pre>
+          <code className="language-mermaid">{source}</code>
+        </pre>
+      </div>
+    );
+  }
+  // biome-ignore lint/security/noDangerouslySetInnerHtml: strict Mermaid output is DOMPurify-sanitized SVG.
+  return <div className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: result.svg ?? "" }} />;
+}
+
+type MarkdownCodeProps = ComponentPropsWithoutRef<"code"> & { node?: unknown };
 
 type MarkdownPreProps = ComponentPropsWithoutRef<"pre"> & { node?: unknown };
 
@@ -90,6 +147,7 @@ function CodeBlock({ children, node: _node, ...props }: MarkdownPreProps) {
   const [copied, setCopied] = useState(false);
   const code = isValidElement<MarkdownCodeProps>(children) ? children : undefined;
   const language = code?.props.className?.match(/(?:^|\s)language-([^\s]+)/u)?.[1] ?? "text";
+  if (language === "mermaid") return <MermaidDiagram source={textFrom(code?.props.children ?? children)} />;
 
   const copy = async () => {
     try {
@@ -167,7 +225,6 @@ export function Markdown({
               </a>
             );
           },
-          code: InertCode,
           img: (props) => <MarkdownImage {...props} pageId={pageId} />,
           pre: CodeBlock,
           h1: ({ children, node: _node, ...props }) => (

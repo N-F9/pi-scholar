@@ -468,15 +468,16 @@ describe("Markdown rendering", () => {
     assert.equal(code?.replace(/<[^>]+>/gu, ""), "const answer = 42;\n  console.log(answer);\n");
   });
 
-  it("keeps Mermaid and raw HTML inert", () => {
+  it("queues Mermaid rendering while keeping raw HTML inert", () => {
     const rendered = renderToStaticMarkup(
       createElement(Markdown, {
         source: '```mermaid\ngraph TD\nA-->B\n```\n\n<div onclick="alert(1)">unsafe</div>\n',
       }),
     );
 
-    assert.match(rendered, /class="language-mermaid mermaid-source"/u);
-    assert.match(rendered, /data-diagram="inert"/u);
+    assert.match(rendered, /class="mermaid-diagram"/u);
+    assert.match(rendered, /aria-busy="true"/u);
+    assert.match(rendered, /Rendering diagram/u);
     assert.doesNotMatch(rendered, /<svg|onclick=|&lt;div/u);
   });
 

@@ -132,10 +132,15 @@ Then stage a representative group of sources and run the initial extraction, ing
 
 This initial setup is still fairly manual in v0.0.1. Use **Notes** to read through the resulting wiki, **Workflows** to confirm that each operation finished, and **Health** to catch missing dependencies or vault problems. The goal is not to create a perfect wiki before learning begins; it is to make the wiki stable and trustworthy enough that its pages can support real quizzes.
 
-When you are satisfied with the initial state, turn maintenance mode off and publish the first daily quiz:
+When you are satisfied with the initial state, turn maintenance mode off from another terminal:
+
+```sh
+pi-scholar maintenance off --vault ~/pi-scholar-vault
+```
+
+Then publish the first daily quiz from Pi:
 
 ```text
-/scholar-maintenance off
 /skill:daily
 ```
 
@@ -161,7 +166,7 @@ Run `/skill:daily`, complete the quiz in **Today**, and then run `/skill:quiz-gr
 
 ### Sunday: maintain the wiki
 
-On Sunday, turn maintenance mode on with `/scholar-maintenance on`, run `/skill:ingest` to incorporate the sources extracted during the week, and then run `/skill:lint` to inspect the final wiki and repair accepted issues. Check **Health** when the maintenance work is complete, then use `/scholar-maintenance off` to resume daily quiz publishing.
+On Sunday, run `pi-scholar maintenance on --vault ~/pi-scholar-vault` from a terminal, run `/skill:ingest` in Pi to incorporate the sources extracted during the week, and then run `/skill:lint` to inspect the final wiki and repair accepted issues. Check **Health** when the maintenance work is complete, then run `pi-scholar maintenance off --vault ~/pi-scholar-vault` from a terminal to resume daily quiz publishing.
 
 If extraction runs every day, the three-source limit can prepare as many as 21 sources in one week. Ingestion itself does not have the same hard cap. Twenty-one sources is still a manageable weekly batch when Oh My Pi fans independent work out to subagents, while the daily limit keeps the individual extraction jobs small.
 
@@ -189,7 +194,6 @@ Imported material is always treated as untrusted data and never as executable in
 | `/scholar-status` | Show vault, workflow, learning, health, and Git facts |
 | `/scholar-issue` | Report an incorrect, unclear, missing, or badly bounded wiki item |
 | `/scholar-lint` | Inspect the wiki and propose guarded repairs |
-| `/scholar-maintenance on\|off` | Pause or permit daily quiz publishing |
 | `/skill:extract` | Convert and publish stable source chunks |
 | `/skill:ingest` | Create guarded, source-grounded wiki knowledge |
 | `/skill:lint` | Inspect the final wiki and repair accepted issues |
@@ -205,7 +209,7 @@ Pi Scholar does not launch Pi or control scheduling. Run these workflows manuall
 - **Add sources** — upload files, add a URL, paste text, and preview source-removal impact.
 - **History** — revisit submitted and settled quizzes.
 - **Workflows** — inspect extraction, ingestion, daily, grading, and maintenance activity.
-- **Settings** — manage the timezone and maintenance mode.
+- **Settings** — manage the timezone and inspect maintenance state.
 - **Health** — inspect vault integrity and external dependency checks.
 
 The HTTP server binds to `127.0.0.1` by default. It is a local, single-user interface rather than a hosted multi-user service.
@@ -241,9 +245,12 @@ Git is required. Missing optional tools are reported by `pi-scholar doctor`; exa
 ```text
 pi-scholar init [path]
 pi-scholar doctor [path]
+pi-scholar maintenance [on|off] [--vault path]
 pi-scholar serve [--vault path] [--port port] [--dev-tools]
 pi-scholar sync [--vault path]
 ```
+
+Without `on` or `off`, `maintenance` reports the current state. Run the command inside a vault to omit `--vault`.
 
 `sync` pushes to an already configured Git remote. Pi Scholar does not create remotes or upload vault data automatically.
 

@@ -76,6 +76,30 @@ describe("vault foundation", () => {
     assert.equal(discovered.vaultId, paths.vaultId);
   });
 
+  it("reports and changes maintenance mode through the CLI", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-maintenance-"));
+    const paths = initVault(join(root, "vault"));
+    const maintenanceEnabled = (): boolean => {
+      const db = openDatabase(paths);
+      try {
+        const row = db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", [
+          "maintenanceEnabled",
+        ]);
+        return JSON.parse(row?.value_json ?? "null") as boolean;
+      } finally {
+        db.close();
+      }
+    };
+
+    assert.equal(maintenanceEnabled(), true);
+    assert.equal(await main(["maintenance", "--vault", paths.vaultRoot]), 0);
+    assert.equal(maintenanceEnabled(), true);
+    assert.equal(await main(["maintenance", "off", "--vault", paths.vaultRoot]), 0);
+    assert.equal(maintenanceEnabled(), false);
+    assert.equal(await main(["maintenance", "on", "--vault", paths.vaultRoot]), 0);
+    assert.equal(maintenanceEnabled(), true);
+  });
+
   it("validates persisted simulated-date settings without failing active simulations", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-settings-"));
     const paths = initVault(join(root, "vault"));

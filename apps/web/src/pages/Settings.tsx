@@ -12,7 +12,6 @@ function shiftDate(value: string, days: number): string {
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
-  const [confirming, setConfirming] = useState(false);
   const [dateInput, setDateInput] = useState<string>();
   const query = useQuery({
     queryKey: ["settings"],
@@ -22,7 +21,6 @@ export function SettingsPage() {
     mutationFn: (request: SettingsUpdateRequest) =>
       api<SettingsResult>("/api/v1/settings", { method: "PUT", body: JSON.stringify(request) }, isSettingsResult),
     onSuccess: async (_result, request) => {
-      setConfirming(false);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["settings"] }),
         queryClient.invalidateQueries({ queryKey: ["quiz"] }),
@@ -82,37 +80,13 @@ export function SettingsPage() {
               </Badge>
             </div>
 
-            {query.data.settings.maintenanceEnabled && !confirming ? (
-              <Button className="mt-6" variant="secondary" onClick={() => setConfirming(true)}>
-                Turn off maintenance mode
-              </Button>
-            ) : null}
-            {!query.data.settings.maintenanceEnabled ? (
-              <Button
-                className="mt-6"
-                variant="secondary"
-                onClick={() => update.mutate({ maintenanceEnabled: true })}
-                disabled={update.isPending}
-              >
-                Turn on maintenance mode
-              </Button>
-            ) : null}
-            {query.data.settings.maintenanceEnabled && confirming ? (
-              <div className="mt-6 rounded-md border border-caution/40 bg-caution/10 p-4">
-                <h3 className="font-bold">Turn off maintenance mode?</h3>
-                <p className="mt-2 text-sm text-muted">
-                  Quiz publishing will be enabled. Skills will run independently according to your cron entries.
-                </p>
-                <div className="mt-4 flex flex-wrap gap-3">
-                  <Button onClick={() => update.mutate({ maintenanceEnabled: false })} disabled={update.isPending}>
-                    {update.isPending ? "Saving…" : "Turn off maintenance mode"}
-                  </Button>
-                  <Button variant="quiet" onClick={() => setConfirming(false)} disabled={update.isPending}>
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            ) : null}
+            <p className="mt-5 max-w-2xl text-sm text-muted">
+              Change this vault-level setting from a terminal with{" "}
+              <code className="font-mono text-ink">
+                {`pi-scholar maintenance ${query.data.settings.maintenanceEnabled ? "off" : "on"} --vault /path/to/vault`}
+              </code>
+              .
+            </p>
           </Card>
 
           {query.data.developerToolsEnabled || query.data.settings.simulatedDate ? (
