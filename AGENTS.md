@@ -2,7 +2,7 @@
 
 ## Scope
 
-These instructions apply to the entire repository. Treat `pi-scholar.md` as the product and architecture source of truth; use `README.md` for operator-facing behavior and `VALIDATION.md` for release checks.
+These instructions apply to the entire repository. Treat `README.md` as user-facing documentation; treat code and tests as the executable behavior.
 
 ## Invariants
 

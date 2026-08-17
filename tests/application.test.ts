@@ -7,13 +7,13 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
-import { publicSource, publicWorkflow } from "../src/application/projections.js";
-import type { GradingContext } from "../src/contracts.js";
+import { publicSource, publicWikiPage, publicWorkflow } from "../src/application/projections.js";
+import type { ExtractProgressEvent, GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
 import { QuizService } from "../src/quiz.js";
-import { localDate, SchedulerService } from "../src/scheduler.js";
+import { type Clock, localDate, SchedulerService } from "../src/scheduler.js";
 import { acquireWriterLock, initVault, LockBusyError } from "../src/vault.js";
 import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
@@ -62,7 +62,9 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?: boolean } = {}) {
+function fixture(
+  options: { readonly maintenance?: boolean; readonly realDoctor?: boolean; readonly clock?: Clock } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
@@ -81,6 +83,7 @@ function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?
     paths,
     db,
     adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
+    clock: options.clock,
     doctor: options.realDoctor
       ? doctor
       : () => {
@@ -99,6 +102,32 @@ function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?
   };
   return { app, db, paths, calls, wiki, scheduler, quiz };
 }
+it("keeps internal wiki results as full OKF while projecting a public copy", async () => {
+  const { app, db } = fixture();
+  try {
+    const created = await app.createNote({
+      path: "public-projection.md",
+      title: "Public projection",
+      body: "# Projection\n\nBody.\n",
+      quizWorthiness: "skip",
+    });
+    const internal = await app.getWiki(created.page.pageId);
+    assert.match(internal.markdown, /^---\r?\n/u);
+    assert.equal(parseWikiMarkdown(internal.markdown).body, "# Projection\n\nBody.\n");
+
+    const projected = publicWikiPage(internal);
+    assert.notEqual(projected, internal);
+    assert.equal(projected.markdown, "# Projection\n\nBody.\n");
+    assert.equal(projected.markdown.includes("type:"), false);
+    assert.equal(projected.sections[0]?.heading, "Projection");
+    const firstSection = projected.sections[0];
+    assert.ok(firstSection);
+    assert.equal(projected.markdown.slice(firstSection.startOffset, firstSection.endOffset), projected.markdown);
+  } finally {
+    await app.close();
+    db.close();
+  }
+});
 
 async function publishedChunkId(app: ScholarApplication): Promise<string> {
   await app.stageSource({ kind: "text", text: "ingest evidence\n", name: "ingest-evidence.txt" });
@@ -147,6 +176,102 @@ describe("durable application writes", () => {
       db.close();
     }
   });
+  it("drains five queued sources in extraction batches of three then two", async () => {
+    const { app, db } = fixture();
+    const names = ["01.txt", "02.txt", "03.txt", "04.txt", "05.txt"];
+    try {
+      for (const name of names) await app.stageSource({ kind: "text", text: `${name}\n`, name });
+
+      const first = await app.getExtractContext();
+      assert.equal(first.claims.length, 3);
+      for (const claim of first.claims)
+        await app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        });
+
+      const second = await app.getExtractContext();
+      assert.equal(second.claims.length, 2);
+      for (const claim of second.claims)
+        await app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        });
+      assert.deepEqual([...first.claims, ...second.claims].map(({ displayName }) => displayName).sort(), names);
+
+      assert.deepEqual((await app.getExtractContext()).claims, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("claims exact pending source IDs atomically and reports bounded preparation phases", async () => {
+    const { app, db } = fixture();
+    try {
+      const staged = [];
+      for (const name of ["01.txt", "02.txt", "03.txt", "04.txt"])
+        staged.push(await app.stageSource({ kind: "text", text: `${name}\n`, displayName: name }));
+      const pendingIds = staged.map(({ source }) => source.sourceId);
+      const invalidProgress: ExtractProgressEvent[] = [];
+      await assert.rejects(
+        app.getExtractContext({ pendingSourceIds: [pendingIds[0]!, pendingIds[0]!] }, (event) =>
+          invalidProgress.push(event),
+        ),
+        /duplicates/u,
+      );
+      await assert.rejects(
+        app.getExtractContext({ pendingSourceIds: ["pending-ffffffffffffffffffffffffffffffff"] }),
+        /stale or missing/u,
+      );
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: ["not-a-source"] }), /malformed/u);
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: pendingIds }), /limited to 3 entries/u);
+      assert.deepEqual(invalidProgress, []);
+
+      const progress: ExtractProgressEvent[] = [];
+      const selected = await app.getExtractContext({ pendingSourceIds: [pendingIds[2]!, pendingIds[0]!] }, (event) => {
+        progress.push(event);
+        if (event.phase === "normalizing") throw new Error("presentation failed");
+      });
+      assert.deepEqual(
+        selected.claims.map(({ displayName }) => displayName),
+        ["03.txt", "01.txt"],
+      );
+      for (const [index, filename] of ["03.txt", "01.txt"].entries()) {
+        assert.deepEqual(
+          progress.filter((event) => event.entry === index + 1),
+          ["claiming", "preparing", "extracting", "normalizing", "validating/indexing", "ready"].map((phase) => ({
+            entry: index + 1,
+            total: 2,
+            filename,
+            phase,
+          })),
+        );
+      }
+
+      const published = [];
+      for (const claim of selected.claims)
+        published.push(
+          await app.publishExtraction({
+            claimId: claim.claimId,
+            preparedId: claim.preparedId,
+            digest: claim.digest,
+            endpoints: [1],
+          }),
+        );
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: [published[0]!.sourceId] }), /not pending/u);
+      assert.deepEqual((await app.getExtractContext()).claims.map(({ displayName }) => displayName).sort(), [
+        "02.txt",
+        "04.txt",
+      ]);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("cleans private staging after lock contention and retries exactly once", async () => {
     const { app, db, paths } = fixture();
     try {
@@ -185,7 +310,17 @@ describe("durable application writes", () => {
       if (stage === "doctor") {
         (app as unknown as { doctorFn: () => unknown }).doctorFn = () => {
           calls.push("doctor");
-          return { ok: false, checkedAt: new Date().toISOString(), checks: [] };
+          return {
+            ok: false,
+            checkedAt: new Date().toISOString(),
+            checks: [
+              {
+                name: "source-packets",
+                status: "fail",
+                message: "Source catalog provenance/linkage is invalid: source-id",
+              },
+            ],
+          };
         };
       }
       if (stage === "commit") {
@@ -205,8 +340,14 @@ describe("durable application writes", () => {
             "test:write",
           ),
           (error: unknown) => {
-            assert.equal((error as { code?: string }).code, "MUTATION_APPLIED_FINALIZATION_FAILED");
-            assert.deepEqual((error as { details?: unknown }).details, { applied: true, retryable: false, stage });
+            const finalizationError = error as Error & { code?: string; details?: unknown };
+            assert.equal(finalizationError.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+            assert.deepEqual(finalizationError.details, { applied: true, retryable: false, stage });
+            if (stage === "doctor")
+              assert.equal(
+                finalizationError.message,
+                "mutation applied but doctor failed: source-packets: Source catalog provenance/linkage is invalid: source-id",
+              );
             return true;
           },
         );
@@ -246,9 +387,17 @@ describe("durable application writes", () => {
       if (!claim) throw new Error("admission claim is missing");
       const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest, endpoints: [1] };
       const appliedCheckpointFailure = (error: unknown): boolean => {
-        if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
+        if (
+          error === null ||
+          typeof error !== "object" ||
+          !("code" in error) ||
+          !("details" in error) ||
+          !("publicationApplied" in error)
+        )
+          return false;
         assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
         assert.deepEqual(error.details, { applied: true, retryable: false, stage: "checkpoint" });
+        assert.equal(error.publicationApplied, true);
         return true;
       };
       (db as unknown as { checkpoint: () => void }).checkpoint = () => {
@@ -833,6 +982,54 @@ describe("knowledge capability contexts", () => {
     }
   });
 
+  it("filters research ingest sources without capping ordinary pages or packets", async () => {
+    const { app, db } = fixture();
+    try {
+      for (const name of ["one.txt", "two.txt", "three.txt", "four.txt"])
+        await app.stageSource({ kind: "text", text: `${name}\n`, displayName: name });
+      const published = [];
+      for (let batch = await app.getExtractContext(); batch.claims.length; batch = await app.getExtractContext()) {
+        for (const claim of batch.claims)
+          published.push(
+            await app.publishExtraction({
+              claimId: claim.claimId,
+              preparedId: claim.preparedId,
+              digest: claim.digest,
+              endpoints: [1],
+            }),
+          );
+      }
+      for (const index of [1, 2, 3, 4])
+        await app.createNote({
+          path: `topic-${index}.md`,
+          body: `# Topic ${index}\n\nBody ${index}.\n`,
+          quizWorthiness: "skip",
+        });
+
+      const ordinary = await app.getIngestContext();
+      assert.equal(ordinary.sources.length, 4);
+      assert.equal(ordinary.pages.length >= 4, true);
+      const selectedIds = [published[3]!.sourceId, published[1]!.sourceId];
+      const filtered = await app.getIngestContext({ sourceIds: selectedIds });
+      assert.deepEqual(
+        filtered.sources.map(({ source }) => source.sourceId),
+        selectedIds,
+      );
+      assert.deepEqual(filtered.pages, ordinary.pages);
+      assert.deepEqual(filtered.issues, ordinary.issues);
+      assert.equal(
+        (await app.getIngestContext({ sourceIds: published.map(({ sourceId }) => sourceId) })).sources.length,
+        4,
+      );
+      await assert.rejects(app.getIngestContext({ sourceIds: [selectedIds[0]!, selectedIds[0]!] }), /duplicates/u);
+      await assert.rejects(app.getIngestContext({ sourceIds: ["not-a-source"] }), /malformed/u);
+      await assert.rejects(app.getIngestContext({ sourceIds: [randomUUID()] }), /stale or missing/u);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
   it("fails closed when a published source packet cannot be verified", async () => {
     const { app, db, paths } = fixture();
     try {
@@ -1024,6 +1221,78 @@ describe("knowledge capability contexts", () => {
   });
 });
 
+describe("application settings validation", () => {
+  it("rejects an invalid simulated date and timezone pair before writing", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      await assert.rejects(app.updateSettings({ simulatedDate: "2026-08-20" }), /developer tools are required/u);
+      await assert.rejects(
+        app.updateSettings({ simulatedDate: "2011-12-30", timezone: "Pacific/Apia" }, { developerToolsEnabled: true }),
+        /simulatedDate/u,
+      );
+      assert.equal(db.get("SELECT value_json FROM settings WHERE key = ?", ["simulatedDate"]), undefined);
+      assert.equal(
+        JSON.parse(
+          String(
+            db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", ["timezone"])?.value_json,
+          ),
+        ),
+        "local",
+      );
+      const settings = (await app.getSettings()).settings;
+      assert.equal(settings.simulatedDate, undefined);
+      assert.equal(settings.timezone, "local");
+      assert.deepEqual(calls, []);
+
+      const valid = await app.updateSettings(
+        { simulatedDate: "2026-08-20", timezone: "Pacific/Apia" },
+        { developerToolsEnabled: true },
+      );
+      assert.equal(valid.settings.simulatedDate, "2026-08-20");
+      assert.equal(valid.settings.timezone, "Pacific/Apia");
+      const cleared = await app.updateSettings({ simulatedDate: null }, { developerToolsEnabled: true });
+      assert.equal(cleared.settings.simulatedDate, undefined);
+      assert.equal(cleared.settings.timezone, "Pacific/Apia");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects timezone-only changes that invalidate a persisted simulated date", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      db.run(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        ["simulatedDate", JSON.stringify("2011-12-30"), new Date().toISOString()],
+      );
+      await assert.rejects(app.updateSettings({ timezone: "Pacific/Apia" }), /simulatedDate/u);
+      const settings = (await app.getSettings()).settings;
+      assert.equal(settings.simulatedDate, "2011-12-30");
+      assert.equal(settings.timezone, "local");
+      assert.equal(
+        JSON.parse(
+          String(
+            db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", ["timezone"])?.value_json,
+          ),
+        ),
+        "local",
+      );
+      assert.deepEqual(calls, []);
+
+      const cleared = await app.updateSettings(
+        { simulatedDate: null, timezone: "Pacific/Apia" },
+        { developerToolsEnabled: true },
+      );
+      assert.equal(cleared.settings.simulatedDate, undefined);
+      assert.equal(cleared.settings.timezone, "Pacific/Apia");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
 describe("application quiz date guards", () => {
   it("uses the configured timezone when rejecting stale submissions", async () => {
     const { app, db } = fixture();
@@ -1128,19 +1397,19 @@ describe("application quiz date guards", () => {
 });
 
 describe("application quiz publication guards", () => {
-  it("blocks quiz evidence and publication while initialization is active", async () => {
+  it("blocks quiz evidence and publication while maintenance mode is active", async () => {
     const { app, db, calls } = fixture();
     const date = localDate(new Date());
     try {
       await assert.rejects(app.getQuizEvidence({ date, pageIds: ["nonexistent-page"] }), (error: Error) => {
-        assert.equal(error.message, "Initialization maintenance is active; quiz evidence is blocked");
+        assert.equal(error.message, "Maintenance mode is active; quiz evidence is blocked");
         return true;
       });
       calls.length = 0;
       await assert.rejects(
-        app.publishQuiz({ status: "skipped", date, reason: "Initialization maintenance is active" }),
+        app.publishQuiz({ status: "skipped", date, reason: "Maintenance mode is active" }),
         (error: Error) => {
-          assert.equal(error.message, "Initialization maintenance is active; quiz publication is blocked");
+          assert.equal(error.message, "Maintenance mode is active; quiz publication is blocked");
           return true;
         },
       );
@@ -1163,10 +1432,10 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const context = await app.getQuizContext({ date });
-      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "initializationEnabled"]);
+      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "maintenanceEnabled"]);
       assert.equal(context.candidates.length, 1);
       const candidate = context.candidates[0]!;
       assert.deepEqual(Object.keys(candidate).sort(), ["description", "dueAt", "pageId", "path", "title"]);
@@ -1194,7 +1463,7 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const candidate = (await app.getQuizContext({ date })).candidates.find((item) => item.pageId === pageId);
       assert.equal(candidate?.description, "é".repeat(512));
@@ -1218,7 +1487,7 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
       assert.equal(evidence.length, 1);
@@ -1271,7 +1540,7 @@ describe("application quiz publication guards", () => {
       new Date(Date.now() + 2 * 86_400_000).toISOString(),
       future.page.pageId,
     ]);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     calls.length = 0;
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [second.page.pageId, first.page.pageId] });
@@ -1295,7 +1564,7 @@ describe("application quiz publication guards", () => {
     });
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     await fs.appendFile(join(paths.wikiRoot, page.page.relativePath), "\nPhysical edit\n");
     try {
       const context = await app.getQuizContext({ date });
@@ -1363,7 +1632,7 @@ describe("application quiz publication guards", () => {
     const pageId = page.page.pageId;
     scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
     scheduler.ensurePageLearning(unselected.page.pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
       const sourceRefs = evidence.map((item) => item.reference);
@@ -1466,8 +1735,8 @@ describe("application browser mutation boundary", () => {
   });
 });
 
-async function gradingFixture() {
-  const fixtureValue = fixture();
+async function gradingFixture(options: Parameters<typeof fixture>[0] = {}) {
+  const fixtureValue = fixture(options);
   const { wiki, scheduler, quiz: quizService } = fixtureValue;
   const date = localDate(new Date());
   const page = await wiki.create({
@@ -1539,6 +1808,284 @@ function gradeFor(context: GradingContext, pageId: string, questionId: string, e
 }
 
 describe("quiz grading workflow lifecycle", () => {
+  it("derives covered pages and bounded whole-wiki readings before and after settlement", async () => {
+    const { app, db, date, pageId, questionId, draft, scheduler, wiki, paths } = await gradingFixture({
+      maintenance: true,
+    });
+    const owner = randomUUID();
+    try {
+      const open = await app.getQuiz(date);
+      assert.deepEqual(open.readings, []);
+      assert.deepEqual(open.recommendations, { readings: [], gaps: [] });
+      const prerequisite = await app.createNote({
+        path: "recommendation-prerequisite.md",
+        title: "Recommendation prerequisite",
+        description: "Foundational material for the graded page.",
+        body: "# Prerequisite\n\nFoundational material.\n",
+        quizWorthiness: "eligible",
+      });
+      scheduler.ensurePageLearning(prerequisite.page.pageId);
+      scheduler.setPrerequisites(pageId, [prerequisite.page.pageId]);
+      const related = [];
+      for (let index = 0; index < 6; index += 1)
+        related.push(
+          await app.createNote({
+            path: `recommendation-related-${index}.md`,
+            title: `Related ${index}`,
+            body: `# Related ${index}\n\nRelated material ${index}.\n`,
+            quizWorthiness: "skip",
+          }),
+        );
+      const tiedRelated = [...related].sort((left, right) => left.page.pageId.localeCompare(right.page.pageId));
+      const drifted = await app.createNote({
+        path: "recommendation-drifted.md",
+        title: "Drifted recommendation",
+        body: "# Drifted\n\nOriginal material.\n",
+        quizWorthiness: "skip",
+      });
+      await app.reportIssue({
+        pageId: related[0]!.page.pageId,
+        kind: "missing",
+        description: "Missing related explanation.",
+      });
+      await app.reportIssue({
+        pageId: related[0]!.page.pageId,
+        kind: "missing",
+        description: "The same missing page must remain one gap.",
+      });
+      await app.reportIssue({
+        pageId: related[1]!.page.pageId,
+        kind: "unclear",
+        description: "Unclear related explanation.",
+      });
+      await fs.appendFile(join(paths.wikiRoot, drifted.page.relativePath), "\nDirect edit.\n");
+
+      const coveredPath = (await app.getWiki(pageId)).page.relativePath;
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      assert.deepEqual(sealed.readings, [{ pageId, path: coveredPath, href: `/notes?pageId=${pageId}#note-content` }]);
+      assert.deepEqual(sealed.quiz.readings, sealed.readings);
+      assert.equal(sealed.quiz.questionResults.length, 0);
+      assert.equal(sealed.quiz.pageResults.length, 0);
+      assert.equal(sealed.grades.length, 0);
+      assert.deepEqual(
+        sealed.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [[prerequisite.page.pageId, "prerequisite"]],
+      );
+      assert.equal(
+        sealed.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.deepEqual(
+        sealed.recommendations.gaps.map(({ pageId: id, kind }) => [id, kind]),
+        [
+          [related[0]!.page.pageId, "missing"],
+          [related[1]!.page.pageId, "unclear"],
+          [drifted.page.pageId, "drifted"],
+        ],
+      );
+      const pending = await app.getQuiz(date);
+      assert.deepEqual(pending.readings, sealed.readings);
+      assert.deepEqual(pending.recommendations, sealed.recommendations);
+      const context = await app.getGradingContext({ date }, owner);
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(evidence);
+      await app.settleGrade(gradeFor(context, pageId, questionId, [evidence]), owner);
+
+      const gradedPath = (await app.getWiki(pageId)).page.relativePath;
+      const databaseState = () =>
+        Object.fromEntries(
+          db.tableNames().map((table) => [
+            table,
+            db
+              .all(`SELECT * FROM "${table}"`)
+              .map((row) => JSON.stringify(row, (_key, value) => (typeof value === "bigint" ? String(value) : value)))
+              .sort(),
+          ]),
+        );
+      const beforeProjection = databaseState();
+      wiki.adapters.qmd!.search = () => [
+        ...related.map((page) => ({ path: page.page.relativePath, score: 1 })),
+        { path: related[0]!.page.relativePath, score: 1 },
+        { path: gradedPath, score: 2 },
+        { path: drifted.page.relativePath, score: 3 },
+      ];
+      const result = await app.getQuiz(date);
+      assert.ok(result.quiz);
+      assert.deepEqual(result.readings, [{ pageId, path: gradedPath, href: `wiki/${gradedPath}#section` }]);
+      assert.deepEqual(result.quiz.readings, result.readings);
+      assert.equal(
+        result.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.deepEqual(
+        result.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [
+          [prerequisite.page.pageId, "prerequisite"],
+          ...tiedRelated.slice(0, 4).map((page) => [page.page.pageId, "related"]),
+        ],
+      );
+      assert.equal(result.recommendations.readings.length, 5);
+      assert.ok(result.recommendations.readings.every((reading) => reading.href.includes(`pageId=${reading.pageId}`)));
+      assert.deepEqual(
+        result.recommendations.gaps.map(({ pageId: id, kind }) => [id, kind]),
+        [
+          [related[0]!.page.pageId, "missing"],
+          [related[1]!.page.pageId, "unclear"],
+          [drifted.page.pageId, "drifted"],
+        ],
+      );
+      assert.ok(result.recommendations.gaps.every((gap) => gap.href.includes(`pageId=${gap.pageId}`)));
+      wiki.adapters.qmd!.search = () => {
+        throw new Error("qmd unavailable");
+      };
+      const fallback = await app.getQuiz(date);
+      assert.deepEqual(
+        fallback.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [[prerequisite.page.pageId, "prerequisite"]],
+      );
+      assert.equal(fallback.recommendations.gaps.length, 3);
+      assert.equal(
+        result.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.equal(sealed.quiz.pageResults.length, 0);
+      assert.deepEqual(databaseState(), beforeProjection);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("projects settled questions and reverse-lexical pages in canonical order", async () => {
+    const { app, db, wiki, scheduler, quiz: quizService } = fixture();
+    const date = localDate(new Date());
+    const owner = randomUUID();
+    try {
+      const pages = [];
+      for (const [path, title] of [
+        ["covered-a.md", "Covered A"],
+        ["covered-b.md", "Covered B"],
+      ] as const) {
+        const created = await wiki.create({
+          path,
+          title,
+          description: `${title} grading page.`,
+          body: `# Section\n\n${title} material.\n`,
+          quizWorthiness: "eligible",
+        });
+        scheduler.ensurePageLearning(created.page.pageId, `${date}T00:00:00.000Z`);
+        pages.push(created.page);
+      }
+      pages.sort((left, right) => right.pageId.localeCompare(left.pageId));
+      const [firstPage, secondPage] = pages;
+      assert.ok(firstPage && secondPage);
+      const firstPageId = firstPage.pageId;
+      const secondPageId = secondPage.pageId;
+      const quiz = quizService.createDailyQuiz({
+        date,
+        selectedPageIds: [firstPageId, secondPageId],
+        questionSpecs: [
+          {
+            kind: "free-response",
+            prompt: "First prompt",
+            pages: [{ pageId: firstPageId, criterion: "First criterion", weight: 1 }],
+            sourceRefs: [],
+          },
+          {
+            kind: "free-response",
+            prompt: "Second prompt",
+            pages: [{ pageId: secondPageId, criterion: "Second criterion", weight: 1 }],
+            sourceRefs: [],
+          },
+        ],
+      });
+      const [firstQuestion, secondQuestion] = quiz.questions;
+      assert.ok(firstQuestion && secondQuestion);
+      const draft = quizService.saveDraft({
+        date,
+        revision: quiz.revision,
+        answers: {
+          [secondQuestion.questionId]: "Second answer",
+          [firstQuestion.questionId]: "First answer",
+        },
+      });
+      await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const context = await app.getGradingContext({ date }, owner);
+      const firstEvidence = context.evidence?.find((item) => item.pageId === firstPageId)?.reference;
+      const secondEvidence = context.evidence?.find((item) => item.pageId === secondPageId)?.reference;
+      assert.ok(firstEvidence && secondEvidence);
+      await app.settleGrade(
+        {
+          requestId: context.requestId!,
+          date,
+          revision: context.revision!,
+          submissionId: context.submissionId!,
+          questions: [
+            { questionId: secondQuestion.questionId, feedback: "Second feedback" },
+            { questionId: firstQuestion.questionId, feedback: "First feedback" },
+          ],
+          pages: [
+            {
+              pageId: secondPageId,
+              rating: "Hard",
+              feedback: "Second page feedback",
+              evidence: [secondEvidence],
+              readings: [{ pageId: secondPageId, anchor: "#section" }],
+            },
+            {
+              pageId: firstPageId,
+              rating: "Good",
+              feedback: "First page feedback",
+              evidence: [firstEvidence],
+              readings: [{ pageId: firstPageId, anchor: "#section" }],
+            },
+          ],
+        },
+        owner,
+      );
+
+      const result = await app.getQuiz(date);
+      assert.ok(result.quiz);
+      assert.deepEqual(
+        result.quiz.answers.map((answer) => answer.questionId),
+        [firstQuestion.questionId, secondQuestion.questionId],
+      );
+      assert.deepEqual(
+        result.quiz.questionResults.map((question) => question.questionId),
+        [firstQuestion.questionId, secondQuestion.questionId],
+      );
+      assert.deepEqual(
+        result.quiz.pageResults.map((page) => page.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.grades.map((grade) => grade.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.readings.map((reading) => reading.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.pageResults.map((page) => page.pageLink),
+        [
+          {
+            pageId: firstPageId,
+            path: firstPage.relativePath,
+            href: `/notes?pageId=${firstPageId}#note-content`,
+          },
+          {
+            pageId: secondPageId,
+            path: secondPage.relativePath,
+            href: `/notes?pageId=${secondPageId}#note-content`,
+          },
+        ],
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
   it("rejects workflow request IDs in question and page feedback before persistence", async () => {
     const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const owner = randomUUID();
@@ -2396,6 +2943,30 @@ describe("application capability boundaries", () => {
       db.close();
     }
   });
+
+  it("rejects delegated ingest mutations after the owning workflow finishes", async () => {
+    const { app, db } = fixture();
+    try {
+      const ingest = await app.beginWorkflow("ingest");
+      await app.finishWorkflow(ingest.workflow.requestId, "succeeded");
+
+      await assert.rejects(
+        app.applyIngestChange(
+          {
+            kind: "create-page",
+            path: "late-delegated-ingest.md",
+            body: "# Late mutation\n\nThis must not be written.\n",
+          },
+          ingest.workflow.requestId,
+        ),
+        /ingest workflow is not running/u,
+      );
+      assert.equal((await app.listWiki()).pages.length, 0);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 });
 
 describe("ingest section-local citation boundaries", () => {
@@ -2415,14 +2986,14 @@ describe("ingest section-local citation boundaries", () => {
         app.applyIngestChange({
           kind: "create-page",
           path: "ingest-create-rejected.md",
-          body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
+          body: `# Grounded\n\nClaim [^${chunkId}][^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
         }),
-        /immutable source chunk citation/u,
+        /section "uncited" requires an immutable source chunk citation/u,
       );
       const created = await app.applyIngestChange({
         kind: "create-page",
         path: "ingest-create-accepted.md",
-        body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
+        body: `# Grounded\n\nClaim [^${chunkId}][^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
       });
       assert.equal(created.page?.relativePath, "ingest-create-accepted.md");
     } finally {

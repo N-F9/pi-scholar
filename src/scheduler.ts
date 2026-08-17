@@ -19,6 +19,9 @@ export interface SqlDatabase {
 }
 
 export type SqlDatabaseSource = Pick<ScholarDatabase, "exec" | "run" | "get" | "all">;
+export interface Clock {
+  now(): Date;
+}
 
 function adaptDatabase(source: SqlDatabaseSource): SqlDatabase {
   return {
@@ -71,11 +74,15 @@ export class ValidationError extends Error {
   }
 }
 
+export const SYSTEM_CLOCK: Clock = {
+  now: () => new Date(),
+};
+
 const FSRS_STATES: readonly FsrsState[] = ["New", "Learning", "Review", "Relearning"];
 const RATINGS: readonly ReviewRating[] = ["Again", "Hard", "Good", "Easy"];
 
-function nowIso(): string {
-  return new Date().toISOString();
+function nowIso(clock: Clock = SYSTEM_CLOCK): string {
+  return clock.now().toISOString();
 }
 
 function json(value: unknown): string {
@@ -128,6 +135,67 @@ export function localDate(value: string | Date, timezone = "local"): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+function timezoneWallClock(value: Date, timezone: string): Date {
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat("en-US", {
+      calendar: "gregory",
+      numberingSystem: "latn",
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(value);
+  } catch {
+    throw new ValidationError("timezone is invalid");
+  }
+  const fields = new Map(parts.map((part) => [part.type, part.value]));
+  const year = Number(fields.get("year"));
+  const month = Number(fields.get("month"));
+  const day = Number(fields.get("day"));
+  const hour = Number(fields.get("hour"));
+  const minute = Number(fields.get("minute"));
+  const second = Number(fields.get("second"));
+  if (![year, month, day, hour, minute, second].every(Number.isFinite))
+    throw new ValidationError("timezone is invalid");
+  const date = new Date(
+    `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${String(
+      hour,
+    ).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}.000Z`,
+  );
+  if (Number.isNaN(date.getTime())) throw new ValidationError("timezone is invalid");
+  return date;
+}
+
+export function localNoon(date: string, timezone = "local"): Date {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(date)) throw new ValidationError("date must be a valid calendar date");
+  localDate(date);
+  const [year, month, day] = date.split("-").map(Number);
+  if (timezone === "local") {
+    const result = new Date(0);
+    result.setFullYear(year!, month! - 1, day);
+    result.setHours(12, 0, 0, 0);
+    return result;
+  }
+  let candidate = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(candidate.getTime())) throw new ValidationError("date must be a valid calendar date");
+  const target = candidate.getTime();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const wall = timezoneWallClock(candidate, timezone);
+    const next = new Date(target - (wall.getTime() - candidate.getTime()));
+    if (next.getTime() === candidate.getTime()) break;
+    candidate = next;
+  }
+  const wall = timezoneWallClock(candidate, timezone);
+  if (wall.getUTCHours() !== 12 || wall.getUTCMinutes() !== 0 || wall.getUTCSeconds() !== 0)
+    throw new ValidationError("simulatedDate cannot resolve to local noon");
+  if (localDate(candidate, timezone) !== date) throw new ValidationError("simulatedDate is not a valid local date");
+  return candidate;
 }
 
 export const SEALED_QUIZ_REVIEW = Symbol("sealed-quiz-review");
@@ -203,9 +271,9 @@ function transaction<T>(db: SqlDatabaseSource, fn: () => T): T {
   return databaseTransaction(db as never, fn);
 }
 
-function mapPageLearning(row: Record<string, unknown>): PageLearningRecord {
-  const dueAt = isoOrUndefined(row.due_at) ?? nowIso();
-  const createdAt = isoOrUndefined(row.created_at) ?? nowIso();
+function mapPageLearning(row: Record<string, unknown>, clock: Clock): PageLearningRecord {
+  const dueAt = isoOrUndefined(row.due_at) ?? nowIso(clock);
+  const createdAt = isoOrUndefined(row.created_at) ?? nowIso(clock);
   return {
     pageId: String(row.page_id),
     initialDueAt: isoOrUndefined(row.initial_due_at) ?? dueAt,
@@ -223,7 +291,7 @@ function mapPageLearning(row: Record<string, unknown>): PageLearningRecord {
   };
 }
 
-function mapPageReview(row: Record<string, unknown>): PageReviewRecord {
+function mapPageReview(row: Record<string, unknown>, clock: Clock): PageReviewRecord {
   return {
     reviewId: String(row.review_id),
     pageId: String(row.page_id),
@@ -231,7 +299,7 @@ function mapPageReview(row: Record<string, unknown>): PageReviewRecord {
     submissionId: String(row.submission_id),
     revision: Number(row.revision),
     rating: String(row.rating) as ReviewRating,
-    reviewedAt: isoOrUndefined(row.reviewed_at) ?? nowIso(),
+    reviewedAt: isoOrUndefined(row.reviewed_at) ?? nowIso(clock),
     stateBefore: parseJson(row.state_before_json, null),
     stateAfter: parseJson(row.state_after_json, null),
     settlementId: String(row.settlement_id),
@@ -266,13 +334,15 @@ function fsrsSnapshot(input: {
 export class SchedulerService {
   readonly db: SqlDatabase;
   readonly paths?: VaultPathsLike;
+  readonly clock: Clock;
   private readonly source: SqlDatabaseSource;
   private readonly engine = fsrs();
 
-  constructor(source: SqlDatabaseSource, paths?: VaultPathsLike) {
+  constructor(source: SqlDatabaseSource, paths?: VaultPathsLike, clock: Clock = SYSTEM_CLOCK) {
     this.source = source;
     this.db = adaptDatabase(source);
     this.paths = paths;
+    this.clock = clock;
   }
 
   ensurePageLearning(pageId: string, initialDueAt?: string | Date): PageLearningRecord {
@@ -280,8 +350,9 @@ export class SchedulerService {
     if (!id) throw new ValidationError("pageId is required");
     if (!this.db.get("SELECT page_id FROM pages WHERE page_id = ?", id))
       throw new ValidationError(`Unknown wiki page: ${id}`);
-    const due = initialDueAt === undefined ? new Date() : asDate(initialDueAt, "initialDueAt");
-    const now = nowIso();
+    const operationNow = this.clock.now();
+    const due = initialDueAt === undefined ? new Date(operationNow.getTime()) : asDate(initialDueAt, "initialDueAt");
+    const now = operationNow.toISOString();
     transaction(this.source, () => {
       this.db.run(
         `INSERT OR IGNORE INTO page_learning
@@ -301,7 +372,7 @@ export class SchedulerService {
     const id = pageId.trim();
     const row = this.db.get<Record<string, unknown>>("SELECT * FROM page_learning WHERE page_id = ?", id);
     if (!row) throw new ValidationError(`Page learning state is missing: ${id}`);
-    return mapPageLearning(row);
+    return mapPageLearning(row, this.clock);
   }
 
   listPageLearning(activeOnly = false): PageLearningRecord[] {
@@ -309,7 +380,7 @@ export class SchedulerService {
       ? `SELECT l.* FROM page_learning l JOIN pages p ON p.page_id = l.page_id
          WHERE p.status = 'active' AND p.quiz_worthiness = 'eligible' ORDER BY l.due_at, l.page_id`
       : "SELECT * FROM page_learning ORDER BY due_at, page_id";
-    return this.db.all<Record<string, unknown>>(sql).map(mapPageLearning);
+    return this.db.all<Record<string, unknown>>(sql).map((row) => mapPageLearning(row, this.clock));
   }
 
   listPrerequisites(pageId: string): PagePrerequisiteRecord[] {
@@ -361,10 +432,11 @@ export class SchedulerService {
     const learning = this.ensurePageLearning(id);
     const revision = expectedRevision ?? learning.revision;
     if (revision !== learning.revision) throw new RevisionConflictError();
+    const updatedAt = nowIso(this.clock);
     transaction(this.source, () => {
       const result = this.db.run(
         "UPDATE page_learning SET revision = revision + 1, updated_at = ? WHERE page_id = ? AND revision = ?",
-        nowIso(),
+        updatedAt,
         id,
         revision,
       );
@@ -408,12 +480,8 @@ export class SchedulerService {
   }
 
   eligiblePages(date: string | Date, initializeMissing = true): PageLearningRecord[] {
-    let timezone = persistedTimezone(this.source);
-    try {
-      localDate(new Date(), timezone);
-    } catch {
-      timezone = "local";
-    }
+    const timezone = persistedTimezone(this.source);
+    localDate(this.clock.now(), timezone);
     const day = localDate(date, timezone);
     if (initializeMissing) {
       const eligible = this.db.all<{ page_id: string }>(
@@ -449,7 +517,7 @@ export class SchedulerService {
               "SELECT * FROM page_learning WHERE page_id = ?",
               prerequisitePageId,
             );
-            return row ? mapPageLearning(row) : undefined;
+            return row ? mapPageLearning(row, this.clock) : undefined;
           })();
         return prerequisite?.status === "active" && prerequisiteLearning?.fsrsState === "Review";
       }),
@@ -462,7 +530,7 @@ export class SchedulerService {
       throw new ValidationError(`Unknown wiki page: ${id}`);
     return this.db
       .all<Record<string, unknown>>("SELECT * FROM page_reviews WHERE page_id = ? ORDER BY reviewed_at, review_id", id)
-      .map(mapPageReview);
+      .map((row) => mapPageReview(row, this.clock));
   }
 
   transitionPage(
@@ -501,7 +569,7 @@ export class SchedulerService {
     if (existing) {
       if (String(existing.submission_id) !== context.submissionId || String(existing.rating) !== rating)
         throw new ValidationError("Page review revision is already settled");
-      return mapPageReview(existing);
+      return mapPageReview(existing, this.clock);
     }
     const at = asDate(reviewedAt, "reviewedAt");
     const before = this.toFsrsInput(learning);
@@ -510,6 +578,7 @@ export class SchedulerService {
     const afterSnapshot = fsrsSnapshot(after);
     const reviewId = randomUUID();
     const settlementId = context.settlementId ?? `${context.quizId}:${id}:${context.submissionId}:${context.revision}`;
+    const updatedAt = at.toISOString();
     const update = this.db.run(
       `UPDATE page_learning
        SET due_at = ?, fsrs_state = ?, stability = ?, difficulty = ?, reps = ?, lapses = ?, scheduled_days = ?, last_review_at = ?, revision = revision + 1, updated_at = ?
@@ -522,7 +591,7 @@ export class SchedulerService {
       after.lapses,
       after.scheduled_days ?? 0,
       at.toISOString(),
-      nowIso(),
+      updatedAt,
       id,
       learning.revision,
     );

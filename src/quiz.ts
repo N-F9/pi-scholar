@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import katex from "katex";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
+import { mathFromMarkdown } from "mdast-util-math";
 import { gfm } from "micromark-extension-gfm";
+import { math } from "micromark-extension-math";
 import type {
   PageLearningRecord,
   QuizEvidenceRecord,
@@ -16,13 +19,14 @@ import type {
   WorkflowRecord,
 } from "./contracts.js";
 import { transaction as databaseTransaction } from "./database.js";
-import type { SqlDatabase, SqlDatabaseSource, VaultPathsLike } from "./scheduler.js";
+import type { Clock, SqlDatabase, SqlDatabaseSource, VaultPathsLike } from "./scheduler.js";
 import {
   localDate,
   RATINGS,
   RevisionConflictError,
   SchedulerService,
   SEALED_QUIZ_REVIEW,
+  SYSTEM_CLOCK,
   ValidationError,
 } from "./scheduler.js";
 import { atomicWriteFile, readFileNoFollow, safeRelativePath } from "./vault.js";
@@ -111,12 +115,32 @@ const FORBIDDEN_SHEET_TEXT = /answer\s*key|correct\s+answer|grading\s+criteria|r
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
+function decodePercentEscapes(value: string): string {
+  let decoded = value;
+  while (true) {
+    const next = decoded.replace(/(?:%[0-9a-f]{2})+/giu, (encoded) => {
+      try {
+        return decodeURIComponent(encoded);
+      } catch {
+        return encoded;
+      }
+    });
+    if (next === decoded) return decoded;
+    decoded = next;
+  }
+}
 function normalizeSearchable(value: string): string {
-  return value
+  return decodePercentEscapes(value)
     .replace(/\p{Default_Ignorable_Code_Point}/gu, "")
     .normalize("NFC")
     .replace(/[ \t\n\f\r]+/gu, " ")
     .trim();
+}
+function renderedMathValue(value: string): string {
+  return katex
+    .renderToString(value, { maxExpand: 1_000, output: "mathml", throwOnError: false, trust: false })
+    .replace(/<annotation\b[\s\S]*?<\/annotation>/gu, "")
+    .replace(/<[^>]+>/gu, "");
 }
 function renderedMarkdownValues(value: string): string {
   const properties: string[] = [];
@@ -125,6 +149,8 @@ function renderedMarkdownValues(value: string): string {
     const record = node as Record<string, unknown>;
     if (record.type === "html") return "";
     for (const key of ["url", "title"]) if (typeof record[key] === "string") properties.push(record[key]);
+    if ((record.type === "inlineMath" || record.type === "math") && typeof record.value === "string")
+      properties.push(renderedMathValue(record.value));
     if (record.type === "image" || record.type === "imageReference")
       return typeof record.alt === "string" ? record.alt : "";
     if (record.type === "break") return "\n";
@@ -139,8 +165,8 @@ function renderedMarkdownValues(value: string): string {
   return [
     render(
       fromMarkdown(value, {
-        extensions: [gfm()],
-        mdastExtensions: [gfmFromMarkdown()],
+        extensions: [gfm(), math()],
+        mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()],
       }),
     ),
     ...properties,
@@ -162,8 +188,14 @@ const UUID_PAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 function pageIdToken(value: string): QuizVisibleTextToken {
   return UUID_PAGE_ID.test(value) ? substringToken(value) : boundaryToken(value);
 }
+const MANAGED_IMAGE_URI =
+  /pi-scholar:\/\/source\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/attachment\/[0-9a-f]{64}/iu;
 
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
+  const rendered = decodePercentEscapes(`${value}\n${renderedMarkdownValues(value)}`);
+  if (/\p{Bidi_Control}/u.test(rendered)) throw new ValidationError("Quiz Markdown contains private metadata");
+  const searchable = normalizeSearchable(rendered);
+  if (MANAGED_IMAGE_URI.test(searchable)) throw new ValidationError("Quiz Markdown contains private metadata");
   const tokens = new Map<string, QuizVisibleTextToken["match"]>();
   for (const token of hiddenTokens) {
     const normalized = normalizeSearchable(token.value);
@@ -171,7 +203,6 @@ export function validateQuizVisibleText(value: string, hiddenTokens: readonly Qu
     if (token.match === "substring" || !tokens.has(normalized)) tokens.set(normalized, token.match);
   }
   if (!tokens.size) return;
-  const searchable = normalizeSearchable(`${value}\n${renderedMarkdownValues(value)}`);
   const substringTokens = [...tokens].filter(([, match]) => match === "substring").map(([token]) => token);
   const boundaryTokens = [...tokens].filter(([, match]) => match === "boundary").map(([token]) => token);
   if (
@@ -186,8 +217,8 @@ export function validateQuizVisibleText(value: string, hiddenTokens: readonly Qu
   }
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
+function nowIso(clock: Clock): string {
+  return clock.now().toISOString();
 }
 
 function json(value: unknown): string {
@@ -332,13 +363,20 @@ export class QuizService {
   readonly db: SqlDatabase;
   readonly paths?: VaultPathsLike;
   readonly scheduler: SchedulerService;
+  readonly clock: Clock;
   private readonly source: SqlDatabaseSource;
 
-  constructor(source: SqlDatabaseSource, paths?: VaultPathsLike, scheduler?: SchedulerService) {
+  constructor(
+    source: SqlDatabaseSource,
+    paths?: VaultPathsLike,
+    scheduler?: SchedulerService,
+    clock: Clock = scheduler?.clock ?? SYSTEM_CLOCK,
+  ) {
     this.source = source;
     this.db = adaptDatabase(source);
     this.paths = paths;
-    this.scheduler = scheduler ?? new SchedulerService(source, paths);
+    this.clock = clock;
+    this.scheduler = scheduler ?? new SchedulerService(source, paths, clock);
   }
 
   get(dateOrQuizId: string | Date): QuizRecord | undefined {
@@ -410,6 +448,7 @@ export class QuizService {
     const date = localDate(typeof input === "object" && !(input instanceof Date) ? input.date : input);
     const existing = this.get(date);
     if (existing) return existing;
+    const generatedAt = nowIso(this.clock);
     const selectedPageIds = typeof input === "object" && !(input instanceof Date) ? input.selectedPageIds : undefined;
     const selectedPages = this.selectedPagesFor(date, selectedPageIds);
     const quizId = randomUUID();
@@ -421,7 +460,7 @@ export class QuizService {
           "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'skipped', NULL, ?, NULL, ?, NULL)",
           quizId,
           date,
-          nowIso(),
+          generatedAt,
           "skipped-no-eligible-pages",
         );
       });
@@ -460,7 +499,7 @@ export class QuizService {
             quizId,
             date,
             sheetPath ?? null,
-            nowIso(),
+            generatedAt,
           );
           for (const item of evidence) {
             this.db.run(
@@ -513,7 +552,7 @@ export class QuizService {
           "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'failed', NULL, ?, NULL, ?, ?)",
           quizId,
           date,
-          nowIso(),
+          generatedAt,
           "generation-failed",
           message,
         );
@@ -551,6 +590,7 @@ export class QuizService {
     const preview: QuizRecord = { ...quiz, revision: nextRevision };
     const rendered = this.renderSheet(preview, answers);
     this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview));
+    const savedAt = nowIso(this.clock);
     const result = this.replaceSheet(preview.sheetPath ?? pathForSheet(this.paths, date), rendered, () => {
       transaction(this.source, () => {
         for (const [questionId, answer] of Object.entries(input.answers)) {
@@ -560,7 +600,7 @@ export class QuizService {
             questionId,
             nextRevision,
             json(normalizedAnswer(answer)),
-            nowIso(),
+            savedAt,
           );
         }
         this.db.run(
@@ -728,7 +768,7 @@ export class QuizService {
       throw new ValidationError("The sealed quiz answers do not match the committed revision");
     }
     const prepared = this.prepareGradeSubmission(quiz, input);
-    const settledAt = nowIso();
+    const settledAt = nowIso(this.clock);
     const previewResults: SettledQuestionResult[] = prepared.questions.map((questionGrade) => ({
       questionId: questionGrade.question.questionId,
       feedback: questionGrade.feedback,
@@ -1034,7 +1074,7 @@ export class QuizService {
     if (input.revision !== quiz.revision) throw new RevisionConflictError("The quiz submission revision is stale");
     const answers = input.answers ?? this.answerMap(quiz.quizId);
     this.validateCompleteAnswers(quiz, answers);
-    const submittedAt = nowIso();
+    const submittedAt = nowIso(this.clock);
     const preview: QuizRecord = { ...quiz, status: "submitted", submittedAt };
     const rendered = this.renderSheet(preview, answers);
     this.validateRenderedSheet(rendered, this.hiddenTokensForQuiz(preview));
@@ -1504,7 +1544,7 @@ export class QuizService {
     }
 
     const pages: SettledPageResult[] = [];
-    const resultByPage = new Map<string, Record<string, unknown>>();
+    const resultByPage = new Map<string, SettledPageResult>();
     for (const row of pageRows) {
       const pageId = String(row.page_id ?? "");
       const reviewId = String(row.review_id ?? "");
@@ -1528,8 +1568,7 @@ export class QuizService {
         throw new ValidationError("Committed grade page rating is inconsistent");
       const feedback = String(row.feedback ?? "");
       this.validateFeedback(feedback, hiddenTokens);
-      resultByPage.set(pageId, row);
-      pages.push({
+      resultByPage.set(pageId, {
         gradeId: reviewId,
         quizId: quiz.quizId,
         pageId,
@@ -1544,6 +1583,7 @@ export class QuizService {
     for (const pageId of expectedPageIds) {
       if (!resultByPage.has(pageId) || !reviewByPage.has(pageId))
         throw new ValidationError("Committed grade is missing a page Result");
+      pages.push(resultByPage.get(pageId)!);
     }
     return { quiz, questions, pages };
   }

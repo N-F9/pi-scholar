@@ -2,11 +2,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import type { SettingsResult, SettingsUpdateRequest } from "../../../../src/contracts";
 import { api, errorMessage, formatDate, isSettingsResult } from "../api";
-import { Badge, Button, Card, Spinner, StateView } from "../components/ui";
+import { Badge, Button, Card, Field, Input, Spinner, StateView } from "../components/ui";
+
+function shiftDate(value: string, days: number): string {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
-  const [confirming, setConfirming] = useState(false);
+  const [dateInput, setDateInput] = useState<string>();
   const query = useQuery({
     queryKey: ["settings"],
     queryFn: ({ signal }) => api<SettingsResult>("/api/v1/settings", { signal }, isSettingsResult),
@@ -14,22 +20,30 @@ export function SettingsPage() {
   const update = useMutation({
     mutationFn: (request: SettingsUpdateRequest) =>
       api<SettingsResult>("/api/v1/settings", { method: "PUT", body: JSON.stringify(request) }, isSettingsResult),
-    onSuccess: async () => {
-      setConfirming(false);
+    onSuccess: async (_result, request) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["settings"] }),
         queryClient.invalidateQueries({ queryKey: ["quiz"] }),
         queryClient.invalidateQueries({ queryKey: ["workflows"] }),
       ]);
+      if ("simulatedDate" in request) setDateInput(undefined);
     },
   });
+  const developerDate = query.data
+    ? (dateInput ?? query.data.settings.simulatedDate ?? query.data.settings.facts.localDate)
+    : "";
+  const moveDate = (days: number) => {
+    const next = shiftDate(developerDate, days);
+    setDateInput(next);
+    update.mutate({ simulatedDate: next });
+  };
 
   return (
     <div className="space-y-8">
       <header>
         <p className="eyebrow">Vault facts</p>
         <h1 className="page-heading mt-2">Settings</h1>
-        <p className="mt-3 max-w-2xl text-muted">Inspect initialization and synchronization facts.</p>
+        <p className="mt-3 max-w-2xl text-muted">Inspect maintenance and synchronization facts.</p>
       </header>
 
       {query.isLoading ? <Spinner label="Loading settings" /> : null}
@@ -40,51 +54,99 @@ export function SettingsPage() {
       ) : null}
       {query.data ? (
         <div className="grid gap-6">
+          {update.isError ? (
+            <p
+              className="rounded-md border border-danger/40 bg-danger/10 p-4 text-sm font-bold text-danger"
+              role="alert"
+            >
+              Could not save settings. {errorMessage(update.error)}
+            </p>
+          ) : null}
           <Card>
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
                 <p className="eyebrow">Quiz publishing</p>
                 <h2 className="mt-2 font-serif text-3xl font-semibold">
-                  Initialization {query.data.settings.initializationEnabled ? "enabled" : "disabled"}
+                  Maintenance mode {query.data.settings.maintenanceEnabled ? "enabled" : "disabled"}
                 </h2>
                 <p className="mt-3 max-w-2xl text-muted">
-                  {query.data.settings.initializationEnabled
-                    ? "Initialization blocks quiz publishing until you turn it off."
+                  {query.data.settings.maintenanceEnabled
+                    ? "Maintenance mode blocks quiz publishing until you turn it off."
                     : "Quiz publishing is enabled. Skills run independently according to your cron entries."}
                 </p>
               </div>
-              <Badge tone={query.data.settings.initializationEnabled ? "caution" : "neutral"}>
-                {query.data.settings.initializationEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}
+              <Badge tone={query.data.settings.maintenanceEnabled ? "caution" : "neutral"}>
+                {query.data.settings.maintenanceEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}
               </Badge>
             </div>
 
-            {query.data.settings.initializationEnabled && !confirming ? (
-              <Button className="mt-6" variant="secondary" onClick={() => setConfirming(true)}>
-                Turn off initialization
-              </Button>
-            ) : null}
-            {query.data.settings.initializationEnabled && confirming ? (
-              <div className="mt-6 rounded-md border border-caution/40 bg-caution/10 p-4">
-                <h3 className="font-bold">Turn off initialization?</h3>
-                <p className="mt-2 text-sm text-muted">
-                  Quiz publishing will be enabled. Skills will run independently according to your cron entries.
-                </p>
-                <div className="mt-4 flex flex-wrap gap-3">
-                  <Button onClick={() => update.mutate({ initializationEnabled: false })} disabled={update.isPending}>
-                    {update.isPending ? "Saving…" : "Turn off initialization"}
-                  </Button>
-                  <Button variant="quiet" onClick={() => setConfirming(false)} disabled={update.isPending}>
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-            {update.isError ? (
-              <p className="mt-4 text-sm font-bold text-danger" role="alert">
-                {errorMessage(update.error)}
-              </p>
-            ) : null}
+            <p className="mt-5 max-w-2xl text-sm text-muted">
+              Change this vault-level setting from a terminal with{" "}
+              <code className="font-mono text-ink">
+                {`pi-scholar maintenance ${query.data.settings.maintenanceEnabled ? "off" : "on"} --vault /path/to/vault`}
+              </code>
+              .
+            </p>
           </Card>
+
+          {query.data.developerToolsEnabled || query.data.settings.simulatedDate ? (
+            <Card className="shadow-none">
+              <p className="eyebrow">Developer tools</p>
+              <h2 className="mt-2 font-serif text-2xl font-semibold">Simulated learning date</h2>
+              {query.data.developerToolsEnabled ? (
+                <>
+                  <p className="mt-3 max-w-2xl text-sm text-muted">
+                    Rehearse learning in a disposable vault. Operational timestamps continue to use real time.
+                  </p>
+                  <div className="mt-5 grid max-w-xl gap-4">
+                    <Field label="Effective learning date">
+                      <Input
+                        type="date"
+                        value={developerDate}
+                        onChange={(event) => setDateInput(event.currentTarget.value)}
+                        disabled={update.isPending}
+                        required
+                      />
+                    </Field>
+                    <div className="flex flex-wrap gap-3">
+                      <Button
+                        onClick={() => update.mutate({ simulatedDate: developerDate })}
+                        disabled={update.isPending || !developerDate}
+                      >
+                        Apply
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        onClick={() => moveDate(-1)}
+                        disabled={update.isPending || !developerDate}
+                      >
+                        Previous day
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        onClick={() => moveDate(1)}
+                        disabled={update.isPending || !developerDate}
+                      >
+                        Next day
+                      </Button>
+                      <Button
+                        variant="quiet"
+                        onClick={() => update.mutate({ simulatedDate: null })}
+                        disabled={update.isPending}
+                      >
+                        Use real date
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <p className="mt-3 max-w-2xl text-sm text-muted">
+                  Simulation is active for {query.data.settings.simulatedDate}. Restart the server with{" "}
+                  <code className="font-mono text-ink">pi-scholar serve --dev-tools</code> to change or clear it.
+                </p>
+              )}
+            </Card>
+          ) : null}
 
           <section aria-labelledby="current-facts-heading">
             <p className="eyebrow">Current facts</p>

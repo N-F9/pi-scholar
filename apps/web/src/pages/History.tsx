@@ -25,7 +25,7 @@ export function HistoryPage() {
         <p className="eyebrow">Dated sheets</p>
         <h1 className="page-heading mt-2">History</h1>
         <p className="mt-3 max-w-2xl text-muted">
-          Past quiz skill invocations, sealed answers, results, and exact follow-up readings.
+          Past quiz skill invocations, sealed answers, results, exact readings, and current whole-wiki guidance.
         </p>
       </header>
 
@@ -91,6 +91,12 @@ export function HistoryDetailPage() {
     queryKey: ["quiz", date],
     queryFn: ({ signal }) => api<QuizResult>(`/api/v1/quizzes/${encodeURIComponent(date)}`, { signal }, isQuizResult),
     enabled: /^\d{4}-\d{2}-\d{2}$/.test(date),
+    refetchOnWindowFocus: true,
+    refetchInterval: ({ state }) =>
+      state.data?.outcome === "submitted" &&
+      !(state.data.quiz?.pageResults.length || state.data.grades.length || state.data.quiz?.grades.length)
+        ? 5_000
+        : false,
   });
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
@@ -99,6 +105,12 @@ export function HistoryDetailPage() {
         <p>Choose a dated sheet from History.</p>
       </StateView>
     );
+
+  const settled = Boolean(
+    query.data?.quiz &&
+      (query.data.quiz.pageResults.length || query.data.grades.length || query.data.quiz.grades.length),
+  );
+  const gradingPending = query.data?.outcome === "submitted" && !settled;
 
   return (
     <div className="space-y-8">
@@ -144,6 +156,17 @@ export function HistoryDetailPage() {
           <p>{query.data.message ?? "No question sheet was published for this date."}</p>
         </StateView>
       ) : null}
+      {gradingPending ? (
+        <StateView title="Answers submitted">
+          <p>Your sealed answers are being graded. This page updates when grading finishes.</p>
+          <Link
+            className="mt-4 inline-block font-bold underline decoration-accent decoration-2 underline-offset-4"
+            to="/workflows"
+          >
+            View grading workflow
+          </Link>
+        </StateView>
+      ) : null}
       {query.data?.quiz && query.data.quiz.questions.length > 0 ? (
         <>
           {query.data.quiz.status === "expired" ? (
@@ -161,6 +184,7 @@ export function HistoryDetailPage() {
             pageResults={query.data.quiz.pageResults}
             grades={query.data.grades.length ? query.data.grades : query.data.quiz.grades}
             readings={query.data.readings.length ? query.data.readings : query.data.quiz.readings}
+            recommendations={query.data.recommendations}
           />
         </>
       ) : null}

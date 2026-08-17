@@ -106,6 +106,25 @@ export interface PreparedAdmission {
   readonly atoms: readonly PreparedAdmissionAtom[];
 }
 
+export interface ExtractContextRequest {
+  readonly pendingSourceIds?: readonly string[];
+}
+export type ExtractProgressPhase =
+  | "claiming"
+  | "preparing"
+  | "docling"
+  | "extracting"
+  | "normalizing"
+  | "validating/indexing"
+  | "ready"
+  | "failed";
+export interface ExtractProgressEvent {
+  readonly entry: number;
+  readonly total: number;
+  readonly filename: string;
+  readonly phase: ExtractProgressPhase;
+}
+
 export interface ExtractClaimRecord extends PreparedAdmission {
   readonly relativePath: string;
   readonly originalName?: string;
@@ -282,6 +301,10 @@ export interface IngestContext {
   readonly sources: readonly IngestSourceContext[];
 }
 
+export interface IngestContextRequest {
+  readonly sourceIds?: readonly string[];
+}
+
 export interface LintContext {
   readonly scope: { readonly kind: "full" } | { readonly kind: "targeted"; readonly description: string };
   readonly pages: readonly WikiPageResult[];
@@ -343,11 +366,32 @@ export interface QuizReadingRecord {
   readonly heading?: string;
   readonly href: string;
 }
+export interface QuizRecommendationReading {
+  readonly pageId: string;
+  readonly path: string;
+  readonly title: string;
+  readonly href: string;
+  readonly reason: "prerequisite" | "related";
+}
+
+export interface QuizRecommendationGap {
+  readonly pageId: string;
+  readonly path: string;
+  readonly title: string;
+  readonly href: string;
+  readonly kind: "missing" | "unclear" | "drifted";
+}
+
+export interface QuizRecommendations {
+  readonly readings: readonly QuizRecommendationReading[];
+  readonly gaps: readonly QuizRecommendationGap[];
+}
 
 export interface QuizPageResultRecord {
   readonly resultId: string;
   readonly quizId: string;
   readonly pageId: string;
+  readonly pageLink: QuizReadingRecord;
   readonly rating: ReviewRating;
   readonly feedback: string;
   readonly reviewId: string;
@@ -453,7 +497,7 @@ export type QuizPublicationInput =
 
 export interface QuizContext {
   readonly date: LocalDate;
-  readonly initializationEnabled: boolean;
+  readonly maintenanceEnabled: boolean;
   readonly expiredCount: number;
   readonly candidates: readonly QuizCandidateRecord[];
   readonly quiz?: QuizDetailRecord;
@@ -545,11 +589,12 @@ export interface SettingsFacts {
 }
 
 export interface SettingsRecord {
-  readonly initializationEnabled: boolean;
+  readonly maintenanceEnabled: boolean;
   readonly timezone: string;
   readonly port: number;
   readonly host: string;
   readonly updatedAt: IsoDateTime;
+  readonly simulatedDate?: LocalDate;
   readonly facts: SettingsFacts;
 }
 export interface ApiError {
@@ -671,6 +716,7 @@ export interface QuizResult {
   readonly answers: readonly QuizAnswerInput[];
   readonly grades: readonly QuizGradeRecord[];
   readonly readings: readonly QuizReadingRecord[];
+  readonly recommendations: QuizRecommendations;
   readonly message?: string;
 }
 
@@ -695,6 +741,7 @@ export interface QuizSubmissionResult {
   readonly quiz: PublicQuizDetailRecord;
   readonly grades: readonly QuizGradeRecord[];
   readonly readings: readonly QuizReadingRecord[];
+  readonly recommendations: QuizRecommendations;
 }
 
 export interface WorkflowListResult {
@@ -703,13 +750,15 @@ export interface WorkflowListResult {
 
 export interface SettingsResult {
   readonly settings: SettingsRecord;
+  readonly developerToolsEnabled: boolean;
 }
 
 export interface SettingsUpdateRequest {
-  readonly initializationEnabled?: boolean;
+  readonly maintenanceEnabled?: boolean;
   readonly timezone?: string;
   readonly port?: number;
   readonly host?: string;
+  readonly simulatedDate?: LocalDate | null;
 }
 
 export interface DoctorCheck {

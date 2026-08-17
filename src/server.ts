@@ -6,6 +6,7 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import busboy from "busboy";
 import { createApplication, type ScholarApplication } from "./application/application.js";
+import { publicWikiPage } from "./application/projections.js";
 import type {
   ApiEnvelope,
   JsonValue,
@@ -59,6 +60,7 @@ export interface ServerOptions {
   readonly version?: string;
   readonly maxJsonBytes?: number;
   readonly maxMultipartBytes?: number;
+  readonly developerTools?: boolean;
 }
 
 export interface ScholarServer extends Server {
@@ -69,6 +71,7 @@ interface RequestOptions {
   readonly host: string;
   readonly maxJsonBytes: number;
   readonly maxMultipartBytes?: number;
+  readonly developerTools?: boolean;
 }
 
 interface MultipartUpload {
@@ -86,14 +89,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function keysExactly(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
 }
-function booleanField(value: Record<string, unknown>, key: string): boolean {
-  if (typeof value[key] !== "boolean") throw new ValidationError(`${key} must be boolean`);
-  return value[key];
-}
 function stringField(value: Record<string, unknown>, key: string, required = false): string | undefined {
   const result = value[key];
   if (result === undefined && !required) return undefined;
   if (typeof result !== "string" || !result.trim()) throw new ValidationError(`${key} must be a nonempty string`);
+  return result;
+}
+function simulatedDateField(value: Record<string, unknown>, key: string): string | null | undefined {
+  const result = value[key];
+  if (result === undefined) return undefined;
+  if (result === null) return null;
+  if (typeof result !== "string" || !DATE.test(result) || localDate(result) !== result)
+    throw new ValidationError(`${key} must be null or a valid calendar date`);
   return result;
 }
 function integerField(value: Record<string, unknown>, key: string): number {
@@ -135,6 +142,7 @@ function assertRouteMethod(path: string, method: string): void {
     allowed = ["GET"];
   else if (path === "/api/v1/wiki/issues") allowed = ["GET", "POST"];
   else if (/^\/api\/v1\/wiki\/issues\/[^/]+$/u.test(path)) allowed = ["PATCH"];
+  else if (/^\/api\/v1\/wiki\/pages\/[^/]+\/attachments\/[^/]+\/[^/]+$/u.test(path)) allowed = ["GET"];
   else if (/^\/api\/v1\/wiki\/pages\/[^/]+\/drift-resolution$/u.test(path)) allowed = ["POST"];
   else if (/^\/api\/v1\/quizzes\/[^/]+(?:\/(answers|submission))?$/u.test(path)) {
     const action = /^\/api\/v1\/quizzes\/[^/]+(?:\/(answers|submission))?$/u.exec(path)?.[1];
@@ -193,7 +201,7 @@ function jsonSafe(value: unknown): JsonValue {
 function securityHeaders(res: ServerResponse): void {
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   );
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -207,6 +215,17 @@ function sendJson<T>(res: ServerResponse, status: number, data: T, requestId: st
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Content-Length", Buffer.byteLength(body));
   res.end(body);
+}
+function sendAttachment(
+  res: ServerResponse,
+  attachment: { readonly bytes: Buffer; readonly byteLength: number; readonly contentType: string },
+): void {
+  securityHeaders(res);
+  res.statusCode = 200;
+  res.setHeader("Content-Type", attachment.contentType);
+  res.setHeader("Content-Length", attachment.byteLength);
+  res.setHeader("Cache-Control", "no-store");
+  res.end(attachment.bytes);
 }
 function sendError(res: ServerResponse, status: number, error: unknown, requestId: string): void {
   const internal = status >= 500;
@@ -710,7 +729,20 @@ async function apiRoute(
     if ((pageId ? 1 : 0) + (pagePath ? 1 : 0) !== 1)
       throw new ValidationError("exactly one of pageId or path is required");
     if (pageId && !UUID.test(pageId)) throw new ValidationError("page ID is malformed");
-    sendJson(res, 200, await app.getWiki(pageId ?? pagePath!), requestId);
+    sendJson(res, 200, publicWikiPage(await app.getWiki(pageId ?? pagePath!)), requestId);
+    return;
+  }
+  const attachmentMatch = /^\/api\/v1\/wiki\/pages\/([^/]+)\/attachments\/([^/]+)\/([^/]+)$/u.exec(path);
+  if (attachmentMatch) {
+    queryOnly(url, []);
+    const pageId = pathSegment(attachmentMatch[1]!, "page");
+    const sourceId = pathSegment(attachmentMatch[2]!, "source");
+    const digest = pathSegment(attachmentMatch[3]!, "attachment");
+    if (!UUID.test(pageId) || pageId !== pageId.toLowerCase()) throw new ValidationError("page ID is malformed");
+    if (!UUID.test(sourceId) || sourceId !== sourceId.toLowerCase())
+      throw new ValidationError("source ID is malformed");
+    if (!/^[0-9a-f]{64}$/u.test(digest)) throw new ValidationError("attachment digest is malformed");
+    sendAttachment(res, await app.getWikiAttachment(pageId, sourceId, digest));
     return;
   }
   if (path === "/api/v1/wiki/search") {
@@ -776,7 +808,7 @@ async function apiRoute(
       expectedDigest: stringField(value, "expectedDigest", true)!,
       ...(value.description === undefined ? {} : { description: stringField(value, "description") }),
     };
-    sendJson(res, 200, await app.resolveDrift(pageId, input, { origin: "browser" }), requestId);
+    sendJson(res, 200, publicWikiPage(await app.resolveDrift(pageId, input, { origin: "browser" })), requestId);
     return;
   }
   if (path === "/api/v1/quizzes") {
@@ -829,21 +861,39 @@ async function apiRoute(
   if (path === "/api/v1/settings") {
     if (method === "GET") {
       queryOnly(url, []);
-      sendJson(res, 200, await app.getSettings(), requestId);
+      sendJson(
+        res,
+        200,
+        { ...(await app.getSettings()), developerToolsEnabled: options.developerTools === true },
+        requestId,
+      );
       return;
     }
     const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-    if (!keysExactly(value, ["initializationEnabled", "timezone", "port", "host"]))
+    const simulatedDateRequested = Object.hasOwn(value, "simulatedDate");
+    if (simulatedDateRequested && options.developerTools !== true)
+      throw Object.assign(new Error("developer tools are required to change simulatedDate"), {
+        code: "DEVELOPER_TOOLS_REQUIRED",
+        status: 403,
+      });
+    if (!keysExactly(value, ["timezone", "port", "host", "simulatedDate"]))
       throw new ValidationError("settings request has unsupported fields");
+    const simulatedDate = simulatedDateField(value, "simulatedDate");
     const input: SettingsUpdateRequest = {
-      ...(value.initializationEnabled === undefined
-        ? {}
-        : { initializationEnabled: booleanField(value, "initializationEnabled") }),
       ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
       ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
       ...(value.host === undefined ? {} : { host: stringField(value, "host") }),
+      ...(simulatedDate === undefined ? {} : { simulatedDate }),
     };
-    sendJson(res, 200, await app.updateSettings(input, { origin: "browser" }), requestId);
+    const context = simulatedDateRequested
+      ? { origin: "browser" as const, developerToolsEnabled: true }
+      : { origin: "browser" as const };
+    sendJson(
+      res,
+      200,
+      { ...(await app.updateSettings(input, context)), developerToolsEnabled: options.developerTools === true },
+      requestId,
+    );
     return;
   }
   throw Object.assign(new Error("route not found"), { code: "ROUTE_NOT_FOUND", status: 404 });
@@ -944,6 +994,7 @@ export function createServer(options: ServerOptions = {}): ScholarServer {
     host,
     maxJsonBytes: options.maxJsonBytes ?? MAX_JSON_BYTES,
     ...(options.maxMultipartBytes === undefined ? {} : { maxMultipartBytes: options.maxMultipartBytes }),
+    ...(options.developerTools === undefined ? {} : { developerTools: options.developerTools }),
   };
   const server = nodeCreateServer((req, res) => {
     void handleRequest(req, res, application, staticRoot, requestOptions);

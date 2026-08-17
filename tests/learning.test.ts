@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, test } from "vitest";
 import { openDatabase, type ScholarDatabase } from "../src/database.js";
 import { QuizConflictError, QuizService, validateQuizVisibleText } from "../src/quiz.js";
-import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
+import { type Clock, localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
 import { parseWikiBodySections, parseWikiDocumentSections } from "../src/wiki-sections.js";
 
 const LEARNING_WIKI_ROOT = mkdtempSync(join(tmpdir(), "pi-scholar-learning-"));
@@ -75,6 +75,58 @@ test("due eligibility uses the persisted timezone for both day and due timestamp
     ["timezone-page"],
   );
   assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
+  db.close();
+});
+test("injected learning clocks stamp due, quiz, and FSRS writes consistently", () => {
+  const { db } = setup();
+  const instant = "2026-08-15T12:00:00.000Z";
+  const clock: Clock = { now: () => new Date(instant) };
+  const scheduler = new SchedulerService(db, undefined, clock);
+  scheduler.ensurePageLearning("p1");
+  const learning = scheduler.getPageLearning("p1");
+  assert.equal(learning.initialDueAt, instant);
+  assert.equal(learning.createdAt, instant);
+  assert.equal(learning.updatedAt, instant);
+
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler, clock);
+  const generated = quiz.createDailyQuiz({
+    date: "2026-08-15",
+    selectedPageIds: ["p1"],
+    questionSpecs: [question("p1")],
+  });
+  assert.equal(generated.generatedAt, instant);
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({
+    date: generated.date,
+    revision: generated.revision,
+    answers: { [questionId]: "answer" },
+  });
+  assert.equal(
+    db.get<{ saved_at: string }>("SELECT saved_at FROM quiz_answers WHERE quiz_id = ?", generated.quizId)?.saved_at,
+    instant,
+  );
+  const sealed = quiz.sealSubmission({ date: generated.date, revision: draft.revision });
+  assert.equal(sealed.submittedAt, instant);
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  const settled = quiz.settleGrade({
+    date: sealed.date,
+    revision: sealed.revision,
+    submissionId: "clock-submission",
+    questions: [{ questionId, feedback: "Good." }],
+    pages: [{ pageId: "p1", rating: "Good", evidence: [evidence.reference] }],
+  });
+  assert.equal(settled.pages[0]!.gradedAt, instant);
+  assert.equal(
+    db.get<{ graded_at: string }>("SELECT graded_at FROM question_results WHERE quiz_id = ?", sealed.quizId)?.graded_at,
+    instant,
+  );
+  assert.equal(
+    db.get<{ reviewed_at: string }>("SELECT reviewed_at FROM page_reviews WHERE quiz_id = ?", sealed.quizId)
+      ?.reviewed_at,
+    instant,
+  );
+  assert.equal(scheduler.getPageLearning("p1").lastReviewAt, instant);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", sealed.quizId).length, 1);
   db.close();
 });
 test("section parsers keep headed preambles and exclude OKF frontmatter", () => {
@@ -553,6 +605,65 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   db.close();
 });
 
+test("persisted grading keeps page reviews in durable question order", () => {
+  const { db, scheduler, date } = setup();
+  const pageIds = ["page-b", "page-a"] as const;
+  for (const pageId of pageIds) addPage(db, pageId);
+  const quiz = new QuizService(
+    db,
+    { wiki: LEARNING_WIKI_ROOT, quizzesRoot: join(LEARNING_WIKI_ROOT, "quizzes") },
+    scheduler,
+  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: pageIds,
+    questionSpecs: pageIds.map((pageId, index) => question(pageId, `Explain page ${index + 1}`)),
+  });
+  const draft = quiz.saveDraft({
+    date,
+    revision: generated.revision,
+    answers: Object.fromEntries(generated.questions.map((item) => [item.questionId, "answer"])),
+  });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed);
+  const grade = {
+    requestId: "page-order-request",
+    date,
+    revision: sealed.revision,
+    submissionId: "page-order-submission",
+    questions: generated.questions.map((item, index) => ({
+      questionId: item.questionId,
+      feedback: `Question ${index + 1} feedback`,
+    })),
+    pages: pageIds.map((pageId, index) => {
+      const authorized = evidence.find((item) => item.pageId === pageId)!;
+      return {
+        pageId,
+        rating: "Good" as const,
+        feedback: `${index === 0 ? "First" : "Second"} page feedback`,
+        evidence: [authorized.reference],
+        readings: [{ pageId, anchor: authorized.anchor }],
+      };
+    }),
+  };
+
+  const settled = quiz.settleGrade(grade);
+  const storedSheet = readFileSync(settled.quiz.sheetPath!, "utf8");
+  assert.equal(quiz.parseSheet(storedSheet).quizId, generated.quizId);
+  assert.deepEqual(
+    settled.pages.map((page) => page.pageId),
+    pageIds,
+  );
+  assert.ok(storedSheet.indexOf("First page feedback") < storedSheet.indexOf("Second page feedback"));
+
+  const replay = quiz.settleGrade(grade);
+  assert.deepEqual(
+    replay.pages.map((page) => page.pageId),
+    pageIds,
+  );
+  db.close();
+});
+
 test("grading rejects generated reading targets that expose page IDs before persistence", () => {
   const { db, scheduler, date } = setup();
   ensureDue(scheduler, ["p1"], date);
@@ -676,7 +787,7 @@ test("quiz publishes more than two synthesis questions", () => {
   db.close();
 });
 
-test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedback", () => {
+test("quiz rejects exact supplied hidden metadata and allows unrelated UUIDs", () => {
   const { db, scheduler, date } = setup();
   ensureDue(scheduler, ["p1"], date);
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
@@ -689,6 +800,33 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   );
   assert.throws(
     () => validateQuizVisibleText(`x${sourceReference}`, [{ value: sourceReference, match: "substring" }]),
+    ValidationError,
+  );
+  const managedImage = `pi-scholar://source/${randomUUID()}/attachment/${"a".repeat(64)}`;
+  assert.throws(() => validateQuizVisibleText(`![image](${managedImage})`, []), ValidationError);
+  const sourceId = sourceReference.slice(0, -2);
+  const hiddenSourceId = [{ value: sourceId, match: "substring" }] as const;
+  assert.doesNotThrow(() => validateQuizVisibleText(`source ${randomUUID()}`, []));
+  assert.throws(() => validateQuizVisibleText(`source ${sourceId}`, hiddenSourceId), ValidationError);
+  assert.throws(
+    () => validateQuizVisibleText(`$${sourceId.replaceAll("-", "\\text{-}")}$`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x $$$${sourceId.replaceAll("-", "\\text{-}")}$$$`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(`[reference](https://example.test/${sourceId.replaceAll("-", "%2D")})`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`\u202e${[...sourceId].reverse().join("")}\u202c`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`&#x202e;${[...sourceId].reverse().join("")}&#x202c;`, hiddenSourceId),
     ValidationError,
   );
   assert.throws(
@@ -897,7 +1035,7 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   db.close();
 });
 
-test("quiz treats host-minted page UUIDs as opaque metadata", () => {
+test("quiz rejects supplied page UUIDs while allowing unrelated UUID answers", () => {
   const { db, scheduler, date } = setup();
   const pageId = randomUUID();
   addPage(db, pageId);
@@ -924,6 +1062,13 @@ test("quiz treats host-minted page UUIDs as opaque metadata", () => {
         answers: { [questionId]: `x${pageId}` },
       }),
     ValidationError,
+  );
+  assert.doesNotThrow(() =>
+    quiz.saveDraft({
+      date,
+      revision: generated.revision,
+      answers: { [questionId]: `x${randomUUID()}` },
+    }),
   );
   db.close();
 });

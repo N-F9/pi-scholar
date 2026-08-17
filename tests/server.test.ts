@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { setTimeout as delay, setImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
-import type { QuizRecord } from "../src/contracts.js";
+import type { QuizRecord, WikiPageResult } from "../src/contracts.js";
 import { type ServerOptions, startServer } from "../src/server.js";
 import { initVault, LockBusyError } from "../src/vault.js";
 
@@ -26,7 +26,7 @@ async function withServer(
   application: ScholarApplication,
   run: (base: string) => Promise<void>,
   staticRoot?: string,
-  serverOptions: Pick<ServerOptions, "maxMultipartBytes"> = {},
+  serverOptions: Pick<ServerOptions, "maxMultipartBytes" | "developerTools"> = {},
 ): Promise<void> {
   const server = await startServer({
     application,
@@ -79,6 +79,124 @@ function publicQuizFixture(): QuizRecord {
 }
 
 describe("server browser boundary", () => {
+  it("projects full OKF only at the wiki HTTP response boundaries", async () => {
+    const pageId = "11111111-1111-4111-8111-111111111111";
+    const result: WikiPageResult = {
+      page: {
+        pageId,
+        relativePath: "public.md",
+        title: "Public",
+        digest: "page-digest",
+        revision: 1,
+        status: "active",
+        quizWorthiness: "skip",
+        updatedAt: new Date(0).toISOString(),
+      },
+      markdown: "---\ntype: note\ntitle: Public\n---\n# Public body\n\nText.\n",
+      sections: [],
+      learning: { prerequisites: [] },
+      drift: { expectedDigest: "expected", actualDigest: "actual", diff: "diff" },
+    };
+    let pageReads = 0;
+    let driftResolutions = 0;
+    const application = {
+      getWiki: async () => {
+        pageReads += 1;
+        return result;
+      },
+      resolveDrift: async () => {
+        driftResolutions += 1;
+        return result;
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const pageResponse = await fetch(`${base}/api/v1/wiki/page?pageId=${pageId}`);
+      assert.equal(pageResponse.status, 200);
+      const pagePayload = (await pageResponse.json()) as { data: WikiPageResult };
+      assert.equal(pagePayload.data.markdown, "# Public body\n\nText.\n");
+      assert.equal(pagePayload.data.markdown.includes("type:"), false);
+      assert.deepEqual(
+        pagePayload.data.sections.map((section) => section.heading),
+        ["Public body"],
+      );
+      assert.deepEqual(pagePayload.data.drift?.diff, result.drift?.diff);
+
+      const driftResponse = await fetch(`${base}/api/v1/wiki/pages/${pageId}/drift-resolution`, {
+        method: "POST",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify({ action: "restore", expectedDigest: "expected" }),
+      });
+      assert.equal(driftResponse.status, 200);
+      const driftPayload = (await driftResponse.json()) as { data: WikiPageResult };
+      assert.equal(driftPayload.data.markdown, "# Public body\n\nText.\n");
+      assert.deepEqual(
+        driftPayload.data.sections.map((section) => section.heading),
+        ["Public body"],
+      );
+      assert.equal(driftPayload.data.drift?.diff, "diff");
+    });
+    assert.equal(pageReads, 1);
+    assert.equal(driftResolutions, 1);
+  });
+
+  it("serves only the page attachment response shape", async () => {
+    const pageId = "a1111111-1111-4111-8111-111111111111";
+    const sourceId = "b2222222-2222-4222-8222-222222222222";
+    const digest = "a".repeat(64);
+    const bytes = Buffer.from([1, 2, 3]);
+    const application = {
+      getWikiAttachment: async (requestedPage: string, requestedSource: string, requestedDigest: string) => {
+        assert.deepEqual([requestedPage, requestedSource, requestedDigest], [pageId, sourceId, digest]);
+        return { bytes, byteLength: bytes.byteLength, contentType: "image/png" };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/wiki/pages/${pageId}/attachments/${sourceId}/${digest}`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("content-type"), "image/png");
+      assert.equal(response.headers.get("content-length"), String(bytes.byteLength));
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.equal(response.headers.get("content-security-policy")?.includes("img-src 'self'"), true);
+      assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [...bytes]);
+      const malformed = await fetch(
+        `${base}/api/v1/wiki/pages/${pageId.toUpperCase()}/attachments/${sourceId}/${digest}`,
+      );
+      assert.equal(malformed.status, 400);
+    });
+  });
+  it("keeps malformed full OKF on the existing internal-error path", async () => {
+    const pageId = "11111111-1111-4111-8111-111111111111";
+    const application = {
+      getWiki: async () => ({
+        page: {
+          pageId,
+          relativePath: "malformed.md",
+          title: "Malformed",
+          digest: "page-digest",
+          revision: 1,
+          status: "active",
+          quizWorthiness: "skip",
+          updatedAt: new Date(0).toISOString(),
+        },
+        markdown: "# missing OKF\n",
+        sections: [],
+        learning: { prerequisites: [] },
+      }),
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+
+    await withServer(application, async (base) => {
+      const response = await fetch(`${base}/api/v1/wiki/page?pageId=${pageId}`);
+      assert.equal(response.status, 500);
+      const payload = (await response.json()) as { error: { code: string; message: string } };
+      assert.equal(payload.error.code, "INTERNAL_ERROR");
+      assert.equal(payload.error.message, "Internal server error");
+    });
+  });
   it("rejects route-disallowed methods before application dispatch", async () => {
     const unexpectedDispatch = () => assert.fail("route method policy allowed application dispatch");
     const application = {
@@ -906,9 +1024,63 @@ describe("server browser boundary", () => {
 
   it("projects quiz list and detail responses without rubric or answer material", async () => {
     const internal = publicQuizFixture();
+    const detail = {
+      ...internal,
+      answers: [{ questionId: "question-1", answer: "A **Markdown** answer." }],
+      questionResults: [
+        {
+          resultId: "question-result-1",
+          quizId: internal.quizId,
+          questionId: "question-1",
+          answerRevision: 1,
+          feedback: "Question **feedback**.",
+          gradedAt: new Date(0).toISOString(),
+        },
+      ],
+      pageResults: [
+        {
+          resultId: "page-result-1",
+          quizId: internal.quizId,
+          pageId: "page-1",
+          pageLink: {
+            pageId: "page-1",
+            path: "guide.md",
+            href: "/notes?pageId=page-1#note-content",
+          },
+          rating: "Good",
+          feedback: "Page **feedback**.",
+          reviewId: "review-1",
+          evidence: ["evidence-1"],
+          readings: [{ pageId: "page-1", path: "guide.md", href: "/notes?pageId=page-1" }],
+        },
+      ],
+      grades: [],
+      readings: [{ pageId: "page-1", path: "guide.md", href: "/notes?pageId=page-1" }],
+    };
+    const recommendations = {
+      readings: [
+        {
+          pageId: "page-2",
+          path: "related.md",
+          title: "Related",
+          href: "/notes?pageId=page-2#note-content",
+          reason: "related",
+        },
+      ],
+      gaps: [
+        {
+          pageId: "page-3",
+          path: "gap.md",
+          title: "Gap",
+          href: "/notes?pageId=page-3#note-content",
+          kind: "missing",
+        },
+      ],
+    };
     const target = {
       quiz: { list: () => [internal], get: () => internal, readSettledResult: () => undefined },
-      quizDetail: async () => internal,
+      quizDetail: async () => detail,
+      quizRecommendations: async () => recommendations,
       db: { all: () => [], get: () => undefined },
     };
     const application = {
@@ -924,7 +1096,11 @@ describe("server browser boundary", () => {
         const envelope = (await response.json()) as {
           data: {
             quizzes?: Array<{ questions: Array<Record<string, unknown>> }>;
-            quiz?: { questions: Array<Record<string, unknown>> };
+            quiz?: {
+              questions: Array<Record<string, unknown>>;
+              pageResults?: Array<Record<string, unknown>>;
+            };
+            recommendations?: typeof recommendations;
           };
         };
         const questions = envelope.data.quizzes?.[0]?.questions ?? envelope.data.quiz?.questions ?? [];
@@ -936,8 +1112,100 @@ describe("server browser boundary", () => {
         assert.equal("weight" in questions[0]!, false);
         assert.equal("answerKey" in questions[0]!, false);
         assert.equal("sourceRefs" in questions[0]!, false);
+        if (path.endsWith("/2026-08-09")) {
+          assert.deepEqual(envelope.data.quiz?.pageResults?.[0]?.pageLink, detail.pageResults[0]!.pageLink);
+          assert.deepEqual(envelope.data.recommendations, recommendations);
+        }
       }
       assert.equal(internal.questions[0]!.pages[0]!.criterion, "secret rubric");
     });
+  });
+  it("keeps maintenance read-only and gates simulated-date settings behind developer tools", async () => {
+    const settings = {
+      maintenanceEnabled: true,
+      simulatedDate: "2026-08-15",
+      timezone: "local",
+      port: 4816,
+      host: "127.0.0.1",
+      updatedAt: "2026-08-15T12:00:00.000Z",
+      facts: {
+        localDate: "2026-08-15",
+        pendingInboxCount: 0,
+        openIssueCount: 0,
+        recentChanges: [],
+        git: { clean: true, ahead: 0, behind: 0, diverged: false },
+      },
+    };
+    const updates: Array<{ readonly input: unknown; readonly context: unknown }> = [];
+    const application = {
+      getSettings: async () => ({ settings }),
+      updateSettings: async (input: unknown, context: unknown) => {
+        updates.push({ input, context });
+        return { settings: { ...settings, ...(input as object) } };
+      },
+      close: async () => undefined,
+    } as unknown as ScholarApplication;
+    const put = (base: string, body: unknown) =>
+      fetch(`${base}/api/v1/settings`, {
+        method: "PUT",
+        headers: sameOriginHeaders(base, { "Content-Type": "application/json", "X-Pi-Scholar-Request": "1" }),
+        body: JSON.stringify(body),
+      });
+
+    await withServer(application, async (base) => {
+      const get = await fetch(`${base}/api/v1/settings`);
+      assert.equal(get.status, 200);
+      const payload = (await get.json()) as { data: { developerToolsEnabled: boolean; settings: typeof settings } };
+      assert.equal(payload.data.developerToolsEnabled, false);
+      assert.equal(payload.data.settings.simulatedDate, "2026-08-15");
+
+      const denied = await put(base, { simulatedDate: "2026-08-16" });
+      assert.equal(denied.status, 403);
+      assert.equal(updates.length, 0);
+
+      const maintenance = await put(base, { maintenanceEnabled: false });
+      assert.equal(maintenance.status, 400);
+      assert.equal(updates.length, 0);
+
+      const ordinary = await put(base, { timezone: "local" });
+      assert.equal(ordinary.status, 200);
+      assert.deepEqual(updates[0], {
+        input: { timezone: "local" },
+        context: { origin: "browser" },
+      });
+      const ordinaryPayload = (await ordinary.json()) as { data: { developerToolsEnabled: boolean } };
+      assert.equal(ordinaryPayload.data.developerToolsEnabled, false);
+    });
+
+    await withServer(
+      application,
+      async (base) => {
+        const get = await fetch(`${base}/api/v1/settings`);
+        const payload = (await get.json()) as { data: { developerToolsEnabled: boolean } };
+        assert.equal(payload.data.developerToolsEnabled, true);
+
+        const date = await put(base, { simulatedDate: "2026-08-16" });
+        assert.equal(date.status, 200);
+        assert.deepEqual(updates[1], {
+          input: { simulatedDate: "2026-08-16" },
+          context: { origin: "browser", developerToolsEnabled: true },
+        });
+
+        const cleared = await put(base, { simulatedDate: null });
+        assert.equal(cleared.status, 200);
+        assert.deepEqual(updates[2], {
+          input: { simulatedDate: null },
+          context: { origin: "browser", developerToolsEnabled: true },
+        });
+
+        for (const body of [{ simulatedDate: "2026-02-29" }, { simulatedDate: 42 }, { unexpected: true }]) {
+          const response = await put(base, body);
+          assert.equal(response.status, 400);
+        }
+        assert.equal(updates.length, 3);
+      },
+      undefined,
+      { developerTools: true },
+    );
   });
 });
