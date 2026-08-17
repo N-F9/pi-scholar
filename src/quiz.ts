@@ -190,14 +190,12 @@ function pageIdToken(value: string): QuizVisibleTextToken {
 }
 const MANAGED_IMAGE_URI =
   /pi-scholar:\/\/source\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/attachment\/[0-9a-f]{64}/iu;
-const PRIVATE_SOURCE_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/iu;
 
 export function validateQuizVisibleText(value: string, hiddenTokens: readonly QuizVisibleTextToken[]): void {
   const rendered = decodePercentEscapes(`${value}\n${renderedMarkdownValues(value)}`);
   if (/\p{Bidi_Control}/u.test(rendered)) throw new ValidationError("Quiz Markdown contains private metadata");
   const searchable = normalizeSearchable(rendered);
-  if (MANAGED_IMAGE_URI.test(searchable) || PRIVATE_SOURCE_ID.test(searchable))
-    throw new ValidationError("Quiz Markdown contains private metadata");
+  if (MANAGED_IMAGE_URI.test(searchable)) throw new ValidationError("Quiz Markdown contains private metadata");
   const tokens = new Map<string, QuizVisibleTextToken["match"]>();
   for (const token of hiddenTokens) {
     const normalized = normalizeSearchable(token.value);

@@ -11,6 +11,7 @@ import {
   hashFile,
   lstatNoFollow,
   lstatNoFollowSync,
+  validRelativePath,
   walkFiles,
   writeFully,
 } from "./source-files.js";
@@ -530,11 +531,86 @@ export function assertNoEmbeddedDoclingImages(extracted: Uint8Array): void {
   const bytes = Buffer.from(extracted.buffer, extracted.byteOffset, extracted.byteLength);
   if (bytes.includes(EMBEDDED_DOCLING_IMAGE)) throw new Error("Docling emitted an embedded image data URI");
 }
+interface DoclingReplacement {
+  source: Buffer;
+  target: Buffer;
+  relative: boolean;
+}
 
-export async function copyDoclingExtraction(source: string, target: string): Promise<void> {
+function doclingRelativeReplacements(paths: readonly string[]): DoclingReplacement[] {
+  return paths.map((path) => {
+    const normalized = validRelativePath(path);
+    return {
+      source: Buffer.from(`](${normalized}`),
+      target: Buffer.from(`](attachments/${normalized}`),
+      relative: true,
+    };
+  });
+}
+
+function findDoclingReplacement(
+  bytes: Buffer,
+  replacements: readonly DoclingReplacement[],
+  from: number,
+  limit: number,
+): { index: number; replacement: DoclingReplacement; deferred: boolean } | undefined {
+  let search = from;
+  for (;;) {
+    let match: { index: number; replacement: DoclingReplacement } | undefined;
+    for (const replacement of replacements) {
+      const index = bytes.indexOf(replacement.source, search);
+      if (
+        index >= 0 &&
+        index < limit &&
+        (!match ||
+          index < match.index ||
+          (index === match.index && replacement.source.length > match.replacement.source.length))
+      )
+        match = { index, replacement };
+    }
+    if (!match) return undefined;
+    if (!match.replacement.relative) return { ...match, deferred: false };
+    const boundary = match.index + match.replacement.source.length;
+    if (boundary >= bytes.length) {
+      if (limit < bytes.length) return { ...match, deferred: true };
+      search = match.index + 1;
+      continue;
+    }
+    const next = bytes[boundary];
+    if (next === 9 || next === 32 || next === 35 || next === 41 || next === 63) return { ...match, deferred: false };
+    search = match.index + 1;
+  }
+}
+
+export function rewriteDoclingAttachmentReferences(extracted: Uint8Array, attachmentPaths: readonly string[]): Buffer {
+  const bytes = Buffer.from(extracted.buffer, extracted.byteOffset, extracted.byteLength);
+  const replacements = doclingRelativeReplacements(attachmentPaths);
+  if (!replacements.length) return bytes;
+  const output: Buffer[] = [];
+  let cursor = 0;
+  for (;;) {
+    const match = findDoclingReplacement(bytes, replacements, cursor, bytes.length);
+    if (!match || match.deferred) break;
+    output.push(bytes.subarray(cursor, match.index), match.replacement.target);
+    cursor = match.index + match.replacement.source.length;
+  }
+  if (cursor === 0) return bytes;
+  output.push(bytes.subarray(cursor));
+  return Buffer.concat(output);
+}
+
+export async function copyDoclingExtraction(
+  source: string,
+  target: string,
+  attachmentPaths: readonly string[] = [],
+): Promise<void> {
   const referenceRoot = Buffer.from(`${dirname(source).replaceAll("\\", "/")}/`);
   const packetRoot = Buffer.from("attachments/");
-  const overlap = Math.max(referenceRoot.length, EMBEDDED_DOCLING_IMAGE.length) - 1;
+  const replacements: DoclingReplacement[] = [
+    { source: referenceRoot, target: packetRoot, relative: false },
+    ...doclingRelativeReplacements(attachmentPaths),
+  ];
+  const overlap = Math.max(EMBEDDED_DOCLING_IMAGE.length, ...replacements.map(({ source: value }) => value.length)) - 1;
   let input: FileHandle | undefined;
   let output: FileHandle | undefined;
   let pending = Buffer.alloc(0);
@@ -543,13 +619,19 @@ export async function copyDoclingExtraction(source: string, target: string): Pro
   };
   const writeReplaced = async (bytes: Buffer, matchStartLimit: number): Promise<number> => {
     let cursor = 0;
-    for (let index = bytes.indexOf(referenceRoot); index >= 0 && index < matchStartLimit; ) {
-      await write(bytes.subarray(cursor, index));
-      await write(packetRoot);
-      cursor = index + referenceRoot.length;
-      index = bytes.indexOf(referenceRoot, cursor);
+    let deferredStart = matchStartLimit;
+    for (;;) {
+      const match = findDoclingReplacement(bytes, replacements, cursor, matchStartLimit);
+      if (!match) break;
+      if (match.deferred) {
+        deferredStart = match.index;
+        break;
+      }
+      await write(bytes.subarray(cursor, match.index));
+      await write(match.replacement.target);
+      cursor = match.index + match.replacement.source.length;
     }
-    const pendingStart = Math.max(cursor, matchStartLimit);
+    const pendingStart = Math.max(cursor, Math.min(matchStartLimit, deferredStart));
     await write(bytes.subarray(cursor, pendingStart));
     return pendingStart;
   };

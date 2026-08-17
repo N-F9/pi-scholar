@@ -787,7 +787,7 @@ test("quiz publishes more than two synthesis questions", () => {
   db.close();
 });
 
-test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedback", () => {
+test("quiz rejects exact supplied hidden metadata and allows unrelated UUIDs", () => {
   const { db, scheduler, date } = setup();
   ensureDue(scheduler, ["p1"], date);
   const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
@@ -804,17 +804,29 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   );
   const managedImage = `pi-scholar://source/${randomUUID()}/attachment/${"a".repeat(64)}`;
   assert.throws(() => validateQuizVisibleText(`![image](${managedImage})`, []), ValidationError);
-  assert.throws(() => validateQuizVisibleText(`source ${sourceReference.slice(0, -2)}`, []), ValidationError);
   const sourceId = sourceReference.slice(0, -2);
-  assert.throws(() => validateQuizVisibleText(`$${sourceId.replaceAll("-", "\\text{-}")}$`, []), ValidationError);
-  assert.throws(() => validateQuizVisibleText(`x $$$${sourceId.replaceAll("-", "\\text{-}")}$$$`, []), ValidationError);
+  const hiddenSourceId = [{ value: sourceId, match: "substring" }] as const;
+  assert.doesNotThrow(() => validateQuizVisibleText(`source ${randomUUID()}`, []));
+  assert.throws(() => validateQuizVisibleText(`source ${sourceId}`, hiddenSourceId), ValidationError);
   assert.throws(
-    () => validateQuizVisibleText(`[reference](https://example.test/${sourceId.replaceAll("-", "%2D")})`, []),
+    () => validateQuizVisibleText(`$${sourceId.replaceAll("-", "\\text{-}")}$`, hiddenSourceId),
     ValidationError,
   );
-  assert.throws(() => validateQuizVisibleText(`\u202e${[...sourceId].reverse().join("")}\u202c`, []), ValidationError);
   assert.throws(
-    () => validateQuizVisibleText(`&#x202e;${[...sourceId].reverse().join("")}&#x202c;`, []),
+    () => validateQuizVisibleText(`x $$$${sourceId.replaceAll("-", "\\text{-}")}$$$`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(`[reference](https://example.test/${sourceId.replaceAll("-", "%2D")})`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`\u202e${[...sourceId].reverse().join("")}\u202c`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`&#x202e;${[...sourceId].reverse().join("")}&#x202c;`, hiddenSourceId),
     ValidationError,
   );
   assert.throws(
@@ -1023,7 +1035,7 @@ test("quiz rejects exact hidden metadata in prompts, choices, answers, and feedb
   db.close();
 });
 
-test("quiz treats host-minted page UUIDs as opaque metadata", () => {
+test("quiz rejects supplied page UUIDs while allowing unrelated UUID answers", () => {
   const { db, scheduler, date } = setup();
   const pageId = randomUUID();
   addPage(db, pageId);
@@ -1050,6 +1062,13 @@ test("quiz treats host-minted page UUIDs as opaque metadata", () => {
         answers: { [questionId]: `x${pageId}` },
       }),
     ValidationError,
+  );
+  assert.doesNotThrow(() =>
+    quiz.saveDraft({
+      date,
+      revision: generated.revision,
+      answers: { [questionId]: `x${randomUUID()}` },
+    }),
   );
   db.close();
 });

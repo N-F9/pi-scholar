@@ -876,15 +876,18 @@ function parseAddArguments(raw: string): string[] {
   const values: string[] = [];
   let value = "";
   let quote: "'" | '"' | undefined;
-  let escaped = false;
   let started = false;
-  for (const character of raw) {
-    if (escaped) {
-      value += character;
-      escaped = false;
-      started = true;
-    } else if (character === "\\") {
-      escaped = true;
+  for (let index = 0; index < raw.length; index++) {
+    const character = raw[index];
+    if (character === undefined) continue;
+    if (character === "\\") {
+      const next = raw[index + 1];
+      if (next !== undefined && (/\s/u.test(next) || next === "'" || next === '"')) {
+        value += next;
+        index++;
+      } else {
+        value += character;
+      }
       started = true;
     } else if (quote !== undefined) {
       if (character === quote) quote = undefined;
@@ -903,7 +906,6 @@ function parseAddArguments(raw: string): string[] {
       started = true;
     }
   }
-  if (escaped) throw new Error("Trailing escape in scholar-add arguments");
   if (quote !== undefined) throw new Error("Unterminated quote in scholar-add arguments");
   if (started) values.push(value);
   return values;

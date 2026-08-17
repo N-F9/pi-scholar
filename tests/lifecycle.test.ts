@@ -437,6 +437,46 @@ describe("Pi package lifecycle", () => {
     }
   });
 
+  it("preserves Windows and literal-backslash paths in scholar-add arguments", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-add-backslashes-"));
+    const windowsPath = "C:\\Users\\me\\book.pdf";
+    const uncPath = "\\\\server\\share\\book.pdf";
+    const literalPath = "draft\\book.pdf";
+    const quotedPath = "notes\\golden notes.pdf";
+    const trailingPath = "draft\\";
+    const argumentPaths = [windowsPath, uncPath, literalPath, quotedPath, trailingPath];
+    for (const path of argumentPaths) writeFileSync(join(root, path), path);
+
+    const commands = new Map<string, CommandHandler>();
+    const fixture = fakeLifecycleApp({}, async () => ({}), root, commands);
+    const staged: unknown[] = [];
+    fixture.app.stageSource = async (request) => {
+      staged.push(request);
+      return {};
+    };
+    const handler = commands.get("scholar-add");
+    if (!handler) throw new Error("scholar-add command was not registered");
+    const context = {
+      cwd: root,
+      hasUI: true,
+      signal: undefined,
+      ui: {
+        notify: () => {},
+        setStatus: () => {},
+      },
+    };
+
+    try {
+      for (const path of argumentPaths) await handler(path === quotedPath ? `"${path}"` : path, context);
+      assert.deepEqual(
+        staged,
+        argumentPaths.map((path) => ({ path: join(root, path) })),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("renders bounded human status while preserving structured tool status", async () => {
     const commands = new Map<string, CommandHandler>();
     const fixture = fakeLifecycleApp({}, async () => ({}), undefined, commands);

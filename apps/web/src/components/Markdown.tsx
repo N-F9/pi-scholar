@@ -185,19 +185,15 @@ export function Markdown({
   inline?: boolean;
   headings?: readonly { readonly heading?: string; readonly anchor: string }[];
 }) {
-  const canonical = new Map<string, string[]>();
-  for (const section of headings) {
-    if (!section.heading) continue;
-    const anchors = canonical.get(section.heading) ?? [];
-    anchors.push(section.anchor.replace(/^#/, ""));
-    canonical.set(section.heading, anchors);
-  }
+  const canonical = headings.filter((section) => section.heading);
+  let canonicalIndex = 0;
   const seen = new Map<string, number>();
   const idFor = (children: ReactNode) => {
     const text = textFrom(children);
     const index = seen.get(text) ?? 0;
     seen.set(text, index + 1);
-    return canonical.get(text)?.[index] ?? `${headingAnchor(text)}${index ? `-${index + 1}` : ""}`;
+    const canonicalAnchor = canonical[canonicalIndex++]?.anchor.replace(/^#/, "");
+    return canonicalAnchor || `${headingAnchor(text)}${index ? `-${index + 1}` : ""}`;
   };
 
   const Wrapper = inline ? "span" : "div";

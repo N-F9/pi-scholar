@@ -141,7 +141,7 @@ function manifestDigest(value: unknown, key: string): string {
 }
 function manifestAttachments(value: unknown): Array<{ path: string; byteLength: number; digest: string }> {
   if (!Array.isArray(value)) throw new Error("invalid source manifest attachments");
-  return value
+  const attachments = value
     .map((item, index) => {
       if (item === null || typeof item !== "object" || Array.isArray(item))
         throw new Error(`invalid source manifest attachment ${index}`);
@@ -161,6 +161,11 @@ function manifestAttachments(value: unknown): Array<{ path: string; byteLength: 
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
+  for (let index = 1; index < attachments.length; index++) {
+    if (attachments[index - 1]!.path === attachments[index]!.path)
+      throw new Error(`source manifest attachment path is duplicated: ${attachments[index]!.path}`);
+  }
+  return attachments;
 }
 export interface VerifiedSourceAttachment {
   readonly bytes: Buffer;
@@ -207,7 +212,7 @@ export async function verifyRetainedAttachment(
     throw new Error("source packet identity mismatch");
   const attachments = manifestAttachments(manifest.attachments);
   const matches = attachments.filter((attachment) => attachment.digest === expected.attachmentDigest);
-  if (matches.length !== 1) throw new Error("source attachment identity is ambiguous or unavailable");
+  if (!matches.length) throw new Error("source attachment identity is ambiguous or unavailable");
   const attachment = matches[0]!;
   const contentType = rasterContentType(attachment.path);
   const attachmentPath = join(attachmentsRoot, attachment.path);

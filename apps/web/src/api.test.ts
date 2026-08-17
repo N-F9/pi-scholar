@@ -450,6 +450,17 @@ describe("Markdown rendering", () => {
     assert.match(rendered, /class="katex-display"/u);
     assert.doesNotMatch(rendered, /<a\b/u);
   });
+  it("uses canonical heading anchors before KaTeX transforms heading children", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(Markdown, {
+        source: "# Energy $E=mc^2$\n\n[Jump to energy](#energy-section)\n",
+        headings: [{ heading: "Energy $E=mc^2$", anchor: "#energy-section" }],
+      }),
+    );
+
+    assert.match(rendered, /<h1 id="energy-section">[\s\S]*class="katex"/u);
+    assert.match(rendered, /<a href="#energy-section">Jump to energy<\/a>/u);
+  });
 
   it("highlights fenced code without changing its whitespace", () => {
     const rendered = renderToStaticMarkup(

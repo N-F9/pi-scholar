@@ -1221,6 +1221,78 @@ describe("knowledge capability contexts", () => {
   });
 });
 
+describe("application settings validation", () => {
+  it("rejects an invalid simulated date and timezone pair before writing", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      await assert.rejects(app.updateSettings({ simulatedDate: "2026-08-20" }), /developer tools are required/u);
+      await assert.rejects(
+        app.updateSettings({ simulatedDate: "2011-12-30", timezone: "Pacific/Apia" }, { developerToolsEnabled: true }),
+        /simulatedDate/u,
+      );
+      assert.equal(db.get("SELECT value_json FROM settings WHERE key = ?", ["simulatedDate"]), undefined);
+      assert.equal(
+        JSON.parse(
+          String(
+            db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", ["timezone"])?.value_json,
+          ),
+        ),
+        "local",
+      );
+      const settings = (await app.getSettings()).settings;
+      assert.equal(settings.simulatedDate, undefined);
+      assert.equal(settings.timezone, "local");
+      assert.deepEqual(calls, []);
+
+      const valid = await app.updateSettings(
+        { simulatedDate: "2026-08-20", timezone: "Pacific/Apia" },
+        { developerToolsEnabled: true },
+      );
+      assert.equal(valid.settings.simulatedDate, "2026-08-20");
+      assert.equal(valid.settings.timezone, "Pacific/Apia");
+      const cleared = await app.updateSettings({ simulatedDate: null }, { developerToolsEnabled: true });
+      assert.equal(cleared.settings.simulatedDate, undefined);
+      assert.equal(cleared.settings.timezone, "Pacific/Apia");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects timezone-only changes that invalidate a persisted simulated date", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      db.run(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        ["simulatedDate", JSON.stringify("2011-12-30"), new Date().toISOString()],
+      );
+      await assert.rejects(app.updateSettings({ timezone: "Pacific/Apia" }), /simulatedDate/u);
+      const settings = (await app.getSettings()).settings;
+      assert.equal(settings.simulatedDate, "2011-12-30");
+      assert.equal(settings.timezone, "local");
+      assert.equal(
+        JSON.parse(
+          String(
+            db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", ["timezone"])?.value_json,
+          ),
+        ),
+        "local",
+      );
+      assert.deepEqual(calls, []);
+
+      const cleared = await app.updateSettings(
+        { simulatedDate: null, timezone: "Pacific/Apia" },
+        { developerToolsEnabled: true },
+      );
+      assert.equal(cleared.settings.simulatedDate, undefined);
+      assert.equal(cleared.settings.timezone, "Pacific/Apia");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
 describe("application quiz date guards", () => {
   it("uses the configured timezone when rejecting stale submissions", async () => {
     const { app, db } = fixture();

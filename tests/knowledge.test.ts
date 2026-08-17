@@ -817,6 +817,20 @@ describe("source admission mechanics", () => {
     const delivered = await app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest);
     expect(delivered.contentType).toBe("image/png");
     expect(delivered.bytes).toEqual(image);
+    const repeatedPath = "document_artifacts/repeated.png";
+    const repeatedManifest = await readManifest();
+    repeatedManifest.attachments.push({
+      ...repeatedManifest.attachments[0],
+      path: repeatedPath,
+      relativePath: repeatedPath,
+    });
+    await fs.writeFile(join(result.packetPath, "attachments", repeatedPath), image);
+    const repeatedBytes = Buffer.from(`${JSON.stringify(repeatedManifest, null, 2)}\n`);
+    await fs.writeFile(packetManifestPath, repeatedBytes);
+    db.run("UPDATE sources SET manifest_digest = ? WHERE source_id = ?", [sha256(repeatedBytes), result.sourceId]);
+    const repeated = await app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest);
+    expect(repeated.contentType).toBe("image/png");
+    expect(repeated.bytes).toEqual(image);
     const crossPage = await wiki.create({
       path: "cross-page-attachment.md",
       body: `Claim only.[^${result.sourceId}:0]`,
@@ -837,8 +851,8 @@ describe("source admission mechanics", () => {
       /byte length|digest/iu,
     );
     await fs.writeFile(join(result.packetPath, "attachments", attachmentPath), image);
-    await fs.writeFile(join(paths.vaultRoot, "outside-image"), image);
     await fs.rm(join(result.packetPath, "attachments", attachmentPath));
+    await fs.writeFile(join(paths.vaultRoot, "outside-image"), image);
     await fs.symlink(join(paths.vaultRoot, "outside-image"), join(result.packetPath, "attachments", attachmentPath));
     await expect(app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
       /symlink/iu,
@@ -851,7 +865,7 @@ describe("source admission mechanics", () => {
     await fs.writeFile(packetManifestPath, ambiguousBytes);
     db.run("UPDATE sources SET manifest_digest = ? WHERE source_id = ?", [sha256(ambiguousBytes), result.sourceId]);
     await expect(app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
-      /ambiguous/iu,
+      /duplicate/iu,
     );
     const svgManifest = await readManifest();
     svgManifest.attachments = [svgManifest.attachments[0]!];
@@ -877,6 +891,31 @@ describe("source admission mechanics", () => {
     const claim = await sources.claim(entry);
     await expect(sources.prepareClaim(claim)).rejects.toThrow(/embedded image data URI/iu);
     expect(await fs.readFile(join(paths.inboxRoot, "document.pdf"), "utf8")).toBe("document\n");
+    db.close();
+  });
+  it("rewrites relative Docling attachment references for direct conversion", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const attachmentPath = "document_artifacts/image.png";
+    const image = Buffer.from("image");
+    const sources = new SourceService(db, paths, {
+      docling: async () => ({
+        extracted:
+          `# Document\n\n![Image](${attachmentPath}?download=1#page=2)\n\n` + `Literal ${attachmentPath} stays.\n`,
+        attachments: [{ path: attachmentPath, bytes: image }],
+      }),
+    });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry is missing");
+    const prepared = await sources.prepareClaim(await sources.claim(entry));
+    expect(await fs.readFile(join(paths.vaultRoot, prepared.extractedPath), "utf8")).toBe(
+      `# Document\n\n![Image](attachments/${attachmentPath}?download=1#page=2)\n\n` +
+        `Literal ${attachmentPath} stays.\n`,
+    );
+    expect(
+      await fs.readFile(join(paths.workRoot, `admission-${prepared.preparedId}`, "attachments", attachmentPath)),
+    ).toEqual(image);
+    await sources.cleanupPrepared(prepared.preparedId);
     db.close();
   });
 

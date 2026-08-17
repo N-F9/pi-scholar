@@ -1524,6 +1524,8 @@ export class ScholarApplication {
             throw new ValidationError("maintenanceEnabled must be boolean");
           updates.push(["maintenanceEnabled", input.maintenanceEnabled]);
         }
+        const storedTimezone = await this.readSetting<unknown>("timezone", "local");
+        const effectiveTimezone = input.timezone ?? String(storedTimezone);
         if (input.simulatedDate !== undefined && input.simulatedDate !== null) {
           if (
             typeof input.simulatedDate !== "string" ||
@@ -1531,7 +1533,6 @@ export class ScholarApplication {
             localDate(input.simulatedDate) !== input.simulatedDate
           )
             throw new ValidationError("simulatedDate must be a valid calendar date");
-          updates.push(["simulatedDate", input.simulatedDate]);
         }
         if (input.timezone !== undefined) {
           if (typeof input.timezone !== "string" || !input.timezone.trim() || input.timezone.length > 100)
@@ -1545,6 +1546,20 @@ export class ScholarApplication {
           }
           updates.push(["timezone", input.timezone]);
         }
+        const storedSimulatedDate = await this.readSetting<unknown>("simulatedDate", undefined);
+        const effectiveSimulatedDate =
+          input.simulatedDate === null ? undefined : (input.simulatedDate ?? storedSimulatedDate);
+        if (effectiveSimulatedDate !== undefined && effectiveSimulatedDate !== null) {
+          if (
+            typeof effectiveSimulatedDate !== "string" ||
+            !/^\d{4}-\d{2}-\d{2}$/u.test(effectiveSimulatedDate) ||
+            localDate(effectiveSimulatedDate) !== effectiveSimulatedDate
+          )
+            throw new ValidationError("simulatedDate must be a valid calendar date");
+          localNoon(effectiveSimulatedDate, effectiveTimezone);
+        }
+        if (input.simulatedDate !== undefined && input.simulatedDate !== null)
+          updates.push(["simulatedDate", input.simulatedDate]);
         if (input.port !== undefined) {
           if (!Number.isInteger(input.port) || input.port < 1 || input.port > 65_535)
             throw new ValidationError("port is invalid");

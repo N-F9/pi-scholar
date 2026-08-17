@@ -32,6 +32,7 @@ import {
   normalizeDoclingResult,
   normalizeMarkdownFile,
   planFileAtoms,
+  rewriteDoclingAttachmentReferences,
   validateChunkEndpoints,
   validateFileEndpoints,
   writeFileChunks,
@@ -1034,18 +1035,25 @@ export class SourceService {
           version: normalizedResult.converter?.version ?? "unknown",
         };
         if ("extractedPath" in normalizedResult) {
-          await copyDoclingExtraction(normalizedResult.extractedPath, rawExtracted);
-          for (const attachment of normalizedResult.attachments) {
-            const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, validRelativePath(attachment.path)));
+          const attachments = normalizedResult.attachments ?? [];
+          const attachmentPaths = attachments.map(({ path }) => validRelativePath(path));
+          await copyDoclingExtraction(normalizedResult.extractedPath, rawExtracted, attachmentPaths);
+          for (const [index, attachment] of attachments.entries()) {
+            const attachmentPath = attachmentPaths[index]!;
+            const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, attachmentPath));
             await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
             await copyFileNoFollow(attachment.absolutePath, target);
           }
         } else {
+          const attachments = normalizedResult.attachments ?? [];
+          const attachmentPaths = attachments.map(({ path }) => validRelativePath(path));
           const extracted = Buffer.from(normalizedResult.extracted);
           assertNoEmbeddedDoclingImages(extracted);
-          await fs.writeFile(rawExtracted, extracted, { flag: "wx", mode: 0o600 });
-          for (const attachment of normalizedResult.attachments ?? []) {
-            const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, validRelativePath(attachment.path)));
+          const rewritten = rewriteDoclingAttachmentReferences(extracted, attachmentPaths);
+          await fs.writeFile(rawExtracted, rewritten, { flag: "wx", mode: 0o600 });
+          for (const [index, attachment] of attachments.entries()) {
+            const attachmentPath = attachmentPaths[index]!;
+            const target = ensureWithin(attachmentsRoot, join(attachmentsRoot, attachmentPath));
             await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
             await fs.writeFile(target, Buffer.from(attachment.bytes), { flag: "wx", mode: 0o600 });
           }
