@@ -77,6 +77,32 @@ test("due eligibility uses the persisted timezone for both day and due timestamp
   assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
   db.close();
 });
+test("day-scale reviews stay on the intended local date across DST", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "dst-page");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("America/New_York"),
+    new Date().toISOString(),
+  ]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", ["dst-quiz", "2026-03-07"]);
+  const scheduler = new SchedulerService(db);
+  const reviewedAt = "2026-03-08T04:30:00.000Z";
+  scheduler.ensurePageLearning("dst-page", reviewedAt);
+  scheduler.transitionPage("dst-page", "Again", reviewedAt, {
+    quizId: "dst-quiz",
+    submissionId: "dst-submission",
+    revision: 1,
+  });
+
+  const learning = scheduler.getPageLearning("dst-page");
+  assert.equal(localDate(learning.dueAt, "America/New_York"), "2026-03-08");
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-03-08", false).map((page) => page.pageId),
+    ["dst-page"],
+  );
+  db.close();
+});
 test("FSRS learning and relearning use day-scale intervals for every rating", () => {
   const { db, scheduler } = setup();
   addPage(db, "p3");
@@ -409,6 +435,39 @@ test("page prerequisites gate due selection until every prerequisite is in Revie
   assert.throws(() => scheduler.setPrerequisites("p1", ["p2"]), ValidationError);
   assert.throws(() => scheduler.setPrerequisites("p1", ["p1"]), ValidationError);
   assert.throws(() => scheduler.setPrerequisites("p2", ["missing-page"]), ValidationError);
+  db.close();
+});
+test("an Again rating does not satisfy a prerequisite", () => {
+  const { db, scheduler } = setup();
+  ensureDue(scheduler, ["p1", "p2"], "2026-08-20");
+  scheduler.setPrerequisites("p2", ["p1"]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "failed-prerequisite-quiz",
+    "2026-08-20",
+  ]);
+  scheduler.transitionPage("p1", "Again", "2026-08-20T12:00:00.000Z", {
+    quizId: "failed-prerequisite-quiz",
+    submissionId: "failed-prerequisite-submission",
+    revision: 1,
+  });
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-21", false).map((page) => page.pageId),
+    ["p1"],
+  );
+
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "passed-prerequisite-quiz",
+    "2026-08-21",
+  ]);
+  scheduler.transitionPage("p1", "Good", "2026-08-21T12:00:00.000Z", {
+    quizId: "passed-prerequisite-quiz",
+    submissionId: "passed-prerequisite-submission",
+    revision: 1,
+  });
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-21", false).map((page) => page.pageId),
+    ["p2"],
+  );
   db.close();
 });
 

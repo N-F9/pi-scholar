@@ -198,6 +198,12 @@ export function localNoon(date: string, timezone = "local"): Date {
   return candidate;
 }
 
+function addCalendarDays(date: string, days: number): string {
+  const result = new Date(`${date}T00:00:00.000Z`);
+  result.setUTCDate(result.getUTCDate() + days);
+  return result.toISOString().slice(0, 10);
+}
+
 export const SEALED_QUIZ_REVIEW = Symbol("sealed-quiz-review");
 
 export interface ReviewTransitionContext {
@@ -519,7 +525,16 @@ export class SchedulerService {
             );
             return row ? mapPageLearning(row, this.clock) : undefined;
           })();
-        return prerequisite?.status === "active" && prerequisiteLearning?.fsrsState === "Review";
+        const prerequisiteReview = this.db.get<{ rating: ReviewRating }>(
+          "SELECT rating FROM page_reviews WHERE page_id = ? ORDER BY reviewed_at DESC, review_id DESC LIMIT 1",
+          prerequisitePageId,
+        );
+        return (
+          prerequisite?.status === "active" &&
+          prerequisiteLearning?.fsrsState === "Review" &&
+          prerequisiteReview !== undefined &&
+          prerequisiteReview.rating !== "Again"
+        );
       }),
     );
   }
@@ -574,8 +589,14 @@ export class SchedulerService {
     const at = asDate(reviewedAt, "reviewedAt");
     const before = this.toFsrsInput(learning);
     const after = this.engine.next(before, at, ratingValue(rating)).card;
+    const scheduledDays = after.scheduled_days ?? 0;
+    const timezone = persistedTimezone(this.source);
+    const due =
+      scheduledDays > 0
+        ? localNoon(addCalendarDays(localDate(at, timezone), scheduledDays), timezone)
+        : new Date(after.due);
     const beforeSnapshot = fsrsSnapshot(before);
-    const afterSnapshot = fsrsSnapshot(after);
+    const afterSnapshot = fsrsSnapshot({ ...after, due });
     const reviewId = randomUUID();
     const settlementId = context.settlementId ?? `${context.quizId}:${id}:${context.submissionId}:${context.revision}`;
     const updatedAt = at.toISOString();
@@ -583,7 +604,7 @@ export class SchedulerService {
       `UPDATE page_learning
        SET due_at = ?, fsrs_state = ?, stability = ?, difficulty = ?, reps = ?, lapses = ?, scheduled_days = ?, last_review_at = ?, revision = revision + 1, updated_at = ?
        WHERE page_id = ? AND revision = ?`,
-      after.due.toISOString(),
+      due.toISOString(),
       stateNumber(parseState(after.state)),
       after.stability,
       after.difficulty,
