@@ -1,4 +1,8 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import type { SettingsResult } from "../../../../src/contracts";
+import { api, formatDate, isSettingsResult } from "../api";
 import { cx } from "./ui";
 
 const primary = [
@@ -21,6 +25,31 @@ const linkClass = ({ isActive }: { isActive: boolean }) =>
   );
 
 export function AppShell() {
+  const location = useLocation();
+  const main = useRef<HTMLElement>(null);
+  const params = new URLSearchParams(location.search);
+  const contentPath = JSON.stringify([location.pathname, params.get("pageId"), params.get("path")]);
+  const previousContentPath = useRef(contentPath);
+  const previousPathname = useRef(location.pathname);
+  const settings = useQuery({
+    queryKey: ["settings"],
+    queryFn: ({ signal }) => api<SettingsResult>("/api/v1/settings", { signal }, isSettingsResult),
+  });
+
+  useEffect(() => {
+    const pathname = location.pathname.toLowerCase().replace(/\/+$/, "") || "/";
+    const routeTitle =
+      primary.find((item) => item.to === pathname)?.label ??
+      secondary.find((item) => item.to === pathname)?.label ??
+      (/^\/history\/[^/]+$/.test(pathname) ? "Quiz history" : "Page not found");
+    document.title = `${routeTitle} · Pi Scholar`;
+    if (previousContentPath.current !== contentPath) {
+      main.current?.focus({ preventScroll: previousPathname.current === location.pathname });
+      previousContentPath.current = contentPath;
+      previousPathname.current = location.pathname;
+    }
+  }, [contentPath, location.pathname]);
+
   return (
     <div className="min-h-screen">
       <aside
@@ -46,9 +75,6 @@ export function AppShell() {
             </NavLink>
           ))}
         </nav>
-        <p className="mt-auto text-xs leading-5 text-muted">
-          Your vault stays on this machine. Changes use the same local application boundary as Pi.
-        </p>
       </aside>
 
       <div className="min-w-0 pb-24 lg:ml-64 lg:pb-0">
@@ -78,7 +104,39 @@ export function AppShell() {
           </details>
         </header>
 
-        <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 sm:py-12 lg:px-10" id="main-content">
+        <main
+          className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 sm:py-12 lg:px-10"
+          id="main-content"
+          ref={main}
+          tabIndex={-1}
+        >
+          {settings.data?.settings.simulatedDate ? (
+            <aside
+              className="mb-8 rounded-lg border border-caution/40 bg-caution/10 p-4 sm:p-5"
+              aria-label="Simulated learning date"
+              role="status"
+            >
+              <p className="text-sm font-bold text-caution">Simulated learning date</p>
+              <p className="mt-1">
+                Pi Scholar is using{" "}
+                <time dateTime={settings.data.settings.simulatedDate}>
+                  {formatDate(settings.data.settings.simulatedDate, {
+                    weekday: "long",
+                    month: "long",
+                    day: "numeric",
+                    year: "numeric",
+                  })}
+                </time>{" "}
+                for learning. Operational timestamps remain on real time.
+              </p>
+              <Link
+                className="mt-3 inline-flex min-h-11 items-center font-bold underline decoration-accent decoration-2 underline-offset-4"
+                to="/settings"
+              >
+                Open Settings
+              </Link>
+            </aside>
+          ) : null}
           <Outlet />
         </main>
       </div>

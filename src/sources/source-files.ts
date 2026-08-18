@@ -516,18 +516,13 @@ function parseMetadata(raw: string): StageMetadata {
   const kind = record.kind as SourceKind;
   const originalName = typeof record.originalName === "string" ? record.originalName : undefined;
   if (originalName !== undefined) validRelativePath(originalName);
-  if (
-    (requestedKind === "url" && kind !== "url") ||
-    ((requestedKind === "text" || requestedKind === "pasted") && kind !== "text") ||
-    (requestedKind === "upload" && kind !== inferKind(originalName ?? record.displayName)) ||
-    (requestedKind === "repository" && kind !== "repository") ||
-    (requestedKind !== "url" &&
-      requestedKind !== "text" &&
-      requestedKind !== "pasted" &&
-      requestedKind !== "upload" &&
-      requestedKind !== "repository")
-  )
-    throw new Error("staged source metadata kind is inconsistent");
+  const expectedKind: SourceKind =
+    requestedKind === "upload"
+      ? inferKind(originalName ?? record.displayName)
+      : requestedKind === "pasted"
+        ? "text"
+        : requestedKind;
+  if (kind !== expectedKind) throw new Error("staged source metadata kind is inconsistent");
   if (requestedKind === "url" && typeof record.sourceUri !== "string")
     throw new Error("staged URL source metadata is missing sourceUri");
   if (requestedKind === "upload" && originalName === undefined)
@@ -566,10 +561,9 @@ async function stagedMetadata(path: string): Promise<StageMetadata | undefined> 
     const metadata = parseMetadata((await readNoFollow(envelope)).toString("utf8"));
     const payload = join(path, metadata.payload);
     const payloadStat = await lstatNoFollow(payload);
-    if (metadata.kind === "repository" ? !payloadStat.isDirectory() : !payloadStat.isFile())
-      throw new Error(
-        `staged source payload must be a regular ${metadata.kind === "repository" ? "directory" : "file"}`,
-      );
+    const directoryPayload = metadata.kind === "directory" || metadata.kind === "repository";
+    if (directoryPayload ? !payloadStat.isDirectory() : !payloadStat.isFile())
+      throw new Error(`staged source payload must be a regular ${directoryPayload ? "directory" : "file"}`);
     return metadata;
   } catch (error) {
     if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")

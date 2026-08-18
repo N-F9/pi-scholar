@@ -18,17 +18,15 @@
   },
   "exports": {
     ".": "./dist/index.js",
-    "./contracts": "./dist/contracts.js",
-    "./vault": "./dist/vault.js",
-    "./database": "./dist/database.js"
+    "./contracts": "./dist/contracts.js"
   },
   "files": [
     "dist",
     "apps/web/dist",
+    "assets",
     "skills",
     "pi",
-    "README.md",
-    "THIRD_PARTY_NOTICES"
+    "README.md"
   ],
   "pi": {
     "extensions": [
@@ -61,15 +59,23 @@
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
+    "@uiw/react-md-editor": "4.1.1",
     "busboy": "1.6.0",
+    "katex": "0.16.25",
     "mdast-util-from-markdown": "2.0.3",
     "mdast-util-gfm": "3.1.0",
+    "mdast-util-math": "3.0.0",
+    "mermaid": "11.16.1",
     "micromark-extension-gfm": "3.0.0",
+    "micromark-extension-math": "3.1.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
     "react-router-dom": "7.18.2",
+    "rehype-highlight": "7.0.2",
+    "rehype-katex": "7.0.1",
     "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0",
     "ts-fsrs": "5.4.1",
     "yaml": "2.9.0"
   },

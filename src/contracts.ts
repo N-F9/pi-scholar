@@ -78,7 +78,7 @@ export interface SourceRecord {
   readonly createdAt: IsoDateTime;
   readonly updatedAt: IsoDateTime;
 }
-export type PublicSourceRecord = Omit<SourceRecord, "manifestPath">;
+export type PublicSourceRecord = Omit<SourceRecord, "manifestPath" | "errorMessage">;
 export interface PreparedAdmissionFile {
   readonly relativePath: string;
   readonly byteLength: number;
@@ -106,6 +106,25 @@ export interface PreparedAdmission {
   readonly atoms: readonly PreparedAdmissionAtom[];
 }
 
+export interface ExtractContextRequest {
+  readonly pendingSourceIds?: readonly string[];
+}
+export type ExtractProgressPhase =
+  | "claiming"
+  | "preparing"
+  | "docling"
+  | "extracting"
+  | "normalizing"
+  | "validating/indexing"
+  | "ready"
+  | "failed";
+export interface ExtractProgressEvent {
+  readonly entry: number;
+  readonly total: number;
+  readonly filename: string;
+  readonly phase: ExtractProgressPhase;
+}
+
 export interface ExtractClaimRecord extends PreparedAdmission {
   readonly relativePath: string;
   readonly originalName?: string;
@@ -124,7 +143,6 @@ export interface ExtractClaimRecord extends PreparedAdmission {
 export interface ExtractFailureRecord {
   readonly relativePath: string;
   readonly errorCode: string;
-  readonly errorMessage: string;
 }
 export interface ExtractContext {
   readonly claims: readonly PreparedAdmission[];
@@ -232,6 +250,7 @@ export interface WikiChangeIssuePageInput {
   readonly pageId: string;
   readonly expectedDigest: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body?: string;
   readonly quizWorthiness?: PageRecord["quizWorthiness"];
 }
@@ -241,6 +260,7 @@ export type WikiChangeInput =
       readonly kind: "create-page";
       readonly path: string;
       readonly title?: string;
+      readonly description?: string;
       readonly body: string;
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     }
@@ -249,6 +269,7 @@ export type WikiChangeInput =
       readonly pageId: string;
       readonly expectedDigest: string;
       readonly title?: string;
+      readonly description?: string;
       readonly body?: string;
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     }
@@ -278,6 +299,10 @@ export interface IngestContext {
   readonly pages: readonly WikiPageResult[];
   readonly issues: readonly WikiIssueRecord[];
   readonly sources: readonly IngestSourceContext[];
+}
+
+export interface IngestContextRequest {
+  readonly sourceIds?: readonly string[];
 }
 
 export interface LintContext {
@@ -341,11 +366,32 @@ export interface QuizReadingRecord {
   readonly heading?: string;
   readonly href: string;
 }
+export interface QuizRecommendationReading {
+  readonly pageId: string;
+  readonly path: string;
+  readonly title: string;
+  readonly href: string;
+  readonly reason: "prerequisite" | "related";
+}
+
+export interface QuizRecommendationGap {
+  readonly pageId: string;
+  readonly path: string;
+  readonly title: string;
+  readonly href: string;
+  readonly kind: "missing" | "unclear" | "drifted";
+}
+
+export interface QuizRecommendations {
+  readonly readings: readonly QuizRecommendationReading[];
+  readonly gaps: readonly QuizRecommendationGap[];
+}
 
 export interface QuizPageResultRecord {
   readonly resultId: string;
   readonly quizId: string;
   readonly pageId: string;
+  readonly pageLink: QuizReadingRecord;
   readonly rating: ReviewRating;
   readonly feedback: string;
   readonly reviewId: string;
@@ -422,17 +468,13 @@ export interface QuizEvidenceRecord {
   readonly textDigest: string;
   readonly excerpt: string;
 }
-export interface QuizCandidateSection {
-  readonly anchor: string;
-  readonly heading?: string;
-}
 
 export interface QuizCandidateRecord {
   readonly pageId: string;
   readonly path: string;
   readonly title: string;
+  readonly description: string;
   readonly dueAt: IsoDateTime;
-  readonly sections: readonly QuizCandidateSection[];
 }
 
 export interface QuizEvidenceRequest {
@@ -455,7 +497,7 @@ export type QuizPublicationInput =
 
 export interface QuizContext {
   readonly date: LocalDate;
-  readonly initializationEnabled: boolean;
+  readonly maintenanceEnabled: boolean;
   readonly expiredCount: number;
   readonly candidates: readonly QuizCandidateRecord[];
   readonly quiz?: QuizDetailRecord;
@@ -522,6 +564,7 @@ export interface WorkflowRecord {
   readonly errorCode?: string;
   readonly errorMessage?: string;
 }
+export type PublicWorkflowRecord = Omit<WorkflowRecord, "errorMessage">;
 
 export interface GitStateFacts {
   readonly branch?: string;
@@ -546,11 +589,12 @@ export interface SettingsFacts {
 }
 
 export interface SettingsRecord {
-  readonly initializationEnabled: boolean;
+  readonly maintenanceEnabled: boolean;
   readonly timezone: string;
   readonly port: number;
   readonly host: string;
   readonly updatedAt: IsoDateTime;
+  readonly simulatedDate?: LocalDate;
   readonly facts: SettingsFacts;
 }
 export interface ApiError {
@@ -672,6 +716,7 @@ export interface QuizResult {
   readonly answers: readonly QuizAnswerInput[];
   readonly grades: readonly QuizGradeRecord[];
   readonly readings: readonly QuizReadingRecord[];
+  readonly recommendations: QuizRecommendations;
   readonly message?: string;
 }
 
@@ -692,25 +737,28 @@ export interface QuizSubmissionRequest {
 
 export interface QuizSubmissionResult {
   readonly status: "sealed";
-  readonly workflow: WorkflowRecord;
+  readonly workflow: PublicWorkflowRecord;
   readonly quiz: PublicQuizDetailRecord;
   readonly grades: readonly QuizGradeRecord[];
   readonly readings: readonly QuizReadingRecord[];
+  readonly recommendations: QuizRecommendations;
 }
 
 export interface WorkflowListResult {
-  readonly workflows: readonly WorkflowRecord[];
+  readonly workflows: readonly PublicWorkflowRecord[];
 }
 
 export interface SettingsResult {
   readonly settings: SettingsRecord;
+  readonly developerToolsEnabled: boolean;
 }
 
 export interface SettingsUpdateRequest {
-  readonly initializationEnabled?: boolean;
+  readonly maintenanceEnabled?: boolean;
   readonly timezone?: string;
   readonly port?: number;
   readonly host?: string;
+  readonly simulatedDate?: LocalDate | null;
 }
 
 export interface DoctorCheck {

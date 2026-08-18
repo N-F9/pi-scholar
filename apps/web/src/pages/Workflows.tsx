@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
-import type { WorkflowListResult, WorkflowRecord } from "../../../../src/contracts";
+import type { PublicWorkflowRecord, WorkflowListResult } from "../../../../src/contracts";
 import { api, errorMessage, formatDate, isWorkflowListResult } from "../api";
 import { Badge, Button, Card, Spinner, StateView } from "../components/ui";
 
-const workflowNames: Record<WorkflowRecord["kind"], string> = {
+const workflowNames: Record<PublicWorkflowRecord["kind"], string> = {
   extract: "Extract",
   ingest: "Ingest",
   lint: "Lint",
@@ -12,13 +12,12 @@ const workflowNames: Record<WorkflowRecord["kind"], string> = {
   sync: "Git sync",
 };
 
-function workflowTone(status: WorkflowRecord["status"]): "neutral" | "positive" | "caution" | "danger" {
+function workflowTone(status: PublicWorkflowRecord["status"]): "neutral" | "positive" | "caution" | "danger" {
   if (status === "succeeded") return "positive";
   if (status === "failed") return "danger";
   if (status === "running" || status === "queued") return "caution";
   return "neutral";
 }
-
 export function WorkflowsPage() {
   const query = useQuery({
     queryKey: ["workflows"],
@@ -81,14 +80,6 @@ export function WorkflowsPage() {
                       : "Waiting to start"}
                 </span>
               </div>
-              {workflow.errorMessage ? (
-                <p
-                  className="mt-4 rounded-md border border-danger/30 bg-danger/10 p-3 text-sm text-danger"
-                  role="alert"
-                >
-                  {workflow.errorMessage}
-                </p>
-              ) : null}
             </Card>
           </li>
         ))}

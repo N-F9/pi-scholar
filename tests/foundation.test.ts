@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -14,12 +15,20 @@ import {
 } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join, relative } from "node:path";
+import { basename, delimiter, dirname, join, relative } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { main } from "../src/cli.js";
-import { openDatabase, transaction } from "../src/database.js";
+import { openDatabase, SCHEMA_SQL, transaction, validateSchema } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
-import { doclingDependencyIdentity, doclingEnvironment } from "../src/external/docling.js";
+import {
+  convertWithDocling,
+  doclingArgs,
+  doclingDependencyIdentity,
+  doclingEnvironment,
+  PDF_BATCH_PAGES,
+  qpdfDependencyIdentity,
+} from "../src/external/docling.js";
 import { gitDependencyIdentity, localCheckpointCommit, runGit, runGitSync } from "../src/external/git.js";
 import { runChild, runChildSync } from "../src/external/process.js";
 import {
@@ -65,6 +74,59 @@ describe("vault foundation", () => {
     mkdirSync(nested);
     const discovered = resolveVault(nested);
     assert.equal(discovered.vaultId, paths.vaultId);
+  });
+
+  it("reports and changes maintenance mode through the CLI", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-maintenance-"));
+    const paths = initVault(join(root, "vault"));
+    const maintenanceEnabled = (): boolean => {
+      const db = openDatabase(paths);
+      try {
+        const row = db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", [
+          "maintenanceEnabled",
+        ]);
+        return JSON.parse(row?.value_json ?? "null") as boolean;
+      } finally {
+        db.close();
+      }
+    };
+
+    assert.equal(maintenanceEnabled(), true);
+    assert.equal(await main(["maintenance", "--vault", paths.vaultRoot]), 0);
+    assert.equal(maintenanceEnabled(), true);
+    assert.equal(await main(["maintenance", "off", "--vault", paths.vaultRoot]), 0);
+    assert.equal(maintenanceEnabled(), false);
+    assert.equal(await main(["maintenance", "on", "--vault", paths.vaultRoot]), 0);
+    assert.equal(maintenanceEnabled(), true);
+  });
+
+  it("validates persisted simulated-date settings without failing active simulations", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-settings-"));
+    const paths = initVault(join(root, "vault"));
+    const settingsCheck = () => doctor(paths.vaultRoot).checks.find((item) => item.name === "settings");
+
+    assert.equal(settingsCheck()?.status, "pass");
+
+    let db = openDatabase(paths);
+    db.run(
+      "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+      ["simulatedDate", JSON.stringify("2026-08-20"), new Date().toISOString()],
+    );
+    db.close();
+    const active = settingsCheck();
+    assert.equal(active?.status, "warn");
+    assert.match(active?.message ?? "", /2026-08-20/u);
+    assert.equal(doctor(paths.vaultRoot).ok, true);
+
+    for (const value of ['{"malformed"', "42", JSON.stringify("2026-02-29")]) {
+      db = openDatabase(paths);
+      db.run("UPDATE settings SET value_json = ?, updated_at = ? WHERE key = 'simulatedDate'", [
+        value,
+        new Date().toISOString(),
+      ]);
+      db.close();
+      assert.equal(settingsCheck()?.status, "fail");
+    }
   });
 
   it("checks qmd collection metadata against the physical wiki root", () => {
@@ -215,6 +277,19 @@ describe("vault foundation", () => {
       XDG_CACHE_HOME: join(paths.workRoot, "cache"),
       DOCLING_CACHE_DIR: paths.workRoot,
     });
+    writeFileSync(join(paths.workRoot, "input.pdf"), "pdf");
+    const command = doclingArgs(paths, {
+      inputRelativePath: "input.pdf",
+      outputRelativeDirectory: "docling-output",
+    });
+    assert.deepEqual(command.args, [
+      "convert",
+      "--image-export-mode",
+      "referenced",
+      "--output",
+      command.outputDirectory,
+      command.inputPath,
+    ]);
     const qmd = qmdDependencyIdentity(paths, (_paths, args) => ({
       executable: "/pinned/qmd",
       args: [...args],
@@ -235,6 +310,16 @@ describe("vault foundation", () => {
       stderr: "",
     }));
     assert.deepEqual(docling, { executable: "/pinned/docling", version: "Docling version 2.4.1" });
+    const qpdf = qpdfDependencyIdentity(paths, (_paths, args) => ({
+      executable: "/pinned/qpdf",
+      args: [...args],
+      code: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "qpdf version 11.9.0",
+      stderr: "",
+    }));
+    assert.deepEqual(qpdf, { executable: "/pinned/qpdf", version: "qpdf version 11.9.0" });
     for (const result of [
       { code: 1, signal: null, timedOut: false },
       { code: 0, signal: "SIGTERM" as const, timedOut: false },
@@ -255,6 +340,15 @@ describe("vault foundation", () => {
           args: [...args],
           ...result,
           stdout: "Docling version 2.4.1",
+          stderr: "",
+        })),
+      );
+      assert.throws(() =>
+        qpdfDependencyIdentity(paths, (_paths, args) => ({
+          executable: "/pinned/qpdf",
+          args: [...args],
+          ...result,
+          stdout: "qpdf version 11.9.0",
           stderr: "",
         })),
       );
@@ -281,6 +375,227 @@ describe("vault foundation", () => {
         stderr: "",
       })),
     );
+    assert.throws(() =>
+      qpdfDependencyIdentity(paths, (_paths, args) => ({
+        executable: "/pinned/qpdf",
+        args: [...args],
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "not qpdf",
+        stderr: "",
+      })),
+    );
+  });
+
+  it("converts oversized PDFs sequentially and combines namespaced output", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi scholar (docling batches)-"));
+    const paths = initVault(join(root, "vault"));
+    const input = join(paths.workRoot, "network.pdf");
+    writeFileSync(input, "original PDF");
+    const calls: string[] = [];
+    let activeConversions = 0;
+    let maximumActiveConversions = 0;
+    const runner = async (executable: string, args: readonly string[]) => {
+      calls.push(`${executable}:${args[0]}`);
+      const success = (stdout = "") => ({
+        executable: `/pinned/${executable}`,
+        args: [...args],
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout,
+        stderr: "",
+      });
+      if (executable === "qpdf" && args[0] === "--show-npages") return success("513\n");
+      if (executable === "qpdf" && args[0] === `--split-pages=${PDF_BATCH_PAGES}`) {
+        assert.ok(args.includes("--warning-exit-0"));
+        const directory = dirname(args.at(-1)!);
+        for (const name of ["part-001-256.pdf", "part-257-512.pdf", "part-513.pdf"])
+          writeFileSync(join(directory, name), name);
+        return success();
+      }
+      assert.equal(executable, "docling");
+      const stem = basename(args.at(-1)!, ".pdf");
+      const part = /^pages-(\d+)-(\d+)-docling-batches-.+$/u.exec(stem);
+      assert.ok(part);
+      const range = `${Number(part[1])}-${Number(part[2])}`;
+      const outputIndex = args.indexOf("--output") + 1;
+      const output = args[outputIndex]!;
+      activeConversions++;
+      maximumActiveConversions = Math.max(maximumActiveConversions, activeConversions);
+      try {
+        await delay(5);
+        const artifacts = join(output, `${stem}_artifacts`);
+        mkdirSync(artifacts, { recursive: true });
+        writeFileSync(join(artifacts, "image.png"), `image ${range}`);
+        const heading = `# Pages ${range}\n\n`;
+        const absoluteOpening = "\n\n![Image](";
+        const padding =
+          range === "1-256" ? "x".repeat(65_532 - Buffer.byteLength(heading) - Buffer.byteLength(absoluteOpening)) : "";
+        writeFileSync(
+          join(output, `${stem}.md`),
+          `${heading}${padding}${absoluteOpening}${join(artifacts, "image.png")})\n\n![Relative](${stem}_artifacts/image.png)\n\nLiteral document_artifacts/image.png stays.\n`,
+        );
+      } finally {
+        activeConversions--;
+      }
+      return success();
+    };
+    try {
+      const result = await convertWithDocling(
+        paths,
+        {
+          inputRelativePath: "network.pdf",
+          outputRelativeDirectory: "docling-output",
+          mediaType: "application/pdf",
+        },
+        {
+          run: runner,
+          dependencyIdentity: () => ({ executable: "/pinned/docling", version: "Docling version 2.4.1" }),
+        },
+      );
+      assert.equal(maximumActiveConversions, 1);
+      assert.deepEqual(calls, [
+        "qpdf:--show-npages",
+        `qpdf:--split-pages=${PDF_BATCH_PAGES}`,
+        "docling:convert",
+        "docling:convert",
+        "docling:convert",
+      ]);
+      assert.deepEqual(readdirSync(result.outputDirectory).sort(), [
+        "combined.md",
+        "pages-1-256",
+        "pages-257-512",
+        "pages-513-513",
+      ]);
+      const combined = readFileSync(join(result.outputDirectory, "combined.md"), "utf8");
+      let previousHeading = -1;
+      for (const heading of ["# Pages 1-256", "# Pages 257-512", "# Pages 513-513"]) {
+        const offset = combined.indexOf(heading);
+        assert.ok(offset > previousHeading);
+        previousHeading = offset;
+      }
+      for (const range of ["1-256", "257-512", "513-513"]) {
+        const target = join(result.outputDirectory, `pages-${range}`, "image.png").replaceAll("\\", "/");
+        assert.equal(combined.split(target).length - 1, 2);
+      }
+      assert.doesNotMatch(combined, /docling-batches-/u);
+      assert.equal(combined.match(/Literal document_artifacts\/image\.png stays\./gu)?.length, 3);
+      assert.equal(readFileSync(input, "utf8"), "original PDF");
+      assert.equal(
+        readdirSync(paths.workRoot).some((name) => name.startsWith("docling-batches-")),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the failed page range and removes batched intermediates", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-docling-failure-"));
+    const paths = initVault(join(root, "vault"));
+    writeFileSync(join(paths.workRoot, "network.pdf"), "original PDF");
+    const runner = async (executable: string, args: readonly string[]) => {
+      const result = {
+        executable: `/pinned/${executable}`,
+        args: [...args],
+        code: 0,
+        signal: null as NodeJS.Signals | null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      };
+      if (executable === "qpdf" && args[0] === "--show-npages") return { ...result, stdout: "300\n" };
+      if (executable === "qpdf") {
+        const directory = dirname(args.at(-1)!);
+        writeFileSync(join(directory, "part-001-256.pdf"), "first");
+        writeFileSync(join(directory, "part-257-300.pdf"), "second");
+        return result;
+      }
+      if (basename(args.at(-1)!, ".pdf").startsWith("pages-257-300-"))
+        return { ...result, code: null, signal: "SIGKILL" as const };
+      const output = args[args.indexOf("--output") + 1]!;
+      mkdirSync(output, { recursive: true });
+      writeFileSync(join(output, "document.md"), "# First\n");
+      return result;
+    };
+    try {
+      await assert.rejects(
+        convertWithDocling(
+          paths,
+          {
+            inputRelativePath: "network.pdf",
+            outputRelativeDirectory: "docling-output",
+            mediaType: "application/pdf",
+          },
+          {
+            run: runner,
+            dependencyIdentity: () => ({ executable: "/pinned/docling", version: "Docling version 2.4.1" }),
+          },
+        ),
+        /Docling conversion for pages 257-300 terminated by signal SIGKILL/u,
+      );
+      assert.equal(existsSync(join(paths.workRoot, "docling-output")), false);
+      assert.equal(
+        readdirSync(paths.workRoot).some((name) => name.startsWith("docling-batches-")),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects incomplete qpdf ranges without starting Docling", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-docling-ranges-"));
+    const paths = initVault(join(root, "vault"));
+    writeFileSync(join(paths.workRoot, "network.pdf"), "original PDF");
+    let doclingStarted = false;
+    const runner = async (executable: string, args: readonly string[]) => {
+      const result = {
+        executable: `/pinned/${executable}`,
+        args: [...args],
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      };
+      if (executable === "qpdf" && args[0] === "--show-npages") return { ...result, stdout: "513\n" };
+      if (executable === "qpdf") {
+        const directory = dirname(args.at(-1)!);
+        writeFileSync(join(directory, "part-001-256.pdf"), "first");
+        writeFileSync(join(directory, "part-258-513.pdf"), "gap");
+        return result;
+      }
+      doclingStarted = true;
+      return result;
+    };
+    try {
+      await assert.rejects(
+        convertWithDocling(
+          paths,
+          {
+            inputRelativePath: "network.pdf",
+            outputRelativeDirectory: "docling-output",
+            mediaType: "application/pdf",
+          },
+          {
+            run: runner,
+            dependencyIdentity: () => ({ executable: "/pinned/docling", version: "Docling version 2.4.1" }),
+          },
+        ),
+        /qpdf split page ranges are incomplete or invalid/u,
+      );
+      assert.equal(doclingStarted, false);
+      assert.equal(existsSync(join(paths.workRoot, "docling-output")), false);
+      assert.equal(
+        readdirSync(paths.workRoot).some((name) => name.startsWith("docling-batches-")),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects traversal, control characters, and symlinks", () => {
@@ -290,6 +605,46 @@ describe("vault foundation", () => {
     assert.throws(() => safeRelativePath(paths.wikiRoot, "bad\u0000name"));
     symlinkSync(paths.sourcesRoot, join(paths.wikiRoot, "link"));
     assert.throws(() => safeRelativePath(paths.wikiRoot, "link/file.md"));
+  });
+  it("honors requested atomic file modes despite a restrictive umask", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-umask-"));
+    const target = join(root, "atomic.txt");
+    const child = runChildSync(
+      process.execPath,
+      [
+        "--import",
+        "jiti/register",
+        "--input-type=module",
+        "-e",
+        `import { strict as assert } from "node:assert";
+import { statSync } from "node:fs";
+const modulePath = process.env.PI_VAULT_MODULE;
+const targetPath = process.env.PI_ATOMIC_PATH;
+if (!modulePath || !targetPath) throw new Error("atomic write child environment is incomplete");
+const loaded = await import(modulePath);
+const { atomicWriteFile } = loaded.default ?? loaded;
+const originalUmask = process.umask();
+try {
+  process.umask(0o077);
+  for (const mode of [0o644, 0o666]) {
+    atomicWriteFile(targetPath, "mode", mode);
+    assert.equal(statSync(targetPath).mode & 0o777, mode);
+  }
+} finally {
+  process.umask(originalUmask);
+}
+`,
+      ],
+      {
+        cwd: process.cwd(),
+        timeoutMs: 30_000,
+        env: {
+          PI_VAULT_MODULE: "./src/vault.ts",
+          PI_ATOMIC_PATH: target,
+        },
+      },
+    );
+    assert.equal(child.code, 0, child.stderr || child.stdout);
   });
 
   it("rejects a gitignore symlink before existing-vault Git operations", () => {
@@ -425,6 +780,78 @@ describe("vault foundation", () => {
     assert.equal(db.get("SELECT key FROM settings WHERE key = ?", ["x"]), undefined);
     db.close();
   });
+  it("rejects partial and non-canonical schema v5 definitions", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    db.exec("DROP TABLE settings");
+    assert.throws(() => validateSchema(db), /missing tables/u);
+    db.exec(`
+      CREATE TABLE settings (
+        key TEXT,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    assert.throws(() => validateSchema(db), /canonical schema v5/u);
+    db.close();
+  });
+  it("rejects case-changed quoted CHECK literals in canonical schema", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const canonicalSourcesSql = db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'",
+    )?.sql;
+    assert.ok(canonicalSourcesSql);
+    db.exec("DROP TABLE sources");
+    db.exec(canonicalSourcesSql.replace("'url'", "'URL'"));
+    assert.equal(Number(db.get<{ user_version: number }>("PRAGMA user_version")?.user_version ?? 0), 5);
+    assert.throws(() => validateSchema(db), /canonical schema v5/u);
+    db.close();
+  });
+
+  it("rolls back failed first-time schema creation atomically", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-schema-"));
+    const db = openDatabase(join(root, "state.sqlite"), { initializeSchema: false });
+    assert.throws(
+      () =>
+        transaction(db, () => {
+          db.exec(SCHEMA_SQL);
+          db.run("INSERT INTO schema_meta (schema_version, applied_at) VALUES (?, ?)", [5, new Date().toISOString()]);
+          db.exec("PRAGMA user_version = 5");
+          validateSchema(db);
+          throw new Error("abort schema creation");
+        }),
+      /abort schema creation/u,
+    );
+    assert.deepEqual(db.tableNames(), []);
+    assert.equal(Number(db.get<{ user_version: number }>("PRAGMA user_version")?.user_version ?? 0), 0);
+    db.close();
+  });
+  it("rejects incomplete WAL checkpoints while a reader pins frames", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-wal-"));
+    const paths = initVault(join(root, "vault"));
+    const writer = openDatabase(paths);
+    const reader = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    try {
+      reader.exec("BEGIN");
+      reader.get("SELECT COUNT(*) AS count FROM settings");
+      writer.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+        `wal-pin-${randomUUID()}`,
+        "{}",
+        new Date().toISOString(),
+      ]);
+      assert.throws(() => writer.checkpoint(), /WAL checkpoint incomplete/u);
+    } finally {
+      try {
+        reader.exec("ROLLBACK");
+      } finally {
+        reader.close();
+        writer.close();
+      }
+    }
+  });
 
   it("rejects unknown schema tables and follows no symlink reads", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -510,7 +937,7 @@ describe("vault foundation", () => {
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       questionId,
       pageId,
-      JSON.stringify("Explain the page"),
+      JSON.stringify("Identify the page's central idea"),
       1,
     ]);
     db.run("INSERT INTO quiz_answers (quiz_id, question_id, revision, answer_json, saved_at) VALUES (?, ?, 1, ?, ?)", [
@@ -533,7 +960,7 @@ describe("vault foundation", () => {
             ordinal: 0,
             kind: "free-response",
             prompt: "Explain the page",
-            pages: [{ pageId, criterion: "Explain the page", weight: 1 }],
+            pages: [{ pageId, criterion: "Identify the page's central idea", weight: 1 }],
             sourceRefs: [],
           },
         ],
@@ -572,7 +999,7 @@ describe("vault foundation", () => {
     db.run("INSERT INTO question_pages (question_id, page_id, criterion_json, weight) VALUES (?, ?, ?, ?)", [
       questionId,
       pageId,
-      JSON.stringify("Explain the page"),
+      JSON.stringify("Identify the page's central idea"),
       1,
     ]);
     const quizService = new QuizService(db, paths);
@@ -617,6 +1044,45 @@ describe("vault foundation", () => {
     );
     assert.equal(result.stdout, "€");
     assert.equal(result.outputOverflowed, false);
+  });
+  it("kills detached descendants after a timed-out leader exits", async () => {
+    // This integration check intentionally uses the real process-group timer; fake clocks cannot drive OS signals.
+    if (process.platform === "win32") return;
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
+    const descendantPidPath = join(root, "descendant.pid");
+    const heartbeatPath = join(root, "descendant.heartbeat");
+    const descendantScript = [
+      "const { writeFileSync } = require('node:fs');",
+      "const path = process.env.PI_DESCENDANT_FILE;",
+      "const tick = () => writeFileSync(path, String(Date.now()));",
+      "tick();",
+      "setInterval(tick, 25);",
+      "process.on('SIGTERM', () => {});",
+    ].join("\n");
+    const leaderScript = [
+      "const { spawn } = require('node:child_process');",
+      "const { writeFileSync } = require('node:fs');",
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: 'ignore' });`,
+      "writeFileSync(process.env.PI_DESCENDANT_PID_FILE, String(child.pid));",
+      "process.on('SIGTERM', () => process.exit(0));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const result = await runChild(process.execPath, ["-e", leaderScript], {
+      cwd: root,
+      timeoutMs: 500,
+      env: { PI_DESCENDANT_FILE: heartbeatPath, PI_DESCENDANT_PID_FILE: descendantPidPath },
+    });
+    assert.equal(result.timedOut, true);
+    const descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
+    const heartbeatAtReturn = readFileSync(heartbeatPath, "utf8");
+    try {
+      await delay(150);
+      assert.equal(readFileSync(heartbeatPath, "utf8"), heartbeatAtReturn);
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {}
+    }
   });
   it("doctor rejects a non-removed source row whose packet is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
@@ -919,6 +1385,59 @@ describe("vault foundation", () => {
     await assert.rejects(runGit(paths, assignment), /Git options must use separate argv values/u);
     assert.equal(runGitSync(paths, ["status", "--porcelain=v2", "--branch", "--ahead-behind"]).code, 0);
   });
+  it("redacts Git push diagnostics from the public result", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-git-push-"));
+    const paths = initVault(join(root, "vault"));
+    const realGit = runChildSync("git", ["--version"], { cwd: paths.vaultRoot, timeoutMs: 5_000 }).executable;
+    const wrapperDirectory = join(root, "bin");
+    mkdirSync(wrapperDirectory);
+    writeFileSync(
+      join(wrapperDirectory, "git"),
+      `#!/bin/sh
+for arg
+do
+  if [ "$arg" = "push" ]; then
+    printf '%s\n' "remote=https://alice:secret@example.invalid/repo.git path=${paths.vaultRoot} ref=refs/heads/main"
+    printf '%s\n' "fatal: credential=top-secret subprocess=/private/git-helper" >&2
+    exit 73
+  fi
+done
+exec ${JSON.stringify(realGit)} "$@"
+`,
+      { mode: 0o700 },
+    );
+    const child = runChildSync(
+      process.execPath,
+      [
+        "--import",
+        "jiti/register",
+        "--input-type=module",
+        "-e",
+        `const modulePath = process.env.PI_GIT_MODULE;
+const vaultRoot = process.env.PI_VAULT_ROOT;
+if (!modulePath || !vaultRoot) throw new Error("push child environment is incomplete");
+const loaded = await import(modulePath);
+const { safePush } = loaded.default ?? loaded;
+const result = safePush({ vaultRoot });
+process.stdout.write(JSON.stringify({ output: result.output, error: result.error }));
+`,
+      ],
+      {
+        cwd: process.cwd(),
+        timeoutMs: 30_000,
+        env: {
+          PATH: `${wrapperDirectory}${delimiter}${process.env.PATH ?? ""}`,
+          PI_GIT_MODULE: "./src/external/git.ts",
+          PI_VAULT_ROOT: paths.vaultRoot,
+        },
+      },
+    );
+    assert.equal(child.code, 0, child.stderr || child.stdout);
+    assert.deepEqual(JSON.parse(child.stdout), {
+      output: "Git push failed",
+      error: "PUSH_FAILED",
+    });
+  });
   it("treats Git checkpoint exclusions as literal path names", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-"));
     const paths = initVault(join(root, "vault"));
@@ -956,6 +1475,10 @@ do
     printf '%s\n' "later" > ${JSON.stringify(includedPath)}
     break
   fi
+  if [ "$arg" = "rev-parse" ]; then
+    printf '%s\n' "follow-up lookup disabled" >&2
+    exit 97
+  fi
 done
 exec ${JSON.stringify(realGit)} "$@"
 `,
@@ -974,7 +1497,7 @@ if (!modulePath || !vaultRoot) throw new Error("checkpoint child environment is 
 const loaded = await import(modulePath);
 const { localCheckpointCommit } = loaded.default ?? loaded;
 const result = localCheckpointCommit({ vaultRoot }, "test: indexed checkpoint");
-if (!result.committed) throw new Error("checkpoint did not commit");
+if (result.commitId !== undefined) throw new Error("checkpoint unexpectedly looked up a commit id");
 `,
       ],
       {

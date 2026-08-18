@@ -38,6 +38,35 @@
     --ui-radius-md: 0.625rem;
     --ui-radius-lg: 1rem;
     --ui-shadow-quiet: 0 0.5rem 2rem hsl(var(--ink) / 0.08);
+    --syntax-comment: 40 12% 68%;
+    --syntax-keyword: 37 92% 68%;
+    --syntax-string: 151 48% 68%;
+    --syntax-number: 2 75% 74%;
+    --syntax-title: 205 75% 75%;
+    --syntax-variable: 28 85% 75%;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --canvas: 220 24% 10%;
+      --paper: 220 22% 14%;
+      --ink: 42 30% 90%;
+      --muted: 215 14% 68%;
+      --line: 218 16% 28%;
+      --accent: 37 92% 55%;
+      --accent-ink: 220 33% 10%;
+      --positive: 151 48% 65%;
+      --caution: 35 90% 67%;
+      --danger: 2 75% 70%;
+      --ui-shadow-quiet: 0 0.5rem 2rem hsl(220 50% 2% / 0.35);
+      --syntax-comment: 218 12% 42%;
+      --syntax-keyword: 26 75% 38%;
+      --syntax-string: 151 39% 30%;
+      --syntax-number: 2 60% 43%;
+      --syntax-title: 205 65% 36%;
+      --syntax-variable: 28 75% 38%;
+    }
   }
 
   * {
@@ -91,6 +120,36 @@
   .markdown {
     @apply max-w-none text-lg leading-7 text-ink;
   }
+  .markdown-inline {
+    display: inline;
+    font-size: inherit;
+    line-height: inherit;
+  }
+  .scholar-answer-editor.w-md-editor {
+    --color-accent-fg: hsl(var(--ink));
+    --color-fg-default: hsl(var(--ink));
+    --color-neutral-muted: hsl(var(--canvas));
+    --md-editor-background-color: hsl(var(--paper));
+    --md-editor-box-shadow-color: hsl(var(--line));
+    --md-editor-font-family: var(--font-sans);
+    border-radius: var(--ui-radius-md);
+  }
+
+  .scholar-answer-editor.w-md-editor:focus-within {
+    box-shadow:
+      0 0 0 2px hsl(var(--accent)),
+      0 0 0 4px hsl(var(--paper));
+  }
+
+  .scholar-answer-editor .w-md-editor-toolbar li > button {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
+    color: hsl(var(--ink));
+  }
+
+  .scholar-answer-editor .w-md-editor-text-input {
+    color: hsl(var(--ink));
+  }
 
   .markdown > * + * {
     @apply mt-4;
@@ -138,8 +197,99 @@
     @apply font-semibold underline decoration-accent decoration-2 underline-offset-4 hover:text-muted;
   }
 
+  .markdown img {
+    @apply h-auto max-w-full;
+  }
+
+  .markdown .mermaid-diagram {
+    @apply overflow-x-auto rounded-md border border-line bg-white p-4 text-center text-slate-900;
+    color-scheme: light;
+  }
+
+  .markdown .mermaid-diagram[aria-busy="true"] {
+    @apply font-sans text-sm text-muted;
+  }
+
+  .markdown .mermaid-diagram svg {
+    @apply mx-auto h-auto max-w-full;
+  }
+
+  .markdown .code-block {
+    @apply overflow-hidden rounded-md border border-line bg-ink text-paper;
+  }
+
+  .markdown .code-toolbar {
+    @apply flex items-center justify-between border-b border-paper/20 px-4 py-2 font-sans text-xs font-bold text-paper;
+  }
+
+  .markdown .code-toolbar > span {
+    @apply uppercase tracking-widest;
+  }
+
+  .markdown .code-toolbar button {
+    @apply min-h-9 rounded-sm px-3 transition-colors duration-200 ease-expo hover:bg-paper/10;
+  }
+
   .markdown pre {
-    @apply overflow-x-auto rounded-md border border-line bg-ink p-4 font-mono text-sm text-paper;
+    @apply m-0 overflow-x-auto bg-transparent p-4 font-mono text-sm text-paper;
+  }
+
+  .markdown .katex-display {
+    @apply overflow-x-auto overflow-y-hidden py-1;
+  }
+
+  .markdown .hljs-comment,
+  .markdown .hljs-quote {
+    color: hsl(var(--syntax-comment));
+    @apply italic;
+  }
+
+  .markdown .hljs-keyword,
+  .markdown .hljs-selector-tag,
+  .markdown .hljs-literal,
+  .markdown .hljs-section,
+  .markdown .hljs-link {
+    color: hsl(var(--syntax-keyword));
+  }
+
+  .markdown .hljs-string,
+  .markdown .hljs-regexp,
+  .markdown .hljs-addition,
+  .markdown .hljs-attribute,
+  .markdown .hljs-meta .hljs-string {
+    color: hsl(var(--syntax-string));
+  }
+
+  .markdown .hljs-number,
+  .markdown .hljs-symbol,
+  .markdown .hljs-bullet {
+    color: hsl(var(--syntax-number));
+  }
+
+  .markdown .hljs-title,
+  .markdown .hljs-title.class_,
+  .markdown .hljs-title.function_ {
+    color: hsl(var(--syntax-title));
+  }
+
+  .markdown .hljs-built_in,
+  .markdown .hljs-type,
+  .markdown .hljs-variable,
+  .markdown .hljs-template-variable,
+  .markdown .hljs-params {
+    color: hsl(var(--syntax-variable));
+  }
+
+  .markdown .hljs-deletion {
+    color: hsl(var(--syntax-number));
+  }
+
+  .markdown .hljs-emphasis {
+    @apply italic;
+  }
+
+  .markdown .hljs-strong {
+    @apply font-bold;
   }
 
   .markdown :not(pre) > code {
@@ -157,9 +307,5 @@
 
   .markdown hr {
     @apply my-8 border-line;
-  }
-
-  .mermaid-source {
-    @apply border-l-4 border-accent;
   }
 }

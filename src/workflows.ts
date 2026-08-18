@@ -64,6 +64,7 @@ export interface WorkflowFinishOptions extends WorkflowUpdateInput {
 const WORKFLOW_MESSAGE_BYTES = 500;
 const WORKFLOW_ERROR_CODE_BYTES = 100;
 const WORKFLOW_ERROR_MESSAGE_BYTES = 500;
+const WORKFLOW_ERROR_FALLBACK = "Workflow failed";
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function boundedUtf8(value: string, maxBytes: number): string {
@@ -82,6 +83,11 @@ function boundedText(value: string | undefined, maxBytes: number, label: string)
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
   return boundedUtf8(value, maxBytes);
+}
+
+export function workflowFailureMessage(value: unknown): string {
+  const diagnostic = value === undefined ? "" : value instanceof Error ? value.message : String(value);
+  return boundedUtf8(diagnostic.trim(), WORKFLOW_ERROR_MESSAGE_BYTES) || WORKFLOW_ERROR_FALLBACK;
 }
 
 function workflowProgress(value: number | undefined): number | undefined {
@@ -193,7 +199,7 @@ export class WorkflowCoordinator {
   failRunningWorkflows(options: WorkflowFinishOptions): WorkflowRecord[] {
     const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
     const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
-    const errorMessage = boundedText(options.errorMessage, WORKFLOW_ERROR_MESSAGE_BYTES, "workflow error message");
+    const errorMessage = workflowFailureMessage(options.errorMessage);
     return transaction(this.db, () => {
       const requestIds = this.db
         .all<Record<string, unknown>>(
@@ -203,7 +209,7 @@ export class WorkflowCoordinator {
       if (requestIds.length === 0) return [];
       const result = this.db.run(
         "UPDATE workflows SET status = 'failed', finished_at = ?, message = COALESCE(?, message), error_code = ?, error_message = ? WHERE status = 'running'",
-        [new Date().toISOString(), message ?? null, errorCode ?? null, errorMessage ?? null],
+        [new Date().toISOString(), message ?? null, errorCode ?? null, errorMessage],
       );
       if (Number(result.changes) !== requestIds.length) throw new Error("running workflows changed during recovery");
       return requestIds.map((requestId) => {
@@ -243,7 +249,7 @@ export class WorkflowCoordinator {
     const progress = workflowProgress(options.progress);
     const message = boundedText(options.message, WORKFLOW_MESSAGE_BYTES, "workflow message");
     const errorCode = boundedText(options.errorCode, WORKFLOW_ERROR_CODE_BYTES, "workflow error code");
-    const errorMessage = boundedText(options.errorMessage, WORKFLOW_ERROR_MESSAGE_BYTES, "workflow error message");
+    const errorMessage = workflowFailureMessage(options.errorMessage);
     return transaction(this.db, () => {
       const current = this.get(requestId);
       if (!current) throw new Error("workflow not found");
@@ -257,7 +263,7 @@ export class WorkflowCoordinator {
           progress ?? (status === "succeeded" ? 1 : current.progress),
           message ?? current.message ?? null,
           status === "failed" ? (errorCode ?? null) : null,
-          status === "failed" ? (errorMessage ?? null) : null,
+          status === "failed" ? errorMessage : null,
           requestId,
         ],
       );

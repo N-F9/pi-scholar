@@ -205,10 +205,11 @@ jobs:
           import { createHash } from 'node:crypto';
           import { readFileSync } from 'node:fs';
 
+          const npmTag = process.env.NPM_TAG;
           const packageName = process.env.PACKAGE_NAME;
           const version = process.env.RELEASE_VERSION;
           const tarball = process.env.TARBALL;
-          if (!packageName || !version || !tarball) {
+          if (!npmTag || !packageName || !version || !tarball) {
             throw new Error('Release metadata is missing');
           }
 
@@ -226,6 +227,14 @@ jobs:
             const registryIntegrity = metadata?.dist?.integrity;
             if (registryIntegrity !== integrity) {
               throw new Error(`Existing ${packageName}@${version} integrity ${registryIntegrity ?? '<missing>'} does not match local ${integrity}`);
+            }
+            const tagsResponse = await fetch(`https://registry.npmjs.org/-/package/${encodeURIComponent(packageName)}/dist-tags`);
+            if (!tagsResponse.ok) {
+              throw new Error(`npm dist-tag lookup failed: ${tagsResponse.status} ${tagsResponse.statusText}`);
+            }
+            const distTags = await tagsResponse.json();
+            if (distTags?.[npmTag] !== version) {
+              throw new Error(`Existing ${packageName}@${version} is not npm dist-tag ${npmTag}`);
             }
             console.error(`Existing ${packageName}@${version} matches local integrity ${integrity}; skipping npm publish`);
             process.stdout.write('skip\n');

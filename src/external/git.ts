@@ -4,6 +4,7 @@ import type { VaultPaths } from "../vault.js";
 import { type ChildResult, type ChildRunOptions, runChild, runChildSync } from "./process.js";
 
 const GIT_TIMEOUT_MS = 120_000;
+const GIT_CHECKPOINT_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_REVISION_TIMEOUT_MS = 5_000;
 const GIT_REVISION_OUTPUT_BYTES = 1024;
 const SUBJECT_PATTERN = /^[^\u0000-\u001f\u007f]{1,160}$/u;
@@ -82,10 +83,11 @@ function assertGitDirectory(paths: VaultPaths, allowMissing = false): void {
   throw new Error(".git must be a real directory or linked-worktree file");
 }
 
-function commandFailure(result: ChildResult, command: string): Error {
-  return new Error(
-    `${command} failed (${result.code ?? result.signal ?? "unknown"}): ${(result.stderr || result.stdout).trim()}`,
-  );
+function commandFailure(result: ChildResult, command: string, timeoutMs = GIT_TIMEOUT_MS): Error {
+  const detail = (result.stderr || result.stdout).trim();
+  if (result.timedOut)
+    return new Error(`${command} timed out after ${Math.ceil(timeoutMs / 1000)} seconds${detail ? `: ${detail}` : ""}`);
+  return new Error(`${command} failed (${result.code ?? result.signal ?? "unknown"})${detail ? `: ${detail}` : ""}`);
 }
 
 export function initializeRepository(paths: VaultPaths): void {
@@ -173,27 +175,23 @@ export function localCheckpointCommit(
     return pathspec;
   });
   if (exclusions.length) {
-    const stagedExcluded = runGitSync(paths, [
-      "diff",
-      "--cached",
-      "--quiet",
-      "--",
-      ...exclusions.map((path) => `:(literal)${path}`),
-    ]);
+    const stagedExcluded = runGitSync(
+      paths,
+      ["diff", "--cached", "--quiet", "--", ...exclusions.map((path) => `:(literal)${path}`)],
+      GIT_CHECKPOINT_TIMEOUT_MS,
+    );
     if (stagedExcluded.code === 1) throw new Error("Git checkpoint has pre-staged excluded changes");
-    if (stagedExcluded.code !== 0) throw commandFailure(stagedExcluded, "git diff");
+    if (stagedExcluded.code !== 0) throw commandFailure(stagedExcluded, "git diff", GIT_CHECKPOINT_TIMEOUT_MS);
   }
   const pathspecs = [".", ...exclusions.map((path) => `:(exclude,literal)${path}`)];
-  let result = runGitSync(paths, ["add", "--all", "--", ...pathspecs]);
-  if (result.code !== 0) throw commandFailure(result, "git add");
-  result = runGitSync(paths, ["diff", "--cached", "--quiet", "--", ...pathspecs]);
+  let result = runGitSync(paths, ["add", "--all", "--", ...pathspecs], GIT_CHECKPOINT_TIMEOUT_MS);
+  if (result.code !== 0) throw commandFailure(result, "git add", GIT_CHECKPOINT_TIMEOUT_MS);
+  result = runGitSync(paths, ["diff", "--cached", "--quiet", "--", ...pathspecs], GIT_CHECKPOINT_TIMEOUT_MS);
   if (result.code === 0) return { committed: false, subject };
-  if (result.code !== 1) throw commandFailure(result, "git diff");
-  result = runGitSync(paths, ["commit", "--no-gpg-sign", "-m", subject]);
-  if (result.code !== 0) throw commandFailure(result, "git commit");
-  const commitIdResult = runGitSync(paths, ["rev-parse", "HEAD"]);
-  if (commitIdResult.code !== 0) throw commandFailure(commitIdResult, "git rev-parse");
-  return { committed: true, commitId: commitIdResult.stdout.trim(), subject };
+  if (result.code !== 1) throw commandFailure(result, "git diff", GIT_CHECKPOINT_TIMEOUT_MS);
+  result = runGitSync(paths, ["commit", "--no-gpg-sign", "-m", subject], GIT_CHECKPOINT_TIMEOUT_MS);
+  if (result.code !== 0) throw commandFailure(result, "git commit", GIT_CHECKPOINT_TIMEOUT_MS);
+  return { committed: true, subject };
 }
 
 function validateRemote(remote: string): void {
@@ -211,11 +209,11 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
   const args = ["push", "--porcelain", remote];
   if (branch !== undefined) args.push(branch);
   const result = runGitSync(paths, args);
-  const output = `${result.stdout}${result.stderr}`.trim();
+  const diagnostic = `${result.stdout}${result.stderr}`.trim();
   if (result.code !== 0) {
     const noUpstream =
       /no configured push destination|has no upstream branch|src refspec .* does not match any|set the remote as upstream/iu.test(
-        output,
+        diagnostic,
       );
     let reconciled = false;
     try {
@@ -232,16 +230,15 @@ export function safePush(paths: VaultPaths, remote = "origin", branch?: string):
       // Preserve the original push failure when reconciliation cannot run.
     }
     const reconciledStatus = gitStatus(paths);
-    if (reconciled)
-      return { ok: true, status: reconciledStatus, output: `${output}\nPush status reconciled after remote update` };
+    if (reconciled) return { ok: true, status: reconciledStatus, output: "Push status reconciled after remote update" };
     return {
       ok: false,
       status: reconciledStatus,
-      output,
+      output: "Git push failed",
       error: noUpstream ? "NO_UPSTREAM" : result.timedOut ? "TIMEOUT" : "PUSH_FAILED",
     };
   }
-  return { ok: true, status: gitStatus(paths), output };
+  return { ok: true, status: gitStatus(paths), output: "Git push completed" };
 }
 
 export function gitDependencyIdentity(paths: VaultPaths): {

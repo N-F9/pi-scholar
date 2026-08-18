@@ -11,6 +11,7 @@ import {
   hashFile,
   lstatNoFollow,
   lstatNoFollowSync,
+  validRelativePath,
   walkFiles,
   writeFully,
 } from "./source-files.js";
@@ -18,6 +19,7 @@ import type { ChunkPlanEndpoint, DoclingResult, SourceChunk, TreeSnapshot } from
 
 const IO_BUFFER_SIZE = 64 * 1024;
 const MAX_ATOMS = 2048;
+const EMBEDDED_DOCLING_IMAGE = Buffer.from("](data:image/");
 export interface AtomMetadata {
   index: number;
   startByte: number;
@@ -492,11 +494,17 @@ export async function normalizeDoclingResult(
   if (isLocalDoclingResult(result)) return result;
   if (typeof result !== "object" || result === null || Array.isArray(result)) throw new Error("invalid Docling result");
   const record = result as unknown as Record<string, unknown>;
+  const converter = record.converter;
   if (
     typeof record.outputDirectory !== "string" ||
     record.command === null ||
     typeof record.command !== "object" ||
-    Array.isArray(record.command)
+    Array.isArray(record.command) ||
+    converter === null ||
+    typeof converter !== "object" ||
+    Array.isArray(converter) ||
+    typeof (converter as Record<string, unknown>).name !== "string" ||
+    typeof (converter as Record<string, unknown>).version !== "string"
   )
     throw new Error("invalid Docling result");
   const command = record.command as Record<string, unknown>;
@@ -507,7 +515,7 @@ export async function normalizeDoclingResult(
   if (!extracted) throw new Error("Docling produced no Markdown or text output");
   return {
     extractedPath: extracted.absolutePath,
-    converter: { name: "docling", version: "unknown" },
+    converter: converter as { name: string; version: string },
     attachments: files
       .filter((file) => file.path !== extracted.path)
       .map((file) => ({
@@ -517,6 +525,142 @@ export async function normalizeDoclingResult(
         digest: file.digest,
       })),
   };
+}
+
+export function assertNoEmbeddedDoclingImages(extracted: Uint8Array): void {
+  const bytes = Buffer.from(extracted.buffer, extracted.byteOffset, extracted.byteLength);
+  if (bytes.includes(EMBEDDED_DOCLING_IMAGE)) throw new Error("Docling emitted an embedded image data URI");
+}
+interface DoclingReplacement {
+  source: Buffer;
+  target: Buffer;
+  relative: boolean;
+}
+
+function doclingRelativeReplacements(paths: readonly string[]): DoclingReplacement[] {
+  return paths.map((path) => {
+    const normalized = validRelativePath(path);
+    return {
+      source: Buffer.from(`](${normalized}`),
+      target: Buffer.from(`](attachments/${normalized}`),
+      relative: true,
+    };
+  });
+}
+
+function findDoclingReplacement(
+  bytes: Buffer,
+  replacements: readonly DoclingReplacement[],
+  from: number,
+  limit: number,
+): { index: number; replacement: DoclingReplacement; deferred: boolean } | undefined {
+  let search = from;
+  for (;;) {
+    let match: { index: number; replacement: DoclingReplacement } | undefined;
+    for (const replacement of replacements) {
+      const index = bytes.indexOf(replacement.source, search);
+      if (
+        index >= 0 &&
+        index < limit &&
+        (!match ||
+          index < match.index ||
+          (index === match.index && replacement.source.length > match.replacement.source.length))
+      )
+        match = { index, replacement };
+    }
+    if (!match) return undefined;
+    if (!match.replacement.relative) return { ...match, deferred: false };
+    const boundary = match.index + match.replacement.source.length;
+    if (boundary >= bytes.length) {
+      if (limit < bytes.length) return { ...match, deferred: true };
+      search = match.index + 1;
+      continue;
+    }
+    const next = bytes[boundary];
+    if (next === 9 || next === 32 || next === 35 || next === 41 || next === 63) return { ...match, deferred: false };
+    search = match.index + 1;
+  }
+}
+
+export function rewriteDoclingAttachmentReferences(extracted: Uint8Array, attachmentPaths: readonly string[]): Buffer {
+  const bytes = Buffer.from(extracted.buffer, extracted.byteOffset, extracted.byteLength);
+  const replacements = doclingRelativeReplacements(attachmentPaths);
+  if (!replacements.length) return bytes;
+  const output: Buffer[] = [];
+  let cursor = 0;
+  for (;;) {
+    const match = findDoclingReplacement(bytes, replacements, cursor, bytes.length);
+    if (!match || match.deferred) break;
+    output.push(bytes.subarray(cursor, match.index), match.replacement.target);
+    cursor = match.index + match.replacement.source.length;
+  }
+  if (cursor === 0) return bytes;
+  output.push(bytes.subarray(cursor));
+  return Buffer.concat(output);
+}
+
+export async function copyDoclingExtraction(
+  source: string,
+  target: string,
+  attachmentPaths: readonly string[] = [],
+): Promise<void> {
+  const referenceRoot = Buffer.from(`${dirname(source).replaceAll("\\", "/")}/`);
+  const packetRoot = Buffer.from("attachments/");
+  const replacements: DoclingReplacement[] = [
+    { source: referenceRoot, target: packetRoot, relative: false },
+    ...doclingRelativeReplacements(attachmentPaths),
+  ];
+  const overlap = Math.max(EMBEDDED_DOCLING_IMAGE.length, ...replacements.map(({ source: value }) => value.length)) - 1;
+  let input: FileHandle | undefined;
+  let output: FileHandle | undefined;
+  let pending = Buffer.alloc(0);
+  const write = async (bytes: Uint8Array): Promise<void> => {
+    if (bytes.byteLength) await writeFully(output!, bytes);
+  };
+  const writeReplaced = async (bytes: Buffer, matchStartLimit: number): Promise<number> => {
+    let cursor = 0;
+    let deferredStart = matchStartLimit;
+    for (;;) {
+      const match = findDoclingReplacement(bytes, replacements, cursor, matchStartLimit);
+      if (!match) break;
+      if (match.deferred) {
+        deferredStart = match.index;
+        break;
+      }
+      await write(bytes.subarray(cursor, match.index));
+      await write(match.replacement.target);
+      cursor = match.index + match.replacement.source.length;
+    }
+    const pendingStart = Math.max(cursor, Math.min(matchStartLimit, deferredStart));
+    await write(bytes.subarray(cursor, pendingStart));
+    return pendingStart;
+  };
+  try {
+    input = await openFile(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    if (!(await input.stat()).isFile()) throw new Error(`extraction must be a regular file: ${source}`);
+    output = await openFile(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    const buffer = Buffer.allocUnsafe(IO_BUFFER_SIZE);
+    for (;;) {
+      const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      const bytes = pending.length
+        ? Buffer.concat([pending, buffer.subarray(0, bytesRead)])
+        : buffer.subarray(0, bytesRead);
+      assertNoEmbeddedDoclingImages(bytes);
+      const pendingStart = await writeReplaced(bytes, Math.max(0, bytes.length - overlap));
+      pending = Buffer.from(bytes.subarray(pendingStart));
+    }
+    assertNoEmbeddedDoclingImages(pending);
+    await writeReplaced(pending, pending.length);
+  } catch (error) {
+    await output?.close().catch(() => undefined);
+    output = undefined;
+    await fs.rm(target, { force: true });
+    throw error;
+  } finally {
+    await input?.close().catch(() => undefined);
+    await output?.close().catch(() => undefined);
+  }
 }
 
 export async function writeNativeExtraction(

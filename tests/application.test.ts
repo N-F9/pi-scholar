@@ -7,14 +7,38 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { decodeExtractPublicationInput } from "../src/application/decoders.js";
-import type { GradingContext } from "../src/contracts.js";
+import { publicSource, publicWikiPage, publicWorkflow } from "../src/application/projections.js";
+import type { ExtractProgressEvent, GradingContext } from "../src/contracts.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { gitStatus, localCheckpointCommit } from "../src/external/git.js";
-import { localDate } from "../src/scheduler.js";
-import { initVault } from "../src/vault.js";
-import { WikiService } from "../src/wiki.js";
+import { QuizService } from "../src/quiz.js";
+import { type Clock, localDate, SchedulerService } from "../src/scheduler.js";
+import { acquireWriterLock, initVault, LockBusyError } from "../src/vault.js";
+import { parseWikiMarkdown, WikiService } from "../src/wiki.js";
 
+it("redacts persisted source and workflow diagnostics from public projections", () => {
+  const source = publicSource({
+    sourceId: "source",
+    kind: "text",
+    status: "failed",
+    displayName: "source",
+    errorCode: "EXTRACT_FAILED",
+    errorMessage: "/home/alice/private",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const workflow = publicWorkflow({
+    requestId: "1c4a9f7f-6c19-4b86-9bf8-6d2af3a4e0c2",
+    kind: "ingest",
+    status: "failed",
+    progress: 0,
+    errorCode: "INGEST_FAILED",
+    errorMessage: "/home/alice/private",
+  });
+  assert.equal("errorMessage" in source, false);
+  assert.equal("errorMessage" in workflow, false);
+});
 it("requires non-empty extraction line endpoints", () => {
   const base = { claimId: "claim", preparedId: "prepared", digest: "digest" };
   for (const endpoints of [undefined, [], [0], ["1"]]) {
@@ -38,15 +62,28 @@ function durable(
   return (app as unknown as DurableApplication).durableDirect(operation, subject);
 }
 
-function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?: boolean } = {}) {
+function fixture(
+  options: { readonly maintenance?: boolean; readonly realDoctor?: boolean; readonly clock?: Clock } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "pi-scholar-durable-"));
   const paths = initVault(join(root, "vault"));
   const db = openDatabase(paths);
   const calls: string[] = [];
+  const wiki = new WikiService(
+    db,
+    paths,
+    options.maintenance ? { qmd: { search: () => [], index: async () => undefined } } : undefined,
+  );
+  const scheduler = new SchedulerService(db, paths);
+  const quiz = new QuizService(db, paths, scheduler);
   const app = new ScholarApplication({
+    wikiService: wiki,
+    schedulerService: scheduler,
+    quizService: quiz,
     paths,
     db,
     adapters: options.maintenance ? { wiki: { qmd: { search: () => [], index: async () => undefined } } } : undefined,
+    clock: options.clock,
     doctor: options.realDoctor
       ? doctor
       : () => {
@@ -63,8 +100,34 @@ function fixture(options: { readonly maintenance?: boolean; readonly realDoctor?
     calls.push("checkpoint");
     checkpoint();
   };
-  return { app, db, paths, calls };
+  return { app, db, paths, calls, wiki, scheduler, quiz };
 }
+it("keeps internal wiki results as full OKF while projecting a public copy", async () => {
+  const { app, db } = fixture();
+  try {
+    const created = await app.createNote({
+      path: "public-projection.md",
+      title: "Public projection",
+      body: "# Projection\n\nBody.\n",
+      quizWorthiness: "skip",
+    });
+    const internal = await app.getWiki(created.page.pageId);
+    assert.match(internal.markdown, /^---\r?\n/u);
+    assert.equal(parseWikiMarkdown(internal.markdown).body, "# Projection\n\nBody.\n");
+
+    const projected = publicWikiPage(internal);
+    assert.notEqual(projected, internal);
+    assert.equal(projected.markdown, "# Projection\n\nBody.\n");
+    assert.equal(projected.markdown.includes("type:"), false);
+    assert.equal(projected.sections[0]?.heading, "Projection");
+    const firstSection = projected.sections[0];
+    assert.ok(firstSection);
+    assert.equal(projected.markdown.slice(firstSection.startOffset, firstSection.endOffset), projected.markdown);
+  } finally {
+    await app.close();
+    db.close();
+  }
+});
 
 async function publishedChunkId(app: ScholarApplication): Promise<string> {
   await app.stageSource({ kind: "text", text: "ingest evidence\n", name: "ingest-evidence.txt" });
@@ -113,6 +176,127 @@ describe("durable application writes", () => {
       db.close();
     }
   });
+  it("drains five queued sources in extraction batches of three then two", async () => {
+    const { app, db } = fixture();
+    const names = ["01.txt", "02.txt", "03.txt", "04.txt", "05.txt"];
+    try {
+      for (const name of names) await app.stageSource({ kind: "text", text: `${name}\n`, name });
+
+      const first = await app.getExtractContext();
+      assert.equal(first.claims.length, 3);
+      for (const claim of first.claims)
+        await app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        });
+
+      const second = await app.getExtractContext();
+      assert.equal(second.claims.length, 2);
+      for (const claim of second.claims)
+        await app.publishExtraction({
+          claimId: claim.claimId,
+          preparedId: claim.preparedId,
+          digest: claim.digest,
+          endpoints: [1],
+        });
+      assert.deepEqual([...first.claims, ...second.claims].map(({ displayName }) => displayName).sort(), names);
+
+      assert.deepEqual((await app.getExtractContext()).claims, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("claims exact pending source IDs atomically and reports bounded preparation phases", async () => {
+    const { app, db } = fixture();
+    try {
+      const staged = [];
+      for (const name of ["01.txt", "02.txt", "03.txt", "04.txt"])
+        staged.push(await app.stageSource({ kind: "text", text: `${name}\n`, displayName: name }));
+      const pendingIds = staged.map(({ source }) => source.sourceId);
+      const invalidProgress: ExtractProgressEvent[] = [];
+      await assert.rejects(
+        app.getExtractContext({ pendingSourceIds: [pendingIds[0]!, pendingIds[0]!] }, (event) =>
+          invalidProgress.push(event),
+        ),
+        /duplicates/u,
+      );
+      await assert.rejects(
+        app.getExtractContext({ pendingSourceIds: ["pending-ffffffffffffffffffffffffffffffff"] }),
+        /stale or missing/u,
+      );
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: ["not-a-source"] }), /malformed/u);
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: pendingIds }), /limited to 3 entries/u);
+      assert.deepEqual(invalidProgress, []);
+
+      const progress: ExtractProgressEvent[] = [];
+      const selected = await app.getExtractContext({ pendingSourceIds: [pendingIds[2]!, pendingIds[0]!] }, (event) => {
+        progress.push(event);
+        if (event.phase === "normalizing") throw new Error("presentation failed");
+      });
+      assert.deepEqual(
+        selected.claims.map(({ displayName }) => displayName),
+        ["03.txt", "01.txt"],
+      );
+      for (const [index, filename] of ["03.txt", "01.txt"].entries()) {
+        assert.deepEqual(
+          progress.filter((event) => event.entry === index + 1),
+          ["claiming", "preparing", "extracting", "normalizing", "validating/indexing", "ready"].map((phase) => ({
+            entry: index + 1,
+            total: 2,
+            filename,
+            phase,
+          })),
+        );
+      }
+
+      const published = [];
+      for (const claim of selected.claims)
+        published.push(
+          await app.publishExtraction({
+            claimId: claim.claimId,
+            preparedId: claim.preparedId,
+            digest: claim.digest,
+            endpoints: [1],
+          }),
+        );
+      await assert.rejects(app.getExtractContext({ pendingSourceIds: [published[0]!.sourceId] }), /not pending/u);
+      assert.deepEqual((await app.getExtractContext()).claims.map(({ displayName }) => displayName).sort(), [
+        "02.txt",
+        "04.txt",
+      ]);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("cleans private staging after lock contention and retries exactly once", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      const lock = acquireWriterLock(paths);
+      try {
+        await assert.rejects(
+          app.stageSource({ kind: "text", text: "blocked\n", name: "blocked.txt" }),
+          (error: unknown) => error instanceof LockBusyError,
+        );
+        assert.deepEqual(await fs.readdir(paths.inboxRoot), []);
+        assert.equal(
+          (await fs.readdir(paths.workRoot)).some((name) => name.startsWith(".source-stage-")),
+          false,
+        );
+      } finally {
+        lock.release();
+      }
+      const result = await app.stageSource({ kind: "text", text: "retry\n", name: "retry.txt" });
+      assert.equal(result.source.status, "pending");
+      assert.equal((await fs.readdir(paths.inboxRoot)).length, 1);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 
   it("reports applied, non-retryable finalization failures and never commits degraded state", async () => {
     for (const stage of ["checkpoint", "doctor", "commit"] as const) {
@@ -126,7 +310,17 @@ describe("durable application writes", () => {
       if (stage === "doctor") {
         (app as unknown as { doctorFn: () => unknown }).doctorFn = () => {
           calls.push("doctor");
-          return { ok: false, checkedAt: new Date().toISOString(), checks: [] };
+          return {
+            ok: false,
+            checkedAt: new Date().toISOString(),
+            checks: [
+              {
+                name: "source-packets",
+                status: "fail",
+                message: "Source catalog provenance/linkage is invalid: source-id",
+              },
+            ],
+          };
         };
       }
       if (stage === "commit") {
@@ -146,8 +340,14 @@ describe("durable application writes", () => {
             "test:write",
           ),
           (error: unknown) => {
-            assert.equal((error as { code?: string }).code, "MUTATION_APPLIED_FINALIZATION_FAILED");
-            assert.deepEqual((error as { details?: unknown }).details, { applied: true, retryable: false, stage });
+            const finalizationError = error as Error & { code?: string; details?: unknown };
+            assert.equal(finalizationError.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+            assert.deepEqual(finalizationError.details, { applied: true, retryable: false, stage });
+            if (stage === "doctor")
+              assert.equal(
+                finalizationError.message,
+                "mutation applied but doctor failed: source-packets: Source catalog provenance/linkage is invalid: source-id",
+              );
             return true;
           },
         );
@@ -187,9 +387,17 @@ describe("durable application writes", () => {
       if (!claim) throw new Error("admission claim is missing");
       const input = { claimId: claim.claimId, preparedId: claim.preparedId, digest: claim.digest, endpoints: [1] };
       const appliedCheckpointFailure = (error: unknown): boolean => {
-        if (error === null || typeof error !== "object" || !("code" in error) || !("details" in error)) return false;
+        if (
+          error === null ||
+          typeof error !== "object" ||
+          !("code" in error) ||
+          !("details" in error) ||
+          !("publicationApplied" in error)
+        )
+          return false;
         assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
         assert.deepEqual(error.details, { applied: true, retryable: false, stage: "checkpoint" });
+        assert.equal(error.publicationApplied, true);
         return true;
       };
       (db as unknown as { checkpoint: () => void }).checkpoint = () => {
@@ -218,7 +426,7 @@ describe("durable application writes", () => {
     }
   });
   it("refreshes OKF projections after source removal drifts a dependent page", async () => {
-    const { app, db, paths } = fixture();
+    const { app, db, paths, wiki } = fixture();
     try {
       await app.stageSource({ kind: "text", text: "evidence\n", name: "evidence.txt" });
       const claim = (await app.getExtractContext()).claims[0];
@@ -235,9 +443,6 @@ describe("durable application writes", () => {
       });
       const preview = await app.removalPreview(admitted.sourceId);
       assert.deepEqual(preview.dependentPageIds, [page.page.pageId]);
-      const wikiCandidate: unknown = Reflect.get(app, "wiki");
-      assert.ok(wikiCandidate instanceof WikiService);
-      const wiki = wikiCandidate;
       let qmdRefreshes = 0;
       wiki.refreshQmdIndex = async () => {
         qmdRefreshes += 1;
@@ -270,12 +475,84 @@ describe("durable application writes", () => {
       db.close();
     }
   }, 30_000);
+  it("surfaces source-removal qmd failures after checkpoint and commit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-source-qmd-"));
+    const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const calls: string[] = [];
+    let qmdIndexes = 0;
+    const app = new ScholarApplication({
+      paths,
+      db,
+      adapters: {
+        wiki: {
+          qmd: {
+            search: () => [],
+            index: async () => {
+              assert.throws(() => acquireWriterLock(paths), LockBusyError);
+              calls.push("qmd");
+              qmdIndexes += 1;
+              if (qmdIndexes === 1) throw new Error("injected source qmd failure");
+            },
+          },
+        },
+      },
+      doctor: () => {
+        calls.push("doctor");
+        return { ok: true, checkedAt: new Date().toISOString(), checks: [] };
+      },
+      commit: (_paths, subject) => {
+        calls.push(`commit:${subject}`);
+        return { committed: true, subject };
+      },
+    });
+    const checkpoint = db.checkpoint.bind(db);
+    (db as unknown as { checkpoint: () => void }).checkpoint = () => {
+      calls.push("checkpoint");
+      checkpoint();
+    };
+    try {
+      await app.stageSource({ kind: "text", text: "evidence\n", name: "evidence.txt" });
+      const claim = (await app.getExtractContext()).claims[0];
+      if (!claim) throw new Error("admission claim is missing");
+      const admitted = await app.publishExtraction({
+        claimId: claim.claimId,
+        preparedId: claim.preparedId,
+        digest: claim.digest,
+        endpoints: [1],
+      });
+      const preview = await app.removalPreview(admitted.sourceId);
+      await assert.rejects(
+        app.removeSource(admitted.sourceId, preview.confirmationId),
+        (error: Error & { code?: string; details?: Record<string, unknown> }) => {
+          assert.equal(error.code, "MUTATION_APPLIED_FINALIZATION_FAILED");
+          assert.deepEqual(error.details, { applied: true, retryable: true, stage: "qmd" });
+          return true;
+        },
+      );
+      assert.deepEqual(calls.slice(-4), ["checkpoint", "doctor", "commit:source:remove", "qmd"]);
+      assert.equal(
+        db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [admitted.sourceId])?.status,
+        "removed",
+      );
+      const retry = await app.removeSource(admitted.sourceId, preview.confirmationId);
+      assert.equal(retry.status, "removed");
+      assert.equal(qmdIndexes, 2);
+    } finally {
+      (db as unknown as { checkpoint: () => void }).checkpoint = checkpoint;
+      await app.close();
+      db.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
   it("restores a page issue exactly when commit fails", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
     const app = new ScholarApplication({
       paths,
+      wikiService: wiki,
       db,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
@@ -300,8 +577,13 @@ describe("durable application writes", () => {
     try {
       const originalBody = "# Section\n\nauthored\n";
       const correctedBody = "# Section\n\ncorrected\n";
-      const page = await app.wiki.create({ path: "rollback.md", body: originalBody, quizWorthiness: "eligible" });
-      const issue = await app.wiki.report({
+      const page = await wiki.create({
+        path: "rollback.md",
+        description: "Rollback page correction.",
+        body: originalBody,
+        quizWorthiness: "eligible",
+      });
+      const issue = await wiki.report({
         pageId: page.page.pageId,
         heading: "Section",
         description: "Wrong section.",
@@ -342,8 +624,18 @@ describe("durable application writes", () => {
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
     let qmdIndexes = 0;
+    const wiki = new WikiService(db, paths, {
+      qmd: {
+        search: () => [],
+        index: async () => {
+          qmdIndexes += 1;
+          if (qmdIndexes === 2) throw new Error("injected page qmd failure");
+        },
+      },
+    });
     const app = new ScholarApplication({
       paths,
+      wikiService: wiki,
       db,
       adapters: {
         wiki: {
@@ -360,7 +652,7 @@ describe("durable application writes", () => {
       commit: (_paths, subject) => ({ committed: true, subject }),
     });
     try {
-      const page = await app.wiki.create({ path: "page-rollback.md", body: "before\n", quizWorthiness: "skip" });
+      const page = await wiki.create({ path: "page-rollback.md", body: "before\n", quizWorthiness: "skip" });
       const destinations = [
         join(paths.wikiRoot, page.page.relativePath),
         join(paths.metadataRoot, "snapshots", "wiki", `${page.page.pageId}.md`),
@@ -394,16 +686,161 @@ describe("durable application writes", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+  it("refreshes qmd after direct create rollback", async () => {
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
+    const pagePath = join(paths.wikiRoot, "direct-create-rollback.md");
+    const indexPath = join(paths.wikiRoot, "index.md");
+    const logPath = join(paths.wikiRoot, "log.md");
+    const beforeIndex = await fs.readFile(indexPath);
+    const beforeLog = await fs.readFile(logPath);
+    const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
+    const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
+    const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
+    let qmdIndexes = 0;
+    qmd.index = async () => {
+      qmdIndexes += 1;
+      if (qmdIndexes === 1) {
+        assert.match(await fs.readFile(pagePath, "utf8"), /Inside mutation/u);
+        assert.ok(db.get("SELECT page_id FROM pages WHERE relative_path = ?", ["direct-create-rollback.md"]));
+        throw new Error("injected create qmd failure");
+      }
+      assert.equal((await fs.readdir(paths.wikiRoot)).includes("direct-create-rollback.md"), false);
+      assert.equal(
+        db.get("SELECT page_id FROM pages WHERE relative_path = ?", ["direct-create-rollback.md"]),
+        undefined,
+      );
+    };
+    try {
+      await assert.rejects(
+        app.createNote({
+          path: "direct-create-rollback.md",
+          body: "# Inside mutation\n\nCreated.\n",
+          quizWorthiness: "skip",
+        }),
+        /injected create qmd failure/u,
+      );
+      assert.equal(qmdIndexes, 2);
+      assert.equal((await fs.readdir(paths.wikiRoot)).includes("direct-create-rollback.md"), false);
+      assert.equal((await fs.readFile(indexPath)).equals(beforeIndex), true);
+      assert.equal((await fs.readFile(logPath)).equals(beforeLog), true);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("refreshes qmd after direct update rollback", async () => {
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
+    try {
+      const original = await app.createNote({
+        path: "direct-update-rollback.md",
+        body: "# Before\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const pagePath = join(paths.wikiRoot, original.page.relativePath);
+      const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${original.page.pageId}.md`);
+      const destinations = [pagePath, snapshotPath, join(paths.wikiRoot, "index.md"), join(paths.wikiRoot, "log.md")];
+      const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
+      const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
+      const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
+      const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
+      let qmdIndexes = 0;
+      qmd.index = async () => {
+        qmdIndexes += 1;
+        if (qmdIndexes === 1) {
+          assert.match(await fs.readFile(pagePath, "utf8"), /Changed by mutation/u);
+          assert.equal(
+            db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+              ?.revision,
+            original.page.revision + 1,
+          );
+          throw new Error("injected update qmd failure");
+        }
+        assert.equal((await fs.readFile(pagePath)).equals(beforeFiles[0]!), true);
+        assert.equal(
+          db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+            ?.revision,
+          original.page.revision,
+        );
+      };
+      await assert.rejects(
+        app.updateNote(original.page.pageId, { body: "# Before\n\nChanged by mutation.\n" }),
+        /injected update qmd failure/u,
+      );
+      assert.equal(qmdIndexes, 2);
+      for (const [index, path] of destinations.entries())
+        assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("refreshes qmd after direct drift resolution rollback", async () => {
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
+    try {
+      const original = await app.createNote({
+        path: "direct-drift-rollback.md",
+        body: "# Drift\n\nOriginal.\n",
+        quizWorthiness: "skip",
+      });
+      const pagePath = join(paths.wikiRoot, original.page.relativePath);
+      await fs.appendFile(pagePath, "\nExternal edit.\n");
+      const drift = await wiki.inspectDrift(original.page.pageId);
+      const snapshotPath = join(paths.metadataRoot, "snapshots", "wiki", `${original.page.pageId}.md`);
+      const destinations = [pagePath, snapshotPath, join(paths.wikiRoot, "index.md"), join(paths.wikiRoot, "log.md")];
+      const beforeFiles = await Promise.all(destinations.map((path) => fs.readFile(path)));
+      const beforePages = db.all<Record<string, unknown>>("SELECT * FROM pages");
+      const beforeSnapshots = db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots");
+      const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
+      let qmdIndexes = 0;
+      qmd.index = async () => {
+        qmdIndexes += 1;
+        if (qmdIndexes === 1) {
+          assert.equal((await fs.readFile(pagePath, "utf8")).includes("External edit."), false);
+          assert.equal(
+            db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+              ?.revision,
+            original.page.revision + 1,
+          );
+          throw new Error("injected drift qmd failure");
+        }
+        assert.equal((await fs.readFile(pagePath)).equals(beforeFiles[0]!), true);
+        assert.equal(
+          db.get<{ revision: number }>("SELECT revision FROM pages WHERE page_id = ?", [original.page.pageId])
+            ?.revision,
+          original.page.revision,
+        );
+      };
+      await assert.rejects(
+        app.resolveDrift(original.page.pageId, { action: "restore", expectedDigest: drift.currentDigest }),
+        /injected drift qmd failure/u,
+      );
+      assert.equal(qmdIndexes, 2);
+      for (const [index, path] of destinations.entries())
+        assert.equal((await fs.readFile(path)).equals(beforeFiles[index]!), true, path);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM pages"), beforePages);
+      assert.deepEqual(db.all<Record<string, unknown>>("SELECT * FROM authored_snapshots"), beforeSnapshots);
+      assert.equal((await wiki.inspectDrift(original.page.pageId)).drifted, true);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("rejects rollback restoration through a symlink", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-rollback-symlink-"));
     const paths = initVault(join(root, "vault"));
     const db = openDatabase(paths);
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
     const outside = join(root, "outside.txt");
     await fs.writeFile(outside, "outside\n");
     let destination = "";
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
       commit: () => {
@@ -413,7 +850,7 @@ describe("durable application writes", () => {
       },
     });
     try {
-      const page = await app.wiki.create({ path: "rollback-symlink.md", body: "before\n", quizWorthiness: "skip" });
+      const page = await wiki.create({ path: "rollback-symlink.md", body: "before\n", quizWorthiness: "skip" });
       destination = join(paths.wikiRoot, page.page.relativePath);
       await assert.rejects(
         app.applyWikiChange({
@@ -487,6 +924,26 @@ describe("durable application writes", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+  it("resolves wiki paths before drift inspection", async () => {
+    const { app, db, paths } = fixture();
+    try {
+      const created = await app.createNote({
+        path: "path-read.md",
+        body: "# Path read\n\nAuthored content.\n",
+        quizWorthiness: "skip",
+      });
+      const path = join(paths.wikiRoot, created.page.relativePath);
+      await fs.appendFile(path, "\nExternal edit.\n");
+      const result = await app.getWiki(created.page.relativePath);
+      assert.equal(result.page.pageId, created.page.pageId);
+      assert.equal(result.page.relativePath, created.page.relativePath);
+      assert.equal(result.drift?.expectedDigest, created.page.digest);
+      assert.notEqual(result.drift?.actualDigest, created.page.digest);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
 });
 describe("knowledge capability contexts", () => {
   it("exposes only verified published source packets to ingest", async () => {
@@ -519,6 +976,54 @@ describe("knowledge capability contexts", () => {
         const { path: _path, ...manifestChunk } = chunk;
         assert.deepEqual(manifestChunk, packet.manifest.chunks[index]);
       }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("filters research ingest sources without capping ordinary pages or packets", async () => {
+    const { app, db } = fixture();
+    try {
+      for (const name of ["one.txt", "two.txt", "three.txt", "four.txt"])
+        await app.stageSource({ kind: "text", text: `${name}\n`, displayName: name });
+      const published = [];
+      for (let batch = await app.getExtractContext(); batch.claims.length; batch = await app.getExtractContext()) {
+        for (const claim of batch.claims)
+          published.push(
+            await app.publishExtraction({
+              claimId: claim.claimId,
+              preparedId: claim.preparedId,
+              digest: claim.digest,
+              endpoints: [1],
+            }),
+          );
+      }
+      for (const index of [1, 2, 3, 4])
+        await app.createNote({
+          path: `topic-${index}.md`,
+          body: `# Topic ${index}\n\nBody ${index}.\n`,
+          quizWorthiness: "skip",
+        });
+
+      const ordinary = await app.getIngestContext();
+      assert.equal(ordinary.sources.length, 4);
+      assert.equal(ordinary.pages.length >= 4, true);
+      const selectedIds = [published[3]!.sourceId, published[1]!.sourceId];
+      const filtered = await app.getIngestContext({ sourceIds: selectedIds });
+      assert.deepEqual(
+        filtered.sources.map(({ source }) => source.sourceId),
+        selectedIds,
+      );
+      assert.deepEqual(filtered.pages, ordinary.pages);
+      assert.deepEqual(filtered.issues, ordinary.issues);
+      assert.equal(
+        (await app.getIngestContext({ sourceIds: published.map(({ sourceId }) => sourceId) })).sources.length,
+        4,
+      );
+      await assert.rejects(app.getIngestContext({ sourceIds: [selectedIds[0]!, selectedIds[0]!] }), /duplicates/u);
+      await assert.rejects(app.getIngestContext({ sourceIds: ["not-a-source"] }), /malformed/u);
+      await assert.rejects(app.getIngestContext({ sourceIds: [randomUUID()] }), /stale or missing/u);
     } finally {
       await app.close();
       db.close();
@@ -561,17 +1066,17 @@ describe("knowledge capability contexts", () => {
   });
 
   it("keeps drifted pages in ingest and lint repair contexts", async () => {
-    const { app, db } = fixture();
+    const { app, db, wiki } = fixture();
     try {
       const drifted = await app.createNote({ path: "drifted.md", body: "# Drifted\n", quizWorthiness: "skip" });
       const retired = await app.createNote({ path: "retired.md", body: "# Retired\n", quizWorthiness: "skip" });
       db.run("UPDATE pages SET status = 'drifted' WHERE page_id = ?", [drifted.page.pageId]);
       db.run("UPDATE pages SET status = 'retired' WHERE page_id = ?", [retired.page.pageId]);
-      const open = await app.wiki.report({ description: "open issue" });
-      const reopened = await app.wiki.report({ description: "reopened issue" });
-      await app.wiki.patchIssue(reopened.issueId, { status: "reopened" });
-      const resolved = await app.wiki.report({ description: "resolved issue" });
-      await app.wiki.resolveIssueAfterCorrection(resolved.issueId, "corrected");
+      const open = await wiki.report({ description: "open issue" });
+      const reopened = await wiki.report({ description: "reopened issue" });
+      await wiki.patchIssue(reopened.issueId, { status: "reopened" });
+      const resolved = await wiki.report({ description: "resolved issue" });
+      await wiki.resolveIssueAfterCorrection(resolved.issueId, "corrected");
 
       const ingest = await app.getIngestContext();
       const lint = await app.getLintContext();
@@ -599,6 +1104,7 @@ describe("knowledge capability contexts", () => {
     try {
       const page = await app.createNote({
         path: "missing-learning.md",
+        description: "Missing learning guard.",
         body: "# Missing learning\n",
         quizWorthiness: "eligible",
       });
@@ -614,14 +1120,14 @@ describe("knowledge capability contexts", () => {
   });
 
   it("rejects stale retire changes before mutating the page", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       const page = await app.createNote({ path: "stale-retire.md", body: "# Stale retire\n", quizWorthiness: "skip" });
       await assert.rejects(
         app.applyWikiChange({ kind: "retire-page", pageId: page.page.pageId, expectedDigest: "stale-digest" }),
         /stale/u,
       );
-      const current = await app.wiki.get(page.page.pageId);
+      const current = await wiki.get(page.page.pageId);
       assert.equal(current.status, "active");
       assert.equal(current.digest, page.page.digest);
     } finally {
@@ -634,11 +1140,13 @@ describe("knowledge capability contexts", () => {
     try {
       const page = await app.createNote({
         path: "quiz-guarded.md",
+        description: "Quiz guard page.",
         body: "# Quiz guarded\n",
         quizWorthiness: "eligible",
       });
       const prerequisite = await app.createNote({
         path: "quiz-prerequisite.md",
+        description: "Quiz prerequisite page.",
         body: "# Quiz prerequisite\n",
         quizWorthiness: "eligible",
       });
@@ -680,15 +1188,17 @@ describe("knowledge capability contexts", () => {
   });
 
   it("rejects retiring pages until prerequisite edges are repaired", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       const dependent = await app.createNote({
         path: "dependent.md",
+        description: "Dependent prerequisite page.",
         body: "# Dependent\n",
         quizWorthiness: "eligible",
       });
       const prerequisite = await app.createNote({
         path: "prerequisite.md",
+        description: "Prerequisite edge page.",
         body: "# Prerequisite\n",
         quizWorthiness: "eligible",
       });
@@ -702,8 +1212,80 @@ describe("knowledge capability contexts", () => {
           app.applyWikiChange({ kind: "retire-page", pageId: page.pageId, expectedDigest: page.digest }),
           /quiz-eligible/u,
         );
-        assert.equal((await app.wiki.get(page.pageId)).status, "active");
+        assert.equal((await wiki.get(page.pageId)).status, "active");
       }
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+});
+
+describe("application settings validation", () => {
+  it("rejects an invalid simulated date and timezone pair before writing", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      await assert.rejects(app.updateSettings({ simulatedDate: "2026-08-20" }), /developer tools are required/u);
+      await assert.rejects(
+        app.updateSettings({ simulatedDate: "2011-12-30", timezone: "Pacific/Apia" }, { developerToolsEnabled: true }),
+        /simulatedDate/u,
+      );
+      assert.equal(db.get("SELECT value_json FROM settings WHERE key = ?", ["simulatedDate"]), undefined);
+      assert.equal(
+        JSON.parse(
+          String(
+            db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", ["timezone"])?.value_json,
+          ),
+        ),
+        "local",
+      );
+      const settings = (await app.getSettings()).settings;
+      assert.equal(settings.simulatedDate, undefined);
+      assert.equal(settings.timezone, "local");
+      assert.deepEqual(calls, []);
+
+      const valid = await app.updateSettings(
+        { simulatedDate: "2026-08-20", timezone: "Pacific/Apia" },
+        { developerToolsEnabled: true },
+      );
+      assert.equal(valid.settings.simulatedDate, "2026-08-20");
+      assert.equal(valid.settings.timezone, "Pacific/Apia");
+      const cleared = await app.updateSettings({ simulatedDate: null }, { developerToolsEnabled: true });
+      assert.equal(cleared.settings.simulatedDate, undefined);
+      assert.equal(cleared.settings.timezone, "Pacific/Apia");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects timezone-only changes that invalidate a persisted simulated date", async () => {
+    const { app, db, calls } = fixture();
+    try {
+      db.run(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        ["simulatedDate", JSON.stringify("2011-12-30"), new Date().toISOString()],
+      );
+      await assert.rejects(app.updateSettings({ timezone: "Pacific/Apia" }), /simulatedDate/u);
+      const settings = (await app.getSettings()).settings;
+      assert.equal(settings.simulatedDate, "2011-12-30");
+      assert.equal(settings.timezone, "local");
+      assert.equal(
+        JSON.parse(
+          String(
+            db.get<{ value_json: string }>("SELECT value_json FROM settings WHERE key = ?", ["timezone"])?.value_json,
+          ),
+        ),
+        "local",
+      );
+      assert.deepEqual(calls, []);
+
+      const cleared = await app.updateSettings(
+        { simulatedDate: null, timezone: "Pacific/Apia" },
+        { developerToolsEnabled: true },
+      );
+      assert.equal(cleared.settings.simulatedDate, undefined);
+      assert.equal(cleared.settings.timezone, "Pacific/Apia");
     } finally {
       await app.close();
       db.close();
@@ -726,6 +1308,56 @@ describe("application quiz date guards", () => {
     } finally {
       await app.close();
       db.close();
+    }
+  });
+  it("refreshes timezone eligibility for live injected schedulers sharing a vault", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-scholar-timezone-"));
+    const paths = initVault(join(root, "vault"));
+    const dbA = openDatabase(paths);
+    const dbB = openDatabase(paths);
+    const schedulerA = new SchedulerService(dbA, paths);
+    const schedulerB = new SchedulerService(dbB, paths);
+    const quizB = new QuizService(dbB, paths, schedulerB);
+    const appA = new ScholarApplication({
+      paths,
+      db: dbA,
+      schedulerService: schedulerA,
+      quizService: new QuizService(dbA, paths, schedulerA),
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const appB = new ScholarApplication({
+      paths,
+      db: dbB,
+      schedulerService: schedulerB,
+      quizService: quizB,
+      doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      commit: (_paths, subject) => ({ committed: true, subject }),
+    });
+    const pageId = "shared-timezone-page";
+    const now = new Date().toISOString();
+    dbA.run(
+      "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
+      [pageId, `${pageId}.md`, pageId, "digest", now, now],
+    );
+    schedulerA.ensurePageLearning(pageId, "2026-08-13T00:30:00.000Z");
+    dbA.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", ["2026-08-13T00:30:00.000Z", pageId]);
+    try {
+      await appA.updateSettings({ timezone: "America/Los_Angeles" });
+      assert.deepEqual(
+        schedulerB.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+        [pageId],
+      );
+      assert.deepEqual(
+        quizB.scheduler.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+        [pageId],
+      );
+    } finally {
+      await appA.close();
+      await appB.close();
+      dbA.close();
+      dbB.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
   it("does not expire prior open quizzes when current publication is rejected", async () => {
@@ -765,31 +1397,116 @@ describe("application quiz date guards", () => {
 });
 
 describe("application quiz publication guards", () => {
+  it("blocks quiz evidence and publication while maintenance mode is active", async () => {
+    const { app, db, calls } = fixture();
+    const date = localDate(new Date());
+    try {
+      await assert.rejects(app.getQuizEvidence({ date, pageIds: ["nonexistent-page"] }), (error: Error) => {
+        assert.equal(error.message, "Maintenance mode is active; quiz evidence is blocked");
+        return true;
+      });
+      calls.length = 0;
+      await assert.rejects(
+        app.publishQuiz({ status: "skipped", date, reason: "Maintenance mode is active" }),
+        (error: Error) => {
+          assert.equal(error.message, "Maintenance mode is active; quiz publication is blocked");
+          return true;
+        },
+      );
+      assert.equal(db.get("SELECT 1 FROM quizzes LIMIT 1"), undefined);
+      assert.deepEqual(calls, []);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("returns verified compact candidates without evidence excerpts", async () => {
-    const { app, db } = fixture();
+    const { app, db, scheduler } = fixture();
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "publication-page.md",
+      description: "A page for publication.",
       title: "Publication page",
       body: "# Section\n\nSection text\n",
       quizWorthiness: "eligible",
     });
     const pageId = page.page.pageId;
-    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const context = await app.getQuizContext({ date });
-      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "initializationEnabled"]);
+      assert.deepEqual(Object.keys(context).sort(), ["candidates", "date", "expiredCount", "maintenanceEnabled"]);
       assert.equal(context.candidates.length, 1);
       const candidate = context.candidates[0]!;
-      assert.deepEqual(Object.keys(candidate).sort(), ["dueAt", "pageId", "path", "sections", "title"]);
+      assert.deepEqual(Object.keys(candidate).sort(), ["description", "dueAt", "pageId", "path", "title"]);
       assert.equal(candidate.pageId, pageId);
       assert.equal(candidate.path, page.page.relativePath);
       assert.equal(candidate.title, "Publication page");
-      assert.equal(candidate.dueAt, app.scheduler.getPageLearning(pageId).dueAt);
-      assert.deepEqual(Object.keys(candidate.sections[0]!).sort(), ["anchor", "heading"]);
+      assert.equal(candidate.description, "A page for publication.");
+      assert.equal(candidate.dueAt, scheduler.getPageLearning(pageId).dueAt);
       assert.equal("excerpt" in candidate, false);
-      assert.equal("excerpt" in candidate.sections[0]!, false);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("bounds daily descriptions without changing canonical OKF", async () => {
+    const { app, db, wiki, scheduler } = fixture();
+    const date = localDate(new Date());
+    const description = `  ${"é".repeat(600)}  `;
+    const page = await app.createNote({
+      path: "bounded-description.md",
+      title: "Bounded description",
+      description,
+      body: "# Section\n\nSection text.\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ maintenanceEnabled: false });
+    try {
+      const candidate = (await app.getQuizContext({ date })).candidates.find((item) => item.pageId === pageId);
+      assert.equal(candidate?.description, "é".repeat(512));
+      assert.equal(Buffer.byteLength(candidate?.description ?? "", "utf8"), 1024);
+      const stored = parseWikiMarkdown((await wiki.get(pageId)).content);
+      assert.equal(stored.frontmatter.description, description);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("publishes a grounded quiz for a described headingless page", async () => {
+    const { app, db, scheduler } = fixture();
+    const date = localDate(new Date());
+    const page = await app.createNote({
+      path: "headingless-publication.md",
+      title: "Headingless publication",
+      description: "A page described without a heading.",
+      body: "Meaningful page-level exposition without a Markdown heading.\n",
+      quizWorthiness: "eligible",
+    });
+    const pageId = page.page.pageId;
+    scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ maintenanceEnabled: false });
+    try {
+      const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
+      assert.equal(evidence.length, 1);
+      assert.equal(evidence[0]?.anchor, "");
+      assert.equal(evidence[0]?.heading, undefined);
+      assert.equal(evidence[0]?.excerpt.includes("---"), false);
+      const quiz = await app.publishQuiz({
+        status: "published",
+        date,
+        questions: [
+          {
+            kind: "free-response",
+            prompt: "Explain the page",
+            pages: [{ pageId, criterion: "Connect the explanation to the source", weight: 1 }],
+            sourceRefs: evidence.map((item) => item.reference),
+          },
+        ],
+      });
+      assert.equal(quiz.questions.length, 1);
     } finally {
       await app.close();
       db.close();
@@ -797,29 +1514,33 @@ describe("application quiz publication guards", () => {
   });
 
   it("returns authoritative evidence only for the requested due subset", async () => {
-    const { app, db, calls } = fixture();
+    const { app, db, calls, scheduler } = fixture();
     const date = localDate(new Date());
     const first = await app.createNote({
       path: "evidence-first.md",
+      description: "First evidence page.",
       body: "# First\n\nFirst text\n",
       quizWorthiness: "eligible",
     });
     const second = await app.createNote({
       path: "evidence-second.md",
+      description: "Second evidence page.",
       body: "# Second\n\nSecond text\n",
       quizWorthiness: "eligible",
     });
     const future = await app.createNote({
       path: "evidence-future.md",
+      description: "Future evidence page.",
       body: "# Future\n\nFuture text\n",
       quizWorthiness: "eligible",
     });
-    app.scheduler.ensurePageLearning(first.page.pageId, `${date}T00:00:00.000Z`);
-    app.scheduler.ensurePageLearning(second.page.pageId, `${date}T00:00:00.000Z`);
+    scheduler.ensurePageLearning(first.page.pageId, `${date}T00:00:00.000Z`);
+    scheduler.ensurePageLearning(second.page.pageId, `${date}T00:00:00.000Z`);
     db.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", [
       new Date(Date.now() + 2 * 86_400_000).toISOString(),
       future.page.pageId,
     ]);
+    await app.updateSettings({ maintenanceEnabled: false });
     calls.length = 0;
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [second.page.pageId, first.page.pageId] });
@@ -833,16 +1554,17 @@ describe("application quiz publication guards", () => {
     }
   });
   it("excludes live-drift pages from quiz candidates, evidence, and publication", async () => {
-    const { app, db, paths } = fixture();
+    const { app, db, paths, scheduler } = fixture();
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "live-drift.md",
+      description: "Live drift page.",
       body: "# Live drift\n\nCataloged text\n",
       quizWorthiness: "eligible",
     });
     const pageId = page.page.pageId;
-    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ maintenanceEnabled: false });
     await fs.appendFile(join(paths.wikiRoot, page.page.relativePath), "\nPhysical edit\n");
     try {
       const context = await app.getQuizContext({ date });
@@ -877,6 +1599,7 @@ describe("application quiz publication guards", () => {
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "evidence-validation.md",
+      description: "Evidence validation page.",
       body: "# Section\n\nSection text\n",
       quizWorthiness: "eligible",
     });
@@ -890,24 +1613,26 @@ describe("application quiz publication guards", () => {
   });
 
   it("publishes an uncapped quiz for a selected due subset with multiple questions per page", async () => {
-    const { app, db } = fixture();
+    const { app, db, scheduler } = fixture();
     const date = localDate(new Date());
     const page = await app.createNote({
       path: "publication-page.md",
+      description: "Selected publication page.",
       title: "Publication page",
       body: "# Section\n\nSection text\n",
       quizWorthiness: "eligible",
     });
     const unselected = await app.createNote({
       path: "unselected-page.md",
+      description: "Unselected publication page.",
       title: "Unselected page",
       body: "# Other\n\nOther text\n",
       quizWorthiness: "eligible",
     });
     const pageId = page.page.pageId;
-    app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-    app.scheduler.ensurePageLearning(unselected.page.pageId, `${date}T00:00:00.000Z`);
-    await app.updateSettings({ initializationEnabled: false });
+    scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+    scheduler.ensurePageLearning(unselected.page.pageId, `${date}T00:00:00.000Z`);
+    await app.updateSettings({ maintenanceEnabled: false });
     try {
       const evidence = await app.getQuizEvidence({ date, pageIds: [pageId] });
       const sourceRefs = evidence.map((item) => item.reference);
@@ -958,16 +1683,20 @@ describe("application browser mutation boundary", () => {
   it("drains browser mutations in FIFO order before closing its database", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-scholar-browser-close-"));
     const paths = initVault(join(root, "vault"));
+    const db = openDatabase(paths);
+    const wiki = new WikiService(db, paths);
     const app = new ScholarApplication({
       paths,
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
+      db,
+      wikiService: wiki,
       commit: (_paths, subject) => ({ committed: true, subject }),
     });
     const started = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const order: string[] = [];
-    const originalReport = app.wiki.report.bind(app.wiki);
-    app.wiki.report = async (input) => {
+    const originalReport = wiki.report.bind(wiki);
+    wiki.report = async (input) => {
       order.push(input.description);
       if (order.length === 1) {
         started.resolve();
@@ -1000,58 +1729,62 @@ describe("application browser mutation boundary", () => {
       release.resolve();
       await Promise.allSettled([...mutations, ...(closing ? [closing] : [])]);
       if (!closing) await app.close();
+      db.close();
       rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
-async function gradingFixture() {
-  const fixtureValue = fixture();
-  const { app } = fixtureValue;
+async function gradingFixture(options: Parameters<typeof fixture>[0] = {}) {
+  const fixtureValue = fixture(options);
+  const { wiki, scheduler, quiz: quizService } = fixtureValue;
   const date = localDate(new Date());
-  const page = await app.wiki.create({
+  const page = await wiki.create({
     path: "page-1.md",
+    description: "Grading fixture page.",
     title: "Page 1",
     body: "# Section\n\nSection text\n",
     quizWorthiness: "eligible",
   });
   const pageId = page.page.pageId;
-  app.scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
-  const quiz = app.quiz.createDailyQuiz({
+  scheduler.ensurePageLearning(pageId, `${date}T00:00:00.000Z`);
+  const quiz = quizService.createDailyQuiz({
     date,
     selectedPageIds: [pageId],
     questionSpecs: [
       {
         kind: "free-response",
         prompt: "Explain the section",
-        pages: [{ pageId, criterion: "Explain the section", weight: 1 }],
+        pages: [{ pageId, criterion: "Identify the section's central idea", weight: 1 }],
         sourceRefs: [],
       },
     ],
   });
   const questionId = quiz.questions[0]?.questionId;
   if (!questionId) throw new Error("grading fixture question missing");
-  const draft = app.quiz.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
-  return { ...fixtureValue, date, pageId, questionId, quiz: app.quiz.get(date)!, draft };
+  const draft = quizService.saveDraft({ date, revision: quiz.revision, answers: { [questionId]: "answer" } });
+  return { ...fixtureValue, date, pageId, questionId, quiz: quizService.get(date)!, draft };
 }
 async function prerequisiteFixture() {
   const fixtureValue = fixture({ maintenance: true });
-  const { app } = fixtureValue;
-  const dependent = await app.wiki.create({
+  const { wiki, scheduler } = fixtureValue;
+  const dependent = await wiki.create({
     path: "dependent.md",
+    description: "Dependent grading page.",
     title: "Dependent",
     body: "# Section\n\ndependent\n",
     quizWorthiness: "eligible",
   });
-  const prerequisite = await app.wiki.create({
+  const prerequisite = await wiki.create({
     path: "prerequisite.md",
+    description: "Prerequisite grading page.",
     title: "Prerequisite",
     body: "# Section\n\nprerequisite\n",
     quizWorthiness: "eligible",
   });
-  app.scheduler.ensurePageLearning(dependent.page.pageId);
-  app.scheduler.ensurePageLearning(prerequisite.page.pageId);
-  app.scheduler.setPrerequisites(dependent.page.pageId, [prerequisite.page.pageId]);
+  scheduler.ensurePageLearning(dependent.page.pageId);
+  scheduler.ensurePageLearning(prerequisite.page.pageId);
+  scheduler.setPrerequisites(dependent.page.pageId, [prerequisite.page.pageId]);
   return { ...fixtureValue, dependent: dependent.page, prerequisite: prerequisite.page };
 }
 
@@ -1075,6 +1808,325 @@ function gradeFor(context: GradingContext, pageId: string, questionId: string, e
 }
 
 describe("quiz grading workflow lifecycle", () => {
+  it("derives covered pages and bounded whole-wiki readings before and after settlement", async () => {
+    const { app, db, date, pageId, questionId, draft, scheduler, wiki, paths } = await gradingFixture({
+      maintenance: true,
+    });
+    const owner = randomUUID();
+    try {
+      const open = await app.getQuiz(date);
+      assert.deepEqual(open.readings, []);
+      assert.deepEqual(open.recommendations, { readings: [], gaps: [] });
+      const prerequisite = await app.createNote({
+        path: "recommendation-prerequisite.md",
+        title: "Recommendation prerequisite",
+        description: "Foundational material for the graded page.",
+        body: "# Prerequisite\n\nFoundational material.\n",
+        quizWorthiness: "eligible",
+      });
+      scheduler.ensurePageLearning(prerequisite.page.pageId);
+      scheduler.setPrerequisites(pageId, [prerequisite.page.pageId]);
+      const related = [];
+      for (let index = 0; index < 6; index += 1)
+        related.push(
+          await app.createNote({
+            path: `recommendation-related-${index}.md`,
+            title: `Related ${index}`,
+            body: `# Related ${index}\n\nRelated material ${index}.\n`,
+            quizWorthiness: "skip",
+          }),
+        );
+      const tiedRelated = [...related].sort((left, right) => left.page.pageId.localeCompare(right.page.pageId));
+      const drifted = await app.createNote({
+        path: "recommendation-drifted.md",
+        title: "Drifted recommendation",
+        body: "# Drifted\n\nOriginal material.\n",
+        quizWorthiness: "skip",
+      });
+      await app.reportIssue({
+        pageId: related[0]!.page.pageId,
+        kind: "missing",
+        description: "Missing related explanation.",
+      });
+      await app.reportIssue({
+        pageId: related[0]!.page.pageId,
+        kind: "missing",
+        description: "The same missing page must remain one gap.",
+      });
+      await app.reportIssue({
+        pageId: related[1]!.page.pageId,
+        kind: "unclear",
+        description: "Unclear related explanation.",
+      });
+      await fs.appendFile(join(paths.wikiRoot, drifted.page.relativePath), "\nDirect edit.\n");
+
+      const coveredPath = (await app.getWiki(pageId)).page.relativePath;
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      assert.deepEqual(sealed.readings, [{ pageId, path: coveredPath, href: `/notes?pageId=${pageId}#note-content` }]);
+      assert.deepEqual(sealed.quiz.readings, sealed.readings);
+      assert.equal(sealed.quiz.questionResults.length, 0);
+      assert.equal(sealed.quiz.pageResults.length, 0);
+      assert.equal(sealed.grades.length, 0);
+      assert.deepEqual(
+        sealed.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [[prerequisite.page.pageId, "prerequisite"]],
+      );
+      assert.equal(
+        sealed.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.deepEqual(
+        sealed.recommendations.gaps.map(({ pageId: id, kind }) => [id, kind]),
+        [
+          [related[0]!.page.pageId, "missing"],
+          [related[1]!.page.pageId, "unclear"],
+          [drifted.page.pageId, "drifted"],
+        ],
+      );
+      const pending = await app.getQuiz(date);
+      assert.deepEqual(pending.readings, sealed.readings);
+      assert.deepEqual(pending.recommendations, sealed.recommendations);
+      const context = await app.getGradingContext({ date }, owner);
+      const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(evidence);
+      await app.settleGrade(gradeFor(context, pageId, questionId, [evidence]), owner);
+
+      const gradedPath = (await app.getWiki(pageId)).page.relativePath;
+      const databaseState = () =>
+        Object.fromEntries(
+          db.tableNames().map((table) => [
+            table,
+            db
+              .all(`SELECT * FROM "${table}"`)
+              .map((row) => JSON.stringify(row, (_key, value) => (typeof value === "bigint" ? String(value) : value)))
+              .sort(),
+          ]),
+        );
+      const beforeProjection = databaseState();
+      wiki.adapters.qmd!.search = () => [
+        ...related.map((page) => ({ path: page.page.relativePath, score: 1 })),
+        { path: related[0]!.page.relativePath, score: 1 },
+        { path: gradedPath, score: 2 },
+        { path: drifted.page.relativePath, score: 3 },
+      ];
+      const result = await app.getQuiz(date);
+      assert.ok(result.quiz);
+      assert.deepEqual(result.readings, [{ pageId, path: gradedPath, href: `wiki/${gradedPath}#section` }]);
+      assert.deepEqual(result.quiz.readings, result.readings);
+      assert.equal(
+        result.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.deepEqual(
+        result.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [
+          [prerequisite.page.pageId, "prerequisite"],
+          ...tiedRelated.slice(0, 4).map((page) => [page.page.pageId, "related"]),
+        ],
+      );
+      assert.equal(result.recommendations.readings.length, 5);
+      assert.ok(result.recommendations.readings.every((reading) => reading.href.includes(`pageId=${reading.pageId}`)));
+      assert.deepEqual(
+        result.recommendations.gaps.map(({ pageId: id, kind }) => [id, kind]),
+        [
+          [related[0]!.page.pageId, "missing"],
+          [related[1]!.page.pageId, "unclear"],
+          [drifted.page.pageId, "drifted"],
+        ],
+      );
+      assert.ok(result.recommendations.gaps.every((gap) => gap.href.includes(`pageId=${gap.pageId}`)));
+      wiki.adapters.qmd!.search = () => {
+        throw new Error("qmd unavailable");
+      };
+      const fallback = await app.getQuiz(date);
+      assert.deepEqual(
+        fallback.recommendations.readings.map(({ pageId: id, reason }) => [id, reason]),
+        [[prerequisite.page.pageId, "prerequisite"]],
+      );
+      assert.equal(fallback.recommendations.gaps.length, 3);
+      assert.equal(
+        result.recommendations.readings.some((reading) => reading.pageId === pageId),
+        false,
+      );
+      assert.equal(sealed.quiz.pageResults.length, 0);
+      assert.deepEqual(databaseState(), beforeProjection);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+  it("projects settled questions and reverse-lexical pages in canonical order", async () => {
+    const { app, db, wiki, scheduler, quiz: quizService } = fixture();
+    const date = localDate(new Date());
+    const owner = randomUUID();
+    try {
+      const pages = [];
+      for (const [path, title] of [
+        ["covered-a.md", "Covered A"],
+        ["covered-b.md", "Covered B"],
+      ] as const) {
+        const created = await wiki.create({
+          path,
+          title,
+          description: `${title} grading page.`,
+          body: `# Section\n\n${title} material.\n`,
+          quizWorthiness: "eligible",
+        });
+        scheduler.ensurePageLearning(created.page.pageId, `${date}T00:00:00.000Z`);
+        pages.push(created.page);
+      }
+      pages.sort((left, right) => right.pageId.localeCompare(left.pageId));
+      const [firstPage, secondPage] = pages;
+      assert.ok(firstPage && secondPage);
+      const firstPageId = firstPage.pageId;
+      const secondPageId = secondPage.pageId;
+      const quiz = quizService.createDailyQuiz({
+        date,
+        selectedPageIds: [firstPageId, secondPageId],
+        questionSpecs: [
+          {
+            kind: "free-response",
+            prompt: "First prompt",
+            pages: [{ pageId: firstPageId, criterion: "First criterion", weight: 1 }],
+            sourceRefs: [],
+          },
+          {
+            kind: "free-response",
+            prompt: "Second prompt",
+            pages: [{ pageId: secondPageId, criterion: "Second criterion", weight: 1 }],
+            sourceRefs: [],
+          },
+        ],
+      });
+      const [firstQuestion, secondQuestion] = quiz.questions;
+      assert.ok(firstQuestion && secondQuestion);
+      const draft = quizService.saveDraft({
+        date,
+        revision: quiz.revision,
+        answers: {
+          [secondQuestion.questionId]: "Second answer",
+          [firstQuestion.questionId]: "First answer",
+        },
+      });
+      await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const context = await app.getGradingContext({ date }, owner);
+      const firstEvidence = context.evidence?.find((item) => item.pageId === firstPageId)?.reference;
+      const secondEvidence = context.evidence?.find((item) => item.pageId === secondPageId)?.reference;
+      assert.ok(firstEvidence && secondEvidence);
+      await app.settleGrade(
+        {
+          requestId: context.requestId!,
+          date,
+          revision: context.revision!,
+          submissionId: context.submissionId!,
+          questions: [
+            { questionId: secondQuestion.questionId, feedback: "Second feedback" },
+            { questionId: firstQuestion.questionId, feedback: "First feedback" },
+          ],
+          pages: [
+            {
+              pageId: secondPageId,
+              rating: "Hard",
+              feedback: "Second page feedback",
+              evidence: [secondEvidence],
+              readings: [{ pageId: secondPageId, anchor: "#section" }],
+            },
+            {
+              pageId: firstPageId,
+              rating: "Good",
+              feedback: "First page feedback",
+              evidence: [firstEvidence],
+              readings: [{ pageId: firstPageId, anchor: "#section" }],
+            },
+          ],
+        },
+        owner,
+      );
+
+      const result = await app.getQuiz(date);
+      assert.ok(result.quiz);
+      assert.deepEqual(
+        result.quiz.answers.map((answer) => answer.questionId),
+        [firstQuestion.questionId, secondQuestion.questionId],
+      );
+      assert.deepEqual(
+        result.quiz.questionResults.map((question) => question.questionId),
+        [firstQuestion.questionId, secondQuestion.questionId],
+      );
+      assert.deepEqual(
+        result.quiz.pageResults.map((page) => page.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.grades.map((grade) => grade.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.readings.map((reading) => reading.pageId),
+        [firstPageId, secondPageId],
+      );
+      assert.deepEqual(
+        result.quiz.pageResults.map((page) => page.pageLink),
+        [
+          {
+            pageId: firstPageId,
+            path: firstPage.relativePath,
+            href: `/notes?pageId=${firstPageId}#note-content`,
+          },
+          {
+            pageId: secondPageId,
+            path: secondPage.relativePath,
+            href: `/notes?pageId=${secondPageId}#note-content`,
+          },
+        ],
+      );
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects workflow request IDs in question and page feedback before persistence", async () => {
+    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
+    const owner = randomUUID();
+    try {
+      const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
+      const first = await app.getGradingContext({ date }, owner);
+      const firstEvidence = first.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(firstEvidence);
+      const firstGrade = gradeFor(first, pageId, questionId, [firstEvidence]);
+      await assert.rejects(
+        app.settleGrade(
+          {
+            ...firstGrade,
+            questions: [{ questionId, feedback: `x${first.requestId}` }],
+          },
+          owner,
+        ),
+        /private metadata/u,
+      );
+      const retry = await app.getGradingContext({ date }, owner);
+      const retryEvidence = retry.evidence?.find((item) => item.pageId === pageId)?.reference;
+      assert.ok(retryEvidence);
+      const retryGrade = gradeFor(retry, pageId, questionId, [retryEvidence]);
+      await assert.rejects(
+        app.settleGrade(
+          {
+            ...retryGrade,
+            questions: [{ questionId, feedback: "visible feedback" }],
+            pages: [{ ...retryGrade.pages[0]!, feedback: `x${retry.requestId}` }],
+          },
+          owner,
+        ),
+        /private metadata/u,
+      );
+      assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+      assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
   it("atomically queues, claims, validates ownership, and settles one sealed submission", async () => {
     const { app, db, date, pageId, questionId, draft } = await gradingFixture();
     const owner = randomUUID();
@@ -1150,6 +2202,11 @@ describe("quiz grading workflow lifecycle", () => {
       const firstWorkflow = first.requestId!;
       await assert.rejects(app.settleGrade(gradeFor(first, pageId, questionId, ["not-authorized"]), firstOwner));
       assert.equal((await app.getWorkflow(firstWorkflow)).status, "failed");
+      const failure = db.get<{ error_message: string }>("SELECT error_message FROM workflows WHERE request_id = ?", [
+        firstWorkflow,
+      ]);
+      assert.equal(failure?.error_message, `Page grade cites unauthorized evidence: ${pageId}`);
+      assert.ok(Buffer.byteLength(failure?.error_message ?? "", "utf8") <= 500);
       assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
       const retry = await app.getGradingContext({ date }, retryOwner);
@@ -1175,18 +2232,22 @@ describe("quiz grading workflow lifecycle", () => {
       ])?.message;
       assert.match(queuedMessage ?? "", /submissionId/u);
       assert.equal("message" in sealed.workflow, false);
+      assert.equal("errorMessage" in sealed.workflow, false);
       const listedWorkflow = (await app.listWorkflows()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(listedWorkflow);
       assert.equal("message" in listedWorkflow, false);
+      assert.equal("errorMessage" in listedWorkflow, false);
       assert.equal(listedWorkflow.status, "queued");
       await app.getGradingContext({ date }, owner);
       const detail = await app.getWorkflow(requestId);
       assert.equal(detail.status, "running");
       assert.equal(detail.progress, 0);
       assert.equal("message" in detail, false);
+      assert.equal("errorMessage" in detail, false);
       const statusWorkflow = (await app.status()).workflows.find((workflow) => workflow.requestId === requestId);
       assert.ok(statusWorkflow);
       assert.equal("message" in statusWorkflow, false);
+      assert.equal("errorMessage" in statusWorkflow, false);
       const runningMessage = db.get<{ message: string }>("SELECT message FROM workflows WHERE request_id = ?", [
         requestId,
       ])?.message;
@@ -1200,11 +2261,11 @@ describe("quiz grading workflow lifecycle", () => {
 
 describe("application wiki mutation quiz guards", () => {
   it("blocks an update covered by an open quiz without changing the page", async () => {
-    const { app, db, pageId } = await gradingFixture();
+    const { app, db, pageId, wiki } = await gradingFixture();
     try {
-      const before = await app.wiki.get(pageId);
+      const before = await wiki.get(pageId);
       await assert.rejects(app.updateNote(pageId, { body: "# Section\n\nchanged\n" }), /unresolved quiz/u);
-      const after = await app.wiki.get(pageId);
+      const after = await wiki.get(pageId);
       assert.equal(after.content, before.content);
       assert.equal(after.digest, before.digest);
       assert.equal(after.revision, before.revision);
@@ -1215,14 +2276,14 @@ describe("application wiki mutation quiz guards", () => {
   });
 
   it("blocks an update covered by a submitted but unsettled quiz without changing the page", async () => {
-    const { app, db, date, pageId, draft } = await gradingFixture();
+    const { app, db, date, pageId, draft, wiki } = await gradingFixture();
     try {
       const sealed = await app.sealSubmission(date, { expectedRevision: draft.revision });
       assert.equal(sealed.quiz.status, "submitted");
       assert.equal(db.all("SELECT 1 FROM page_results WHERE quiz_id = ?", [sealed.quiz.quizId]).length, 0);
-      const before = await app.wiki.get(pageId);
+      const before = await wiki.get(pageId);
       await assert.rejects(app.updateNote(pageId, { body: "# Section\n\nchanged\n" }), /unresolved quiz/u);
-      const after = await app.wiki.get(pageId);
+      const after = await wiki.get(pageId);
       assert.equal(after.content, before.content);
       assert.equal(after.digest, before.digest);
       assert.equal(after.revision, before.revision);
@@ -1233,7 +2294,7 @@ describe("application wiki mutation quiz guards", () => {
   });
 
   it("allows an update after the covered quiz is settled", async () => {
-    const { app, db, date, pageId, questionId, draft } = await gradingFixture();
+    const { app, db, date, pageId, questionId, draft, wiki } = await gradingFixture();
     const owner = randomUUID();
     try {
       await app.sealSubmission(date, { expectedRevision: draft.revision });
@@ -1241,7 +2302,7 @@ describe("application wiki mutation quiz guards", () => {
       const evidence = context.evidence?.find((item) => item.pageId === pageId)?.reference;
       assert.ok(evidence);
       await app.settleGrade(gradeFor(context, pageId, questionId, [evidence]), owner);
-      const before = await app.wiki.get(pageId);
+      const before = await wiki.get(pageId);
       const updated = await app.updateNote(pageId, { body: "# Section\n\nchanged\n" });
       assert.notEqual(updated.page.digest, before.digest);
       assert.equal(updated.page.revision, before.revision + 1);
@@ -1255,14 +2316,14 @@ describe("application wiki mutation quiz guards", () => {
 
 describe("application prerequisite mutation guards", () => {
   it("rejects making a dependent page ineligible without mutating the page or edge", async () => {
-    const { app, db, dependent } = await prerequisiteFixture();
+    const { app, db, dependent, wiki } = await prerequisiteFixture();
     try {
-      const before = await app.wiki.get(dependent.pageId);
+      const before = await wiki.get(dependent.pageId);
       const beforePrerequisites = db.all<Record<string, unknown>>(
         "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
       );
       await assert.rejects(app.updateNote(dependent.pageId, { quizWorthiness: "skip" }), /prerequisites/u);
-      const after = await app.wiki.get(dependent.pageId);
+      const after = await wiki.get(dependent.pageId);
       assert.equal(after.quizWorthiness, before.quizWorthiness);
       assert.equal(after.digest, before.digest);
       assert.equal(after.revision, before.revision);
@@ -1279,9 +2340,9 @@ describe("application prerequisite mutation guards", () => {
   });
 
   it("rejects making a prerequisite page unknown through maintenance without mutating the page or edge", async () => {
-    const { app, db, prerequisite } = await prerequisiteFixture();
+    const { app, db, prerequisite, wiki } = await prerequisiteFixture();
     try {
-      const before = await app.wiki.get(prerequisite.pageId);
+      const before = await wiki.get(prerequisite.pageId);
       const beforePrerequisites = db.all<Record<string, unknown>>(
         "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
       );
@@ -1295,7 +2356,7 @@ describe("application prerequisite mutation guards", () => {
         }),
         /prerequisites/u,
       );
-      const after = await app.wiki.get(prerequisite.pageId);
+      const after = await wiki.get(prerequisite.pageId);
       assert.equal(after.quizWorthiness, before.quizWorthiness);
       assert.equal(after.digest, before.digest);
       assert.equal(after.revision, before.revision);
@@ -1312,16 +2373,29 @@ describe("application prerequisite mutation guards", () => {
   });
 
   it("rejects ineligible resolve-issue corrections before preparing the page update", async () => {
-    const { app, db, dependent } = await prerequisiteFixture();
+    const { app, db, dependent, wiki } = await prerequisiteFixture();
     try {
-      const issue = await app.wiki.report({
+      const issue = await wiki.report({
         pageId: dependent.pageId,
         heading: "Section",
         description: "Correct the section.",
       });
-      const before = await app.wiki.get(dependent.pageId);
+      const before = await wiki.get(dependent.pageId);
       const beforePrerequisites = db.all<Record<string, unknown>>(
         "SELECT page_id, prerequisite_page_id FROM page_prerequisites ORDER BY page_id, prerequisite_page_id",
+      );
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "resolve-issue",
+          issueId: issue.issueId,
+          page: {
+            pageId: dependent.pageId,
+            expectedDigest: before.digest,
+            description: "Dependent grading page.",
+          },
+          resolution: "No page correction.",
+        }),
+        /actual page correction/u,
       );
       await assert.rejects(
         app.applyWikiChange({
@@ -1337,7 +2411,7 @@ describe("application prerequisite mutation guards", () => {
         }),
         /prerequisites/u,
       );
-      const after = await app.wiki.get(dependent.pageId);
+      const after = await wiki.get(dependent.pageId);
       assert.equal(after.quizWorthiness, before.quizWorthiness);
       assert.equal(after.digest, before.digest);
       assert.equal(after.revision, before.revision);
@@ -1355,9 +2429,9 @@ describe("application prerequisite mutation guards", () => {
   });
 
   it("does not over-block body-only or eligible updates on prerequisite pages", async () => {
-    const { app, db, prerequisite } = await prerequisiteFixture();
+    const { app, db, prerequisite, wiki } = await prerequisiteFixture();
     try {
-      const first = await app.wiki.get(prerequisite.pageId);
+      const first = await wiki.get(prerequisite.pageId);
       const bodyOnly = await app.updateNote(prerequisite.pageId, {
         body: "# Section\n\nbody-only\n",
       });
@@ -1379,7 +2453,7 @@ describe("application prerequisite mutation guards", () => {
 
 describe("application capability boundaries", () => {
   it("requires an immutable citation for ingest page edits but not generic lint edits", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       const created = await app.createNote({
         path: "ingest-citation.md",
@@ -1393,18 +2467,18 @@ describe("application capability boundaries", () => {
         body: "# Ingest citation\n\nUpdated without a citation.\n",
       };
       await assert.rejects(app.applyIngestChange(proposal), /immutable source chunk citation/u);
-      assert.match((await app.wiki.get(created.page.pageId)).content, /Original/u);
+      assert.match((await wiki.get(created.page.pageId)).content, /Original/u);
 
       const lint = await app.applyWikiChange(proposal);
       assert.equal(lint.page?.pageId, created.page.pageId);
-      assert.match((await app.wiki.get(created.page.pageId)).content, /Updated without a citation/u);
+      assert.match((await wiki.get(created.page.pageId)).content, /Updated without a citation/u);
     } finally {
       await app.close();
       db.close();
     }
   });
   it("rejects empty ingest exposition while preserving cited updates and retirement", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       await assert.rejects(
         app.applyIngestChange({
@@ -1419,8 +2493,10 @@ describe("application capability boundaries", () => {
       for (const [index, body] of [
         `[^${chunkId}]`,
         `# Evidence\n\n[^${chunkId}]`,
-        `<!-- hidden -->[^${chunkId}]`,
+        `Topic\n=====\n[^${chunkId}]`,
         `[](https://example.test)[^${chunkId}]`,
+        `# Grounded\n\nSupported [^${chunkId}].\n\n# [](https://example.test)\n\nUnsupported claim.`,
+        `# Grounded\n\nSupported [^${chunkId}].\n\n# [][empty]\n\nUnsupported claim.\n\n[empty]: https://example.test`,
         `---\n\n[^${chunkId}]`,
         `- [^${chunkId}]`,
       ].entries()) {
@@ -1447,9 +2523,9 @@ describe("application capability boundaries", () => {
         }),
         /non-empty/u,
       );
-      assert.match((await app.wiki.get(created.page.pageId)).content, /Original support/u);
+      assert.match((await wiki.get(created.page.pageId)).content, /Original support/u);
 
-      const issue = await app.wiki.report({
+      const issue = await wiki.report({
         pageId: created.page.pageId,
         pageDigest: created.page.digest,
         heading: "Ingest",
@@ -1496,10 +2572,11 @@ describe("application capability boundaries", () => {
     }
   });
   it("repairs multiple live-drift pages sequentially without over-blocking unrelated drift", async () => {
-    const { app, db, paths } = fixture({ maintenance: true });
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
     try {
       const first = await app.createNote({
         path: "drift-first.md",
+        description: "Original first description.",
         body: "# First\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
@@ -1508,10 +2585,17 @@ describe("application capability boundaries", () => {
         body: "# Second\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
+      const firstPath = join(paths.wikiRoot, first.page.relativePath);
+      const firstContent = await fs.readFile(firstPath, "utf8");
+      assert.match(firstContent, /description: Original first description\./u);
+      await fs.writeFile(
+        firstPath,
+        firstContent.replace("description: Original first description.", "description: External first description."),
+      );
       await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
       await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
-      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
-      const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      const firstDrift = await wiki.inspectDrift(first.page.pageId);
+      const secondDrift = await wiki.inspectDrift(second.page.pageId);
       await assert.rejects(
         app.applyIngestChange({
           kind: "update-page",
@@ -1521,6 +2605,16 @@ describe("application capability boundaries", () => {
         }),
         /body/u,
       );
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: first.page.pageId,
+          expectedDigest: firstDrift.currentDigest,
+          title: "First repaired",
+          body: "# First\n\nRepaired.\n",
+        }),
+        /description/u,
+      );
       (app as unknown as { doctorFn: typeof doctor }).doctorFn = doctor;
 
       await app.applyWikiChange({
@@ -1528,9 +2622,10 @@ describe("application capability boundaries", () => {
         pageId: first.page.pageId,
         expectedDigest: firstDrift.currentDigest,
         body: "# First\n\nRepaired.\n",
+        description: "External first description.",
       });
-      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
-      assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, true);
+      assert.equal((await wiki.inspectDrift(first.page.pageId)).drifted, false);
+      assert.equal((await wiki.inspectDrift(second.page.pageId)).drifted, true);
 
       await app.applyWikiChange({
         kind: "update-page",
@@ -1539,18 +2634,19 @@ describe("application capability boundaries", () => {
 
         body: "# Second\n\nRepaired.\n",
       });
-      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, false);
-      assert.equal((await app.wiki.inspectDrift(second.page.pageId)).drifted, false);
+      assert.equal((await wiki.inspectDrift(first.page.pageId)).drifted, false);
+      assert.equal((await wiki.inspectDrift(second.page.pageId)).drifted, false);
     } finally {
       await app.close();
       db.close();
     }
   }, 15_000);
   it("repairs malformed byte drift from the verified authored snapshot", async () => {
-    const { app, db, paths } = fixture({ maintenance: true });
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
     try {
       const created = await app.createNote({
         path: "malformed-drift.md",
+        description: "Authored description.",
         body: "# Authored\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
@@ -1559,19 +2655,31 @@ describe("application capability boundaries", () => {
         Buffer.from([0x80]),
       ]);
       await fs.writeFile(join(paths.wikiRoot, created.page.relativePath), malformed);
-      const drift = await app.wiki.inspectDrift(created.page.pageId);
+      const drift = await wiki.inspectDrift(created.page.pageId);
       assert.equal(drift.currentDigest, createHash("sha256").update(malformed).digest("hex"));
+      await assert.rejects(
+        app.applyWikiChange({
+          kind: "update-page",
+          pageId: created.page.pageId,
+          expectedDigest: drift.currentDigest,
+          title: "Repaired",
+          body: "# Repaired\n\nCorrected.\n",
+          quizWorthiness: "skip",
+        }),
+        /description/u,
+      );
 
       const repaired = await app.applyWikiChange({
         kind: "update-page",
         pageId: created.page.pageId,
         expectedDigest: drift.currentDigest,
         title: "Repaired",
+        description: "Repaired description.",
         body: "# Repaired\n\nCorrected.\n",
         quizWorthiness: "skip",
       });
       assert.equal(repaired.page?.title, "Repaired");
-      assert.equal((await app.wiki.inspectDrift(created.page.pageId)).drifted, false);
+      assert.equal((await wiki.inspectDrift(created.page.pageId)).drifted, false);
       assert.equal(doctor(paths.vaultRoot).ok, true);
     } finally {
       await app.close();
@@ -1579,7 +2687,7 @@ describe("application capability boundaries", () => {
     }
   });
   it("rechecks unrelated drift after asynchronous qmd maintenance", async () => {
-    const { app, db, paths } = fixture({ maintenance: true });
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
     try {
       const first = await app.createNote({
         path: "race-first.md",
@@ -1593,9 +2701,9 @@ describe("application capability boundaries", () => {
       });
       await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
       await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
-      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
+      const firstDrift = await wiki.inspectDrift(first.page.pageId);
       const secondPath = join(paths.wikiRoot, second.page.relativePath);
-      const qmd = app.wiki.adapters.qmd as { index: () => Promise<void> };
+      const qmd = wiki.adapters.qmd as { index: () => Promise<void> };
       let indexes = 0;
       qmd.index = async () => {
         indexes += 1;
@@ -1612,21 +2720,21 @@ describe("application capability boundaries", () => {
         /Preexisting wiki drift changed during mutation/u,
       );
       assert.match(await fs.readFile(secondPath, "utf8"), /Concurrent second edit/u);
-      assert.equal((await app.wiki.inspectDrift(first.page.pageId)).drifted, true);
+      assert.equal((await wiki.inspectDrift(first.page.pageId)).drifted, true);
     } finally {
       await app.close();
       db.close();
     }
   });
   it("resolves directly drifted linked issues with separate authored and live digest guards", async () => {
-    const { app, db, paths } = fixture({ maintenance: true });
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
     try {
       const created = await app.createNote({
         path: "resolve-drifted-issue.md",
         body: "# Resolve drifted issue\n\nOriginal.\n",
         quizWorthiness: "skip",
       });
-      const staleIssue = await app.wiki.report({
+      const staleIssue = await wiki.report({
         pageId: created.page.pageId,
         heading: "Resolve drifted issue",
         description: "Correct the authored revision.",
@@ -1634,13 +2742,13 @@ describe("application capability boundaries", () => {
       const authoredRevision = await app.updateNote(created.page.pageId, {
         body: "# Resolve drifted issue\n\nAuthored revision.\n",
       });
-      const validIssue = await app.wiki.report({
+      const validIssue = await wiki.report({
         pageId: created.page.pageId,
         heading: "Resolve drifted issue",
         description: "Correct the direct edit.",
       });
       await fs.appendFile(join(paths.wikiRoot, created.page.relativePath), "\nExternal direct edit.\n");
-      const drift = await app.wiki.inspectDrift(created.page.pageId);
+      const drift = await wiki.inspectDrift(created.page.pageId);
       const correctedBody = "# Resolve drifted issue\n\nCorrected.\n";
 
       await assert.rejects(
@@ -1669,16 +2777,16 @@ describe("application capability boundaries", () => {
         resolution: "Corrected the direct edit.",
       });
       assert.equal(resolved.issue?.status, "resolved");
-      assert.equal((await app.wiki.get(created.page.pageId)).status, "active");
-      assert.equal((await app.wiki.inspectDrift(created.page.pageId)).drifted, false);
-      assert.match((await app.wiki.get(created.page.pageId)).content, /Corrected/u);
+      assert.equal((await wiki.get(created.page.pageId)).status, "active");
+      assert.equal((await wiki.inspectDrift(created.page.pageId)).drifted, false);
+      assert.match((await wiki.get(created.page.pageId)).content, /Corrected/u);
     } finally {
       await app.close();
       db.close();
     }
   });
   it("leaves unrelated drift bytes outside a targeted checkpoint", async () => {
-    const { app, db, paths } = fixture({ maintenance: true });
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
     try {
       const first = await app.createNote({
         path: "checkpoint-first.md",
@@ -1693,8 +2801,8 @@ describe("application capability boundaries", () => {
       localCheckpointCommit(paths, "test: baseline");
       await fs.appendFile(join(paths.wikiRoot, first.page.relativePath), "\nExternal first edit.\n");
       await fs.appendFile(join(paths.wikiRoot, second.page.relativePath), "\nExternal second edit.\n");
-      const firstDrift = await app.wiki.inspectDrift(first.page.pageId);
-      const secondDrift = await app.wiki.inspectDrift(second.page.pageId);
+      const firstDrift = await wiki.inspectDrift(first.page.pageId);
+      const secondDrift = await wiki.inspectDrift(second.page.pageId);
       (app as unknown as { commitFn: typeof localCheckpointCommit }).commitFn = localCheckpointCommit;
 
       await app.applyWikiChange({
@@ -1721,7 +2829,7 @@ describe("application capability boundaries", () => {
   }, 15_000);
 
   it("refuses retirement with open or reopened linked issues without changing page bytes", async () => {
-    const { app, db, paths } = fixture({ maintenance: true });
+    const { app, db, paths, wiki } = fixture({ maintenance: true });
     try {
       for (const status of ["open", "reopened"] as const) {
         const created = await app.createNote({
@@ -1729,12 +2837,12 @@ describe("application capability boundaries", () => {
           body: `# Blocked ${status}\n`,
           quizWorthiness: "skip",
         });
-        const issue = await app.wiki.report({
+        const issue = await wiki.report({
           pageId: created.page.pageId,
           heading: "Blocked",
           description: "Keep this page until corrected.",
         });
-        if (status === "reopened") await app.wiki.patchIssue(issue.issueId, { status });
+        if (status === "reopened") await wiki.patchIssue(issue.issueId, { status });
         const pagePath = join(paths.wikiRoot, created.page.relativePath);
         const beforeBytes = await fs.readFile(pagePath);
         await assert.rejects(
@@ -1746,7 +2854,7 @@ describe("application capability boundaries", () => {
           /open or reopened linked issue/u,
         );
         assert.equal((await fs.readFile(pagePath)).equals(beforeBytes), true);
-        const after = await app.wiki.get(created.page.pageId);
+        const after = await wiki.get(created.page.pageId);
         assert.equal(after.status, "active");
         assert.equal(after.digest, created.page.digest);
         assert.equal(after.revision, created.page.revision);
@@ -1773,11 +2881,13 @@ describe("application capability boundaries", () => {
           endpoints: [1],
         }),
       );
-      const failure = db.get<{ status: string; error_code: string | null }>(
-        "SELECT status, error_code FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
+      const failure = db.get<{ status: string; error_code: string | null; error_message: string | null }>(
+        "SELECT status, error_code, error_message FROM sources WHERE status = 'failed' ORDER BY updated_at DESC LIMIT 1",
       );
       assert.equal(failure?.status, "failed");
       assert.equal(failure?.error_code, "EXTRACT_FAILED");
+      assert.equal(failure?.error_message, "prepared extraction digest mismatch");
+      assert.ok(Buffer.byteLength(failure.error_message, "utf8") <= 500);
     } finally {
       await app.close();
       db.close();
@@ -1825,9 +2935,33 @@ describe("application capability boundaries", () => {
 
       const facts = (await app.getSettings()).settings.facts;
       assert.equal(facts.lastIngestAt, failedIngestResult.workflow.finishedAt);
-      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): source packet unavailable");
+      assert.equal(facts.lastIngestResult, "failed (INGEST_FAILED): Workflow failed");
       assert.equal(facts.lastLintAt, lintResult.workflow.finishedAt);
       assert.equal(facts.lastLintResult, "lint complete");
+    } finally {
+      await app.close();
+      db.close();
+    }
+  });
+
+  it("rejects delegated ingest mutations after the owning workflow finishes", async () => {
+    const { app, db } = fixture();
+    try {
+      const ingest = await app.beginWorkflow("ingest");
+      await app.finishWorkflow(ingest.workflow.requestId, "succeeded");
+
+      await assert.rejects(
+        app.applyIngestChange(
+          {
+            kind: "create-page",
+            path: "late-delegated-ingest.md",
+            body: "# Late mutation\n\nThis must not be written.\n",
+          },
+          ingest.workflow.requestId,
+        ),
+        /ingest workflow is not running/u,
+      );
+      assert.equal((await app.listWiki()).pages.length, 0);
     } finally {
       await app.close();
       db.close();
@@ -1852,14 +2986,14 @@ describe("ingest section-local citation boundaries", () => {
         app.applyIngestChange({
           kind: "create-page",
           path: "ingest-create-rejected.md",
-          body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
+          body: `# Grounded\n\nClaim [^${chunkId}][^${chunkId}].\n\n## Uncited\n\nNew unsupported content.\n`,
         }),
-        /immutable source chunk citation/u,
+        /section "uncited" requires an immutable source chunk citation/u,
       );
       const created = await app.applyIngestChange({
         kind: "create-page",
         path: "ingest-create-accepted.md",
-        body: `# Grounded\n\nClaim [^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
+        body: `# Grounded\n\nClaim [^${chunkId}][^${chunkId}].\n\n## Grounded again\n\nMore support [^${chunkId}].\n`,
       });
       assert.equal(created.page?.relativePath, "ingest-create-accepted.md");
     } finally {
@@ -1869,7 +3003,7 @@ describe("ingest section-local citation boundaries", () => {
   });
 
   it("requires citations in changed update sections instead of reusing unchanged cited sections", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       const chunkId = await publishedChunkId(app);
       const original = await app.createNote({
@@ -1887,7 +3021,7 @@ describe("ingest section-local citation boundaries", () => {
         }),
         /immutable source chunk citation/u,
       );
-      assert.match((await app.wiki.get(original.page.pageId)).content, /Original unsupported text/u);
+      assert.match((await wiki.get(original.page.pageId)).content, /Original unsupported text/u);
       const accepted = await app.applyIngestChange({
         kind: "update-page",
         pageId: original.page.pageId,
@@ -1895,14 +3029,14 @@ describe("ingest section-local citation boundaries", () => {
         body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nUpdated support [^${chunkId}].\n`,
       });
       assert.equal(accepted.page?.pageId, original.page.pageId);
-      assert.match((await app.wiki.get(original.page.pageId)).content, /Updated support/u);
+      assert.match((await wiki.get(original.page.pageId)).content, /Updated support/u);
     } finally {
       await app.close();
       db.close();
     }
   });
   it("treats ordinary footnote definitions as substantive changed evidence", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       await publishedChunkId(app);
       const original = await app.createNote({
@@ -1919,7 +3053,7 @@ describe("ingest section-local citation boundaries", () => {
         }),
         /immutable source chunk citation/u,
       );
-      assert.match((await app.wiki.get(original.page.pageId)).content, /Original note/u);
+      assert.match((await wiki.get(original.page.pageId)).content, /Original note/u);
     } finally {
       await app.close();
       db.close();
@@ -1979,7 +3113,7 @@ describe("ingest section-local citation boundaries", () => {
   });
 
   it("requires citations in changed resolve-issue sections instead of reusing unchanged cited sections", async () => {
-    const { app, db } = fixture({ maintenance: true });
+    const { app, db, wiki } = fixture({ maintenance: true });
     try {
       const chunkId = await publishedChunkId(app);
       const original = await app.createNote({
@@ -1987,7 +3121,7 @@ describe("ingest section-local citation boundaries", () => {
         body: `# Grounded\n\nExisting support [^${chunkId}].\n\n## Changed\n\nOriginal unsupported text.\n`,
         quizWorthiness: "skip",
       });
-      const issue = await app.wiki.report({
+      const issue = await wiki.report({
         pageId: original.page.pageId,
         pageDigest: original.page.digest,
         heading: "Changed",
@@ -2019,7 +3153,7 @@ describe("ingest section-local citation boundaries", () => {
         resolution: "Correction is grounded in the cited source chunk.",
       });
       assert.equal(resolved.issue?.status, "resolved");
-      assert.match((await app.wiki.get(original.page.pageId)).content, /Corrected support/u);
+      assert.match((await wiki.get(original.page.pageId)).content, /Corrected support/u);
     } finally {
       await app.close();
       db.close();

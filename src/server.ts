@@ -6,6 +6,7 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import busboy from "busboy";
 import { createApplication, type ScholarApplication } from "./application/application.js";
+import { publicWikiPage } from "./application/projections.js";
 import type {
   ApiEnvelope,
   JsonValue,
@@ -21,6 +22,11 @@ import { localDate, RevisionConflictError, ValidationError } from "./scheduler.j
 import { DEFAULT_VAULT_HOST, DEFAULT_VAULT_PORT, LockBusyError, resolveVault, type VaultPaths } from "./vault.js";
 
 const MAX_JSON_BYTES = 1 * 1024 * 1024;
+const INTERNAL_ERROR_CODE = "INTERNAL_ERROR";
+const INTERNAL_ERROR_MESSAGE = "Internal server error";
+const APPLIED_FINALIZATION_CODE = "MUTATION_APPLIED_FINALIZATION_FAILED";
+const FINALIZATION_STAGES = ["checkpoint", "doctor", "commit", "projection", "qmd", "rollback"] as const;
+type FinalizationStage = (typeof FINALIZATION_STAGES)[number];
 const MULTIPART_FIELD_BYTES = 64 * 1024;
 const MULTIPART_FIELD_NAMES: Record<string, true> = {
   kind: true,
@@ -54,6 +60,7 @@ export interface ServerOptions {
   readonly version?: string;
   readonly maxJsonBytes?: number;
   readonly maxMultipartBytes?: number;
+  readonly developerTools?: boolean;
 }
 
 export interface ScholarServer extends Server {
@@ -64,6 +71,7 @@ interface RequestOptions {
   readonly host: string;
   readonly maxJsonBytes: number;
   readonly maxMultipartBytes?: number;
+  readonly developerTools?: boolean;
 }
 
 interface MultipartUpload {
@@ -81,14 +89,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function keysExactly(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
 }
-function booleanField(value: Record<string, unknown>, key: string): boolean {
-  if (typeof value[key] !== "boolean") throw new ValidationError(`${key} must be boolean`);
-  return value[key];
-}
 function stringField(value: Record<string, unknown>, key: string, required = false): string | undefined {
   const result = value[key];
   if (result === undefined && !required) return undefined;
   if (typeof result !== "string" || !result.trim()) throw new ValidationError(`${key} must be a nonempty string`);
+  return result;
+}
+function simulatedDateField(value: Record<string, unknown>, key: string): string | null | undefined {
+  const result = value[key];
+  if (result === undefined) return undefined;
+  if (result === null) return null;
+  if (typeof result !== "string" || !DATE.test(result) || localDate(result) !== result)
+    throw new ValidationError(`${key} must be null or a valid calendar date`);
   return result;
 }
 function integerField(value: Record<string, unknown>, key: string): number {
@@ -130,6 +142,7 @@ function assertRouteMethod(path: string, method: string): void {
     allowed = ["GET"];
   else if (path === "/api/v1/wiki/issues") allowed = ["GET", "POST"];
   else if (/^\/api\/v1\/wiki\/issues\/[^/]+$/u.test(path)) allowed = ["PATCH"];
+  else if (/^\/api\/v1\/wiki\/pages\/[^/]+\/attachments\/[^/]+\/[^/]+$/u.test(path)) allowed = ["GET"];
   else if (/^\/api\/v1\/wiki\/pages\/[^/]+\/drift-resolution$/u.test(path)) allowed = ["POST"];
   else if (/^\/api\/v1\/quizzes\/[^/]+(?:\/(answers|submission))?$/u.test(path)) {
     const action = /^\/api\/v1\/quizzes\/[^/]+(?:\/(answers|submission))?$/u.exec(path)?.[1];
@@ -149,7 +162,24 @@ function errorCode(error: unknown): string {
   if (error instanceof Error && "code" in error && typeof error.code === "string") return error.code;
   return "REQUEST_FAILED";
 }
+function safeFinalizationDetails(
+  error: unknown,
+): { readonly applied: true; readonly retryable: boolean; readonly stage: FinalizationStage } | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const candidate = error as Error & { code?: unknown; details?: unknown };
+  if (
+    candidate.code !== APPLIED_FINALIZATION_CODE ||
+    !isRecord(candidate.details) ||
+    candidate.details.applied !== true ||
+    typeof candidate.details.retryable !== "boolean"
+  )
+    return undefined;
+  const stage = candidate.details.stage;
+  if (typeof stage !== "string" || !(FINALIZATION_STAGES as readonly string[]).includes(stage)) return undefined;
+  return { applied: true, retryable: candidate.details.retryable, stage: stage as FinalizationStage };
+}
 function errorStatus(error: unknown): number {
+  if (errorCode(error) === APPLIED_FINALIZATION_CODE) return 500;
   if (
     error instanceof LockBusyError ||
     error instanceof RevisionConflictError ||
@@ -158,7 +188,8 @@ function errorStatus(error: unknown): number {
   )
     return 409;
   if (/not found|unknown page|no quiz for/iu.test(errorText(error))) return 404;
-  return 400;
+  if (error instanceof ValidationError) return 400;
+  return 500;
 }
 function jsonSafe(value: unknown): JsonValue {
   if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean")
@@ -170,7 +201,7 @@ function jsonSafe(value: unknown): JsonValue {
 function securityHeaders(res: ServerResponse): void {
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   );
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -185,15 +216,34 @@ function sendJson<T>(res: ServerResponse, status: number, data: T, requestId: st
   res.setHeader("Content-Length", Buffer.byteLength(body));
   res.end(body);
 }
+function sendAttachment(
+  res: ServerResponse,
+  attachment: { readonly bytes: Buffer; readonly byteLength: number; readonly contentType: string },
+): void {
+  securityHeaders(res);
+  res.statusCode = 200;
+  res.setHeader("Content-Type", attachment.contentType);
+  res.setHeader("Content-Length", attachment.byteLength);
+  res.setHeader("Cache-Control", "no-store");
+  res.end(attachment.bytes);
+}
 function sendError(res: ServerResponse, status: number, error: unknown, requestId: string): void {
+  const internal = status >= 500;
+  const finalizationDetails = internal ? safeFinalizationDetails(error) : undefined;
   const body: ApiEnvelope<never> = {
     ok: false,
     error: {
-      code: errorCode(error),
-      message: error instanceof LockBusyError ? "Pi Scholar is busy; try again later." : errorText(error),
-      ...(error instanceof Error && "details" in error && isRecord(error.details)
-        ? { details: jsonSafe(error.details) }
-        : {}),
+      code: finalizationDetails ? APPLIED_FINALIZATION_CODE : internal ? INTERNAL_ERROR_CODE : errorCode(error),
+      message: internal
+        ? INTERNAL_ERROR_MESSAGE
+        : error instanceof LockBusyError
+          ? "Pi Scholar is busy; try again later."
+          : errorText(error),
+      ...(finalizationDetails
+        ? { details: finalizationDetails }
+        : !internal && error instanceof Error && "details" in error && isRecord(error.details)
+          ? { details: jsonSafe(error.details) }
+          : {}),
       requestId,
     },
   };
@@ -251,8 +301,9 @@ async function receiveMultipartUpload(
     let writePromise: Promise<void> | undefined;
     let failure: unknown;
 
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      const parser = busboy({
+    let parser: ReturnType<typeof busboy>;
+    try {
+      parser = busboy({
         headers: req.headers,
         defParamCharset: "utf8",
         limits: {
@@ -262,6 +313,10 @@ async function receiveMultipartUpload(
           parts: Object.keys(MULTIPART_FIELD_NAMES).length + 2,
         },
       });
+    } catch (error) {
+      throw new ValidationError(errorText(error));
+    }
+    await new Promise<void>((resolvePromise, rejectPromise) => {
       const fail = (error: unknown): void => {
         failure ??= error;
       };
@@ -326,7 +381,7 @@ async function receiveMultipartUpload(
       parser.on("filesLimit", () => fail(new ValidationError("multipart request contains multiple files")));
       parser.on("fieldsLimit", () => fail(new ValidationError("multipart request contains too many fields")));
       parser.on("partsLimit", () => fail(new ValidationError("multipart request contains too many parts")));
-      parser.on("error", fail);
+      parser.on("error", (error) => fail(new ValidationError(errorText(error))));
       parser.on("close", () => {
         req.off("error", requestError);
         void (async () => {
@@ -394,7 +449,12 @@ function queryOne(url: URL, key: string, required = true): string | undefined {
 }
 function publicSourceRecord(value: unknown): unknown {
   if (!isRecord(value)) return value;
-  return Object.fromEntries(Object.entries(value).filter(([key]) => !key.toLocaleLowerCase().endsWith("path")));
+  return Object.fromEntries(
+    Object.entries(value).filter(([key]) => {
+      const normalized = key.toLocaleLowerCase();
+      return !normalized.endsWith("path") && normalized !== "errormessage" && normalized !== "error_message";
+    }),
+  );
 }
 function publicSourceResponse(value: unknown): unknown {
   if (!isRecord(value)) return value;
@@ -402,6 +462,18 @@ function publicSourceResponse(value: unknown): unknown {
     ...value,
     ...(Array.isArray(value.sources) ? { sources: value.sources.map(publicSourceRecord) } : {}),
     ...(isRecord(value.source) ? { source: publicSourceRecord(value.source) } : {}),
+  };
+}
+function publicWorkflowRecord(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "errorMessage" && key !== "error_message"));
+}
+function publicWorkflowResponse(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  return {
+    ...value,
+    ...(Array.isArray(value.workflows) ? { workflows: value.workflows.map(publicWorkflowRecord) } : {}),
+    ...(isRecord(value.workflow) ? { workflow: publicWorkflowRecord(value.workflow) } : {}),
   };
 }
 function sourceRequest(value: Record<string, unknown>): SourceRequest {
@@ -657,12 +729,26 @@ async function apiRoute(
     if ((pageId ? 1 : 0) + (pagePath ? 1 : 0) !== 1)
       throw new ValidationError("exactly one of pageId or path is required");
     if (pageId && !UUID.test(pageId)) throw new ValidationError("page ID is malformed");
-    sendJson(res, 200, await app.getWiki(pageId ?? pagePath!), requestId);
+    sendJson(res, 200, publicWikiPage(await app.getWiki(pageId ?? pagePath!)), requestId);
+    return;
+  }
+  const attachmentMatch = /^\/api\/v1\/wiki\/pages\/([^/]+)\/attachments\/([^/]+)\/([^/]+)$/u.exec(path);
+  if (attachmentMatch) {
+    queryOnly(url, []);
+    const pageId = pathSegment(attachmentMatch[1]!, "page");
+    const sourceId = pathSegment(attachmentMatch[2]!, "source");
+    const digest = pathSegment(attachmentMatch[3]!, "attachment");
+    if (!UUID.test(pageId) || pageId !== pageId.toLowerCase()) throw new ValidationError("page ID is malformed");
+    if (!UUID.test(sourceId) || sourceId !== sourceId.toLowerCase())
+      throw new ValidationError("source ID is malformed");
+    if (!/^[0-9a-f]{64}$/u.test(digest)) throw new ValidationError("attachment digest is malformed");
+    sendAttachment(res, await app.getWikiAttachment(pageId, sourceId, digest));
     return;
   }
   if (path === "/api/v1/wiki/search") {
     queryOnly(url, ["q", "mode", "limit"]);
     const q = queryOne(url, "q")!;
+    if (!q.trim()) throw new ValidationError("q query parameter must be nonempty");
     const mode = queryOne(url, "mode", false) as "semantic" | "lexical" | "exact" | undefined;
     if (mode !== undefined && mode !== "semantic" && mode !== "lexical" && mode !== "exact")
       throw new ValidationError("mode is invalid");
@@ -722,7 +808,7 @@ async function apiRoute(
       expectedDigest: stringField(value, "expectedDigest", true)!,
       ...(value.description === undefined ? {} : { description: stringField(value, "description") }),
     };
-    sendJson(res, 200, await app.resolveDrift(pageId, input, { origin: "browser" }), requestId);
+    sendJson(res, 200, publicWikiPage(await app.resolveDrift(pageId, input, { origin: "browser" })), requestId);
     return;
   }
   if (path === "/api/v1/quizzes") {
@@ -749,10 +835,12 @@ async function apiRoute(
     sendJson(
       res,
       200,
-      await app.sealSubmission(
-        date,
-        { expectedRevision: integerField(value, "expectedRevision") },
-        { origin: "browser" },
+      publicWorkflowResponse(
+        await app.sealSubmission(
+          date,
+          { expectedRevision: integerField(value, "expectedRevision") },
+          { origin: "browser" },
+        ),
       ),
       requestId,
     );
@@ -760,34 +848,52 @@ async function apiRoute(
   }
   if (path === "/api/v1/workflows") {
     queryOnly(url, []);
-    sendJson(res, 200, await app.listWorkflows(), requestId);
+    sendJson(res, 200, publicWorkflowResponse(await app.listWorkflows()), requestId);
     return;
   }
   const workflowMatch = /^\/api\/v1\/workflows\/([^/]+)$/u.exec(path);
   if (workflowMatch) {
     const requestIdValue = pathSegment(workflowMatch[1]!, "workflow");
     if (!UUID.test(requestIdValue)) throw new ValidationError("workflow ID is malformed");
-    sendJson(res, 200, { workflow: await app.getWorkflow(requestIdValue) }, requestId);
+    sendJson(res, 200, publicWorkflowResponse({ workflow: await app.getWorkflow(requestIdValue) }), requestId);
     return;
   }
   if (path === "/api/v1/settings") {
     if (method === "GET") {
       queryOnly(url, []);
-      sendJson(res, 200, await app.getSettings(), requestId);
+      sendJson(
+        res,
+        200,
+        { ...(await app.getSettings()), developerToolsEnabled: options.developerTools === true },
+        requestId,
+      );
       return;
     }
     const value = decodeJson<Record<string, unknown>>(await bodyBuffer(req, options.maxJsonBytes));
-    if (!keysExactly(value, ["initializationEnabled", "timezone", "port", "host"]))
+    const simulatedDateRequested = Object.hasOwn(value, "simulatedDate");
+    if (simulatedDateRequested && options.developerTools !== true)
+      throw Object.assign(new Error("developer tools are required to change simulatedDate"), {
+        code: "DEVELOPER_TOOLS_REQUIRED",
+        status: 403,
+      });
+    if (!keysExactly(value, ["timezone", "port", "host", "simulatedDate"]))
       throw new ValidationError("settings request has unsupported fields");
+    const simulatedDate = simulatedDateField(value, "simulatedDate");
     const input: SettingsUpdateRequest = {
-      ...(value.initializationEnabled === undefined
-        ? {}
-        : { initializationEnabled: booleanField(value, "initializationEnabled") }),
       ...(value.timezone === undefined ? {} : { timezone: stringField(value, "timezone") }),
       ...(value.port === undefined ? {} : { port: integerField(value, "port") }),
       ...(value.host === undefined ? {} : { host: stringField(value, "host") }),
+      ...(simulatedDate === undefined ? {} : { simulatedDate }),
     };
-    sendJson(res, 200, await app.updateSettings(input, { origin: "browser" }), requestId);
+    const context = simulatedDateRequested
+      ? { origin: "browser" as const, developerToolsEnabled: true }
+      : { origin: "browser" as const };
+    sendJson(
+      res,
+      200,
+      { ...(await app.updateSettings(input, context)), developerToolsEnabled: options.developerTools === true },
+      requestId,
+    );
     return;
   }
   throw Object.assign(new Error("route not found"), { code: "ROUTE_NOT_FOUND", status: 404 });
@@ -888,6 +994,7 @@ export function createServer(options: ServerOptions = {}): ScholarServer {
     host,
     maxJsonBytes: options.maxJsonBytes ?? MAX_JSON_BYTES,
     ...(options.maxMultipartBytes === undefined ? {} : { maxMultipartBytes: options.maxMultipartBytes }),
+    ...(options.developerTools === undefined ? {} : { developerTools: options.developerTools }),
   };
   const server = nodeCreateServer((req, res) => {
     void handleRequest(req, res, application, staticRoot, requestOptions);

@@ -3,15 +3,22 @@ import type {
   PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
+  PublicWorkflowRecord,
   QuizAnswerInput,
   QuizDetailRecord,
   QuizRecord,
   SourceRecord,
   WikiIssueRecord,
+  WikiPageResult,
   WorkflowRecord,
 } from "../contracts.js";
+import { parseOkfConcept } from "../okf.js";
 import type { WikiPage } from "../wiki.js";
+import { parseWikiBodySections } from "../wiki-sections.js";
 
+export function notesPageHref(pageId: string): string {
+  return `/notes?pageId=${encodeURIComponent(pageId)}#note-content`;
+}
 export function sourceRecord(value: Record<string, unknown>): SourceRecord {
   return {
     sourceId: String(value.sourceId ?? value.source_id),
@@ -41,15 +48,14 @@ export function sourceRecord(value: Record<string, unknown>): SourceRecord {
 }
 
 export function publicSource(source: SourceRecord): PublicSourceRecord {
-  const { manifestPath: _manifestPath, ...record } = source;
+  const { manifestPath: _manifestPath, errorMessage: _errorMessage, ...record } = source;
   return record;
 }
 
-export type PublicWorkflowRecord = Omit<WorkflowRecord, "message"> & { readonly message?: string };
-
 export function publicWorkflow(workflow: WorkflowRecord): PublicWorkflowRecord {
-  if (workflow.kind !== "quiz-grader") return workflow;
-  const { message: _message, ...record } = workflow;
+  const { errorMessage: _errorMessage, ...withoutErrorMessage } = workflow;
+  if (workflow.kind !== "quiz-grader") return withoutErrorMessage;
+  const { message: _message, ...record } = withoutErrorMessage;
   return record;
 }
 
@@ -63,6 +69,15 @@ export function pageRecord(value: WikiPage): PageRecord {
     status: value.status,
     quizWorthiness: value.quizWorthiness,
     updatedAt: value.updatedAt,
+  };
+}
+
+export function publicWikiPage(result: WikiPageResult): WikiPageResult {
+  const { body } = parseOkfConcept(result.markdown);
+  return {
+    ...result,
+    markdown: body,
+    sections: parseWikiBodySections(body, result.page.pageId),
   };
 }
 

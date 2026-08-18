@@ -1,3 +1,5 @@
+import MDEditor, { commands } from "@uiw/react-md-editor/nohighlight";
+import "@uiw/react-md-editor/markdown-editor.css";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
@@ -23,7 +25,20 @@ import {
 } from "../api";
 import { Markdown } from "../components/Markdown";
 import { QuizResults, ReadOnlyQuestions } from "../components/QuizPanel";
-import { Button, Card, Spinner, StateView, Textarea } from "../components/ui";
+import { Button, Card, Spinner, StateView } from "../components/ui";
+
+const ANSWER_EDITOR_COMMANDS = [
+  commands.bold,
+  commands.italic,
+  commands.strikethrough,
+  commands.link,
+  commands.quote,
+  commands.unorderedListCommand,
+  commands.orderedListCommand,
+  commands.checkedListCommand,
+  commands.code,
+  commands.codeBlock,
+];
 
 const quietOutcomes: Record<
   Exclude<QuizOutcome, "available" | "submitted" | "expired" | "failed">,
@@ -39,7 +54,7 @@ const quietOutcomes: Record<
   },
   "maintenance-day": {
     title: "Quiz publishing blocked",
-    body: "Initialization blocks quiz publishing until it is disabled.",
+    body: "Maintenance mode blocks quiz publishing until it is disabled.",
   },
 };
 function normalizeAnswers(quiz: PublicQuizRecord, values: readonly QuizAnswerInput[]): QuizAnswerInput[] {
@@ -188,6 +203,10 @@ function QuizAnswerForm({
   const complete = payload.every((item) =>
     typeof item.answer === "string" ? item.answer.trim().length > 0 : item.answer.length > 0,
   );
+  const displayQuestions = [...quiz.questions].sort((left, right) => left.ordinal - right.ordinal);
+  const questionPositions = new Map(
+    displayQuestions.map((question, index) => [question.questionId, index + 1] as const),
+  );
 
   async function submitFinal() {
     if (revisionConflict) return;
@@ -241,76 +260,102 @@ function QuizAnswerForm({
       </div>
 
       <ol className="grid gap-5">
-        {[...quiz.questions]
-          .sort((a, b) => a.ordinal - b.ordinal)
-          .map((question) => (
-            <li key={question.questionId}>
-              <Card className="shadow-none">
-                <p className="eyebrow">
-                  Question {question.ordinal} of {quiz.questions.length} ·{" "}
-                  {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
-                </p>
-                <div className="mt-3">
-                  <Markdown source={question.prompt} />
-                </div>
-                <fieldset className="mt-5" disabled={saveDraft.isPending || submission.isPending || revisionConflict}>
-                  <legend className="sr-only">
-                    Answer question {question.ordinal}: {question.prompt}
-                  </legend>
-                  {question.kind === "multiple-choice" && question.choices?.length ? (
-                    <div className="grid gap-3">
-                      {question.choices.map((choice) => {
-                        const value = answers[question.questionId];
-                        const selected =
-                          typeof value === "string" ? value === choice : (value?.includes(choice) ?? false);
-                        return (
-                          <label
-                            className={
-                              selected
-                                ? "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-accent bg-accent/10 p-3 font-semibold"
-                                : "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-line bg-paper p-3 hover:border-ink"
-                            }
-                            key={choice}
-                          >
-                            <input
-                              className="mt-1 size-5 shrink-0 accent-accent"
-                              type="radio"
-                              name={question.questionId}
-                              value={choice}
-                              checked={selected}
-                              onChange={() => setAnswers((current) => ({ ...current, [question.questionId]: choice }))}
-                            />
-                            <span>{choice}</span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  ) : question.kind === "multiple-choice" ? (
-                    <p className="rounded-md border border-danger/30 bg-danger/10 p-3 text-sm text-danger" role="alert">
-                      No selectable choices were provided for this question.
-                    </p>
-                  ) : (
-                    <label className="block" htmlFor={`answer-${question.questionId}`}>
-                      <span className="sr-only">Answer to question {question.ordinal}</span>
-                      <Textarea
-                        id={`answer-${question.questionId}`}
-                        rows={6}
-                        value={
-                          typeof answers[question.questionId] === "string"
-                            ? (answers[question.questionId] as string)
-                            : ""
-                        }
-                        onChange={(event) =>
-                          setAnswers((current) => ({ ...current, [question.questionId]: event.target.value }))
-                        }
-                        placeholder="Recall from memory, then explain in your own words."
-                      />
+        {displayQuestions.map((question) => (
+          <li key={question.questionId}>
+            <Card className="shadow-none">
+              <p className="eyebrow">
+                Question {questionPositions.get(question.questionId)} of {displayQuestions.length} ·{" "}
+                {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
+              </p>
+              <div className="mt-3">
+                <Markdown source={question.prompt} />
+              </div>
+              <fieldset className="mt-5" disabled={saveDraft.isPending || submission.isPending || revisionConflict}>
+                <legend className="sr-only">
+                  Answer question {questionPositions.get(question.questionId)}: {question.prompt}
+                </legend>
+                {question.kind === "multiple-choice" && question.choices?.length ? (
+                  <div className="grid gap-3">
+                    {question.choices.map((choice, choiceIndex) => {
+                      const value = answers[question.questionId];
+                      const selected =
+                        typeof value === "string" ? value === choice : (value?.includes(choice) ?? false);
+                      const choiceId = `answer-${question.questionId}-choice-${choiceIndex}`;
+                      return (
+                        <label
+                          className={
+                            selected
+                              ? "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-accent bg-accent/10 p-3 font-semibold"
+                              : "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-line bg-paper p-3 hover:border-ink"
+                          }
+                          htmlFor={choiceId}
+                          key={choice}
+                        >
+                          <input
+                            checked={selected}
+                            className="mt-1 size-5 shrink-0 accent-accent"
+                            id={choiceId}
+                            name={question.questionId}
+                            onChange={() => setAnswers((current) => ({ ...current, [question.questionId]: choice }))}
+                            type="radio"
+                            value={choice}
+                          />
+                          <Markdown inline source={choice} />
+                        </label>
+                      );
+                    })}
+                  </div>
+                ) : question.kind === "multiple-choice" ? (
+                  <p className="rounded-md border border-danger/30 bg-danger/10 p-3 text-sm text-danger" role="alert">
+                    No selectable choices were provided for this question.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    <label className="sr-only" htmlFor={`answer-${question.questionId}`}>
+                      Answer to question {questionPositions.get(question.questionId)}
                     </label>
-                  )}
-                </fieldset>
-              </Card>
-            </li>
-          ))}
+                    <MDEditor
+                      autoFocus={false}
+                      className="scholar-answer-editor"
+                      commands={ANSWER_EDITOR_COMMANDS}
+                      defaultTabEnable={true}
+                      extraCommands={[]}
+                      height={240}
+                      onChange={(value) =>
+                        setAnswers((current) => ({ ...current, [question.questionId]: value ?? "" }))
+                      }
+                      preview="edit"
+                      textareaProps={{
+                        id: `answer-${question.questionId}`,
+                        placeholder: "Recall from memory, then explain in your own words.",
+                      }}
+                      value={
+                        typeof answers[question.questionId] === "string" ? (answers[question.questionId] as string) : ""
+                      }
+                      visibleDragbar={false}
+                    />
+                    <section
+                      className="rounded-md border border-line bg-canvas p-4"
+                      aria-labelledby={`answer-preview-${question.questionId}`}
+                    >
+                      <p className="eyebrow" id={`answer-preview-${question.questionId}`}>
+                        Live preview
+                      </p>
+                      {typeof answers[question.questionId] === "string" &&
+                      (answers[question.questionId] as string).trim() ? (
+                        <div className="mt-2">
+                          <Markdown source={answers[question.questionId] as string} />
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-sm text-muted">Your formatted answer will appear here.</p>
+                      )}
+                    </section>
+                  </div>
+                )}
+              </fieldset>
+            </Card>
+          </li>
+        ))}
       </ol>
 
       <Card className="border-ink bg-ink text-paper">
@@ -415,6 +460,7 @@ function TodayContent({ result }: { result: QuizResult }) {
         pageResults={result.quiz.pageResults}
         grades={grades}
         readings={readings}
+        recommendations={result.recommendations}
       />
     </div>
   );

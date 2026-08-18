@@ -1,11 +1,12 @@
 import { promises as fs } from "node:fs";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScholarApplication } from "../src/application/application.js";
 import { openDatabase } from "../src/database.js";
 import { doctor } from "../src/doctor.js";
 import { runChild } from "../src/external/process.js";
+import { managedImageUri, markdownImages, parseManagedImageUri } from "../src/markdown.js";
 import {
   parseOkfConcept,
   removeOkfFootnoteDefinitions,
@@ -13,6 +14,7 @@ import {
   validateOkfIndex,
   validateOkfLog,
 } from "../src/okf.js";
+import { SchedulerService, ValidationError } from "../src/scheduler.js";
 import { validateFileEndpoints } from "../src/sources/source-chunks.js";
 import { requestSourceToFile, SourceService, sha256, validateChunkEndpoints } from "../src/sources/source-service.js";
 import { initVault } from "../src/vault.js";
@@ -155,6 +157,153 @@ describe("source admission mechanics", () => {
     expect(extracted).toContain(`--- FILE: example.rb ---\n${ruby}`);
     expect(extracted).toContain("--- FILE: notes.md ---\nbefore\n\nafter\n");
     expect(staged.kind).toBe("directory");
+    db.close();
+  });
+  it("keeps prepared directory envelopes private until atomic publication", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "prepared-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    expect(Object.keys(prepared)).toEqual(["stageId"]);
+    expect(await sources.discover()).toEqual([]);
+    expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+
+    const published = await sources.publishPreparedStage(prepared);
+    expect(published).toMatchObject({
+      kind: "directory",
+      metadata: { displayName: "prepared-directory", originalName: "prepared-directory" },
+    });
+    expect(published.relativePath).toMatch(/^[0-9a-f-]{36}\.pi-scholar$/u);
+    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual([published.relativePath]);
+    db.close();
+  });
+  it("keeps an envelope out of discovery while its atomic rename is pending", async () => {
+    const { root, db, sources } = await fixture();
+    const directory = join(root, "publishing-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const realRename = fs.rename.bind(fs);
+    const rename = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      entered.resolve();
+      await release.promise;
+      await realRename(from, to);
+    });
+    const publication = sources.publishPreparedStage(prepared);
+    await entered.promise;
+    try {
+      expect(await sources.discover()).toEqual([]);
+    } finally {
+      release.resolve();
+      rename.mockRestore();
+    }
+    expect((await publication).relativePath).toMatch(/\.pi-scholar$/u);
+    db.close();
+  });
+  it("publishes to generated envelopes without replacing same-name direct drops", async () => {
+    const { root, paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "race.txt"), "direct-file\n");
+    await fs.mkdir(join(paths.inboxRoot, "race-directory"));
+    await fs.writeFile(join(paths.inboxRoot, "race-directory", "direct.txt"), "direct-directory\n");
+
+    const file = join(root, "file.txt");
+    await fs.writeFile(file, "prepared-file\n");
+    const directory = join(root, "directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "prepared.txt"), "prepared-directory\n");
+    const publishedFile = await sources.stage({ path: file, name: "race.txt" });
+    const publishedDirectory = await sources.stage({ path: directory, name: "race-directory" });
+
+    expect(publishedFile.relativePath).not.toBe("race.txt");
+    expect(publishedDirectory.relativePath).not.toBe("race-directory");
+    expect(publishedFile.metadata?.originalName).toBe("race.txt");
+    expect(publishedDirectory.metadata?.originalName).toBe("race-directory");
+    expect(await fs.readFile(join(paths.inboxRoot, "race.txt"), "utf8")).toBe("direct-file\n");
+    expect(await fs.readFile(join(paths.inboxRoot, "race-directory", "direct.txt"), "utf8")).toBe("direct-directory\n");
+    expect(new Set((await sources.discover()).map((entry) => entry.relativePath))).toEqual(
+      new Set(["race.txt", "race-directory", publishedFile.relativePath, publishedDirectory.relativePath]),
+    );
+    db.close();
+  });
+  it("rejects staging an existing inbox file without cloning it", async () => {
+    const { paths, db, sources } = await fixture();
+    const original = join(paths.inboxRoot, "existing.txt");
+    await fs.writeFile(original, "original\n");
+
+    await expect(sources.prepareStage({ path: original })).rejects.toBeInstanceOf(ValidationError);
+    await expect(sources.stage({ filePath: original, kind: "upload" })).rejects.toBeInstanceOf(ValidationError);
+
+    expect(await fs.readdir(paths.inboxRoot)).toEqual(["existing.txt"]);
+    expect((await sources.discover()).map((entry) => entry.relativePath)).toEqual(["existing.txt"]);
+    db.close();
+  });
+  it("rejects mutated prepared handles before resolving an inbox path", async () => {
+    const { paths, db, sources } = await fixture();
+    const prepared = await sources.prepareStage({ text: "private\n" });
+    Object.assign(prepared, { relativePath: "../../outside.txt" });
+
+    await expect(sources.publishPreparedStage(prepared)).rejects.toThrow("source stage is not owned");
+    expect(await fs.readdir(paths.inboxRoot)).toEqual([]);
+    await sources.cleanupPreparedStage(prepared);
+    db.close();
+  });
+  it("discovers a complete envelope left by an interrupted atomic publication", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "atomic-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "directory\n");
+    const prepared = await sources.prepareStage({ path: directory });
+    const relativePath = "interrupted.pi-scholar";
+    await fs.rename(join(paths.workRoot, `.source-stage-${prepared.stageId}`), join(paths.inboxRoot, relativePath));
+
+    const entries = await sources.discover();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      relativePath,
+      kind: "directory",
+      metadata: { originalName: "atomic-directory" },
+    });
+    expect((await sources.claim(entries[0]!)).snapshot.files.map((file) => file.path)).toEqual(["notes.txt"]);
+    db.close();
+  });
+  it("cannot expose a partial target when atomic publication and cleanup fail", async () => {
+    const { root, paths, db, sources } = await fixture();
+    const directory = join(root, "failed-directory");
+    await fs.mkdir(directory);
+    await fs.writeFile(join(directory, "notes.txt"), "private\n");
+    const publicationFailure = Object.assign(new Error("publication blocked"), { code: "EIO" });
+    const cleanupFailure = Object.assign(new Error("cleanup blocked"), { code: "EACCES" });
+    const realRm = fs.rm.bind(fs);
+    const rename = vi.spyOn(fs, "rename").mockRejectedValue(publicationFailure);
+    const rm = vi.spyOn(fs, "rm").mockImplementation(async (path, options) => {
+      if (String(path).includes(".source-stage-")) throw cleanupFailure;
+      await realRm(path, options);
+    });
+    try {
+      await expect(sources.stage({ path: directory })).rejects.toThrow("publication blocked");
+      expect(await sources.discover()).toEqual([]);
+      expect((await fs.readdir(paths.workRoot)).some((name) => name.startsWith(".source-stage-"))).toBe(true);
+    } finally {
+      rename.mockRestore();
+      rm.mockRestore();
+    }
+    db.close();
+  });
+  it("retains extraction diagnostics within the local UTF-8 byte bound", async () => {
+    const { paths, db, sources } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "broken.txt"), "evidence\n");
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry was not discovered");
+    sources.recordExtractFailure(entry, new Error(`conversion failed: ${"é".repeat(400)}`));
+
+    const failure = db.get<{ error_message: string }>(
+      "SELECT error_message FROM sources WHERE status = 'failed' LIMIT 1",
+    );
+    expect(failure?.error_message.startsWith("conversion failed:")).toBe(true);
+    expect(Buffer.byteLength(failure?.error_message ?? "", "utf8")).toBeLessThanOrEqual(500);
     db.close();
   });
   it("resets Markdown fence normalization at native file boundaries", async () => {
@@ -307,6 +456,92 @@ describe("source admission mechanics", () => {
     ).toBe("https://example.com/path/remote.txt");
     db.close();
   });
+  it("uses adapter URL names after fetch for metadata and textual extraction", async () => {
+    const { paths, db } = await fixture();
+    const sources = new SourceService(db, paths, {
+      fetchUrl: async () => ({ bytes: Buffer.from("# fetched\n"), name: "fetched.md" }),
+    });
+    const explicit = await sources.prepareStage({
+      url: "https://example.com/download",
+      name: "ignored.txt",
+      originalName: "requested.txt",
+      displayName: "Shown",
+    });
+    const explicitPublished = await sources.publishPreparedStage(explicit);
+    expect(explicitPublished.metadata).toMatchObject({ originalName: "requested.txt", displayName: "Shown" });
+    await fs.rm(explicitPublished.absolutePath, { recursive: true });
+    const staged = await sources.stage({ url: "https://example.com/download" });
+    expect(staged.metadata).toMatchObject({ originalName: "fetched.md", displayName: "fetched.md" });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("adapter URL entry was not discovered");
+    const result = await sources.admitClaim(await sources.claim(entry));
+    expect(result.manifest.originalName).toBe("fetched.md");
+    expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe("# fetched\n");
+    db.close();
+  });
+  it("uses the final redirect basename for textual URL extraction", async () => {
+    const server = createServer((request, response) => {
+      if (request.url === "/start") {
+        response.writeHead(302, { location: "/remote.md" });
+        response.end();
+        return;
+      }
+      response.end("# redirected\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string")
+        throw new Error("redirect test server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        const staged = await sources.stage({ url: `http://127.0.0.1:${address.port}/start` });
+        expect(staged.metadata).toMatchObject({ originalName: "remote.md", displayName: "remote.md" });
+        const [entry] = await sources.discover();
+        if (!entry) throw new Error("redirect URL entry was not discovered");
+        const result = await sources.admitClaim(await sources.claim(entry));
+        expect(result.manifest.originalName).toBe("remote.md");
+        expect(await fs.readFile(join(result.packetPath, "extracted.md"), "utf8")).toBe("# redirected\n");
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it("rejects control-character display names from default URL staging", async () => {
+    const server = createServer((_request, response) => {
+      response.setHeader("content-type", "text/plain");
+      response.end("remote\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("URL test server address is unavailable");
+      const { paths, db } = await fixture();
+      try {
+        const sources = new SourceService(db, paths);
+        await expect(
+          sources.stage({
+            url: `http://127.0.0.1:${address.port}/remote.txt`,
+            displayName: `remote${String.fromCharCode(10)}name`,
+          }),
+        ).rejects.toBeInstanceOf(ValidationError);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
   it("keeps streamed URL envelopes private until the payload is complete", async () => {
     const firstChunk = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -448,6 +683,239 @@ describe("source admission mechanics", () => {
     expect(await fs.stat(join(paths.workRoot, `admission-${prepared[0]?.preparedId}`))).toBeTruthy();
     expect(await fs.stat(join(paths.workRoot, `admission-${prepared[1]?.preparedId}`))).toBeTruthy();
     await Promise.all(prepared.map((item) => sources.cleanupPrepared(item.preparedId)));
+    db.close();
+  });
+
+  it("reports delayed Docling preparation phases without letting observer failures abort extraction", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "delayed.pdf"), "document\n");
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const phases: string[] = [];
+    const sources = new SourceService(db, paths, {
+      docling: async () => {
+        started.resolve();
+        await release.promise;
+        return { extracted: "# Delayed\n\nConverted.\n" };
+      },
+    });
+    const [entry] = await sources.discover();
+    const claim = await sources.claim(entry);
+    const preparation = sources.prepareClaim(claim, (phase) => {
+      phases.push(phase);
+      if (phase === "validating/indexing") return Promise.reject(new Error("presentation failed"));
+    });
+    await started.promise;
+    expect(phases).toEqual(["preparing", "docling"]);
+    release.resolve();
+    const prepared = await preparation;
+    expect(phases).toEqual(["preparing", "docling", "normalizing", "validating/indexing", "ready"]);
+    await sources.cleanupPrepared(prepared.preparedId);
+    db.close();
+  });
+
+  it("publishes referenced Docling images and converter provenance as immutable packet artifacts", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const attachmentPath = "document_artifacts/image.png";
+    const image = Buffer.from("image");
+    const sources = new SourceService(db, paths, {
+      docling: async ({ originalPath }) => {
+        const outputDirectory = join(dirname(dirname(originalPath)), "docling-output");
+        const absoluteAttachment = join(outputDirectory, attachmentPath);
+        await fs.mkdir(dirname(absoluteAttachment), { recursive: true });
+        await fs.writeFile(absoluteAttachment, image);
+        await fs.writeFile(
+          join(outputDirectory, "document.md"),
+          `# Document\n\n![Image](${absoluteAttachment.replaceAll("\\", "/")})\n\nText\n`,
+        );
+        return {
+          converter: { name: "docling", version: "2.110.0" },
+          outputDirectory,
+          command: {
+            executable: "docling",
+            args: [],
+            code: 0,
+            signal: null,
+            timedOut: false,
+            stdout: "",
+            stderr: "",
+          },
+        };
+      },
+    });
+    const [entry] = await sources.discover();
+    const claim = await sources.claim(entry);
+    const prepared = await sources.prepareClaim(claim);
+    const expected = `# Document\n\n![Image](attachments/${attachmentPath})\n\nText\n`;
+    expect((await fs.readFile(join(paths.vaultRoot, prepared.extractedPath))).toString()).toBe(expected);
+    const result = await sources.publishPreparedClaim({
+      prepared,
+      preparedId: prepared.preparedId,
+      claimId: prepared.claimId,
+      digest: prepared.digest,
+      endpoints: [5],
+    });
+    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).toString()).toBe(expected);
+    expect(await fs.readFile(join(result.packetPath, "attachments", attachmentPath))).toEqual(image);
+    const manifest = JSON.parse((await fs.readFile(join(result.packetPath, "manifest.json"))).toString()) as {
+      attachments: Array<{ path: string; digest: string }>;
+      converter: { name: string; version: string };
+    };
+    expect(manifest.attachments.map(({ path }) => path)).toEqual([attachmentPath]);
+    expect(manifest.converter).toEqual({ name: "docling", version: "2.110.0" });
+    const verified = await sources.publishedAttachment(result.sourceId, manifest.attachments[0]!.digest);
+    expect(verified.contentType).toBe("image/png");
+    expect(verified.byteLength).toBe(image.byteLength);
+    expect(verified.bytes).toEqual(image);
+    db.close();
+  });
+  it("authorizes page-bound raster attachments and rejects packet or page mismatches", async () => {
+    const { paths, db, wiki } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const attachmentPath = "document_artifacts/image.png";
+    const image = Buffer.from("image");
+    const sources = new SourceService(db, paths, {
+      docling: async ({ originalPath }) => {
+        const outputDirectory = join(dirname(dirname(originalPath)), "docling-output");
+        const absoluteAttachment = join(outputDirectory, attachmentPath);
+        await fs.mkdir(dirname(absoluteAttachment), { recursive: true });
+        await fs.writeFile(absoluteAttachment, image);
+        await fs.writeFile(
+          join(outputDirectory, "document.md"),
+          `# Document\n\n![Image](attachments/${attachmentPath})\n\nText\n`,
+        );
+        return {
+          converter: { name: "docling", version: "2.110.0" },
+          outputDirectory,
+          command: { executable: "docling", args: [], code: 0, signal: null, timedOut: false, stdout: "", stderr: "" },
+        };
+      },
+    });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry is missing");
+    const prepared = await sources.prepareClaim(await sources.claim(entry));
+    const result = await sources.publishPreparedClaim({
+      prepared,
+      preparedId: prepared.preparedId,
+      claimId: prepared.claimId,
+      digest: prepared.digest,
+      endpoints: [5],
+    });
+    const packetManifestPath = join(result.packetPath, "manifest.json");
+    const readManifest = async (): Promise<{
+      attachments: Array<Record<string, unknown>>;
+    }> => JSON.parse(await fs.readFile(packetManifestPath, "utf8")) as { attachments: Array<Record<string, unknown>> };
+    const manifest = await readManifest();
+    const attachmentDigest = String(manifest.attachments[0]!.digest);
+    const app = new ScholarApplication({ paths, db, sourceService: sources, wikiService: wiki });
+    const uri = managedImageUri(result.sourceId, attachmentDigest);
+    const page = await wiki.create({
+      path: "authorized-attachment.md",
+      body: `![Image](${uri})\n\nClaim.[^${result.sourceId}:0]`,
+    });
+    const delivered = await app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest);
+    expect(delivered.contentType).toBe("image/png");
+    expect(delivered.bytes).toEqual(image);
+    const repeatedPath = "document_artifacts/repeated.png";
+    const repeatedManifest = await readManifest();
+    repeatedManifest.attachments.push({
+      ...repeatedManifest.attachments[0],
+      path: repeatedPath,
+      relativePath: repeatedPath,
+    });
+    await fs.writeFile(join(result.packetPath, "attachments", repeatedPath), image);
+    const repeatedBytes = Buffer.from(`${JSON.stringify(repeatedManifest, null, 2)}\n`);
+    await fs.writeFile(packetManifestPath, repeatedBytes);
+    db.run("UPDATE sources SET manifest_digest = ? WHERE source_id = ?", [sha256(repeatedBytes), result.sourceId]);
+    const repeated = await app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest);
+    expect(repeated.contentType).toBe("image/png");
+    expect(repeated.bytes).toEqual(image);
+    const crossPage = await wiki.create({
+      path: "cross-page-attachment.md",
+      body: `Claim only.[^${result.sourceId}:0]`,
+    });
+    await expect(app.getWikiAttachment(crossPage.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
+      /not referenced/iu,
+    );
+    const missingDigest = "b".repeat(64);
+    const missing = await wiki.create({
+      path: "missing-attachment.md",
+      body: `![Missing](${managedImageUri(result.sourceId, missingDigest)})\n\nClaim.[^${result.sourceId}:0]`,
+    });
+    await expect(app.getWikiAttachment(missing.page.pageId, result.sourceId, missingDigest)).rejects.toThrow(
+      /ambiguous or unavailable/iu,
+    );
+    await fs.writeFile(join(result.packetPath, "attachments", attachmentPath), "tampered");
+    await expect(app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
+      /byte length|digest/iu,
+    );
+    await fs.writeFile(join(result.packetPath, "attachments", attachmentPath), image);
+    await fs.rm(join(result.packetPath, "attachments", attachmentPath));
+    await fs.writeFile(join(paths.vaultRoot, "outside-image"), image);
+    await fs.symlink(join(paths.vaultRoot, "outside-image"), join(result.packetPath, "attachments", attachmentPath));
+    await expect(app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
+      /symlink/iu,
+    );
+    const originalManifest = await readManifest();
+    originalManifest.attachments.push({ ...originalManifest.attachments[0] });
+    const ambiguousBytes = Buffer.from(`${JSON.stringify(originalManifest, null, 2)}\n`);
+    await fs.rm(join(result.packetPath, "attachments", attachmentPath));
+    await fs.writeFile(join(result.packetPath, "attachments", attachmentPath), image);
+    await fs.writeFile(packetManifestPath, ambiguousBytes);
+    db.run("UPDATE sources SET manifest_digest = ? WHERE source_id = ?", [sha256(ambiguousBytes), result.sourceId]);
+    await expect(app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
+      /duplicate/iu,
+    );
+    const svgManifest = await readManifest();
+    svgManifest.attachments = [svgManifest.attachments[0]!];
+    svgManifest.attachments[0]!.path = "document_artifacts/image.svg";
+    svgManifest.attachments[0]!.relativePath = "document_artifacts/image.svg";
+    const svgBytes = Buffer.from(`${JSON.stringify(svgManifest, null, 2)}\n`);
+    await fs.writeFile(packetManifestPath, svgBytes);
+    db.run("UPDATE sources SET manifest_digest = ? WHERE source_id = ?", [sha256(svgBytes), result.sourceId]);
+    await expect(app.getWikiAttachment(page.page.pageId, result.sourceId, attachmentDigest)).rejects.toThrow(
+      /renderable/iu,
+    );
+    await app.close();
+    db.close();
+  });
+
+  it("rejects embedded Docling image data before chunk planning", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const sources = new SourceService(db, paths, {
+      docling: async () => ({ extracted: "![Image](data:image/png;base64,AAAA)\n" }),
+    });
+    const [entry] = await sources.discover();
+    const claim = await sources.claim(entry);
+    await expect(sources.prepareClaim(claim)).rejects.toThrow(/embedded image data URI/iu);
+    expect(await fs.readFile(join(paths.inboxRoot, "document.pdf"), "utf8")).toBe("document\n");
+    db.close();
+  });
+  it("rewrites relative Docling attachment references for direct conversion", async () => {
+    const { paths, db } = await fixture();
+    await fs.writeFile(join(paths.inboxRoot, "document.pdf"), "document\n");
+    const attachmentPath = "document_artifacts/image.png";
+    const image = Buffer.from("image");
+    const sources = new SourceService(db, paths, {
+      docling: async () => ({
+        extracted:
+          `# Document\n\n![Image](${attachmentPath}?download=1#page=2)\n\n` + `Literal ${attachmentPath} stays.\n`,
+        attachments: [{ path: attachmentPath, bytes: image }],
+      }),
+    });
+    const [entry] = await sources.discover();
+    if (!entry) throw new Error("source entry is missing");
+    const prepared = await sources.prepareClaim(await sources.claim(entry));
+    expect(await fs.readFile(join(paths.vaultRoot, prepared.extractedPath), "utf8")).toBe(
+      `# Document\n\n![Image](attachments/${attachmentPath}?download=1#page=2)\n\n` +
+        `Literal ${attachmentPath} stays.\n`,
+    );
+    expect(
+      await fs.readFile(join(paths.workRoot, `admission-${prepared.preparedId}`, "attachments", attachmentPath)),
+    ).toEqual(image);
+    await sources.cleanupPrepared(prepared.preparedId);
     db.close();
   });
 
@@ -826,7 +1294,7 @@ describe("source admission mechanics", () => {
     db.close();
   });
   it("previews page and open-quiz dependents and restores the packet after a failed removal transaction", async () => {
-    const { paths, db, sources, wiki } = await fixture();
+    const { root, paths, db, sources, wiki } = await fixture();
     await fs.writeFile(join(paths.inboxRoot, "source.txt"), "evidence\n");
     const [entry] = await sources.discover();
     const result = await sources.admitClaim(await sources.claim(entry));
@@ -834,6 +1302,7 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "grounded.md",
+      description: "Grounded page removal behavior.",
       body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
       quizWorthiness: "eligible",
     });
@@ -843,6 +1312,9 @@ describe("source admission mechanics", () => {
     await fs.mkdir(join(paths.quizzesRoot, "2099", "01"), { recursive: true });
     const sheetBefore = Buffer.from("# canonical quiz\n");
     await fs.writeFile(sheetPath, sheetBefore);
+    await fs.chmod(sheetPath, 0o640);
+    const sheetBeforeMode = (await fs.stat(sheetPath)).mode & 0o777;
+    expect(sheetBeforeMode).not.toBe(0o600);
     db.run(
       "INSERT INTO quizzes (quiz_id, date, revision, status, sheet_path, generated_at, submitted_at, error_code, error_message) VALUES (?, ?, 1, 'open', ?, ?, NULL, NULL, NULL)",
       ["quiz-removal", "2099-01-01", sheetPath, now],
@@ -883,14 +1355,22 @@ describe("source admission mechanics", () => {
     await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(
       "forced removal failure",
     );
-    expect((await fs.readFile(join(result.packetPath, "extracted.md"))).toString()).toBe("evidence\n");
     expect((await fs.readFile(sheetPath)).equals(sheetBefore)).toBe(true);
+    expect((await fs.stat(sheetPath)).mode & 0o777).toBe(sheetBeforeMode);
     expect(
       db.get<{ status: string }>("SELECT status FROM sources WHERE source_id = ?", [result.sourceId])?.status,
     ).toBe("published");
     expect(db.get<{ status: string }>("SELECT status FROM quizzes WHERE quiz_id = ?", ["quiz-removal"])?.status).toBe(
       "open",
     );
+    const outsidePath = join(root, "outside.md");
+    const linkedSheetPath = join(paths.quizzesRoot, "linked-sheet.md");
+    await fs.writeFile(outsidePath, "outside sentinel\n");
+    await fs.symlink(outsidePath, linkedSheetPath);
+    originalRun("UPDATE quizzes SET sheet_path = ? WHERE quiz_id = ?", [linkedSheetPath, "quiz-removal"]);
+    await expect(sources.removeConfirmed(result.sourceId, preview.confirmationId)).rejects.toThrow(/path|symlink/u);
+    expect((await fs.readFile(outsidePath)).toString()).toBe("outside sentinel\n");
+    expect(await fs.stat(result.packetPath)).toBeDefined();
     db.close();
   });
   it("blocks removal while a cited page has an unsettled submitted quiz", async () => {
@@ -902,6 +1382,7 @@ describe("source admission mechanics", () => {
     if (!chunkId) throw new Error("source chunk is missing");
     const page = await wiki.create({
       path: "submitted-grounding.md",
+      description: "Submitted quiz removal guard.",
       body: `# Grounded\n\nGrounded at [^${chunkId}].\n`,
       quizWorthiness: "eligible",
     });
@@ -1043,6 +1524,7 @@ describe("wiki mechanics", () => {
     const { paths, db, wiki } = await fixture();
     const created = await wiki.create({
       path: "notes/retire.md",
+      description: "Retired page history.",
       body: "# Retire\n\nKeep this history.",
       quizWorthiness: "eligible",
     });
@@ -1253,10 +1735,13 @@ describe("wiki mechanics", () => {
       [`${sourceId}:0`, sourceId, "b".repeat(64)],
     );
     const created = await wiki.create({
-      path: "destination-literals.md",
-      body: `[link](https://example.test/[^${sourceId}:0])\n\n![image](https://example.test/[^${sourceId}:0])`,
+      path: "destination-link-literal.md",
+      body: `[link](https://example.test/[^${sourceId}:0])`,
     });
     expect(parseOkfConcept(created.content).frontmatter.sources).toBeUndefined();
+    await expect(
+      wiki.create({ path: "destination-image-literal.md", body: `![image](https://example.test/[^${sourceId}:0])` }),
+    ).rejects.toThrow(/canonical managed/iu);
     const hiddenFootnote = await wiki.create({
       path: "hidden-footnote-markdown.md",
       body: `Claim.[^note]\n\n[^note]: [link](https://example.test/${sourceId}:0) and \`${sourceId}:0\``,
@@ -1283,6 +1768,42 @@ describe("wiki mechanics", () => {
       ],
     ] as const)
       await expect(wiki.create({ path, body })).rejects.toThrow(/keyed footnote/u);
+    db.close();
+  });
+  it("accepts only cited canonical managed raster images and ignores code examples", async () => {
+    const { db, wiki } = await fixture();
+    const sourceId = "11111111-1111-5111-8111-111111111111";
+    const digest = "a".repeat(64);
+    const timestamp = new Date().toISOString();
+    db.run(
+      "INSERT INTO sources (source_id, kind, status, display_name, digest, created_at, updated_at) VALUES (?, 'text', 'published', ?, ?, ?, ?)",
+      [sourceId, "Image source", "a".repeat(64), timestamp, timestamp],
+    );
+    db.run(
+      "INSERT INTO source_chunks (chunk_id, source_id, ordinal, relative_path, byte_length, digest, atom_start, atom_end) VALUES (?, ?, 0, 'extracted.md', 7, ?, 0, 1)",
+      [`${sourceId}:0`, sourceId, "b".repeat(64)],
+    );
+    const uri = managedImageUri(sourceId, digest);
+    expect(parseManagedImageUri(uri)).toEqual({ sourceId, digest });
+    expect(parseManagedImageUri(uri.toUpperCase())).toBeUndefined();
+    expect(
+      markdownImages(`![Diagram][diagram]\n\n[diagram]: ${uri}\n\n\`\`\`\n![unsafe](file:///tmp/x)\n\`\`\``),
+    ).toEqual([{ url: uri, alt: "Diagram" }]);
+    await expect(
+      wiki.create({
+        path: "managed-image.md",
+        body: `![Diagram][diagram]\n\nClaim.[^${sourceId}:0]\n\n[diagram]: ${uri}`,
+      }),
+    ).resolves.toBeDefined();
+    await expect(wiki.create({ path: "uncited-image.md", body: `![Diagram](${uri})` })).rejects.toThrow(
+      /image source is not cited/iu,
+    );
+    await expect(
+      wiki.create({ path: "external-image.md", body: "![Diagram](https://example.test/diagram.png)" }),
+    ).rejects.toThrow(/canonical managed/iu);
+    await expect(wiki.create({ path: "local-image.md", body: "![Diagram](diagram.png)" })).rejects.toThrow(
+      /canonical managed/iu,
+    );
     db.close();
   });
   it("retains custom metadata while regenerating managed source identity", async () => {
@@ -1436,15 +1957,17 @@ describe("wiki mechanics", () => {
   });
   it("repairs a directly drifted blank title through a guarded ingest update", async () => {
     const { paths, db } = await fixture();
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor,
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
-      const created = await app.wiki.create({ path: "drift-title.md", title: "Stable", body: "authored" });
+      const created = await wiki.create({ path: "drift-title.md", title: "Stable", body: "authored" });
       const pagePath = join(paths.wikiRoot, created.page.relativePath);
       const parsed = parseOkfConcept(await fs.readFile(pagePath, "utf8"));
       parsed.frontmatter.title = " \t";
@@ -1458,7 +1981,7 @@ describe("wiki mechanics", () => {
         title: "Repaired",
       });
       expect(result.page?.title).toBe("Repaired");
-      const repaired = await app.wiki.get(created.page.pageId);
+      const repaired = await wiki.get(created.page.pageId);
       expect(repaired.status).toBe("active");
       expect(parseOkfConcept(repaired.content).frontmatter.externallyAdded).toBeUndefined();
       const report = doctor(paths.vaultRoot);
@@ -1471,15 +1994,17 @@ describe("wiki mechanics", () => {
   });
   it("rejects drift repair when the authored snapshot bytes are tampered", async () => {
     const { paths, db } = await fixture();
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
       doctor,
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
-      const created = await app.wiki.create({
+      const created = await wiki.create({
         path: "tampered-snapshot.md",
         title: "Stable",
         body: "Authored baseline. \uFFFD",
@@ -1503,7 +2028,7 @@ describe("wiki mechanics", () => {
         expectedDigest: sha256(externalPage),
       };
 
-      await expect(app.wiki.prepareUpdate(created.page.pageId, repair)).rejects.toThrow(/product-authored snapshot/u);
+      await expect(wiki.prepareUpdate(created.page.pageId, repair)).rejects.toThrow(/product-authored snapshot/u);
       await expect(
         app.applyWikiChange({ kind: "update-page", pageId: created.page.pageId, ...repair }),
       ).rejects.toThrow(/product-authored snapshot/u);
@@ -1521,9 +2046,20 @@ describe("wiki mechanics", () => {
     const { paths, db } = await fixture();
     let mutateOther = false;
     let otherPath = "";
+    const wiki = new WikiService(db, paths, {
+      qmd: {
+        search: () => [],
+        index: async () => {
+          if (!mutateOther) return;
+          mutateOther = false;
+          await fs.appendFile(otherPath, "\nsecond unsupported edit");
+        },
+      },
+    });
     const app = new ScholarApplication({
       paths,
       db,
+      wikiService: wiki,
       adapters: {
         wiki: {
           qmd: {
@@ -1540,8 +2076,8 @@ describe("wiki mechanics", () => {
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
-      const target = await app.wiki.create({ path: "repair-target.md", body: "authored target" });
-      const other = await app.wiki.create({ path: "repair-other.md", body: "authored other" });
+      const target = await wiki.create({ path: "repair-target.md", body: "authored target" });
+      const other = await wiki.create({ path: "repair-other.md", body: "authored other" });
       const targetPath = join(paths.wikiRoot, target.page.relativePath);
       otherPath = join(paths.wikiRoot, other.page.relativePath);
       await fs.appendFile(targetPath, "\nfirst unsupported edit");
@@ -1870,18 +2406,26 @@ describe("wiki mechanics", () => {
 
   it("resolves an issue only after a corrected page passes together", async () => {
     const { db, paths } = await fixture();
+    const wiki = new WikiService(db, paths, { qmd: { search: () => [], index: async () => undefined } });
+    const scheduler = new SchedulerService(db, paths);
     const app = new ScholarApplication({
       paths,
       db,
-      adapters: { wiki: { qmd: { search: () => [], index: async () => undefined } } },
+      wikiService: wiki,
+      schedulerService: scheduler,
       doctor: () => ({ ok: true, checkedAt: new Date().toISOString(), checks: [] }),
       commit: (_paths, subject) => ({ committed: false, subject }),
     });
     try {
       const originalBody = "# Section\n\noriginal\n";
       const correctedBody = "# Section\n\ncorrected\n";
-      const page = await app.wiki.create({ path: "page-issue.md", body: originalBody, quizWorthiness: "eligible" });
-      const issue = await app.wiki.report({
+      const page = await wiki.create({
+        path: "page-issue.md",
+        description: "Issue correction behavior.",
+        body: originalBody,
+        quizWorthiness: "eligible",
+      });
+      const issue = await wiki.report({
         pageId: page.page.pageId,
         heading: "Section",
         description: "The section is wrong.",
@@ -1893,16 +2437,16 @@ describe("wiki mechanics", () => {
         resolution: "Corrected the section.",
       });
       await expect(app.applyWikiChange(proposal(originalBody))).rejects.toThrow(/actual page correction/u);
-      expect((await app.wiki.get(page.page.pageId)).content).toContain("original");
+      expect((await wiki.get(page.page.pageId)).content).toContain("original");
       expect((await app.listIssues()).issues.find((item) => item.issueId === issue.issueId)?.status).toBe("open");
 
       const applied = await app.applyWikiChange(proposal(correctedBody));
       expect(applied.issue?.status).toBe("resolved");
-      expect((await app.wiki.get(page.page.pageId)).content).toContain("corrected");
-      expect((await app.wiki.get(page.page.pageId)).revision).toBe(2);
-      expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
+      expect((await wiki.get(page.page.pageId)).content).toContain("corrected");
+      expect((await wiki.get(page.page.pageId)).revision).toBe(2);
+      expect(scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
 
-      const beforeRename = await app.wiki.get(page.page.pageId);
+      const beforeRename = await wiki.get(page.page.pageId);
       const renamed = await app.applyWikiChange({
         kind: "rename-page",
         pageId: page.page.pageId,
@@ -1910,8 +2454,8 @@ describe("wiki mechanics", () => {
         path: "page-issue-renamed.md",
       });
       expect(renamed.page?.relativePath).toBe("page-issue-renamed.md");
-      expect((await app.wiki.get(page.page.pageId)).digest).toBe(beforeRename.digest);
-      expect(app.scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
+      expect((await wiki.get(page.page.pageId)).digest).toBe(beforeRename.digest);
+      expect(scheduler.getPageLearning(page.page.pageId)?.pageId).toBe(page.page.pageId);
     } finally {
       await app.close();
       db.close();

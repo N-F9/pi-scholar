@@ -4,11 +4,13 @@ import { dirname, join, normalize, relative } from "node:path";
 import type { WikiIssueKind, WikiIssueRecord, WikiIssueStatus } from "./contracts.js";
 import { type ScholarDatabase, type SqlRow, type SqlRunResult, transaction } from "./database.js";
 import { type QmdIndexOptions, qmdCollectionName } from "./external/qmd.js";
+import { markdownImages, parseManagedImageUri } from "./markdown.js";
 import {
   type OkfProjectionPage,
   okfCitationText,
   okfFootnoteLabels,
   okfMarkdownEscapedAt,
+  okfRenderedText,
   parseOkfConcept,
   removeOkfFootnoteDefinitions,
   renderOkfIndex,
@@ -31,6 +33,7 @@ export interface WikiPage {
 export interface WikiPageInput {
   path: string;
   title?: string;
+  description?: string;
   body: string;
   pageId?: string;
   quizWorthiness?: "eligible" | "skip" | "unknown";
@@ -125,6 +128,16 @@ function assertInertMarkdown(body: string): void {
 function assertPageTitle(value: unknown): asserts value is string {
   if (typeof value !== "string" || !value.trim()) throw new Error("wiki page title is required");
 }
+function assertQuizEligibleContent(
+  quizWorthiness: WikiPage["quizWorthiness"],
+  frontmatter: Record<string, unknown>,
+  body: string,
+): void {
+  if (quizWorthiness !== "eligible") return;
+  if (typeof frontmatter.description !== "string" || !frontmatter.description.trim())
+    throw new Error("eligible wiki pages require a non-empty OKF description");
+  if (!okfRenderedText(body).trim()) throw new Error("eligible wiki pages require a non-empty rendered body");
+}
 function serializePage(frontmatter: Record<string, unknown>, body: string): string {
   assertInertMarkdown(body);
   return serializeOkfConcept(frontmatter, body);
@@ -176,7 +189,7 @@ function rowToIssue(row: IssueRow): WikiIssueRecord {
 }
 function linksFromMarkdown(body: string): string[] {
   const links: string[] = [];
-  const pattern = /!?(?:\[[^\]]*\])\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/gu;
+  const pattern = /(?<!!)\[[^\]]*\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/gu;
   for (const match of body.matchAll(pattern)) {
     const target = match[1];
     if (!target || target.startsWith("#") || /^https?:\/\//iu.test(target)) continue;
@@ -206,6 +219,13 @@ function resolveWikiLink(root: string, pagePath: string, target: string): string
 }
 function validateMarkdownLinks(root: string, pagePath: string, body: string): void {
   for (const target of linksFromMarkdown(body)) resolveWikiLink(root, pagePath, target);
+}
+function validateMarkdownImages(body: string, citedSourceIds: ReadonlySet<string>): void {
+  for (const image of markdownImages(body)) {
+    const managed = parseManagedImageUri(image.url);
+    if (!managed) throw new Error("wiki images must use canonical managed source URIs");
+    if (!citedSourceIds.has(managed.sourceId)) throw new Error("wiki image source is not cited by the page");
+  }
 }
 function titleFromPath(path: string): string {
   const name = path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? path;
@@ -247,11 +267,7 @@ export class WikiService {
     if (typeof index === "function") await index({ ignoredPaths: this.qmdIgnoredPaths() });
   }
   private async refreshQmd(): Promise<void> {
-    try {
-      await this.refreshQmdIndex();
-    } catch {
-      /* application maintenance checks enforce qmd */
-    }
+    await this.refreshQmdIndex();
   }
   private async atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
     await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -387,6 +403,15 @@ export class WikiService {
       status: String(row.status),
     }));
   }
+  citedSourceIds(body: string): ReadonlySet<string> {
+    const byId = new Map(this.sourceRows().map((row) => [sourceCitationId(row), row.source_id]));
+    const cited = new Set<string>();
+    for (const label of okfFootnoteLabels(body).references) {
+      const sourceId = byId.get(label);
+      if (sourceId) cited.add(sourceId);
+    }
+    return cited;
+  }
   private sourceAwareContent(
     frontmatter: Record<string, unknown>,
     body: string,
@@ -479,6 +504,7 @@ export class WikiService {
   }
   private serializeContent(frontmatter: Record<string, unknown>, body: string): string {
     const prepared = this.sourceAwareContent(frontmatter, body);
+    validateMarkdownImages(prepared.body, this.citedSourceIds(prepared.body));
     return serializePage(prepared.frontmatter, prepared.body);
   }
   async create(input: WikiPageInput): Promise<WikiCreateResult> {
@@ -493,6 +519,7 @@ export class WikiService {
     const quizWorthiness = input.quizWorthiness ?? "unknown";
     const frontmatter: Record<string, unknown> = {
       ...(input.frontmatter ?? {}),
+      ...(input.description === undefined ? {} : { description: input.description }),
       id: pageId,
       title,
       type: input.frontmatter?.type ?? "note",
@@ -500,6 +527,7 @@ export class WikiService {
       updated: createdAt,
       "quiz-worthiness": quizWorthiness,
     };
+    assertQuizEligibleContent(quizWorthiness, frontmatter, input.body);
     const content = this.serializeContent(frontmatter, input.body);
     validateMarkdownLinks(this.root(), location.relativePath, input.body);
     const page: WikiPage = {
@@ -517,6 +545,7 @@ export class WikiService {
     const logPath = join(this.root(), "log.md");
     const priorIndex = await this.optionalBytes(indexPath);
     const priorLog = await this.optionalBytes(logPath);
+    let qmdFailed = false;
     const rollback = async (): Promise<void> => {
       const errors: unknown[] = [];
       const attempt = async (action: () => Promise<void> | void): Promise<void> => {
@@ -536,6 +565,7 @@ export class WikiService {
       });
       await attempt(() => this.restoreOptional(indexPath, priorIndex));
       await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki create rollback failed: ${detail}`, { cause: errors[0] });
@@ -545,7 +575,12 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, content);
       await this.writeCatalog(page, content);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
     } catch (error) {
       try {
         await rollback();
@@ -564,6 +599,7 @@ export class WikiService {
     input: {
       body?: string;
       title?: string;
+      description?: string;
       quizWorthiness?: WikiPage["quizWorthiness"];
       expectedDigest?: string;
       path?: string;
@@ -593,12 +629,14 @@ export class WikiService {
     const quizWorthiness = input.quizWorthiness ?? page.quizWorthiness;
     const frontmatter: Record<string, unknown> = {
       ...parsed.frontmatter,
+      ...(input.description === undefined ? {} : { description: input.description }),
       id: pageId,
       title,
       created: typeof parsed.frontmatter.created === "string" ? parsed.frontmatter.created : updatedAt,
       updated: updatedAt,
       "quiz-worthiness": quizWorthiness,
     };
+    assertQuizEligibleContent(quizWorthiness, frontmatter, body);
     const content = this.serializeContent(frontmatter, body);
     validateMarkdownLinks(this.root(), page.relativePath, body);
     const updated: WikiPage = {
@@ -617,6 +655,7 @@ export class WikiService {
     input: {
       body?: string;
       title?: string;
+      description?: string;
       quizWorthiness?: WikiPage["quizWorthiness"];
       expectedDigest?: string;
       path?: string;
@@ -625,8 +664,10 @@ export class WikiService {
   ): Promise<WikiCreateResult> {
     const next = prepared ?? (await this.prepareUpdate(pageId, input));
     assertPageTitle(next.page.title);
-    const nextFrontmatter = parseOkfConcept(next.content).frontmatter;
+    const parsedNext = parseOkfConcept(next.content);
+    const nextFrontmatter = parsedNext.frontmatter;
     assertPageTitle(nextFrontmatter.title);
+    assertQuizEligibleContent(next.page.quizWorthiness, nextFrontmatter, parsedNext.body);
     const priorPageRow = this.catalog(pageId);
     if (!priorPageRow) throw new Error("page not found");
     const page = rowToPage(priorPageRow);
@@ -648,6 +689,7 @@ export class WikiService {
     const logPath = join(this.root(), "log.md");
     const priorIndex = await this.optionalBytes(indexPath);
     const priorLog = await this.optionalBytes(logPath);
+    let qmdFailed = false;
     const rollback = async (): Promise<void> => {
       const errors: unknown[] = [];
       const attempt = async (action: () => Promise<void> | void): Promise<void> => {
@@ -692,6 +734,7 @@ export class WikiService {
       });
       await attempt(() => this.restoreOptional(indexPath, priorIndex));
       await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki update rollback failed: ${detail}`, { cause: errors[0] });
@@ -701,7 +744,12 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, next.content);
       await this.writeCatalog(next.page, next.content);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
     } catch (error) {
       try {
         await rollback();
@@ -755,6 +803,7 @@ export class WikiService {
       updatedAt: now(),
       status: "active",
     };
+    let qmdFailed = false;
     const rollback = async (): Promise<void> => {
       const errors: unknown[] = [];
       const attempt = async (action: () => Promise<void> | void): Promise<void> => {
@@ -800,6 +849,7 @@ export class WikiService {
       });
       await attempt(() => this.restoreOptional(indexPath, priorIndex));
       await attempt(() => this.restoreOptional(logPath, priorLog));
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki rename rollback failed: ${detail}`, { cause: errors[0] });
@@ -808,7 +858,12 @@ export class WikiService {
     try {
       await this.writeCatalog(updated, content, page.relativePath);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
     } catch (error) {
       try {
         await rollback();
@@ -1147,6 +1202,7 @@ export class WikiService {
     const logPath = join(this.root(), "log.md");
     const priorIndexBytes = await optionalBytes(indexPath);
     const priorLogBytes = await optionalBytes(logPath);
+    let qmdFailed = false;
     const issue =
       choice === "record-issue"
         ? {
@@ -1214,6 +1270,7 @@ export class WikiService {
         if (priorLogBytes === undefined) await fs.rm(logPath, { force: true });
         else await this.atomicWrite(logPath, priorLogBytes);
       });
+      if (qmdFailed) await attempt(() => this.refreshQmd());
       if (errors.length) {
         const detail = errors.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
         throw new Error(`wiki drift resolution rollback failed: ${detail}`, { cause: errors[0] });
@@ -1231,7 +1288,12 @@ export class WikiService {
       await this.atomicWrite(location.absolutePath, snapshot.content);
       await this.writeCatalog(updated, snapshot.content);
       await this.refreshProjections();
-      await this.refreshQmd();
+      try {
+        await this.refreshQmd();
+      } catch (error) {
+        qmdFailed = true;
+        throw error;
+      }
       if (issue) {
         transaction(this.db, () =>
           dbRun(
@@ -1315,6 +1377,7 @@ export class WikiService {
       const content = (await this.readExact(page.relativePath)).toString("utf8");
       const parsed = parseOkfConcept(content);
       assertPageTitle(parsed.frontmatter.title);
+      validateMarkdownImages(parsed.body, this.citedSourceIds(parsed.body));
       projectionPages.push({
         title: page.title,
         path: page.relativePath,
@@ -1352,6 +1415,7 @@ export class WikiService {
         const content = readFileSync(join(this.root(), page.relativePath), "utf8");
         assertInertMarkdown(content);
         const parsed = parseOkfConcept(content);
+        validateMarkdownImages(parsed.body, this.citedSourceIds(parsed.body));
         const parsedId = parsed.frontmatter.id;
         if (parsedId !== page.pageId || typeof parsedId !== "string" || !ID.test(parsedId))
           errors.push(`${page.relativePath}: stable page ID mismatch`);

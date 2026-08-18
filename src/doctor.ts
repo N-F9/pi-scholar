@@ -14,7 +14,7 @@ import {
 import { delimiter, join, resolve } from "node:path";
 import type { DoctorCheck, DoctorReport, JsonValue } from "./contracts.js";
 import { openDatabase, SCHEMA_VERSION, type ScholarDatabase, validateSchema } from "./database.js";
-import { doclingDependencyIdentity } from "./external/docling.js";
+import { doclingDependencyIdentity, qpdfDependencyIdentity } from "./external/docling.js";
 import { gitDependencyIdentity, gitStatus } from "./external/git.js";
 import { qmdDependencyIdentity, qmdScopeCheck } from "./external/qmd.js";
 import {
@@ -22,6 +22,7 @@ import {
   okfDate,
   okfFootnoteLabels,
   okfMarkdownEscapedAt,
+  okfRenderedText,
   parseOkfConcept,
   renderOkfIndex,
   renderOkfLog,
@@ -1015,9 +1016,10 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
       digest: string;
       revision: number;
       status: string;
+      quiz_worthiness: string;
       updated_at: string;
     }>(
-      "SELECT page_id, relative_path, title, digest, revision, status, updated_at FROM pages ORDER BY relative_path, page_id",
+      "SELECT page_id, relative_path, title, digest, revision, status, quiz_worthiness, updated_at FROM pages ORDER BY relative_path, page_id",
     );
     const byPath = new Map(rows.map((row) => [row.relative_path, row]));
     const snapshots = db.all<{ relative_path: string; digest: string; revision: number }>(
@@ -1049,6 +1051,12 @@ function checkPages(paths: VaultPaths): DoctorCheck[] {
     const projectionPages = active.map((row) => {
       const concept = conceptByPath.get(row.relative_path);
       if (!concept) throw new Error(`Page catalog has no matching wiki artifact: ${row.relative_path}`);
+      if (row.quiz_worthiness === "eligible") {
+        if (typeof concept.frontmatter.description !== "string" || !concept.frontmatter.description.trim())
+          throw new Error(`${row.relative_path}: eligible wiki pages require a non-empty OKF description`);
+        if (!okfRenderedText(concept.body).trim())
+          throw new Error(`${row.relative_path}: eligible wiki pages require a non-empty rendered body`);
+      }
       return {
         title: row.title,
         path: row.relative_path,
@@ -1264,6 +1272,37 @@ function checkScheduler(paths: VaultPaths): DoctorCheck {
     db?.close();
   }
 }
+const SIMULATED_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+
+function checkSettings(paths: VaultPaths): DoctorCheck {
+  let db: ScholarDatabase | undefined;
+  try {
+    db = openDatabase(paths, { readOnly: true, initializeSchema: false });
+    const row = db.get<{ readonly value_json: unknown }>("SELECT value_json FROM settings WHERE key = 'simulatedDate'");
+    if (!row) return check("settings", "pass", "No simulated date is active");
+    if (typeof row.value_json !== "string")
+      return check("settings", "fail", "Simulated date setting is not a JSON string");
+    let value: unknown;
+    try {
+      value = JSON.parse(row.value_json);
+    } catch {
+      return check("settings", "fail", "Simulated date setting contains malformed JSON");
+    }
+    if (typeof value !== "string" || !SIMULATED_DATE_PATTERN.test(value))
+      return check("settings", "fail", "Simulated date setting must be a YYYY-MM-DD string");
+    try {
+      if (localDate(value) !== value)
+        return check("settings", "fail", "Simulated date setting is not a valid calendar date");
+    } catch {
+      return check("settings", "fail", "Simulated date setting is not a valid calendar date");
+    }
+    return check("settings", "warn", `Simulated date is active: ${value}`, { simulatedDate: value });
+  } catch (error) {
+    return check("settings", "fail", `Cannot inspect settings: ${errorMessage(error)}`);
+  } finally {
+    db?.close();
+  }
+}
 
 function checkQuizzes(paths: VaultPaths): DoctorCheck {
   let files: string[];
@@ -1382,6 +1421,7 @@ function checkDependencies(paths: VaultPaths): DoctorCheck[] {
     ["git", () => gitDependencyIdentity(paths)],
     ["qmd", () => qmdDependencyIdentity(paths)],
     ["docling", () => doclingDependencyIdentity(paths)],
+    ["qpdf", () => qpdfDependencyIdentity(paths)],
   ];
   for (const [name, probe] of probes) {
     const fingerprint = dependencyFingerprint(name);
@@ -1472,6 +1512,7 @@ export function doctor(explicitPath?: string): DoctorReport {
   const checks = [
     roots,
     ...checkDatabase(paths),
+    checkSettings(paths),
     checkPackets(paths),
     checkWorkflows(paths),
     ...checkPages(paths),

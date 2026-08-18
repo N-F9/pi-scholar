@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, test } from "vitest";
 import { openDatabase, type ScholarDatabase } from "../src/database.js";
-import { QuizConflictError, QuizService } from "../src/quiz.js";
-import { localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
+import { QuizConflictError, QuizService, validateQuizVisibleText } from "../src/quiz.js";
+import { type Clock, localDate, SchedulerService, ValidationError } from "../src/scheduler.js";
+import { parseWikiBodySections, parseWikiDocumentSections } from "../src/wiki-sections.js";
 
 const LEARNING_WIKI_ROOT = mkdtempSync(join(tmpdir(), "pi-scholar-learning-"));
-const PAGE_MARKDOWN = `${[
+const PAGE_BODY = `${[
   "# Part",
   "section text",
   "# A",
@@ -19,15 +20,23 @@ const PAGE_MARKDOWN = `${[
   "# Later",
   "later section text",
 ].join("\n")}\n`;
+function pageDocument(pageId: string, body: string): string {
+  return `---\ntype: note\nid: ${pageId}\ntitle: ${pageId}\ndescription: ${pageId} description\n---\n${body}`;
+}
+function syntheticPagePath(pageId: string): string {
+  return `fixture-${createHash("sha256").update(pageId).digest("hex").slice(0, 12)}.md`;
+}
+const PAGE_MARKDOWN = pageDocument("p1", PAGE_BODY);
 afterAll(() => rmSync(LEARNING_WIKI_ROOT, { recursive: true, force: true }));
 
-function addPage(db: ScholarDatabase, pageId: string, markdown = PAGE_MARKDOWN): void {
-  writeFileSync(join(LEARNING_WIKI_ROOT, `${pageId}.md`), markdown);
-  const digest = createHash("sha256").update(markdown).digest("hex");
+function addPage(db: ScholarDatabase, pageId: string, markdown = PAGE_BODY): void {
+  const document = markdown.startsWith("---\n") ? markdown : pageDocument(pageId, markdown);
+  writeFileSync(join(LEARNING_WIKI_ROOT, syntheticPagePath(pageId)), document);
+  const digest = createHash("sha256").update(document).digest("hex");
   const now = new Date().toISOString();
   db.run(
     "INSERT INTO pages (page_id, relative_path, title, digest, revision, status, quiz_worthiness, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'active', 'eligible', ?, ?)",
-    [pageId, `${pageId}.md`, pageId, digest, now, now],
+    [pageId, syntheticPagePath(pageId), pageId, digest, now, now],
   );
 }
 
@@ -50,6 +59,390 @@ function question(pageId: string, prompt = "Explain the page") {
     sourceRefs: [],
   };
 }
+test("due eligibility uses the persisted timezone for both day and due timestamps", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "timezone-page");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("America/Los_Angeles"),
+    new Date().toISOString(),
+  ]);
+  const scheduler = new SchedulerService(db);
+  scheduler.ensurePageLearning("timezone-page");
+  db.run("UPDATE page_learning SET due_at = ? WHERE page_id = ?", ["2026-08-13T00:30:00.000Z", "timezone-page"]);
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-12", false).map((page) => page.pageId),
+    ["timezone-page"],
+  );
+  assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
+  db.close();
+});
+test("day-scale reviews stay on the intended local date across DST", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "dst-page");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("America/New_York"),
+    new Date().toISOString(),
+  ]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", ["dst-quiz", "2026-03-07"]);
+  const scheduler = new SchedulerService(db);
+  const reviewedAt = "2026-03-08T04:30:00.000Z";
+  scheduler.ensurePageLearning("dst-page", reviewedAt);
+  scheduler.transitionPage("dst-page", "Again", reviewedAt, {
+    quizId: "dst-quiz",
+    submissionId: "dst-submission",
+    revision: 1,
+  });
+
+  const learning = scheduler.getPageLearning("dst-page");
+  assert.equal(localDate(learning.dueAt, "America/New_York"), "2026-03-08");
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-03-08", false).map((page) => page.pageId),
+    ["dst-page"],
+  );
+  db.close();
+});
+test("day-scale reviews advance past skipped civil dates", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "skipped-date-page");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("Pacific/Apia"),
+    new Date().toISOString(),
+  ]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "skipped-date-quiz",
+    "2011-12-29",
+  ]);
+  const scheduler = new SchedulerService(db);
+  const reviewedAt = "2011-12-29T22:00:00.000Z";
+  scheduler.ensurePageLearning("skipped-date-page", reviewedAt);
+  scheduler.transitionPage("skipped-date-page", "Again", reviewedAt, {
+    quizId: "skipped-date-quiz",
+    submissionId: "skipped-date-submission",
+    revision: 1,
+  });
+
+  const learning = scheduler.getPageLearning("skipped-date-page");
+  assert.equal(localDate(learning.dueAt, "Pacific/Apia"), "2011-12-31");
+  assert.deepEqual(
+    scheduler.eligiblePages("2011-12-31", false).map((page) => page.pageId),
+    ["skipped-date-page"],
+  );
+  db.close();
+});
+test("FSRS learning and relearning use day-scale intervals for every rating", () => {
+  const { db, scheduler } = setup();
+  addPage(db, "p3");
+  addPage(db, "p4");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("UTC"),
+    new Date().toISOString(),
+  ]);
+  const reviewedAt = "2026-08-20T12:00:00.000Z";
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "daily-fsrs-quiz",
+    "2026-08-20",
+  ]);
+  const cases = [
+    ["p1", "Again", 1, "2026-08-21"],
+    ["p2", "Hard", 2, "2026-08-22"],
+    ["p3", "Good", 3, "2026-08-23"],
+    ["p4", "Easy", 8, "2026-08-28"],
+  ] as const;
+
+  for (const [pageId, rating, expectedDays, expectedDate] of cases) {
+    scheduler.ensurePageLearning(pageId, reviewedAt);
+    const review = scheduler.transitionPage(pageId, rating, reviewedAt, {
+      quizId: "daily-fsrs-quiz",
+      submissionId: "daily-fsrs-submission",
+      revision: 1,
+    });
+    const learning = scheduler.getPageLearning(pageId);
+    assert.equal(learning.fsrsState, "Review");
+    assert.equal(learning.scheduledDays, expectedDays);
+    assert.equal(localDate(learning.dueAt, "UTC"), expectedDate);
+    assert.equal((review.stateAfter as { learning_steps: number }).learning_steps, 0);
+  }
+
+  const relearnedAt = "2026-08-28T12:00:00.000Z";
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "daily-fsrs-relearning-quiz",
+    "2026-08-28",
+  ]);
+  scheduler.transitionPage("p4", "Again", relearnedAt, {
+    quizId: "daily-fsrs-relearning-quiz",
+    submissionId: "daily-fsrs-relearning-submission",
+    revision: 1,
+  });
+  const relearned = scheduler.getPageLearning("p4");
+  assert.equal(relearned.fsrsState, "Review");
+  assert.equal(relearned.scheduledDays, 1);
+  assert.equal(localDate(relearned.dueAt, "UTC"), "2026-08-29");
+  assert.equal(relearned.lapses, 1);
+  db.close();
+});
+test("injected learning clocks stamp due, quiz, and FSRS writes consistently", () => {
+  const { db } = setup();
+  const instant = "2026-08-15T12:00:00.000Z";
+  const clock: Clock = { now: () => new Date(instant) };
+  const scheduler = new SchedulerService(db, undefined, clock);
+  scheduler.ensurePageLearning("p1");
+  const learning = scheduler.getPageLearning("p1");
+  assert.equal(learning.initialDueAt, instant);
+  assert.equal(learning.createdAt, instant);
+  assert.equal(learning.updatedAt, instant);
+
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler, clock);
+  const generated = quiz.createDailyQuiz({
+    date: "2026-08-15",
+    selectedPageIds: ["p1"],
+    questionSpecs: [question("p1")],
+  });
+  assert.equal(generated.generatedAt, instant);
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({
+    date: generated.date,
+    revision: generated.revision,
+    answers: { [questionId]: "answer" },
+  });
+  assert.equal(
+    db.get<{ saved_at: string }>("SELECT saved_at FROM quiz_answers WHERE quiz_id = ?", generated.quizId)?.saved_at,
+    instant,
+  );
+  const sealed = quiz.sealSubmission({ date: generated.date, revision: draft.revision });
+  assert.equal(sealed.submittedAt, instant);
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  const settled = quiz.settleGrade({
+    date: sealed.date,
+    revision: sealed.revision,
+    submissionId: "clock-submission",
+    questions: [{ questionId, feedback: "Good." }],
+    pages: [{ pageId: "p1", rating: "Good", evidence: [evidence.reference] }],
+  });
+  assert.equal(settled.pages[0]!.gradedAt, instant);
+  assert.equal(
+    db.get<{ graded_at: string }>("SELECT graded_at FROM question_results WHERE quiz_id = ?", sealed.quizId)?.graded_at,
+    instant,
+  );
+  assert.equal(
+    db.get<{ reviewed_at: string }>("SELECT reviewed_at FROM page_reviews WHERE quiz_id = ?", sealed.quizId)
+      ?.reviewed_at,
+    instant,
+  );
+  assert.equal(scheduler.getPageLearning("p1").lastReviewAt, instant);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", sealed.quizId).length, 1);
+  db.close();
+});
+test("section parsers keep headed preambles and exclude OKF frontmatter", () => {
+  const body = "Meaningful preamble.\n\n# Heading\n\nHeading text.\n";
+  const document = pageDocument("parser", body);
+  const bodySections = parseWikiBodySections(body, "parser");
+  assert.deepEqual(
+    bodySections.map((section) => ({ anchor: section.anchor, heading: section.heading })),
+    [
+      { anchor: "", heading: undefined },
+      { anchor: "#heading", heading: "Heading" },
+    ],
+  );
+  const commentPreambleSections = parseWikiBodySections(
+    "<!-- comment-only -->\n\n# Heading\n\nHeading text.\n",
+    "parser",
+  );
+  assert.deepEqual(
+    commentPreambleSections.map((section) => section.anchor),
+    ["#heading"],
+  );
+  assert.deepEqual(parseWikiBodySections("<!-- comment-only -->\n", "parser"), []);
+  const headinglessSections = parseWikiBodySections("Only page text.\n", "parser");
+  assert.deepEqual(
+    headinglessSections.map((section) => ({ anchor: section.anchor, heading: section.heading })),
+    [{ anchor: "", heading: undefined }],
+  );
+  const documentSections = parseWikiDocumentSections(document, "parser");
+  assert.equal(documentSections.length, 2);
+  assert.equal(
+    document.slice(documentSections[0]!.startOffset, documentSections[0]!.endOffset),
+    "Meaningful preamble.\n\n",
+  );
+  assert.equal(
+    document.slice(documentSections[1]!.startOffset, documentSections[1]!.endOffset),
+    "# Heading\n\nHeading text.\n",
+  );
+  assert.equal(documentSections[0]!.startOffset, document.indexOf(body));
+  assert.equal(documentSections[0]!.textDigest, createHash("sha256").update("Meaningful preamble.\n\n").digest("hex"));
+  assert.equal(
+    document.slice(documentSections[0]!.startOffset, documentSections[0]!.endOffset).includes("description"),
+    false,
+  );
+});
+
+test("section parser recognizes Setext headings and keeps their boundaries", () => {
+  const setextBody = "Topic\n=====\nTopic evidence.\n\nNext\n-----\nNext evidence.\n";
+  const sections = parseWikiBodySections(setextBody, "setext");
+  assert.deepEqual(
+    sections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#topic", heading: "Topic" },
+      { anchor: "#next", heading: "Next" },
+    ],
+  );
+  assert.equal(setextBody.slice(sections[0]!.startOffset, sections[0]!.endOffset), "Topic\n=====\nTopic evidence.\n\n");
+  assert.equal(setextBody.slice(sections[1]!.startOffset, sections[1]!.endOffset), "Next\n-----\nNext evidence.\n");
+
+  const mixedBody = "Topic\n=====\nSetext evidence.\n\n# Topic\nATX evidence.\n";
+  assert.deepEqual(
+    parseWikiBodySections(mixedBody, "mixed").map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#topic", heading: "Topic" },
+      { anchor: "#topic-1", heading: "Topic" },
+    ],
+  );
+  const inlineSetextSections = parseWikiBodySections(
+    "[Topic](https://example.test)\n=====\nSetext evidence.\n",
+    "inline-setext",
+  );
+  assert.deepEqual(
+    inlineSetextSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [{ anchor: "#topic", heading: "Topic" }],
+  );
+  const richAtxSections = parseWikiBodySections("# **ATX** [link](x) `code`\n\nATX evidence.\n", "rich-atx");
+  assert.deepEqual(
+    richAtxSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [{ anchor: "#atx-link-code", heading: "ATX link code" }],
+  );
+  const imageAtxBody = "# ![Architecture](diagram.png)\n\nImage evidence.\n\n# Following\nFollowing evidence.\n";
+  const imageAtxSections = parseWikiBodySections(imageAtxBody, "image-atx");
+  assert.deepEqual(
+    imageAtxSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#image-architecture", heading: "[Image: Architecture]" },
+      { anchor: "#following", heading: "Following" },
+    ],
+  );
+  assert.equal(
+    imageAtxBody.slice(imageAtxSections[0]!.startOffset, imageAtxSections[0]!.endOffset),
+    "# ![Architecture](diagram.png)\n\nImage evidence.\n\n",
+  );
+
+  const imageSetextBody =
+    "![Architecture](diagram.png)\n===\nSetext image evidence.\n\nFollowing\n---\nFollowing evidence.\n";
+  const imageSetextSections = parseWikiBodySections(imageSetextBody, "image-setext");
+  assert.deepEqual(
+    imageSetextSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "#image-architecture", heading: "[Image: Architecture]" },
+      { anchor: "#following", heading: "Following" },
+    ],
+  );
+  assert.equal(
+    imageSetextBody.slice(imageSetextSections[0]!.startOffset, imageSetextSections[0]!.endOffset),
+    "![Architecture](diagram.png)\n===\nSetext image evidence.\n\n",
+  );
+
+  const imageReferenceBody =
+    "# ![Architecture][architecture]\n\n[architecture]: diagram.png\n\nReference image evidence.\n";
+  assert.deepEqual(
+    parseWikiBodySections(imageReferenceBody, "image-reference").map((item) => ({
+      anchor: item.anchor,
+      heading: item.heading,
+    })),
+    [{ anchor: "#image-architecture", heading: "[Image: Architecture]" }],
+  );
+  assert.deepEqual(
+    parseWikiBodySections("# ![](diagram.png)\n\nFallback image evidence.\n", "image-fallback").map((item) => ({
+      anchor: item.anchor,
+      heading: item.heading,
+    })),
+    [{ anchor: "#image-illustration", heading: "[Image: illustration]" }],
+  );
+
+  const hardBreakSetext = "One\\\nTwo\n===\nEvidence.\n";
+  assert.deepEqual(
+    parseWikiBodySections(hardBreakSetext, "hard-break").map((item) => ({
+      anchor: item.anchor,
+      heading: item.heading,
+    })),
+    [{ anchor: "#one-two", heading: "One\nTwo" }],
+  );
+
+  const indentedBody = "Preamble.\n\n  # Heading\n\nBody.\n";
+  const indentedSections = parseWikiBodySections(indentedBody, "indented");
+  assert.equal(indentedBody.slice(indentedSections[0]!.startOffset, indentedSections[0]!.endOffset), "Preamble.\n\n");
+  assert.equal(indentedBody.slice(indentedSections[1]!.startOffset), "  # Heading\n\nBody.\n");
+
+  const crBody = "# First\rFirst evidence.\r# Second\rSecond evidence.\r";
+  const crSections = parseWikiBodySections(crBody, "cr");
+  assert.equal(crBody.slice(crSections[0]!.startOffset, crSections[0]!.endOffset), "# First\rFirst evidence.\r");
+  assert.equal(crBody.slice(crSections[1]!.startOffset), "# Second\rSecond evidence.\r");
+
+  const fencedBody = "```md\nIgnored\n-----\nIgnored body.\n```\nActual\n=====\nActual evidence.\n";
+  const fencedSections = parseWikiBodySections(fencedBody, "fenced");
+  assert.deepEqual(
+    fencedSections.map((item) => ({ anchor: item.anchor, heading: item.heading })),
+    [
+      { anchor: "", heading: undefined },
+      { anchor: "#actual", heading: "Actual" },
+    ],
+  );
+  assert.equal(
+    fencedBody.slice(fencedSections[0]!.startOffset, fencedSections[0]!.endOffset),
+    "```md\nIgnored\n-----\nIgnored body.\n```\n",
+  );
+  assert.equal(fencedBody.slice(fencedSections[1]!.startOffset), "Actual\n=====\nActual evidence.\n");
+});
+
+test("headingless eligible pages publish page evidence and authorize page-only readings", () => {
+  const { db, scheduler, date } = setup();
+  addPage(db, "headingless", pageDocument("headingless", "Only page-level exposition.\n"));
+  ensureDue(scheduler, ["headingless"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["headingless"],
+    questionSpecs: [question("headingless")],
+  });
+  const evidence = quiz.gradingEvidence(generated);
+  assert.deepEqual(
+    evidence.map((item) => item.anchor),
+    [""],
+  );
+  assert.equal(evidence[0]?.heading, undefined);
+  assert.equal(evidence[0]?.excerpt.includes("---"), false);
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const authorized = quiz.gradingEvidence(sealed)[0]!;
+  const settled = quiz.settleGrade({
+    date,
+    revision: sealed.revision,
+    submissionId: "headingless-submission",
+    questions: [{ questionId, feedback: "Good explanation." }],
+    pages: [
+      {
+        pageId: "headingless",
+        rating: "Good",
+        evidence: [authorized.reference],
+        readings: [{ pageId: "headingless", anchor: "" }],
+      },
+    ],
+  });
+  assert.equal(settled.pages[0]!.readings[0]!.anchor, "");
+  assert.equal(quiz.readingHref({ pageId: "headingless", anchor: "" }), `wiki/${syntheticPagePath("headingless")}`);
+  db.close();
+});
+test("grading rejects malformed stored evidence paths without a live vault", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({ date, selectedPageIds: ["p1"], questionSpecs: [question("p1")] });
+  db.run("UPDATE quiz_evidence SET relative_path = ? WHERE quiz_id = ?", ["../escape.md", generated.quizId]);
+  const snapshotOnly = new QuizService(db, undefined, scheduler);
+  assert.throws(() => snapshotOnly.gradingEvidence(generated), ValidationError);
+  db.close();
+});
 
 test("page prerequisites gate due selection until every prerequisite is in Review and reject cycles", () => {
   const { db, scheduler, date } = setup();
@@ -76,6 +469,39 @@ test("page prerequisites gate due selection until every prerequisite is in Revie
   assert.throws(() => scheduler.setPrerequisites("p1", ["p2"]), ValidationError);
   assert.throws(() => scheduler.setPrerequisites("p1", ["p1"]), ValidationError);
   assert.throws(() => scheduler.setPrerequisites("p2", ["missing-page"]), ValidationError);
+  db.close();
+});
+test("an Again rating does not satisfy a prerequisite", () => {
+  const { db, scheduler } = setup();
+  ensureDue(scheduler, ["p1", "p2"], "2026-08-20");
+  scheduler.setPrerequisites("p2", ["p1"]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "failed-prerequisite-quiz",
+    "2026-08-20",
+  ]);
+  scheduler.transitionPage("p1", "Again", "2026-08-20T12:00:00.000Z", {
+    quizId: "failed-prerequisite-quiz",
+    submissionId: "failed-prerequisite-submission",
+    revision: 1,
+  });
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-21", false).map((page) => page.pageId),
+    ["p1"],
+  );
+
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "passed-prerequisite-quiz",
+    "2026-08-21",
+  ]);
+  scheduler.transitionPage("p1", "Good", "2026-08-21T12:00:00.000Z", {
+    quizId: "passed-prerequisite-quiz",
+    submissionId: "passed-prerequisite-submission",
+    revision: 1,
+  });
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-21", false).map((page) => page.pageId),
+    ["p2"],
+  );
   db.close();
 });
 
@@ -276,14 +702,14 @@ test("grading snapshots page sections directly and settles one FSRS transition p
       {
         pageId: "p1",
         rating: "Good" as const,
-        feedback: "P1 feedback",
+        feedback: "First page feedback",
         evidence: [authorized.reference],
         readings: [{ pageId: "p1", anchor: authorized.anchor }],
       },
       {
         pageId: "p2",
         rating: "Good" as const,
-        feedback: "P2 feedback",
+        feedback: "Second page feedback",
         evidence: [authorizedP2.reference],
         readings: [{ pageId: "p2", anchor: authorizedP2.anchor }],
       },
@@ -296,9 +722,9 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(settled.pages[0]!.evidence.length, 1);
   assert.equal(settled.pages[0]!.readings.length, 1);
   const sheet = quiz.renderSheet(settled.quiz, undefined, settled.questions, settled.pages);
-  const p1Feedback = sheet.indexOf("P1 feedback");
+  const p1Feedback = sheet.indexOf("First page feedback");
   const p1Reading = sheet.indexOf(`- [Reading 1](${quiz.readingHref(settled.pages[0]!.readings[0]!)})`);
-  const p2Feedback = sheet.indexOf("P2 feedback");
+  const p2Feedback = sheet.indexOf("Second page feedback");
   const p2Reading = sheet.indexOf(`- [Reading 1](${quiz.readingHref(settled.pages[1]!.readings[0]!)})`);
   assert.ok(p1Feedback >= 0 && p1Reading > p1Feedback);
   assert.ok(p2Feedback > p1Reading && p2Reading > p2Feedback);
@@ -316,6 +742,98 @@ test("grading snapshots page sections directly and settles one FSRS transition p
   assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [generated.quizId]).length, 2);
   assert.equal(scheduler.getPageLearning("p1").reps, 1);
   assert.equal(scheduler.getPageLearning("p2").reps, 1);
+  db.close();
+});
+
+test("persisted grading keeps page reviews in durable question order", () => {
+  const { db, scheduler, date } = setup();
+  const pageIds = ["page-b", "page-a"] as const;
+  for (const pageId of pageIds) addPage(db, pageId);
+  const quiz = new QuizService(
+    db,
+    { wiki: LEARNING_WIKI_ROOT, quizzesRoot: join(LEARNING_WIKI_ROOT, "quizzes") },
+    scheduler,
+  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: pageIds,
+    questionSpecs: pageIds.map((pageId, index) => question(pageId, `Explain page ${index + 1}`)),
+  });
+  const draft = quiz.saveDraft({
+    date,
+    revision: generated.revision,
+    answers: Object.fromEntries(generated.questions.map((item) => [item.questionId, "answer"])),
+  });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed);
+  const grade = {
+    requestId: "page-order-request",
+    date,
+    revision: sealed.revision,
+    submissionId: "page-order-submission",
+    questions: generated.questions.map((item, index) => ({
+      questionId: item.questionId,
+      feedback: `Question ${index + 1} feedback`,
+    })),
+    pages: pageIds.map((pageId, index) => {
+      const authorized = evidence.find((item) => item.pageId === pageId)!;
+      return {
+        pageId,
+        rating: "Good" as const,
+        feedback: `${index === 0 ? "First" : "Second"} page feedback`,
+        evidence: [authorized.reference],
+        readings: [{ pageId, anchor: authorized.anchor }],
+      };
+    }),
+  };
+
+  const settled = quiz.settleGrade(grade);
+  const storedSheet = readFileSync(settled.quiz.sheetPath!, "utf8");
+  assert.equal(quiz.parseSheet(storedSheet).quizId, generated.quizId);
+  assert.deepEqual(
+    settled.pages.map((page) => page.pageId),
+    pageIds,
+  );
+  assert.ok(storedSheet.indexOf("First page feedback") < storedSheet.indexOf("Second page feedback"));
+
+  const replay = quiz.settleGrade(grade);
+  assert.deepEqual(
+    replay.pages.map((page) => page.pageId),
+    pageIds,
+  );
+  db.close();
+});
+
+test("grading rejects generated reading targets that expose page IDs before persistence", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({ date, selectedPageIds: ["p1"], questionSpecs: [question("p1")] });
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  db.run("UPDATE pages SET relative_path = ? WHERE page_id = ?", ["p1.md", "p1"]);
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        date,
+        revision: sealed.revision,
+        submissionId: "generated-reading-target",
+        questions: [{ questionId, feedback: "Valid feedback." }],
+        pages: [
+          {
+            pageId: "p1",
+            rating: "Good",
+            evidence: [evidence.reference],
+            readings: [{ pageId: "p1", anchor: evidence.anchor }],
+          },
+        ],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   db.close();
 });
 
@@ -338,7 +856,7 @@ test("grading rejects fabricated or stale direct evidence before page transition
   assert.throws(() => quiz.settleGrade(makeGrade("fabricated-reference")), ValidationError);
   assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
   writeFileSync(
-    join(LEARNING_WIKI_ROOT, "p1.md"),
+    join(LEARNING_WIKI_ROOT, syntheticPagePath("p1")),
     PAGE_MARKDOWN.replace("# Part\nsection text", "# Part\nchanged section text"),
   );
   assert.throws(() => quiz.settleGrade(makeGrade(authorized.reference)), ValidationError);
@@ -406,5 +924,336 @@ test("quiz publishes more than two synthesis questions", () => {
   assert.equal(generated.status, "open");
   assert.equal(generated.questions.length, 3);
   assert.ok(generated.questions.every((item) => item.pages.length === 2));
+  db.close();
+});
+
+test("quiz rejects exact supplied hidden metadata and allows unrelated UUIDs", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const pageDigest = db.get<{ digest: string }>("SELECT digest FROM pages WHERE page_id = ?", ["p1"])!.digest;
+  const opaqueId = randomUUID();
+  const sourceReference = `${randomUUID()}:0`;
+  assert.throws(
+    () => validateQuizVisibleText(`x${opaqueId}`, [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x${sourceReference}`, [{ value: sourceReference, match: "substring" }]),
+    ValidationError,
+  );
+  const managedImage = `pi-scholar://source/${randomUUID()}/attachment/${"a".repeat(64)}`;
+  assert.throws(() => validateQuizVisibleText(`![image](${managedImage})`, []), ValidationError);
+  const sourceId = sourceReference.slice(0, -2);
+  const hiddenSourceId = [{ value: sourceId, match: "substring" }] as const;
+  assert.doesNotThrow(() => validateQuizVisibleText(`source ${randomUUID()}`, []));
+  assert.throws(() => validateQuizVisibleText(`source ${sourceId}`, hiddenSourceId), ValidationError);
+  assert.throws(
+    () => validateQuizVisibleText(`$${sourceId.replaceAll("-", "\\text{-}")}$`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x $$$${sourceId.replaceAll("-", "\\text{-}")}$$$`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(`[reference](https://example.test/${sourceId.replaceAll("-", "%2D")})`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`\u202e${[...sourceId].reverse().join("")}\u202c`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`&#x202e;${[...sourceId].reverse().join("")}&#x202c;`, hiddenSourceId),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace("-", "\\-"), [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(opaqueId.replace("-", "-\u200b"), [{ value: opaqueId, match: "substring" }]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-**$2**"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)/u, "$1-~~$2~~"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(opaqueId.replace(/^([^-]+)-([^-]+)-/u, "$1-<em>$2</em>-"), [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      validateQuizVisibleText(`![${opaqueId.replace("-", "\\-")}][img]\n\n[img]: image.png`, [
+        { value: opaqueId, match: "substring" },
+      ]),
+    ValidationError,
+  );
+  assert.throws(
+    () => validateQuizVisibleText(`x${pageDigest}`, [{ value: pageDigest, match: "substring" }]),
+    ValidationError,
+  );
+  assert.doesNotThrow(() => validateQuizVisibleText("xp1", [{ value: "p1", match: "boundary" }]));
+  const storedCriterion = "Stored **grading crit\u00e9rion &amp; evidence**";
+  const renderedCriterion = "Stored grading crit\u00e9rion & evidence";
+  const softBreakCriterion = renderedCriterion.replace("grading ", "grading\n");
+  const decomposedCriterion = renderedCriterion.normalize("NFD");
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", "Explain p1")],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [
+          {
+            ...question("p1"),
+            kind: "multiple-choice",
+            choices: ["p1", "other"],
+          },
+        ],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [question("p1", `Explain x${pageDigest}`)],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.createDailyQuiz({
+        date,
+        selectedPageIds: ["p1"],
+        questionSpecs: [{ ...question("p1", "Explain evidence-reference"), sourceRefs: ["evidence-reference"] }],
+      }),
+    ValidationError,
+  );
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        ...question("p1"),
+        pages: [{ pageId: "p1", criterion: storedCriterion, weight: 1 }],
+        sourceRefs: ["evidence-reference"],
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  assert.throws(
+    () =>
+      quiz.saveDraft({
+        date,
+        revision: generated.revision,
+        answers: { [questionId]: `page-${questionId.toUpperCase()}` },
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () => quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "p1" } }),
+    ValidationError,
+  );
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "valid answer" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const evidence = quiz.gradingEvidence(sealed)[0]!;
+  const requestId = randomUUID();
+  const requestGrade = {
+    date,
+    revision: sealed.revision,
+    requestId,
+    submissionId: "hidden-request-feedback",
+    questions: [{ questionId, feedback: `x${requestId}` }],
+    pages: [{ pageId: "p1", rating: "Good" as const, evidence: [evidence.reference] }],
+  };
+  assert.throws(() => quiz.settleGrade(requestGrade), ValidationError);
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        questions: [{ questionId, feedback: "visible feedback" }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: `x${requestId}` }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        date,
+        revision: sealed.revision,
+        submissionId: "hidden-feedback",
+        questions: [{ questionId, feedback: "p1" }],
+        pages: [{ pageId: "p1", rating: "Good", evidence: [evidence.reference] }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-criterion-feedback",
+        questions: [{ questionId, feedback: storedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-letter-adjacent-criterion-feedback",
+        questions: [{ questionId, feedback: `x${storedCriterion}` }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-rendered-criterion-feedback",
+        questions: [{ questionId, feedback: renderedCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-soft-break-criterion-feedback",
+        questions: [{ questionId, feedback: softBreakCriterion }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      quiz.settleGrade({
+        ...requestGrade,
+        requestId: randomUUID(),
+        submissionId: "hidden-decomposed-criterion-feedback",
+        questions: [{ questionId, feedback: `x${decomposedCriterion}` }],
+        pages: [{ ...requestGrade.pages[0]!, feedback: "visible feedback" }],
+      }),
+    ValidationError,
+  );
+  assert.equal(db.all("SELECT * FROM question_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_results WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  assert.equal(db.all("SELECT * FROM page_reviews WHERE quiz_id = ?", [sealed.quizId]).length, 0);
+  db.close();
+});
+
+test("quiz rejects supplied page UUIDs while allowing unrelated UUID answers", () => {
+  const { db, scheduler, date } = setup();
+  const pageId = randomUUID();
+  addPage(db, pageId);
+  ensureDue(scheduler, [pageId], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: [pageId],
+    questionSpecs: [
+      {
+        kind: "free-response",
+        prompt: "Explain the page",
+        pages: [{ pageId, criterion: "Identify the central idea", weight: 1 }],
+        sourceRefs: [],
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  assert.throws(
+    () =>
+      quiz.saveDraft({
+        date,
+        revision: generated.revision,
+        answers: { [questionId]: `x${pageId}` },
+      }),
+    ValidationError,
+  );
+  assert.doesNotThrow(() =>
+    quiz.saveDraft({
+      date,
+      revision: generated.revision,
+      answers: { [questionId]: `x${randomUUID()}` },
+    }),
+  );
+  db.close();
+});
+
+test("quiz keeps permitted identity comments and does not block answer-key values", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [
+      {
+        kind: "multiple-choice",
+        prompt: "Choose the correct statement",
+        choices: ["correct", "incorrect"],
+        pages: [{ pageId: "p1", criterion: "Explain the page", weight: 1 }],
+        sourceRefs: [],
+        answerKey: "correct",
+      },
+    ],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  const draft = quiz.saveDraft({ date, revision: generated.revision, answers: { [questionId]: "correct" } });
+  const sealed = quiz.sealSubmission({ date, revision: draft.revision });
+  const sheet = quiz.renderSheet(sealed, { [questionId]: "correct" });
+  assert.match(sheet, new RegExp(`pi-scholar:quiz format=1 id=${generated.quizId} revision=`, "u"));
+  assert.match(sheet, new RegExp(`pi-scholar:question id=${questionId}`, "u"));
+  assert.match(sheet, /correct/u);
+  db.close();
+});
+
+test("quiz rejects quiz and question identifiers outside identity comments", () => {
+  const { db, scheduler, date } = setup();
+  ensureDue(scheduler, ["p1"], date);
+  const quiz = new QuizService(db, { wiki: LEARNING_WIKI_ROOT }, scheduler);
+  const generated = quiz.createDailyQuiz({
+    date,
+    selectedPageIds: ["p1"],
+    questionSpecs: [question("p1")],
+  });
+  const questionId = generated.questions[0]!.questionId;
+  db.run("UPDATE quiz_questions SET prompt = ? WHERE question_id = ?", [generated.quizId, questionId]);
+  assert.throws(() => quiz.parseSheet(quiz.renderSheet(quiz.get(date)!)), ValidationError);
+  db.run("UPDATE quiz_questions SET prompt = ? WHERE question_id = ?", [questionId, questionId]);
+  assert.throws(() => quiz.parseSheet(quiz.renderSheet(quiz.get(date)!)), ValidationError);
   db.close();
 });

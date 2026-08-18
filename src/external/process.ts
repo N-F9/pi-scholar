@@ -168,12 +168,18 @@ export function runChild(executable: string, args: readonly string[], options: C
     timedOut = true;
     const pid = child.pid;
     terminateTree(pid, "SIGTERM");
-    killTimer = setTimeout(() => terminateTree(pid, "SIGKILL"), 1_000);
+    killTimer = setTimeout(() => {
+      killTimer = undefined;
+      terminateTree(pid, "SIGKILL");
+    }, 1_000);
     killTimer.unref();
   }, timeoutMs);
   const clearTimers = (): void => {
     clearTimeout(timer);
+    if (!killTimer) return;
     clearTimeout(killTimer);
+    killTimer = undefined;
+    if (timedOut) terminateTree(child.pid, "SIGKILL");
   };
   child.once("error", (error) => {
     clearTimers();

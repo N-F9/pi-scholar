@@ -3,6 +3,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -293,6 +294,7 @@ export function atomicWriteFile(path: string, data: string | Uint8Array, mode = 
   const temporary = join(directory, `.${randomUUID()}.tmp`);
   const fd = openSync(temporary, "wx", mode);
   try {
+    fchmodSync(fd, mode);
     writeFileSync(fd, data);
     fsyncSync(fd);
     closeSync(fd);
@@ -371,7 +373,7 @@ function seedDefaultSettings(paths: VaultPaths): void {
     transaction(db, () => {
       const now = new Date().toISOString();
       const defaults: readonly [string, string][] = [
-        ["initializationEnabled", "true"],
+        ["maintenanceEnabled", "true"],
         ["timezone", JSON.stringify("local")],
         ["port", String(DEFAULT_VAULT_PORT)],
         ["host", JSON.stringify(DEFAULT_VAULT_HOST)],

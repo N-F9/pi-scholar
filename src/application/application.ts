@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import type {
   DoctorReport,
   ExtractContext,
+  ExtractContextRequest,
   ExtractFailureRecord,
+  ExtractProgressEvent,
+  ExtractProgressPhase,
   ExtractPublicationInput,
   ExtractPublicationResult,
   GradeSettlementInput,
@@ -12,15 +15,16 @@ import type {
   GradingResult,
   HealthResult,
   IngestContext,
+  IngestContextRequest,
   IngestSourceChunk,
   IngestSourceContext,
   LintContext,
   PageLearningRecord,
   PageRecord,
   PreparedAdmission,
-  PublicQuizDetailRecord,
   PublicQuizRecord,
   PublicSourceRecord,
+  PublicWorkflowRecord,
   QuizAnswerInput,
   QuizCandidateRecord,
   QuizContext,
@@ -33,7 +37,10 @@ import type {
   QuizQuestionProposal,
   QuizQuestionResultRecord,
   QuizReadingRecord,
+  QuizRecommendations,
   QuizRecord,
+  QuizResult,
+  QuizSubmissionResult,
   SettingsFacts,
   SettingsRecord,
   SettingsUpdateRequest,
@@ -49,6 +56,7 @@ import type {
   WikiIssueUpdateRequest,
   WikiPageLearningProjection,
   WikiPageResult,
+  WorkflowListResult,
   WorkflowRecord,
 } from "../contracts.js";
 import { openDatabase, type ScholarDatabase, transaction } from "../database.js";
@@ -62,6 +70,7 @@ import {
   safePush,
 } from "../external/git.js";
 import { qmdRefresh, qmdScopeCheck, qmdSearch } from "../external/qmd.js";
+import { managedImageUri, markdownImages } from "../markdown.js";
 import {
   okfCitationText,
   okfFootnoteLabels,
@@ -70,8 +79,18 @@ import {
   removeOkfFootnoteDefinitions,
 } from "../okf.js";
 import { evidenceReference, QuizConflictError, QuizService, type ReadingLink } from "../quiz.js";
-import { localDate, RevisionConflictError, SchedulerService, ValidationError } from "../scheduler.js";
 import {
+  type Clock,
+  localDate,
+  localNoon,
+  persistedTimezone,
+  RevisionConflictError,
+  SchedulerService,
+  SYSTEM_CLOCK,
+  ValidationError,
+} from "../scheduler.js";
+import {
+  type InboxEntry,
   type SourceStageRequest as MechanicsSourceStageRequest,
   type SourceAdapters,
   type SourceClaim,
@@ -89,20 +108,25 @@ import {
   withWriterLock,
 } from "../vault.js";
 import { parseWikiMarkdown, type WikiAdapters, WikiService } from "../wiki.js";
-import { parseWikiSections } from "../wiki-sections.js";
+import {
+  hasRenderedEmptyHeading,
+  parseWikiBodySections,
+  parseWikiDocumentSections,
+  stripFirstHeading,
+} from "../wiki-sections.js";
 import {
   BrowserMutationWorker,
   WorkflowCoordinator,
   type WorkflowFinishOptions,
   type WorkflowKind,
   type WorkflowUpdateInput,
+  workflowFailureMessage,
 } from "../workflows.js";
 import {
   asAnswers,
   decodeExtractPublicationInput,
   decodeGrade,
   decodeQuizPublication,
-  decodeReading,
   decodeWikiChangeInput,
   exact,
   isRecord,
@@ -121,7 +145,7 @@ import {
 } from "./grader-binding.js";
 import {
   answersObject,
-  type PublicWorkflowRecord,
+  notesPageHref,
   pageRecord,
   publicQuiz,
   publicQuizDetail,
@@ -132,8 +156,28 @@ import {
   sourceRecord,
 } from "./projections.js";
 
+const EXTRACT_BATCH_SIZE = 3;
+const UUID_SOURCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+class DatabaseBackedClock implements Clock {
+  constructor(
+    private readonly db: ScholarDatabase,
+    private readonly base: Clock,
+  ) {}
+
+  now(): Date {
+    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [
+      "simulatedDate",
+    ]);
+    const value = jsonValue(row?.value_json);
+    if (value === undefined || value === null) return this.base.now();
+    if (typeof value !== "string") throw new ValidationError("simulatedDate is invalid");
+    return localNoon(value, persistedTimezone(this.db));
+  }
+}
+const PENDING_SOURCE_ID = /^pending-[0-9a-f]{32}$/iu;
 export interface ApplicationMutationContext {
   readonly origin?: "browser" | "pi" | "cli" | "internal";
+  readonly developerToolsEnabled?: boolean;
 }
 export interface ApplicationAdapters {
   readonly sources?: SourceAdapters;
@@ -151,11 +195,13 @@ export interface ApplicationOptions {
   readonly commit?: (paths: VaultPaths, subject: string, excludedPaths?: readonly string[]) => GitCheckpointResult;
   readonly push?: (paths: VaultPaths) => GitPushResult;
   readonly version?: string;
+  readonly clock?: Clock;
 }
 export interface ApplicationStatus extends HealthResult {
   readonly settings: SettingsRecord;
-  readonly workflows: readonly WorkflowRecord[];
+  readonly workflows: readonly PublicWorkflowRecord[];
 }
+export type ExtractProgressObserver = (event: ExtractProgressEvent) => void | Promise<void>;
 export interface SourceStageResult {
   readonly source: PublicSourceRecord;
 }
@@ -168,6 +214,7 @@ export interface WikiIssueListResult {
 export interface WikiNoteInput {
   readonly path: string;
   readonly title?: string;
+  readonly description?: string;
   readonly body: string;
   readonly pageId?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
@@ -175,6 +222,7 @@ export interface WikiNoteInput {
 export interface WikiNoteUpdateInput {
   readonly body?: string;
   readonly title?: string;
+  readonly description?: string;
   readonly quizWorthiness?: "eligible" | "skip" | "unknown";
   readonly expectedDigest?: string;
   readonly path?: string;
@@ -219,6 +267,7 @@ function errorMessage(error: unknown): string {
 function extractionResultKey(input: Pick<ExtractPublicationInput, "claimId" | "preparedId" | "digest">): string {
   return `${input.claimId}\u0000${input.preparedId}\u0000${input.digest}`;
 }
+const DAILY_CANDIDATE_DESCRIPTION_BYTES = 1024;
 function boundedUtf8(value: string, maxBytes: number): string {
   let bytes = 0;
   let end = 0;
@@ -230,8 +279,57 @@ function boundedUtf8(value: string, maxBytes: number): string {
   }
   return value.slice(0, end);
 }
+const QUIZ_RECOMMENDATION_LIMIT = 5;
+const QUIZ_GAP_LIMIT = 3;
+const QUIZ_RECOMMENDATION_QUERY_BYTES = 16_384;
+function quizRecommendationQuery(quiz: QuizDetailRecord): string {
+  return boundedUtf8(
+    [
+      ...quiz.questions.flatMap((question) => [question.prompt, ...(question.choices ?? [])]),
+      ...quiz.answers.flatMap((answer) => answer.answer),
+      ...quiz.questionResults.map((result) => result.feedback),
+      ...quiz.pageResults.map((result) => result.feedback),
+    ]
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .join("\n"),
+    QUIZ_RECOMMENDATION_QUERY_BYTES,
+  );
+}
+function sourceIdFilter(
+  value: unknown,
+  options: { readonly pending: boolean; readonly limit?: number },
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new ValidationError("source ID filter must be an array");
+  if (options.limit !== undefined && value.length > options.limit)
+    throw new ValidationError(`source ID filter is limited to ${options.limit} entries`);
+  const ids = value.map((entry) => {
+    if (
+      typeof entry !== "string" ||
+      !(options.pending ? PENDING_SOURCE_ID.test(entry) || UUID_SOURCE_ID.test(entry) : UUID_SOURCE_ID.test(entry))
+    )
+      throw new ValidationError("source ID filter contains a malformed ID");
+    return entry;
+  });
+  if (new Set(ids).size !== ids.length) throw new ValidationError("source ID filter contains duplicates");
+  return ids;
+}
+function safeExtractFilename(value: string): string {
+  const filename = basename(value.replace(/\\/gu, "/"))
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return boundedUtf8(filename || "source", 160);
+}
+function emitExtractProgress(observer: ExtractProgressObserver | undefined, event: ExtractProgressEvent): void {
+  try {
+    const result = observer?.(event);
+    if (result) void Promise.resolve(result).catch(() => undefined);
+  } catch {}
+}
 function mutationFinalizationError(
-  stage: "checkpoint" | "doctor" | "commit" | "projection" | "rollback",
+  stage: "checkpoint" | "doctor" | "commit" | "projection" | "qmd" | "rollback",
   cause: unknown,
   retryable = false,
 ): Error {
@@ -252,7 +350,7 @@ function isAppliedFinalizationFailure(error: unknown): boolean {
 function defaultSourceAdapters(paths: VaultPaths, overrides?: SourceAdapters): SourceAdapters {
   const docling =
     overrides?.docling ??
-    (async ({ originalPath }: { readonly originalPath: string }) => {
+    (async ({ originalPath, mediaType }: { readonly originalPath: string; readonly mediaType?: string }) => {
       const inputRelativePath = relative(paths.workRoot, originalPath).replaceAll("\\", "/");
       const originalMarker = "/original/";
       const marker = inputRelativePath.indexOf(originalMarker);
@@ -261,6 +359,7 @@ function defaultSourceAdapters(paths: VaultPaths, overrides?: SourceAdapters): S
       return convertWithDocling(paths, {
         inputRelativePath,
         outputRelativeDirectory: join(preparedRelativeRoot, "docling-output"),
+        mediaType,
       });
     });
   return { ...overrides, docling };
@@ -307,11 +406,12 @@ function defaultWikiAdapters(paths: VaultPaths, overrides?: WikiAdapters): WikiA
 }
 export class ScholarApplication {
   readonly paths: VaultPaths;
-  readonly db: ScholarDatabase;
-  readonly sources: SourceService;
-  readonly wiki: WikiService;
-  readonly scheduler: SchedulerService;
-  readonly quiz: QuizService;
+  private readonly db: ScholarDatabase;
+  private readonly sources: SourceService;
+  private readonly wiki: WikiService;
+  private readonly scheduler: SchedulerService;
+  private readonly quiz: QuizService;
+  private readonly clock: Clock;
   private readonly workflows: WorkflowCoordinator;
   private readonly worker: BrowserMutationWorker;
   readonly version: string;
@@ -335,13 +435,14 @@ export class ScholarApplication {
     this.paths = typeof input.paths === "string" ? resolveVault(input.paths) : input.paths;
     this.db = input.db ?? openDatabase(this.paths);
     this.ownsDatabase = !input.db;
+    this.clock = new DatabaseBackedClock(this.db, input.clock ?? SYSTEM_CLOCK);
     this.sources =
       input.sourceService ??
       new SourceService(this.db, this.paths, defaultSourceAdapters(this.paths, input.adapters?.sources));
     this.wiki =
       input.wikiService ?? new WikiService(this.db, this.paths, defaultWikiAdapters(this.paths, input.adapters?.wiki));
-    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths);
-    this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler);
+    this.scheduler = input.schedulerService ?? new SchedulerService(this.db, this.paths, this.clock);
+    this.quiz = input.quizService ?? new QuizService(this.db, this.paths, this.scheduler, this.clock);
     this.worker = new BrowserMutationWorker();
     this.version = input.version ?? "0.1.0";
     this.doctorFn = input.doctor ?? doctor;
@@ -353,6 +454,7 @@ export class ScholarApplication {
     operation: () => T | PromiseLike<T>,
     subject: string,
     rollback?: DurableRollback<R>,
+    afterCommit?: () => void | PromiseLike<void>,
   ): Promise<T> {
     return withWriterLock(this.paths, async () => {
       let snapshot: R | undefined;
@@ -373,12 +475,17 @@ export class ScholarApplication {
         let report: DoctorReport;
         try {
           report = this.doctorFn(this.paths.vaultRoot);
-          if (!report.ok) {
-            const error = new Error("doctor checks failed");
-            if (!rollback) throw mutationFinalizationError("doctor", error);
-            throw error;
-          }
         } catch (error) {
+          if (!rollback) throw mutationFinalizationError("doctor", error);
+          throw error;
+        }
+        if (!report.ok) {
+          const failures = report.checks.filter((check) => check.status === "fail");
+          const error = new Error(
+            failures.length > 0
+              ? failures.map((check) => `${check.name}: ${check.message}`).join("; ")
+              : "doctor checks failed",
+          );
           if (!rollback) throw mutationFinalizationError("doctor", error);
           throw error;
         }
@@ -402,6 +509,7 @@ export class ScholarApplication {
             throw mutationFinalizationError("rollback", error);
           }
         }
+        await afterCommit?.();
         return value;
       } catch (error) {
         if (rollback && captured && !committed) {
@@ -414,6 +522,12 @@ export class ScholarApplication {
         throw error;
       }
     });
+  }
+  private async readSetting<T>(key: string, fallback: T): Promise<T> {
+    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
+    if (!row) return fallback;
+    const value = jsonValue(row.value_json);
+    return (value === undefined ? fallback : value) as T;
   }
   private async mutate<T>(
     context: ApplicationMutationContext | undefined,
@@ -457,21 +571,14 @@ export class ScholarApplication {
     const authorized = new Set<string>();
     for (const { manifest } of await this.sources.publishedPackets())
       for (const chunk of manifest.chunks) authorized.add(chunk.chunkId);
-    if (
-      [body, authoredBody].some(
-        (markdown) =>
-          markdown !== undefined && /^ {0,3}#{1,6}(?:[ \t]+#*[ \t]*)?\r?$/mu.test(okfCitationText(markdown)),
-      )
-    )
+    if ([body, authoredBody].some((markdown) => markdown !== undefined && hasRenderedEmptyHeading(markdown)))
       throw new ValidationError("source-grounded ingest sections require non-empty headings");
-    const sections = (markdown: string): IngestSection[] => {
-      const parsed = parseWikiSections(markdown, "");
-      const first = parsed[0];
-      if (!first) return markdown.trim() ? [{ anchor: "", startOffset: 0, endOffset: markdown.length }] : [];
-      return markdown.slice(0, first.startOffset).trim()
-        ? [{ anchor: "", startOffset: 0, endOffset: first.startOffset }, ...parsed]
-        : parsed;
-    };
+    const sections = (markdown: string): IngestSection[] =>
+      parseWikiBodySections(markdown, "").map(({ anchor, startOffset, endOffset }) => ({
+        anchor,
+        startOffset,
+        endOffset,
+      }));
     const sectionText = (markdown: string, section: IngestSection): string =>
       markdown.slice(section.startOffset, section.endOffset);
     const withoutDefinitions = (text: string): string => {
@@ -496,17 +603,19 @@ export class ScholarApplication {
     };
     const substantive = (markdown: string, section: IngestSection): boolean => {
       const text = sectionText(markdown, section);
-      const newline = text.indexOf("\n");
-      const content = section.anchor === "" ? text : newline < 0 ? "" : text.slice(newline + 1);
+      const content = section.anchor === "" ? text : stripFirstHeading(text);
       return okfRenderedText(withoutEvidence(content)).trim().length > 0;
     };
     const requireSectionCitation = (markdown: string, section: IngestSection): void => {
       const references = okfFootnoteLabels(sectionText(markdown, section)).references;
+      const label = section.anchor.replace(/^#+/u, "") || "preamble";
       if (!references.length)
-        throw new ValidationError("source-grounded ingest changes require an immutable source chunk citation");
+        throw new ValidationError(
+          `source-grounded ingest section "${label}" requires an immutable source chunk citation`,
+        );
       if (!references.some((reference) => authorized.has(reference)))
         throw new ValidationError(
-          "source-grounded ingest changes require an authorized immutable source chunk citation",
+          `source-grounded ingest section "${label}" requires an authorized immutable source chunk citation`,
         );
     };
     const nextSections = sections(body);
@@ -546,27 +655,14 @@ export class ScholarApplication {
       if (substantive(body, section)) requireSectionCitation(body, section);
     }
   }
-  private async readSetting<T>(key: string, fallback: T): Promise<T> {
-    const row = this.db.get<Record<string, unknown>>("SELECT value_json FROM settings WHERE key = ?", [key]);
-    if (!row) return fallback;
-    return jsonValue(row.value_json) as T;
-  }
   private async currentLocalDate(): Promise<string> {
-    const timezone = await this.readSetting("timezone", "local");
-    if (timezone === "local") return localDate(new Date());
-    try {
-      return new Intl.DateTimeFormat("en-CA", {
-        timeZone: timezone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).format(new Date());
-    } catch {
-      return localDate(new Date());
-    }
+    return localDate(this.clock.now(), persistedTimezone(this.db));
   }
-  private pendingSource(entry: Awaited<ReturnType<SourceService["discover"]>>[number]): SourceRecord {
-    const sourceId = `pending-${sha256(`${entry.relativePath}:${JSON.stringify(entry.identity)}`).slice(0, 32)}`;
+  private pendingSourceId(entry: InboxEntry): string {
+    return `pending-${sha256(`${entry.relativePath}:${JSON.stringify(entry.identity)}`).slice(0, 32)}`;
+  }
+  private pendingSource(entry: InboxEntry): SourceRecord {
+    const sourceId = this.pendingSourceId(entry);
     const now = new Date().toISOString();
     return {
       sourceId,
@@ -591,19 +687,49 @@ export class ScholarApplication {
     this.extractionClaims.clear();
     for (const { prepared } of tracked) await this.sources.cleanupPrepared(prepared.preparedId);
   }
-  async getExtractContext(): Promise<ExtractContext> {
+  async getExtractContext(
+    input: ExtractContextRequest = {},
+    observer?: ExtractProgressObserver,
+  ): Promise<ExtractContext> {
+    const discovered = await this.sources.discover();
+    const requestedIds = sourceIdFilter(input.pendingSourceIds, { pending: true, limit: EXTRACT_BATCH_SIZE });
+    const entries =
+      requestedIds === undefined
+        ? discovered.slice(0, EXTRACT_BATCH_SIZE)
+        : (() => {
+            const pending = new Map(discovered.map((entry) => [this.pendingSourceId(entry), entry]));
+            const durable = new Set(this.sources.list().map((source) => String(source.sourceId ?? "")));
+            return requestedIds.map((sourceId) => {
+              const entry = pending.get(sourceId);
+              if (entry) return entry;
+              if (durable.has(sourceId)) throw new ValidationError("requested source is not pending");
+              throw new ValidationError("requested pending source is stale or missing");
+            });
+          })();
     await this.clearExtractionClaims();
     const claims: PreparedAdmission[] = [];
     const failures: ExtractFailureRecord[] = [];
     let recordingError: unknown;
-    for (const entry of await this.sources.discover()) {
+    for (const [index, entry] of entries.entries()) {
+      const filename = safeExtractFilename(
+        entry.metadata?.displayName ?? entry.metadata?.originalName ?? entry.relativePath,
+      );
+      const notify = (phase: ExtractProgressPhase): void =>
+        emitExtractProgress(observer, { entry: index + 1, total: entries.length, filename, phase });
       let claim: SourceClaim | undefined;
+      const progressState = { failed: false };
+      const observe = (phase: ExtractProgressPhase): void => {
+        progressState.failed ||= phase === "failed";
+        notify(phase);
+      };
+      notify("claiming");
       try {
         claim = await this.sources.claim(entry);
-        const prepared = await this.sources.prepareClaim(claim);
+        const prepared = await this.sources.prepareClaim(claim, observe);
         this.extractionClaims.set(claim.claimId, { claim, prepared });
         claims.push(prepared);
       } catch (error) {
+        if (!progressState.failed) notify("failed");
         try {
           await this.durableDirect(
             () => this.sources.recordExtractFailure(entry, error, claim),
@@ -620,7 +746,6 @@ export class ScholarApplication {
         failures.push({
           relativePath: entry.relativePath,
           errorCode: "EXTRACT_FAILED",
-          errorMessage: errorMessage(error).slice(0, 500),
         });
       }
     }
@@ -643,9 +768,14 @@ export class ScholarApplication {
     const completed = this.completedExtractions.get(resultKey);
     if (completed) {
       if (!completed.pendingFinalization) return completed.result;
-      const result = await this.durableDirect(() => completed.result, "source:extract");
-      cacheResult(result);
-      return result;
+      try {
+        const result = await this.durableDirect(() => completed.result, "source:extract");
+        cacheResult(result);
+        return result;
+      } catch (error) {
+        if (isAppliedFinalizationFailure(error)) Object.assign(error as object, { publicationApplied: true });
+        throw error;
+      }
     }
     const pending = this.extractionClaims.get(decoded.claimId);
     if (!pending || pending.prepared.preparedId !== decoded.preparedId || pending.prepared.digest !== decoded.digest)
@@ -675,6 +805,7 @@ export class ScholarApplication {
       if (appliedResult && isAppliedFinalizationFailure(error)) {
         cacheResult(appliedResult, true);
         this.extractionClaims.delete(decoded.claimId);
+        Object.assign(error as object, { publicationApplied: true });
         throw error;
       }
       let recordingError: unknown;
@@ -700,16 +831,19 @@ export class ScholarApplication {
     request: SourceRequest | MechanicsSourceStageRequest,
     context?: ApplicationMutationContext,
   ): Promise<SourceStageResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        const staged = await this.sources.stage(request as MechanicsSourceStageRequest);
-        const entry = (await this.sources.discover()).find(
-          (candidate) => candidate.relativePath === staged.relativePath,
-        );
-        if (!entry) throw new Error("staged source disappeared");
-        return { source: publicSource(this.pendingSource(entry)) };
-      }, "source:stage"),
-    );
+    return this.mutate(context, async () => {
+      const prepared = await this.sources.prepareStage(request as MechanicsSourceStageRequest);
+      try {
+        return await this.durableDirect(async () => {
+          const staged = await this.sources.publishPreparedStage(prepared);
+          return { source: publicSource(this.pendingSource(staged)) };
+        }, "source:stage");
+      } catch (error) {
+        if (!isAppliedFinalizationFailure(error))
+          await this.sources.cleanupPreparedStage(prepared).catch(() => undefined);
+        throw error;
+      }
+    });
   }
   async removalPreview(sourceId: string): Promise<{
     readonly source: PublicSourceRecord;
@@ -734,30 +868,46 @@ export class ScholarApplication {
     context?: ApplicationMutationContext,
   ): Promise<SourceRemovalResult> {
     return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
-        try {
-          await this.wiki.refreshProjections();
-          await this.wiki.refreshQmdIndex().catch(() => undefined);
-        } catch (error) {
-          throw mutationFinalizationError("projection", error, true);
-        }
-        return { sourceId, status: "removed", dependentPageIds: removed.dependentPageIds };
-      }, "source:remove"),
+      this.durableDirect(
+        async () => {
+          const removed = await this.sources.removeConfirmed(sourceId, confirmationId);
+          try {
+            await this.wiki.refreshProjections();
+          } catch (error) {
+            throw mutationFinalizationError("projection", error, true);
+          }
+          return { sourceId, status: "removed" as const, dependentPageIds: removed.dependentPageIds };
+        },
+        "source:remove",
+        undefined,
+        async () => {
+          try {
+            await this.wiki.refreshQmdIndex();
+          } catch (error) {
+            throw mutationFinalizationError("qmd", error, true);
+          }
+        },
+      ),
     );
   }
   private async quizDetail(quiz: QuizRecord): Promise<QuizDetailRecord> {
-    const answers = this.db
-      .all<Record<string, unknown>>(
-        "SELECT question_id, answer_json FROM quiz_answers WHERE quiz_id = ? ORDER BY question_id",
-        [quiz.quizId],
-      )
-      .flatMap((row) => {
-        const answer = jsonValue(row.answer_json);
-        return typeof answer === "string" || (Array.isArray(answer) && answer.every((item) => typeof item === "string"))
-          ? [{ questionId: String(row.question_id), answer: answer as string | readonly string[] }]
-          : [];
-      });
+    const answerByQuestion = new Map(
+      this.db
+        .all<Record<string, unknown>>("SELECT question_id, answer_json FROM quiz_answers WHERE quiz_id = ?", [
+          quiz.quizId,
+        ])
+        .flatMap((row) => {
+          const answer = jsonValue(row.answer_json);
+          return typeof answer === "string" ||
+            (Array.isArray(answer) && answer.every((item) => typeof item === "string"))
+            ? [[String(row.question_id), answer as string | readonly string[]] as const]
+            : [];
+        }),
+    );
+    const answers = quiz.questions.flatMap((question) => {
+      const answer = answerByQuestion.get(question.questionId);
+      return answer === undefined ? [] : [{ questionId: question.questionId, answer }];
+    });
     const answerSaved = this.db.get<Record<string, unknown>>(
       "SELECT saved_at FROM quiz_answers WHERE quiz_id = ? ORDER BY saved_at DESC LIMIT 1",
       [quiz.quizId],
@@ -767,80 +917,88 @@ export class ScholarApplication {
         ? { revision: quiz.revision, savedAt: String(answerSaved.saved_at), answers }
         : undefined;
     const settled = this.quiz.readSettledResult(quiz);
-    const settledByQuestion = new Map((settled?.questions ?? []).map((question) => [question.questionId, question]));
-    const settledByPage = new Map((settled?.pages ?? []).map((page) => [page.pageId, page]));
-    const questionResults: QuizQuestionResultRecord[] = this.db
-      .all<Record<string, unknown>>("SELECT * FROM question_results WHERE quiz_id = ? ORDER BY question_id", [
-        quiz.quizId,
-      ])
-      .map((row) => ({
+    const questionRows = new Map(
+      this.db
+        .all<Record<string, unknown>>("SELECT * FROM question_results WHERE quiz_id = ?", [quiz.quizId])
+        .map((row) => [String(row.question_id), row] as const),
+    );
+    const questionResults: QuizQuestionResultRecord[] = (settled?.questions ?? []).map((question) => {
+      const row = questionRows.get(question.questionId);
+      if (!row) throw new ValidationError(`Committed question result is missing: ${question.questionId}`);
+      return {
         resultId: String(row.result_id),
         quizId: String(row.quiz_id),
-        questionId: String(row.question_id),
+        questionId: question.questionId,
         answerRevision: Number(row.answer_revision),
-        feedback: settledByQuestion.get(String(row.question_id))?.feedback ?? "",
+        feedback: question.feedback,
         gradedAt: String(row.graded_at),
-      }));
-    const publicReading = (reading: ReadingLink): QuizReadingRecord => {
-      const page = this.db.get<Record<string, unknown>>("SELECT relative_path FROM pages WHERE page_id = ?", [
-        reading.pageId,
-      ]);
-      if (!page) throw new ValidationError(`Committed grade reading page is missing: ${reading.pageId}`);
-      return {
-        pageId: reading.pageId,
-        path: String(page.relative_path),
-        ...(reading.heading === undefined ? {} : { heading: reading.heading }),
-        href: this.quiz.readingHref(reading),
       };
+    });
+    const pagePath = (pageId: string): string => {
+      const page = this.db.get<Record<string, unknown>>("SELECT relative_path FROM pages WHERE page_id = ?", [pageId]);
+      if (!page) throw new ValidationError(`Committed grade page is missing: ${pageId}`);
+      return String(page.relative_path);
     };
-    const internalPageResults = this.db
-      .all<Record<string, unknown>>("SELECT * FROM page_results WHERE quiz_id = ? ORDER BY page_id", [quiz.quizId])
-      .map((row) => {
-        const pageId = String(row.page_id);
-        const settledPage = settledByPage.get(pageId);
-        const evidenceValue = jsonValue(row.evidence_json);
-        const readingsValue = jsonValue(row.readings_json);
-        const evidence =
-          settledPage?.evidence ??
-          (Array.isArray(evidenceValue)
-            ? evidenceValue.filter((item): item is string => typeof item === "string")
-            : []);
-        const readings: readonly ReadingLink[] =
-          settledPage?.readings ?? (Array.isArray(readingsValue) ? readingsValue.map(decodeReading) : []);
-        return {
-          resultId: String(row.result_id),
-          quizId: String(row.quiz_id),
-          pageId,
-          rating: String(row.rating) as QuizPageResultRecord["rating"],
-          feedback: settledPage?.feedback ?? String(row.feedback ?? ""),
-          reviewId: String(row.review_id),
-          evidence,
-          readings,
-        };
-      });
+    const publicReading = (reading: ReadingLink): QuizReadingRecord => ({
+      pageId: reading.pageId,
+      path: pagePath(reading.pageId),
+      ...(reading.heading === undefined ? {} : { heading: reading.heading }),
+      href: this.quiz.readingHref(reading),
+    });
+    const pageRows = new Map(
+      this.db
+        .all<Record<string, unknown>>("SELECT * FROM page_results WHERE quiz_id = ?", [quiz.quizId])
+        .map((row) => [String(row.page_id), row] as const),
+    );
+    const internalPageResults = (settled?.pages ?? []).map((page) => {
+      const row = pageRows.get(page.pageId);
+      if (!row) throw new ValidationError(`Committed page result is missing: ${page.pageId}`);
+      return {
+        resultId: String(row.result_id),
+        quizId: page.quizId,
+        pageId: page.pageId,
+        rating: page.rating,
+        feedback: page.feedback,
+        reviewId: page.reviewId,
+        evidence: page.evidence,
+        readings: page.readings,
+      };
+    });
     const pageResults: QuizPageResultRecord[] = internalPageResults.map((page) => ({
       ...page,
+      pageLink: {
+        pageId: page.pageId,
+        path: pagePath(page.pageId),
+        href: notesPageHref(page.pageId),
+      },
       readings: page.readings.map(publicReading),
     }));
-    const grades: QuizGradeRecord[] = pageResults.map((row) => ({
-      gradeId: row.reviewId,
-      quizId: row.quizId,
-      pageId: row.pageId,
-      rating: row.rating,
-      feedback: row.feedback,
-      gradedAt: String(
-        this.db.get<Record<string, unknown>>("SELECT reviewed_at FROM page_reviews WHERE review_id = ?", [row.reviewId])
-          ?.reviewed_at ?? new Date().toISOString(),
-      ),
-      reviewId: row.reviewId,
+    const grades: QuizGradeRecord[] = (settled?.pages ?? []).map((page) => ({
+      gradeId: page.gradeId,
+      quizId: page.quizId,
+      pageId: page.pageId,
+      rating: page.rating,
+      feedback: page.feedback,
+      gradedAt: page.gradedAt,
+      reviewId: page.reviewId,
     }));
-    const readings = [
-      ...new Map(
-        internalPageResults
-          .flatMap((page) => page.readings)
-          .map((reading): readonly [string, ReadingLink] => [`${reading.pageId}#${reading.anchor}`, reading]),
-      ).values(),
-    ].map(publicReading);
+    const readings = settled
+      ? [
+          ...new Map(
+            internalPageResults
+              .flatMap((page) => page.readings)
+              .map((reading): readonly [string, ReadingLink] => [`${reading.pageId}#${reading.anchor}`, reading]),
+          ).values(),
+        ].map(publicReading)
+      : quiz.status === "submitted"
+        ? [...new Set(quiz.questions.flatMap((question) => question.pages.map((page) => page.pageId)))].map(
+            (pageId): QuizReadingRecord => ({
+              pageId,
+              path: pagePath(pageId),
+              href: notesPageHref(pageId),
+            }),
+          )
+        : [];
     return { ...quiz, answers, ...(draft ? { draft } : {}), questionResults, pageResults, grades, readings };
   }
 
@@ -848,11 +1006,11 @@ export class ScholarApplication {
     return { pages: (await this.wiki.list()).map(pageRecord) };
   }
   private async wikiResult(pageIdOrPath: string): Promise<WikiPageResult> {
-    const inspected = await this.wiki.inspectDrift(pageIdOrPath);
-    const value = await this.wiki.get(inspected.page.pageId);
+    const value = await this.wiki.get(pageIdOrPath);
+    const inspected = await this.wiki.inspectDrift(value.pageId);
     const page = pageRecord(inspected.page);
     const markdown = value.content;
-    const pageSections = parseWikiSections(markdown, page.pageId);
+    const pageSections = parseWikiDocumentSections(markdown, page.pageId);
     const schedule =
       page.quizWorthiness === "eligible" ||
       this.db.get("SELECT page_id FROM page_learning WHERE page_id = ?", [page.pageId])
@@ -867,6 +1025,25 @@ export class ScholarApplication {
   }
   async getWiki(pageIdOrPath: string): Promise<WikiPageResult> {
     return this.wikiResult(pageIdOrPath);
+  }
+  async getWikiAttachment(pageId: string, sourceId: string, attachmentDigest: string) {
+    if (
+      !UUID_SOURCE_ID.test(pageId) ||
+      !UUID_SOURCE_ID.test(sourceId) ||
+      pageId !== pageId.toLowerCase() ||
+      sourceId !== sourceId.toLowerCase() ||
+      !/^[0-9a-f]{64}$/u.test(attachmentDigest)
+    )
+      throw new ValidationError("managed image identity is malformed");
+    const value = await this.wiki.get(pageId);
+    if (value.status === "retired") throw new Error("page not found");
+    const parsed = parseWikiMarkdown(value.content);
+    const uri = managedImageUri(sourceId, attachmentDigest);
+    if (!markdownImages(parsed.body).some((image) => image.url === uri))
+      throw new ValidationError("image is not referenced by page");
+    if (!this.wiki.citedSourceIds(parsed.body).has(sourceId))
+      throw new ValidationError("image source is not cited by page");
+    return this.sources.publishedAttachment(sourceId, attachmentDigest);
   }
   async searchWiki(
     query: string,
@@ -969,42 +1146,144 @@ export class ScholarApplication {
       }, "wiki:update"),
     );
   }
-  async renameNote(
-    pageId: string,
-    requestedPath: string,
-    context?: ApplicationMutationContext,
-  ): Promise<WikiPageResult> {
-    return this.mutate(context, () =>
-      this.durableDirect(async () => {
-        this.assertPageMutationAllowed(pageId);
-        const updated = await this.wiki.rename(pageId, requestedPath);
-        return this.wikiResult(updated.pageId);
-      }, "wiki:rename"),
-    );
-  }
 
   async listQuizzes(): Promise<{ readonly quizzes: readonly PublicQuizRecord[] }> {
     return { quizzes: this.quiz.list().map(publicQuiz) };
   }
-  async getQuiz(date: string): Promise<{
-    readonly quiz?: PublicQuizDetailRecord;
-    readonly outcome: "available" | "submitted" | "expired" | "skipped" | "failed" | "not-yet-run" | "maintenance-day";
-    readonly answers: readonly QuizAnswerInput[];
-    readonly grades: readonly QuizGradeRecord[];
-    readonly readings: readonly QuizReadingRecord[];
-    readonly message?: string;
-  }> {
+  private async quizRecommendations(detail: QuizDetailRecord): Promise<QuizRecommendations> {
+    if (detail.status !== "submitted") return { readings: [], gaps: [] };
+    const coveredPageIds = detail.pageResults.length
+      ? [...new Set(detail.pageResults.map((result) => result.pageId))]
+      : [...new Set(detail.questions.flatMap((question) => question.pages.map((page) => page.pageId)))];
+    if (!coveredPageIds.length) return { readings: [], gaps: [] };
+
+    const excluded = new Set([...coveredPageIds, ...detail.readings.map((reading) => reading.pageId)]);
+    const currentPages = await Promise.all(
+      (await this.wiki.list())
+        .filter((page) => page.status !== "retired")
+        .map(async (page) => {
+          try {
+            const inspected = await this.wiki.inspectDrift(page.pageId);
+            return { page: pageRecord(inspected.page), drifted: inspected.drifted, readable: true };
+          } catch {
+            return { page: pageRecord(page), drifted: page.status === "drifted", readable: false };
+          }
+        }),
+    );
+    const currentById = new Map(currentPages.map((page) => [page.page.pageId, page]));
+    const currentByPath = new Map(currentPages.map((page) => [page.page.relativePath, page]));
+    const candidates = new Map(
+      currentPages
+        .filter(
+          ({ page, drifted, readable }) =>
+            page.status === "active" && !drifted && readable && !excluded.has(page.pageId),
+        )
+        .map(({ page }) => [page.pageId, page]),
+    );
+    const prerequisiteIds = new Set(
+      coveredPageIds.flatMap((pageId) =>
+        this.scheduler.listPrerequisites(pageId).map((edge) => edge.prerequisitePageId),
+      ),
+    );
+    const prerequisites = [...prerequisiteIds]
+      .flatMap((pageId) => {
+        const page = candidates.get(pageId);
+        return page ? [page] : [];
+      })
+      .sort((left, right) => left.pageId.localeCompare(right.pageId));
+    const selected = new Set(prerequisites.map((page) => page.pageId));
+    const semanticScores = new Map<string, number>();
+    const query = quizRecommendationQuery(detail);
+    if (query) {
+      try {
+        for (const value of await this.wiki.semanticSearch(query, 100)) {
+          if (!isRecord(value) || typeof value.path !== "string" || typeof value.score !== "number") continue;
+          const current = currentByPath.get(value.path);
+          if (
+            current?.page.status !== "active" ||
+            current.drifted ||
+            !current.readable ||
+            !Number.isFinite(value.score)
+          )
+            continue;
+          const previous = semanticScores.get(current.page.pageId);
+          if (previous === undefined || value.score > previous) semanticScores.set(current.page.pageId, value.score);
+        }
+      } catch {
+        semanticScores.clear();
+      }
+    }
+    const related = [...semanticScores]
+      .flatMap(([pageId, score]) => {
+        const page = candidates.get(pageId);
+        return page && !selected.has(pageId) ? [{ page, score }] : [];
+      })
+      .sort((left, right) => right.score - left.score || left.page.pageId.localeCompare(right.page.pageId));
+
+    const gapPages = new Map<string, { readonly page: PageRecord; readonly kind: "missing" | "unclear" | "drifted" }>();
+    for (const issue of (await this.listIssues()).issues) {
+      if (
+        !issue.pageId ||
+        (issue.status !== "open" && issue.status !== "reopened") ||
+        (issue.kind !== "missing" && issue.kind !== "unclear")
+      )
+        continue;
+      const page = currentById.get(issue.pageId)?.page;
+      if (page) gapPages.set(`${page.pageId}\u0000${issue.kind}`, { page, kind: issue.kind });
+    }
+    for (const { page, drifted } of currentPages)
+      if (drifted) gapPages.set(`${page.pageId}\u0000drifted`, { page, kind: "drifted" });
+    const kindOrder = { missing: 0, unclear: 1, drifted: 2 } as const;
+    const gaps = [...gapPages.values()]
+      .sort((left, right) => {
+        const leftScore = semanticScores.get(left.page.pageId) ?? Number.NEGATIVE_INFINITY;
+        const rightScore = semanticScores.get(right.page.pageId) ?? Number.NEGATIVE_INFINITY;
+        if (leftScore !== rightScore) return rightScore - leftScore;
+        return kindOrder[left.kind] - kindOrder[right.kind] || left.page.pageId.localeCompare(right.page.pageId);
+      })
+      .slice(0, QUIZ_GAP_LIMIT)
+      .map(({ page, kind }) => ({
+        pageId: page.pageId,
+        path: page.relativePath,
+        title: page.title,
+        href: notesPageHref(page.pageId),
+        kind,
+      }));
+
+    return {
+      readings: [
+        ...prerequisites.map((page) => ({
+          pageId: page.pageId,
+          path: page.relativePath,
+          title: page.title,
+          href: notesPageHref(page.pageId),
+          reason: "prerequisite" as const,
+        })),
+        ...related.map(({ page }) => ({
+          pageId: page.pageId,
+          path: page.relativePath,
+          title: page.title,
+          href: notesPageHref(page.pageId),
+          reason: "related" as const,
+        })),
+      ].slice(0, QUIZ_RECOMMENDATION_LIMIT),
+      gaps,
+    };
+  }
+
+  async getQuiz(date: string): Promise<QuizResult> {
     const quiz = this.quiz.get(date);
     if (!quiz) {
       const settings = await this.getSettings();
-      const maintenance = settings.settings.initializationEnabled && date === settings.settings.facts.localDate;
+      const maintenance = settings.settings.maintenanceEnabled && date === settings.settings.facts.localDate;
       return {
         outcome: maintenance ? "maintenance-day" : "not-yet-run",
         answers: [],
         grades: [],
         readings: [],
+        recommendations: { readings: [], gaps: [] },
         message: maintenance
-          ? "Initialization maintenance is active; no quiz is generated today."
+          ? "Maintenance mode is active; no quiz is generated today."
           : "No quiz has been generated for this date.",
       };
     }
@@ -1015,6 +1294,7 @@ export class ScholarApplication {
       answers: detail.answers,
       grades: detail.grades,
       readings: detail.readings,
+      recommendations: await this.quizRecommendations(detail),
       ...(quiz.status === "failed" ? { message: "Quiz generation failed." } : {}),
     };
   }
@@ -1036,7 +1316,7 @@ export class ScholarApplication {
           "SELECT saved_at FROM quiz_answers WHERE quiz_id = ? ORDER BY saved_at DESC LIMIT 1",
           [result.quizId],
         )?.saved_at;
-        return { revision: result.revision, savedAt: String(savedAt ?? new Date().toISOString()), answers };
+        return { revision: result.revision, savedAt: String(savedAt ?? this.clock.now().toISOString()), answers };
       }),
     );
   }
@@ -1044,13 +1324,7 @@ export class ScholarApplication {
     date: string,
     input: { readonly expectedRevision: number },
     context?: ApplicationMutationContext,
-  ): Promise<{
-    readonly status: "sealed";
-    readonly workflow: PublicWorkflowRecord;
-    readonly quiz: PublicQuizDetailRecord;
-    readonly grades: readonly QuizGradeRecord[];
-    readonly readings: readonly QuizReadingRecord[];
-  }> {
+  ): Promise<QuizSubmissionResult> {
     const requestId = randomUUID();
     return this.mutate(context, () =>
       this.durableDirect(async () => {
@@ -1079,6 +1353,7 @@ export class ScholarApplication {
           quiz: publicQuizDetail(detail),
           grades: detail.grades,
           readings: detail.readings,
+          recommendations: await this.quizRecommendations(detail),
         };
       }, "quiz:seal"),
     );
@@ -1150,7 +1425,7 @@ export class ScholarApplication {
     );
   }
 
-  async listWorkflows(): Promise<{ readonly workflows: readonly PublicWorkflowRecord[] }> {
+  async listWorkflows(): Promise<WorkflowListResult> {
     return { workflows: this.workflows.list().map(publicWorkflow) };
   }
   async getWorkflow(requestId: string): Promise<PublicWorkflowRecord> {
@@ -1159,10 +1434,12 @@ export class ScholarApplication {
     return publicWorkflow(workflow);
   }
   async getSettings(): Promise<{ readonly settings: SettingsRecord }> {
-    const initializationEnabled = await this.readSetting("initializationEnabled", true);
+    const maintenanceEnabled = await this.readSetting("maintenanceEnabled", true);
     const timezone = await this.readSetting("timezone", "local");
     const port = await this.readSetting("port", DEFAULT_VAULT_PORT);
     const host = await this.readSetting("host", DEFAULT_VAULT_HOST);
+    const simulatedDateValue = await this.readSetting<unknown>("simulatedDate", undefined);
+    const simulatedDate = typeof simulatedDateValue === "string" ? simulatedDateValue : undefined;
     const pendingInboxCount = (await this.sources.discover()).length;
     const openIssueCount = Number(
       this.db.get<Record<string, unknown>>(
@@ -1180,12 +1457,7 @@ export class ScholarApplication {
       const status = String(workflow.status ?? "unknown");
       if (status === "failed") {
         const errorCode = workflow.error_code ? ` (${String(workflow.error_code)})` : "";
-        const detail = workflow.error_message
-          ? String(workflow.error_message)
-          : workflow.message
-            ? String(workflow.message)
-            : "Workflow failed";
-        return `failed${errorCode}: ${detail}`;
+        return `failed${errorCode}: Workflow failed`;
       }
       return workflow.message ? String(workflow.message) : status;
     };
@@ -1224,7 +1496,7 @@ export class ScholarApplication {
     };
     return {
       settings: {
-        initializationEnabled: Boolean(initializationEnabled),
+        maintenanceEnabled: Boolean(maintenanceEnabled),
         timezone: String(timezone),
         port: Number(port),
         host: String(host),
@@ -1232,6 +1504,7 @@ export class ScholarApplication {
           this.db.get<Record<string, unknown>>("SELECT MAX(updated_at) AS updated_at FROM settings")?.updated_at ??
             new Date().toISOString(),
         ),
+        ...(simulatedDate === undefined ? {} : { simulatedDate }),
         facts,
       },
     };
@@ -1242,12 +1515,24 @@ export class ScholarApplication {
   ): Promise<{ readonly settings: SettingsRecord }> {
     return this.mutate(context, () =>
       this.durableDirect(async () => {
+        if (input.simulatedDate !== undefined && context?.developerToolsEnabled !== true)
+          throw new ValidationError("developer tools are required to change simulatedDate");
         const now = new Date().toISOString();
         const updates: [string, unknown][] = [];
-        if (input.initializationEnabled !== undefined) {
-          if (typeof input.initializationEnabled !== "boolean")
-            throw new ValidationError("initializationEnabled must be boolean");
-          updates.push(["initializationEnabled", input.initializationEnabled]);
+        if (input.maintenanceEnabled !== undefined) {
+          if (typeof input.maintenanceEnabled !== "boolean")
+            throw new ValidationError("maintenanceEnabled must be boolean");
+          updates.push(["maintenanceEnabled", input.maintenanceEnabled]);
+        }
+        const storedTimezone = await this.readSetting<unknown>("timezone", "local");
+        const effectiveTimezone = input.timezone ?? String(storedTimezone);
+        if (input.simulatedDate !== undefined && input.simulatedDate !== null) {
+          if (
+            typeof input.simulatedDate !== "string" ||
+            !/^\d{4}-\d{2}-\d{2}$/u.test(input.simulatedDate) ||
+            localDate(input.simulatedDate) !== input.simulatedDate
+          )
+            throw new ValidationError("simulatedDate must be a valid calendar date");
         }
         if (input.timezone !== undefined) {
           if (typeof input.timezone !== "string" || !input.timezone.trim() || input.timezone.length > 100)
@@ -1261,6 +1546,20 @@ export class ScholarApplication {
           }
           updates.push(["timezone", input.timezone]);
         }
+        const storedSimulatedDate = await this.readSetting<unknown>("simulatedDate", undefined);
+        const effectiveSimulatedDate =
+          input.simulatedDate === null ? undefined : (input.simulatedDate ?? storedSimulatedDate);
+        if (effectiveSimulatedDate !== undefined && effectiveSimulatedDate !== null) {
+          if (
+            typeof effectiveSimulatedDate !== "string" ||
+            !/^\d{4}-\d{2}-\d{2}$/u.test(effectiveSimulatedDate) ||
+            localDate(effectiveSimulatedDate) !== effectiveSimulatedDate
+          )
+            throw new ValidationError("simulatedDate must be a valid calendar date");
+          localNoon(effectiveSimulatedDate, effectiveTimezone);
+        }
+        if (input.simulatedDate !== undefined && input.simulatedDate !== null)
+          updates.push(["simulatedDate", input.simulatedDate]);
         if (input.port !== undefined) {
           if (!Number.isInteger(input.port) || input.port < 1 || input.port > 65_535)
             throw new ValidationError("port is invalid");
@@ -1275,6 +1574,7 @@ export class ScholarApplication {
               "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
               [key, JSON.stringify(value), now],
             );
+          if (input.simulatedDate === null) this.db.run("DELETE FROM settings WHERE key = ?", ["simulatedDate"]);
         });
         return this.getSettings();
       }, "settings:update"),
@@ -1324,9 +1624,18 @@ export class ScholarApplication {
     const issues = (await this.listIssues()).issues.filter((issue) => issue.status !== "resolved");
     return { pages, issues };
   }
-  async getIngestContext(): Promise<IngestContext> {
+  async getIngestContext(input: IngestContextRequest = {}): Promise<IngestContext> {
+    const sourceIds = sourceIdFilter(input.sourceIds, { pending: false });
+    if (sourceIds !== undefined) {
+      const byId = new Map(this.sources.list().map((source) => [String(source.sourceId ?? ""), source]));
+      for (const sourceId of sourceIds) {
+        const source = byId.get(sourceId);
+        if (!source) throw new ValidationError("requested published source is stale or missing");
+        if (source.status !== "published") throw new ValidationError("requested source is not published");
+      }
+    }
     const { pages, issues } = await this.wikiMaintenanceContext();
-    const sources = await this.sources.publishedPackets();
+    const sources = await this.sources.publishedPackets(sourceIds);
     return {
       pages,
       issues,
@@ -1370,6 +1679,7 @@ export class ScholarApplication {
     proposed: {
       readonly body?: string;
       readonly title?: string;
+      readonly description?: string;
       readonly quizWorthiness?: PageRecord["quizWorthiness"];
     },
   ): string {
@@ -1391,6 +1701,9 @@ export class ScholarApplication {
       missing = [
         current.body !== authored.body && proposed.body === undefined ? "body" : undefined,
         current.frontmatter.title !== authored.frontmatter.title && proposed.title === undefined ? "title" : undefined,
+        current.frontmatter.description !== authored.frontmatter.description && proposed.description === undefined
+          ? "description"
+          : undefined,
         current.frontmatter["quiz-worthiness"] !== authored.frontmatter["quiz-worthiness"] &&
         proposed.quizWorthiness === undefined
           ? "quizWorthiness"
@@ -1400,6 +1713,7 @@ export class ScholarApplication {
       missing = [
         proposed.body === undefined ? "body" : undefined,
         proposed.title === undefined ? "title" : undefined,
+        proposed.description === undefined ? "description" : undefined,
         proposed.quizWorthiness === undefined ? "quizWorthiness" : undefined,
       ].filter((field): field is string => field !== undefined);
     }
@@ -1623,6 +1937,7 @@ export class ScholarApplication {
   private async applyWikiChangeDecoded(
     proposal: WikiChangeInput,
     requireIngestCitation: boolean,
+    workflowRequestId?: string,
   ): Promise<WikiChangeResult> {
     const rollback = {
       capture: () => this.captureWikiChangeRollback(proposal),
@@ -1632,6 +1947,11 @@ export class ScholarApplication {
     let preexistingDrift: ReadonlyMap<string, string> = new Map();
     return this.durableDirect(
       async () => {
+        if (workflowRequestId !== undefined) {
+          const workflow = this.workflows.get(workflowRequestId);
+          if (workflow?.kind !== "ingest" || workflow.status !== "running")
+            throw new ValidationError("ingest workflow is not running");
+        }
         const allowDrift = proposal.kind === "update-page" || proposal.kind === "resolve-issue";
         preexistingDrift = allowDrift ? await this.liveDriftDigests() : new Map();
         if (preexistingDrift.size)
@@ -1729,6 +2049,12 @@ export class ScholarApplication {
             if (sha256(await this.wiki.readExact(current.relativePath)) !== proposal.page.expectedDigest)
               throw new RevisionConflictError("The issue page digest is stale");
             const body = proposal.page.body;
+            let currentDescription: unknown;
+            try {
+              currentDescription = parseWikiMarkdown(current.content).frontmatter.description;
+            } catch {
+              currentDescription = undefined;
+            }
             const authoredBody = preexistingDrift.has(issue.pageId)
               ? this.assertDriftRepairFields(issue.pageId, current.content, proposal.page)
               : parseWikiMarkdown(current.content).body;
@@ -1737,6 +2063,7 @@ export class ScholarApplication {
               preexistingDrift.has(issue.pageId) ||
               bodyChanged ||
               (proposal.page.title !== undefined && proposal.page.title !== current.title) ||
+              (proposal.page.description !== undefined && proposal.page.description !== currentDescription) ||
               (proposal.page.quizWorthiness !== undefined && proposal.page.quizWorthiness !== current.quizWorthiness);
             if (!pageChanged) throw new ValidationError("resolve-issue requires an actual page correction");
             if (requireIngestCitation && bodyChanged) await this.assertIngestCitation(body, authoredBody);
@@ -1745,6 +2072,7 @@ export class ScholarApplication {
               expectedDigest: proposal.page.expectedDigest,
               ...(proposal.page.body === undefined ? {} : { body: proposal.page.body }),
               ...(proposal.page.title === undefined ? {} : { title: proposal.page.title }),
+              ...(proposal.page.description === undefined ? {} : { description: proposal.page.description }),
               ...(proposal.page.quizWorthiness === undefined ? {} : { quizWorthiness: proposal.page.quizWorthiness }),
             });
             const updatedPage = await this.wiki.update(
@@ -1753,6 +2081,7 @@ export class ScholarApplication {
                 expectedDigest: proposal.page.expectedDigest,
                 ...(proposal.page.body === undefined ? {} : { body: proposal.page.body }),
                 ...(proposal.page.title === undefined ? {} : { title: proposal.page.title }),
+                ...(proposal.page.description === undefined ? {} : { description: proposal.page.description }),
                 ...(proposal.page.quizWorthiness === undefined ? {} : { quizWorthiness: proposal.page.quizWorthiness }),
               },
               prepared,
@@ -1780,8 +2109,8 @@ export class ScholarApplication {
   async applyWikiChange(input: WikiChangeInput): Promise<WikiChangeResult> {
     return this.applyWikiChangeDecoded(decodeWikiChangeInput(input), false);
   }
-  async applyIngestChange(input: WikiChangeInput): Promise<WikiChangeResult> {
-    return this.applyWikiChangeDecoded(decodeWikiChangeInput(input), true);
+  async applyIngestChange(input: WikiChangeInput, workflowRequestId?: string): Promise<WikiChangeResult> {
+    return this.applyWikiChangeDecoded(decodeWikiChangeInput(input), true, workflowRequestId);
   }
   private async quizEvidence(pages: readonly PageLearningRecord[]): Promise<QuizEvidenceRecord[]> {
     const contents = new Map<string, Buffer>();
@@ -1819,7 +2148,7 @@ export class ScholarApplication {
       if (sha256(bytes) !== pageDigest)
         throw new ValidationError(`Learning page is stale or unavailable: ${learning.pageId}`);
       const content = bytes.toString("utf8");
-      for (const section of parseWikiSections(content, learning.pageId)) {
+      for (const section of parseWikiDocumentSections(content, learning.pageId)) {
         const sectionText = content.slice(section.startOffset, section.endOffset);
         if (!sectionText || sha256(sectionText) !== section.textDigest)
           throw new ValidationError(`Learning section is stale: ${learning.pageId}${section.anchor}`);
@@ -1850,15 +2179,15 @@ export class ScholarApplication {
           result.page.pageId !== learning.pageId
         )
           return undefined;
+        const parsed = parseWikiMarkdown(result.markdown);
+        const description = parsed.frontmatter.description;
+        if (typeof description !== "string" || !description.trim()) return undefined;
         return {
           pageId: result.page.pageId,
           path: result.page.relativePath,
           title: result.page.title,
+          description: boundedUtf8(description.trim(), DAILY_CANDIDATE_DESCRIPTION_BYTES),
           dueAt: learning.dueAt,
-          sections: result.sections.map((section) => ({
-            anchor: section.anchor,
-            ...(section.heading === undefined ? {} : { heading: section.heading }),
-          })),
         };
       }),
     );
@@ -1877,12 +2206,12 @@ export class ScholarApplication {
       const quiz = this.quiz.get(date);
       return {
         date,
-        initializationEnabled: settings.settings.initializationEnabled,
+        maintenanceEnabled: settings.settings.maintenanceEnabled,
         expiredCount,
         candidates: await this.quizCandidates(duePages),
         ...(quiz ? { quiz: await this.quizDetail(quiz) } : {}),
-        ...(settings.settings.initializationEnabled
-          ? { message: "Initialization maintenance is active; quiz publication is blocked." }
+        ...(settings.settings.maintenanceEnabled
+          ? { message: "Maintenance mode is active; quiz publication is blocked." }
           : {}),
       };
     }, "quiz:context");
@@ -1902,6 +2231,8 @@ export class ScholarApplication {
     return withWriterLock(this.paths, async () => {
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz evidence is limited to the current local date");
+      if (await this.readSetting("maintenanceEnabled", true))
+        throw new ValidationError("Maintenance mode is active; quiz evidence is blocked");
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date, false));
       const byId = new Map(duePages.map((page) => [page.pageId, page]));
       const selectedPages = pageIds.map((pageId) => {
@@ -1942,15 +2273,11 @@ export class ScholarApplication {
   async publishQuiz(input: QuizPublicationInput): Promise<QuizDetailRecord> {
     const proposal = decodeQuizPublication(input);
     const date = proposal.date;
-    let blocked = false;
-    const result = await this.durableDirect(async () => {
+    return this.durableDirect(async () => {
       if (date !== (await this.currentLocalDate()))
         throw new ValidationError("quiz publication is limited to the current local date");
-      const settings = await this.getSettings();
-      if (settings.settings.initializationEnabled) {
-        blocked = true;
-        return undefined;
-      }
+      if (await this.readSetting("maintenanceEnabled", true))
+        throw new ValidationError("Maintenance mode is active; quiz publication is blocked");
       const duePages = await this.filterLiveDriftPages(this.scheduler.eligiblePages(date));
       if (proposal.status === "skipped") {
         if (duePages.length) throw new ValidationError("A quiz may be skipped only when no pages are eligible");
@@ -1975,9 +2302,6 @@ export class ScholarApplication {
         }),
       );
     }, "quiz:publish");
-    if (blocked || !result)
-      throw new ValidationError("Initialization maintenance is active; quiz publication is blocked");
-    return result;
   }
   private async gradingContextFor(date: string, requestId: string, quiz: QuizRecord): Promise<GradingContext> {
     return {
@@ -2074,9 +2398,9 @@ export class ScholarApplication {
     });
   }
   private async failGradingWorkflow(requestId: string, error: unknown, ownerHash: string): Promise<void> {
-    const message = errorMessage(error).slice(0, 500);
     const code =
       error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "QUIZ_GRADING_FAILED";
+    const message = workflowFailureMessage(error);
     await this.durableDirect(() => {
       transaction(this.db, () => {
         const workflow = this.db.get<Record<string, unknown>>(
@@ -2151,6 +2475,7 @@ export class ScholarApplication {
             date: proposal.date,
             revision: proposal.revision,
             submissionId: proposal.submissionId,
+            requestId: proposal.requestId,
             questions: proposal.questions,
             pages: proposal.pages,
           },
