@@ -6,21 +6,127 @@ name: Release
 # workflow: release.yml
 # environment: npm
 # allowed action: npm publish
+#
+# A branch dispatch commits the version and tag, then dispatches this workflow
+# again at that tag so npm provenance identifies the committed release source.
+# Repository rules must let github-actions[bot] update main and create v* tags.
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z or vX.Y.Z-rc.N)
+        required: true
+        type: string
+
+run-name: Release ${{ inputs.tag }} from ${{ github.ref_name }}
 
 permissions: {}
 
 concurrency:
-  group: release-${{ contains(github.ref_name, '-rc.') && 'next' || 'latest' }}
-  queue: max
+  group: release-${{ contains(inputs.tag, '-rc.') && 'next' || 'latest' }}
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Validate requested release
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "Release preparation must run from the main branch" >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_TAG" =~ ^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?)$ ]]; then
+            RELEASE_VERSION="${BASH_REMATCH[1]}"
+          else
+            echo "Unsupported release tag: $RELEASE_TAG" >&2
+            echo 'Expected vX.Y.Z or vX.Y.Z-rc.N with canonical numeric components' >&2
+            exit 1
+          fi
+
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "Release preparation must run from the current origin/main commit" >&2
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Release tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pin npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.19.0"
+          npm install --global npm@11.19.0
+          test "$(npm --version)" = "11.19.0"
+
+      - name: Update package version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version "$RELEASE_VERSION" --no-git-tag-version
+          git diff --check
+          test "$(node -p "require('./package.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./package-lock.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./package-lock.json').packages[''].version")" = "$RELEASE_VERSION"
+          if ! git diff --quiet -- . ':(exclude)package.json' ':(exclude)package-lock.json'; then
+            echo "npm version changed files outside package metadata" >&2
+            exit 1
+          fi
+
+      - name: Commit and tag release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "Release $RELEASE_TAG"
+          git tag --annotate "$RELEASE_TAG" --message "$RELEASE_TAG"
+          git push --atomic origin HEAD:main "refs/tags/$RELEASE_TAG"
+
+      - name: Dispatch tagged release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_TAG" -f tag="$RELEASE_TAG"
+
   build:
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -48,11 +154,17 @@ jobs:
       - name: Validate release tag and ancestry
         id: release
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
             echo "Release workflow requires a tag ref" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "$GITHUB_REF_NAME" ]]; then
+            echo "Requested tag $RELEASE_TAG does not match workflow ref $GITHUB_REF_NAME" >&2
             exit 1
           fi
 
