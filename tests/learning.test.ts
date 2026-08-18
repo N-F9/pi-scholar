@@ -77,6 +77,113 @@ test("due eligibility uses the persisted timezone for both day and due timestamp
   assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
   db.close();
 });
+test("day-scale reviews stay on the intended local date across DST", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "dst-page");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("America/New_York"),
+    new Date().toISOString(),
+  ]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", ["dst-quiz", "2026-03-07"]);
+  const scheduler = new SchedulerService(db);
+  const reviewedAt = "2026-03-08T04:30:00.000Z";
+  scheduler.ensurePageLearning("dst-page", reviewedAt);
+  scheduler.transitionPage("dst-page", "Again", reviewedAt, {
+    quizId: "dst-quiz",
+    submissionId: "dst-submission",
+    revision: 1,
+  });
+
+  const learning = scheduler.getPageLearning("dst-page");
+  assert.equal(localDate(learning.dueAt, "America/New_York"), "2026-03-08");
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-03-08", false).map((page) => page.pageId),
+    ["dst-page"],
+  );
+  db.close();
+});
+test("day-scale reviews advance past skipped civil dates", () => {
+  const db = openDatabase(":memory:");
+  addPage(db, "skipped-date-page");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("Pacific/Apia"),
+    new Date().toISOString(),
+  ]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "skipped-date-quiz",
+    "2011-12-29",
+  ]);
+  const scheduler = new SchedulerService(db);
+  const reviewedAt = "2011-12-29T22:00:00.000Z";
+  scheduler.ensurePageLearning("skipped-date-page", reviewedAt);
+  scheduler.transitionPage("skipped-date-page", "Again", reviewedAt, {
+    quizId: "skipped-date-quiz",
+    submissionId: "skipped-date-submission",
+    revision: 1,
+  });
+
+  const learning = scheduler.getPageLearning("skipped-date-page");
+  assert.equal(localDate(learning.dueAt, "Pacific/Apia"), "2011-12-31");
+  assert.deepEqual(
+    scheduler.eligiblePages("2011-12-31", false).map((page) => page.pageId),
+    ["skipped-date-page"],
+  );
+  db.close();
+});
+test("FSRS learning and relearning use day-scale intervals for every rating", () => {
+  const { db, scheduler } = setup();
+  addPage(db, "p3");
+  addPage(db, "p4");
+  db.run("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)", [
+    "timezone",
+    JSON.stringify("UTC"),
+    new Date().toISOString(),
+  ]);
+  const reviewedAt = "2026-08-20T12:00:00.000Z";
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "daily-fsrs-quiz",
+    "2026-08-20",
+  ]);
+  const cases = [
+    ["p1", "Again", 1, "2026-08-21"],
+    ["p2", "Hard", 2, "2026-08-22"],
+    ["p3", "Good", 3, "2026-08-23"],
+    ["p4", "Easy", 8, "2026-08-28"],
+  ] as const;
+
+  for (const [pageId, rating, expectedDays, expectedDate] of cases) {
+    scheduler.ensurePageLearning(pageId, reviewedAt);
+    const review = scheduler.transitionPage(pageId, rating, reviewedAt, {
+      quizId: "daily-fsrs-quiz",
+      submissionId: "daily-fsrs-submission",
+      revision: 1,
+    });
+    const learning = scheduler.getPageLearning(pageId);
+    assert.equal(learning.fsrsState, "Review");
+    assert.equal(learning.scheduledDays, expectedDays);
+    assert.equal(localDate(learning.dueAt, "UTC"), expectedDate);
+    assert.equal((review.stateAfter as { learning_steps: number }).learning_steps, 0);
+  }
+
+  const relearnedAt = "2026-08-28T12:00:00.000Z";
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "daily-fsrs-relearning-quiz",
+    "2026-08-28",
+  ]);
+  scheduler.transitionPage("p4", "Again", relearnedAt, {
+    quizId: "daily-fsrs-relearning-quiz",
+    submissionId: "daily-fsrs-relearning-submission",
+    revision: 1,
+  });
+  const relearned = scheduler.getPageLearning("p4");
+  assert.equal(relearned.fsrsState, "Review");
+  assert.equal(relearned.scheduledDays, 1);
+  assert.equal(localDate(relearned.dueAt, "UTC"), "2026-08-29");
+  assert.equal(relearned.lapses, 1);
+  db.close();
+});
 test("injected learning clocks stamp due, quiz, and FSRS writes consistently", () => {
   const { db } = setup();
   const instant = "2026-08-15T12:00:00.000Z";
@@ -362,6 +469,39 @@ test("page prerequisites gate due selection until every prerequisite is in Revie
   assert.throws(() => scheduler.setPrerequisites("p1", ["p2"]), ValidationError);
   assert.throws(() => scheduler.setPrerequisites("p1", ["p1"]), ValidationError);
   assert.throws(() => scheduler.setPrerequisites("p2", ["missing-page"]), ValidationError);
+  db.close();
+});
+test("an Again rating does not satisfy a prerequisite", () => {
+  const { db, scheduler } = setup();
+  ensureDue(scheduler, ["p1", "p2"], "2026-08-20");
+  scheduler.setPrerequisites("p2", ["p1"]);
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "failed-prerequisite-quiz",
+    "2026-08-20",
+  ]);
+  scheduler.transitionPage("p1", "Again", "2026-08-20T12:00:00.000Z", {
+    quizId: "failed-prerequisite-quiz",
+    submissionId: "failed-prerequisite-submission",
+    revision: 1,
+  });
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-21", false).map((page) => page.pageId),
+    ["p1"],
+  );
+
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "passed-prerequisite-quiz",
+    "2026-08-21",
+  ]);
+  scheduler.transitionPage("p1", "Good", "2026-08-21T12:00:00.000Z", {
+    quizId: "passed-prerequisite-quiz",
+    submissionId: "passed-prerequisite-submission",
+    revision: 1,
+  });
+  assert.deepEqual(
+    scheduler.eligiblePages("2026-08-21", false).map((page) => page.pageId),
+    ["p2"],
+  );
   db.close();
 });
 
