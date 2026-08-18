@@ -16,6 +16,7 @@ permissions: {}
 
 concurrency:
   group: release-${{ contains(github.ref_name, '-rc.') && 'next' || 'latest' }}
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -294,8 +295,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if RELEASE_DRAFT="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
             gh release upload "$GITHUB_REF_NAME" "$TARBALL" --repo "$GITHUB_REPOSITORY" --clobber
+            if [[ "$RELEASE_DRAFT" == true ]]; then
+              gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+            fi
           elif [[ "$RELEASE_PRERELEASE" == true ]]; then
             gh release create "$GITHUB_REF_NAME" "$TARBALL" \
               --repo "$GITHUB_REPOSITORY" \
