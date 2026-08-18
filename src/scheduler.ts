@@ -204,6 +204,19 @@ function addCalendarDays(date: string, days: number): string {
   return result.toISOString().slice(0, 10);
 }
 
+function localNoonOnOrAfter(date: string, timezone: string): Date {
+  let candidate = date;
+  while (true) {
+    try {
+      return localNoon(candidate, timezone);
+    } catch (error) {
+      if (!(error instanceof ValidationError) || error.message !== "simulatedDate is not a valid local date")
+        throw error;
+      candidate = addCalendarDays(candidate, 1);
+    }
+  }
+}
+
 export const SEALED_QUIZ_REVIEW = Symbol("sealed-quiz-review");
 
 export interface ReviewTransitionContext {
@@ -593,7 +606,7 @@ export class SchedulerService {
     const timezone = persistedTimezone(this.source);
     const due =
       scheduledDays > 0
-        ? localNoon(addCalendarDays(localDate(at, timezone), scheduledDays), timezone)
+        ? localNoonOnOrAfter(addCalendarDays(localDate(at, timezone), scheduledDays), timezone)
         : new Date(after.due);
     const beforeSnapshot = fsrsSnapshot(before);
     const afterSnapshot = fsrsSnapshot({ ...after, due });
