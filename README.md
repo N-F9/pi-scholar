@@ -4,28 +4,6 @@
   <img src="./assets/pi-scholar-readme.png" alt="A scholar writing beside books and a candle" width="50%">
 </p>
 
-<!--
-Original author notes preserved from the working draft:
-
-Pi Scholar turns a personal source library into a local, evidence-grounded wiki and a bounded daily review practice using research based methods.
-
-Pi Scholar v0.0.1 is usable but extremely primitive, the methods are good but not frontier level, and interfaces may change. The plan is to establish a roadmap after v0.0.1 toward the optimal system intended for v1.0.0.
-
-Pi Scholar is intended to automate the learning process and remove the friction of typical learning. At the University of Pittsburgh, I noticed that even very capable students often found it difficult to begin studying for an exam or project. The v0.0.1 goal is to remove that friction; later versions should apply stronger research-backed learning methods.
-
-Think of the project in relation to Engram, but with less friction for the learner. Engram is a wonderful project that works well but asks more of the user in deciding what to learn and initiating the experience.
-
-For now, Oh My Pi is recommended. The project is still primitive in how it approaches its architecture, and Oh My Pi simplifies context-management problems that are harder under bare Pi, such as fanning ingestion work out to subagents so one model context does not become too large.
-
-Future versions should fully support bare Pi. For v0.0.1, recommending Oh My Pi is a reasonable tradeoff.
-
-A high-quality model is recommended because model quality affects wiki quality, which affects quiz quality.
-
-During initialization, keep Pi Scholar in maintenance mode while adding, extracting, ingesting, and linting sources. The goal is to make the wiki stable enough to begin learning. Once initialization is complete, turn maintenance mode off.
-
-The recommended routine is to extract up to three sources every day. Run daily quizzes and grading from Monday through Saturday. On Sunday, use maintenance mode to ingest the week’s extracted material and lint the wiki. Seven daily extraction batches can prepare up to 21 sources, although ingestion itself has no hard cap. Freezing quiz publication during larger wiki changes avoids difficult cases where a page changes between quiz publication and grading.
--->
-
 **Pi Scholar is a local-first learning system that turns a personal source library into a sourced wiki and a manageable daily study practice.**
 
 It is built for people who want to learn from their own books, papers, notes, websites, and code without planning every study session by hand.
@@ -34,7 +12,7 @@ It is built for people who want to learn from their own books, papers, notes, we
 
 ## What is Pi Scholar, and why does it exist?
 
-The idea came from my time at the University of Pittsburgh. I noticed that very capable students often struggled with actually beginning to study for an exam or project. The problem was not that they were unable to understand the material. The problem was that useful studying required a chain of smaller decisions before the learning could even begin.
+The idea came from my time at the University of Pittsburgh. I noticed that very capable students often struggled with actually beginning to study for an exam or project. The problem was that useful studying required a chain of smaller decisions before the learning could even begin.
 
 You have to decide what matters, find the relevant material, organize it, choose what to study first, and then decide how to test yourself. By the time all of that is done, it is easy to lose the time or energy that was supposed to go toward learning.
 
