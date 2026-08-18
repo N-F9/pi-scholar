@@ -3,6 +3,10 @@
   "version": "0.0.1",
   "description": "Local-first sourced Markdown wiki and daily review for Pi",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/N-F9/pi-scholar.git"
+  },
   "keywords": [
     "pi-package"
   ],

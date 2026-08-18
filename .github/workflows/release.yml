@@ -1,0 +1,316 @@
+name: Release
+
+# npm Trusted Publishing (OIDC) settings:
+# owner: N-F9
+# repository: pi-scholar
+# workflow: release.yml
+# environment: npm
+# allowed action: npm publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ contains(github.ref_name, '-rc.') && 'next' || 'latest' }}
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      npm-tag: ${{ steps.release.outputs.npm-tag }}
+      package-name: ${{ steps.package.outputs.name }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      tarball: ${{ steps.package.outputs.tarball }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Validate release tag and ancestry
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "Release workflow requires a tag ref" >&2
+            exit 1
+          fi
+
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" =~ ^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$ ]]; then
+            RELEASE_VERSION="${BASH_REMATCH[1]}"
+            NPM_TAG=next
+            RELEASE_PRERELEASE=true
+          elif [[ "$TAG" =~ ^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
+            RELEASE_VERSION="${BASH_REMATCH[1]}"
+            NPM_TAG=latest
+            RELEASE_PRERELEASE=false
+          else
+            echo "Unsupported release tag: $TAG" >&2
+            echo 'Expected vX.Y.Z or vX.Y.Z-rc.N with canonical numeric components' >&2
+            exit 1
+          fi
+
+          PACKAGE_NAME="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package.json', 'utf8')).name ?? '')")"
+          PACKAGE_VERSION="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package.json', 'utf8')).version ?? '')")"
+          PACKAGE_REPOSITORY="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package.json', 'utf8')).repository?.url ?? '')")"
+          PACKAGE_LOCK_NAME="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).name ?? '')")"
+          PACKAGE_LOCK_VERSION="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).version ?? '')")"
+          PACKAGE_LOCK_ROOT_NAME="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).packages?.['']?.name ?? '')")"
+          PACKAGE_LOCK_ROOT_VERSION="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).packages?.['']?.version ?? '')")"
+          if [[ "$PACKAGE_NAME" != "pi-scholar" || "$PACKAGE_LOCK_NAME" != "$PACKAGE_NAME" || "$PACKAGE_LOCK_ROOT_NAME" != "$PACKAGE_NAME" ]]; then
+            echo "Package names ($PACKAGE_NAME, $PACKAGE_LOCK_NAME, $PACKAGE_LOCK_ROOT_NAME) must all be pi-scholar" >&2
+            exit 1
+          fi
+          if [[ "$PACKAGE_REPOSITORY" != "git+https://github.com/N-F9/pi-scholar.git" ]]; then
+            echo "package.json repository.url must identify the Trusted Publisher repository" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_VERSION" != "$PACKAGE_VERSION" ]]; then
+            echo "Tag version $RELEASE_VERSION does not match package.json version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+          if [[ "$PACKAGE_LOCK_VERSION" != "$PACKAGE_VERSION" || "$PACKAGE_LOCK_ROOT_VERSION" != "$PACKAGE_VERSION" ]]; then
+            echo "package-lock.json versions ($PACKAGE_LOCK_VERSION, $PACKAGE_LOCK_ROOT_VERSION) do not match package.json version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
+          TAG_COMMIT="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+            echo "Tagged commit $TAG_COMMIT is not in origin/main history" >&2
+            exit 1
+          fi
+
+          {
+            echo "npm-tag=$NPM_TAG"
+            echo "prerelease=$RELEASE_PRERELEASE"
+            echo "version=$RELEASE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Validated $TAG for $NPM_TAG release of $RELEASE_VERSION at $TAG_COMMIT"
+
+      - name: Pin npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.19.0"
+          npm install --global npm@11.19.0
+          test "$(npm --version)" = "11.19.0"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Verify package
+        run: npm run clean && npm run verify
+
+      - name: Pack verified release tarball
+        id: package
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_NAME="$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('package.json', 'utf8')).name)")"
+          PACKAGE_BASENAME="${PACKAGE_NAME#@}"
+          PACKAGE_BASENAME="${PACKAGE_BASENAME//\//-}"
+          TARBALL="${PACKAGE_BASENAME}-${RELEASE_VERSION}.tgz"
+
+          if compgen -G './*.tgz' >/dev/null; then
+            echo "Refusing to pack with a pre-existing tarball" >&2
+            exit 1
+          fi
+          npm pack --ignore-scripts
+          test -f "$TARBALL"
+
+          {
+            echo "name=$PACKAGE_NAME"
+            echo "tarball=$TARBALL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Packed verified artifact $TARBALL"
+
+      - name: Upload verified tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package-${{ steps.release.outputs.version }}
+          path: ${{ steps.package.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22.19.0
+          registry-url: https://registry.npmjs.org
+
+      - name: Pin npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.19.0"
+          npm install --global npm@11.19.0
+          test "$(npm --version)" = "11.19.0"
+
+      - name: Download verified tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package-${{ needs.build.outputs.version }}
+
+      - name: Publish tarball with OIDC
+        shell: bash
+        env:
+          NPM_TAG: ${{ needs.build.outputs.npm-tag }}
+          PACKAGE_NAME: ${{ needs.build.outputs.package-name }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          TARBALL: ${{ needs.build.outputs.tarball }}
+        run: |
+          set -euo pipefail
+
+          NPM_ACTION="$(node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+
+          const compareVersions = (left, right) => {
+            const parse = (value) => {
+              const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.(0|[1-9]\d*))?$/.exec(value);
+              if (!match) throw new Error(`Cannot compare non-release version ${value}`);
+              return [BigInt(match[1]), BigInt(match[2]), BigInt(match[3]), match[4] === undefined ? null : BigInt(match[4])];
+            };
+            const leftParts = parse(left);
+            const rightParts = parse(right);
+            for (let index = 0; index < 3; index += 1) {
+              if (leftParts[index] !== rightParts[index]) return leftParts[index] > rightParts[index] ? 1 : -1;
+            }
+            const leftRc = leftParts[3];
+            const rightRc = rightParts[3];
+            if (leftRc === null || rightRc === null) return leftRc === rightRc ? 0 : leftRc === null ? 1 : -1;
+            return leftRc === rightRc ? 0 : leftRc > rightRc ? 1 : -1;
+          };
+
+          const npmTag = process.env.NPM_TAG;
+          const packageName = process.env.PACKAGE_NAME;
+          const version = process.env.RELEASE_VERSION;
+          const tarball = process.env.TARBALL;
+          if (!npmTag || !packageName || !version || !tarball) {
+            throw new Error('Release metadata is missing');
+          }
+
+          const integrity = `sha512-${createHash('sha512').update(readFileSync(tarball)).digest('base64')}`;
+          const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(packageName)}/${version}`);
+
+          if (response.status === 404) {
+            const tagsResponse = await fetch(`https://registry.npmjs.org/-/package/${encodeURIComponent(packageName)}/dist-tags`);
+            if (tagsResponse.status !== 404 && !tagsResponse.ok) {
+              throw new Error(`npm dist-tag lookup failed: ${tagsResponse.status} ${tagsResponse.statusText}`);
+            }
+            const currentVersion = tagsResponse.ok ? (await tagsResponse.json())?.[npmTag] : undefined;
+            if (currentVersion && compareVersions(version, currentVersion) <= 0) {
+              throw new Error(`Refusing to move npm dist-tag ${npmTag} backward from ${currentVersion} to ${version}`);
+            }
+            console.error(`No existing ${packageName}@${version}; local integrity is ${integrity}`);
+            process.stdout.write('publish\n');
+          } else {
+            if (!response.ok) {
+              throw new Error(`npm registry lookup failed: ${response.status} ${response.statusText}`);
+            }
+            const metadata = await response.json();
+            const registryIntegrity = metadata?.dist?.integrity;
+            if (registryIntegrity !== integrity) {
+              throw new Error(`Existing ${packageName}@${version} integrity ${registryIntegrity ?? '<missing>'} does not match local ${integrity}`);
+            }
+            console.error(`Existing ${packageName}@${version} matches local integrity ${integrity}; skipping npm publish`);
+            process.stdout.write('skip\n');
+          }
+          NODE
+          )"
+
+          case "$NPM_ACTION" in
+            publish)
+              npm publish "$TARBALL" --tag "$NPM_TAG" --access public
+              ;;
+            skip)
+              ;;
+            *)
+              echo "Unexpected npm action: $NPM_ACTION" >&2
+              exit 1
+              ;;
+          esac
+
+  github-release:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download published tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package-${{ needs.build.outputs.version }}
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          TARBALL: ${{ needs.build.outputs.tarball }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if RELEASE_DRAFT="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            gh release upload "$GITHUB_REF_NAME" "$TARBALL" --repo "$GITHUB_REPOSITORY" --clobber
+            if [[ "$RELEASE_DRAFT" == true ]]; then
+              gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+            fi
+          elif [[ "$RELEASE_PRERELEASE" == true ]]; then
+            gh release create "$GITHUB_REF_NAME" "$TARBALL" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --prerelease \
+              --verify-tag
+          else
+            gh release create "$GITHUB_REF_NAME" "$TARBALL" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
