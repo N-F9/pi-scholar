@@ -336,7 +336,7 @@ export class SchedulerService {
   readonly paths?: VaultPathsLike;
   readonly clock: Clock;
   private readonly source: SqlDatabaseSource;
-  private readonly engine = fsrs();
+  private readonly engine = fsrs({ enable_short_term: false });
 
   constructor(source: SqlDatabaseSource, paths?: VaultPathsLike, clock: Clock = SYSTEM_CLOCK) {
     this.source = source;

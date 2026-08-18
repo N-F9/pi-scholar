@@ -77,6 +77,53 @@ test("due eligibility uses the persisted timezone for both day and due timestamp
   assert.deepEqual(scheduler.eligiblePages("2026-08-11", false), []);
   db.close();
 });
+test("FSRS learning and relearning use day-scale intervals for every rating", () => {
+  const { db, scheduler } = setup();
+  addPage(db, "p3");
+  addPage(db, "p4");
+  const reviewedAt = "2026-08-20T12:00:00.000Z";
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "daily-fsrs-quiz",
+    "2026-08-20",
+  ]);
+  const cases = [
+    ["p1", "Again", 1],
+    ["p2", "Hard", 2],
+    ["p3", "Good", 3],
+    ["p4", "Easy", 8],
+  ] as const;
+
+  for (const [pageId, rating, expectedDays] of cases) {
+    scheduler.ensurePageLearning(pageId, reviewedAt);
+    const review = scheduler.transitionPage(pageId, rating, reviewedAt, {
+      quizId: "daily-fsrs-quiz",
+      submissionId: "daily-fsrs-submission",
+      revision: 1,
+    });
+    const learning = scheduler.getPageLearning(pageId);
+    assert.equal(learning.fsrsState, "Review");
+    assert.equal(learning.scheduledDays, expectedDays);
+    assert.equal(learning.dueAt, new Date(Date.parse(reviewedAt) + expectedDays * 86_400_000).toISOString());
+    assert.equal((review.stateAfter as { learning_steps: number }).learning_steps, 0);
+  }
+
+  const relearnedAt = "2026-08-28T12:00:00.000Z";
+  db.run("INSERT INTO quizzes (quiz_id, date, revision, status) VALUES (?, ?, 1, 'open')", [
+    "daily-fsrs-relearning-quiz",
+    "2026-08-28",
+  ]);
+  scheduler.transitionPage("p4", "Again", relearnedAt, {
+    quizId: "daily-fsrs-relearning-quiz",
+    submissionId: "daily-fsrs-relearning-submission",
+    revision: 1,
+  });
+  const relearned = scheduler.getPageLearning("p4");
+  assert.equal(relearned.fsrsState, "Review");
+  assert.equal(relearned.scheduledDays, 1);
+  assert.equal(relearned.dueAt, "2026-08-29T12:00:00.000Z");
+  assert.equal(relearned.lapses, 1);
+  db.close();
+});
 test("injected learning clocks stamp due, quiz, and FSRS writes consistently", () => {
   const { db } = setup();
   const instant = "2026-08-15T12:00:00.000Z";

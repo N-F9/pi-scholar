@@ -67,7 +67,7 @@ Pi Scholar is still early, but the full source-to-review path already exists:
 - It builds a Markdown wiki through guarded ingest and lint workflows. The model can propose changes, but the application validates and commits the durable result.
 - It chooses daily material from pages that are active, due, free of unresolved drift, and no longer blocked by prerequisites.
 - It requires every published quiz question to point back to authorized page and source evidence.
-- It schedules wiki pages rather than creating a second collection of permanent question cards. Each covered page receives at most one bundled FSRS rating per quiz.
+- It schedules wiki pages rather than creating a second collection of permanent question cards. Each covered page receives at most one bundled FSRS rating per quiz, and every resulting interval is day-scale to match the daily quiz cadence.
 - It keeps the durable work local in the vault: Markdown pages, source records, quizzes, SQLite state, and local Git checkpoints.
 - It includes a browser interface for the normal workflow, with Today, Notes, Add sources, History, Workflows, Settings, and Health.
 
