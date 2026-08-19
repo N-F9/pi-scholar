@@ -6,21 +6,225 @@ name: Release
 # workflow: release.yml
 # environment: npm
 # allowed action: npm publish
+#
+# A branch dispatch commits the version and tag, then dispatches this workflow
+# again at that tag so npm provenance identifies the committed release source.
+# Repository rules must let github-actions[bot] update main and create v* tags.
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z or vX.Y.Z-rc.N)
+        required: true
+        type: string
+
+run-name: Release ${{ inputs.tag }} from ${{ github.ref_name }}
 
 permissions: {}
 
 concurrency:
-  group: release-${{ contains(github.ref_name, '-rc.') && 'next' || 'latest' }}
-  queue: max
+  group: release-${{ github.ref_type == 'tag' && 'publish' || 'prepare' }}-${{ contains(inputs.tag, '-rc.') && 'next' || 'latest' }}
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Validate requested release
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "Release preparation must run from the main branch" >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_TAG" =~ ^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?)$ ]]; then
+            RELEASE_VERSION="${BASH_REMATCH[1]}"
+          else
+            echo "Unsupported release tag: $RELEASE_TAG" >&2
+            echo 'Expected vX.Y.Z or vX.Y.Z-rc.N with canonical numeric components' >&2
+            exit 1
+          fi
+
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "Release preparation must run from the current origin/main commit" >&2
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Release tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          export PACKAGE_VERSION RELEASE_VERSION
+          node --input-type=module <<'NODE'
+          const parse = (value) => {
+            const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.(0|[1-9]\d*))?$/.exec(value);
+            if (!match) throw new Error(`Cannot compare non-release version ${value}`);
+            return [BigInt(match[1]), BigInt(match[2]), BigInt(match[3]), match[4] === undefined ? null : BigInt(match[4])];
+          };
+          const compare = (left, right) => {
+            const leftParts = parse(left);
+            const rightParts = parse(right);
+            for (let index = 0; index < 3; index += 1) {
+              if (leftParts[index] !== rightParts[index]) return leftParts[index] > rightParts[index] ? 1 : -1;
+            }
+            const leftRc = leftParts[3];
+            const rightRc = rightParts[3];
+            if (leftRc === null || rightRc === null) return leftRc === rightRc ? 0 : leftRc === null ? 1 : -1;
+            return leftRc === rightRc ? 0 : leftRc > rightRc ? 1 : -1;
+          };
+          if (compare(process.env.RELEASE_VERSION, process.env.PACKAGE_VERSION) <= 0) {
+            throw new Error(`Release version ${process.env.RELEASE_VERSION} must be newer than package version ${process.env.PACKAGE_VERSION}`);
+          }
+          NODE
+
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pin npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.19.0"
+          npm install --global npm@11.19.0
+          test "$(npm --version)" = "11.19.0"
+
+      - name: Update package version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version "$RELEASE_VERSION" --no-git-tag-version
+          git diff --check
+          test "$(node -p "require('./package.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./package-lock.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./package-lock.json').packages[''].version")" = "$RELEASE_VERSION"
+          if ! git diff --quiet -- . ':(exclude)package.json' ':(exclude)package-lock.json'; then
+            echo "npm version changed files outside package metadata" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Verify release before push
+        run: npm run clean && npm run verify
+
+      - name: Check release package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_MANIFEST="$RUNNER_TEMP/npm-pack.json"
+          npm pack --dry-run --ignore-scripts --json > "$PACKAGE_MANIFEST"
+          export PACKAGE_MANIFEST
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+
+          const [pack] = JSON.parse(readFileSync(process.env.PACKAGE_MANIFEST, 'utf8'));
+          if (!pack || !Array.isArray(pack.files)) throw new Error('npm pack did not return a file manifest');
+
+          const paths = pack.files.map(({ path }) => path);
+          const required = [
+            'LICENSE',
+            'README.md',
+            'apps/web/dist/index.html',
+            'assets/pi-scholar-readme.png',
+            'dist/cli.js',
+            'dist/contracts.d.ts',
+            'dist/contracts.js',
+            'dist/index.d.ts',
+            'dist/index.js',
+            'package.json',
+            'pi/extension.ts',
+            'skills/daily/SKILL.md',
+            'skills/extract/SKILL.md',
+            'skills/ingest/SKILL.md',
+            'skills/lint/SKILL.md',
+            'skills/quiz-grader/SKILL.md',
+          ];
+          const missing = required.filter((path) => !paths.includes(path));
+          if (missing.length > 0) throw new Error(`Release package is missing: ${missing.join(', ')}`);
+
+          const allowedFiles = new Set(['LICENSE', 'README.md', 'package.json']);
+          const allowedPrefixes = ['apps/web/dist/', 'assets/', 'dist/', 'pi/', 'skills/'];
+          const unexpected = paths.filter(
+            (path) => !allowedFiles.has(path) && !allowedPrefixes.some((prefix) => path.startsWith(prefix)),
+          );
+          if (unexpected.length > 0) throw new Error(`Release package contains unexpected files: ${unexpected.join(', ')}`);
+
+          console.log(`Validated ${paths.length} packed files`);
+          NODE
+
+      - name: Commit and tag release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "Release $RELEASE_TAG"
+          git tag --annotate "$RELEASE_TAG" --message "$RELEASE_TAG"
+          git push --atomic origin HEAD:main "refs/tags/$RELEASE_TAG"
+
+      - name: Dispatch and await tagged release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TAG_COMMIT="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_TAG" -f tag="$RELEASE_TAG"
+
+          RUN_ID=
+          for _ in {1..30}; do
+            RUN_ID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml --event workflow_dispatch --commit "$TAG_COMMIT" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            if [[ -n "$RUN_ID" ]]; then
+              break
+            fi
+            sleep 2
+          done
+          if [[ -z "$RUN_ID" ]]; then
+            echo "Tagged release run did not appear for $TAG_COMMIT" >&2
+            exit 1
+          fi
+
+          gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+
   build:
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -48,11 +252,17 @@ jobs:
       - name: Validate release tag and ancestry
         id: release
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
             echo "Release workflow requires a tag ref" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "$GITHUB_REF_NAME" ]]; then
+            echo "Requested tag $RELEASE_TAG does not match workflow ref $GITHUB_REF_NAME" >&2
             exit 1
           fi
 
