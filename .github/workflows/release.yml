@@ -78,6 +78,30 @@ jobs:
             exit 1
           fi
 
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          export PACKAGE_VERSION RELEASE_VERSION
+          node --input-type=module <<'NODE'
+          const parse = (value) => {
+            const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.(0|[1-9]\d*))?$/.exec(value);
+            if (!match) throw new Error(`Cannot compare non-release version ${value}`);
+            return [BigInt(match[1]), BigInt(match[2]), BigInt(match[3]), match[4] === undefined ? null : BigInt(match[4])];
+          };
+          const compare = (left, right) => {
+            const leftParts = parse(left);
+            const rightParts = parse(right);
+            for (let index = 0; index < 3; index += 1) {
+              if (leftParts[index] !== rightParts[index]) return leftParts[index] > rightParts[index] ? 1 : -1;
+            }
+            const leftRc = leftParts[3];
+            const rightRc = rightParts[3];
+            if (leftRc === null || rightRc === null) return leftRc === rightRc ? 0 : leftRc === null ? 1 : -1;
+            return leftRc === rightRc ? 0 : leftRc > rightRc ? 1 : -1;
+          };
+          if (compare(process.env.RELEASE_VERSION, process.env.PACKAGE_VERSION) <= 0) {
+            throw new Error(`Release version ${process.env.RELEASE_VERSION} must be newer than package version ${process.env.PACKAGE_VERSION}`);
+          }
+          NODE
+
           echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Pin npm
@@ -103,6 +127,18 @@ jobs:
             echo "npm version changed files outside package metadata" >&2
             exit 1
           fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Verify release before push
+        run: npm run clean && npm run verify
+
+      - name: Check release package
+        run: npm pack --dry-run --ignore-scripts
 
       - name: Commit and tag release
         shell: bash
