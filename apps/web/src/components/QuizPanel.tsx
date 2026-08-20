@@ -1,4 +1,8 @@
 import { Link } from "react-router-dom";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 import type {
   PublicQuizQuestionRecord,
   QuizAnswerInput,
@@ -9,7 +13,6 @@ import type {
   QuizRecommendations,
 } from "../../../../src/contracts";
 import { headingAnchor, Markdown } from "./Markdown";
-import { Badge, Card } from "./ui";
 
 function answerText(value: QuizAnswerInput["answer"] | undefined): string {
   if (typeof value === "string") return value.trim() || "No answer recorded";
@@ -17,10 +20,10 @@ function answerText(value: QuizAnswerInput["answer"] | undefined): string {
 }
 
 const ratingTones = {
-  Again: "danger",
-  Hard: "caution",
-  Good: "positive",
-  Easy: "positive",
+  Again: "destructive",
+  Hard: "secondary",
+  Good: "default",
+  Easy: "default",
 } as const;
 const recommendationLabels = {
   prerequisite: "Prerequisite",
@@ -73,48 +76,52 @@ export function ReadOnlyQuestions({
     <ol className="grid gap-5">
       {displayQuestions.map((question) => (
         <li key={question.questionId}>
-          <Card className="shadow-none">
-            <p className="eyebrow">
-              Question {questionPositions.get(question.questionId)} ·{" "}
-              {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
-            </p>
-            <div className="mt-3">
-              <Markdown source={question.prompt} />
-            </div>
-            {question.kind === "multiple-choice" && question.choices?.length ? (
-              <ul className="mt-4 grid gap-2">
-                {question.choices.map((choice) => {
-                  const answer = byQuestion.get(question.questionId);
-                  const selected = typeof answer === "string" ? answer === choice : (answer?.includes(choice) ?? false);
-                  return (
-                    <li
-                      className={
-                        selected
-                          ? "rounded-md border border-accent bg-accent/10 px-3 py-2 font-bold"
-                          : "rounded-md border border-line px-3 py-2 text-muted"
-                      }
-                      key={choice}
-                    >
-                      <span>
-                        <Markdown inline source={choice} />
-                        {selected ? " — selected" : ""}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : question.kind === "multiple-choice" ? (
-              <p className="mt-4 rounded-md border border-danger/30 bg-danger/10 p-3 text-sm text-danger">
-                Choices unavailable for this question.
+          <Card>
+            <CardHeader>
+              <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                Question {questionPositions.get(question.questionId)} ·{" "}
+                {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
               </p>
-            ) : (
-              <div className="mt-4 rounded-md border border-line bg-canvas p-4">
-                <p className="eyebrow">Answer</p>
-                <div className="mt-2">
-                  <Markdown source={answerText(byQuestion.get(question.questionId))} />
-                </div>
+            </CardHeader>
+            <CardContent>
+              <div>
+                <Markdown source={question.prompt} />
               </div>
-            )}
+              {question.kind === "multiple-choice" && question.choices?.length ? (
+                <ul className="mt-4 grid gap-2">
+                  {question.choices.map((choice) => {
+                    const answer = byQuestion.get(question.questionId);
+                    const selected =
+                      typeof answer === "string" ? answer === choice : (answer?.includes(choice) ?? false);
+                    return (
+                      <li
+                        className={cn(
+                          "rounded-md border px-3 py-2",
+                          selected ? "border-primary bg-primary/10 font-bold" : "border-border text-muted-foreground",
+                        )}
+                        key={choice}
+                      >
+                        <span>
+                          <Markdown inline source={choice} />
+                          {selected ? " — selected" : ""}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : question.kind === "multiple-choice" ? (
+                <Alert className="mt-4" variant="destructive">
+                  <AlertDescription>Choices unavailable for this question.</AlertDescription>
+                </Alert>
+              ) : (
+                <div className="mt-4 rounded-md border border-border bg-muted p-4">
+                  <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">Answer</p>
+                  <div className="mt-2">
+                    <Markdown source={answerText(byQuestion.get(question.questionId))} />
+                  </div>
+                </div>
+              )}
+            </CardContent>
           </Card>
         </li>
       ))}
@@ -156,29 +163,35 @@ export function QuizResults({
   return (
     <section className="space-y-8" aria-labelledby="results-heading">
       <div>
-        <p className="eyebrow">{settled ? "Settled review" : "Submitted guidance"}</p>
-        <h2 className="mt-2 font-serif text-3xl font-semibold" id="results-heading">
+        <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          {settled ? "Settled review" : "Submitted guidance"}
+        </p>
+        <h2 className="mt-2 text-3xl font-semibold" id="results-heading">
           {settled ? "Results" : "While grading is pending"}
         </h2>
       </div>
 
       {questionResults.length ? (
         <section className="space-y-3" aria-labelledby="question-results-heading">
-          <h3 className="font-serif text-2xl font-semibold" id="question-results-heading">
+          <h3 className="text-2xl font-semibold" id="question-results-heading">
             Question feedback
           </h3>
           <ol className="grid gap-3">
             {questionResults.map((result, index) => (
               <li key={result.resultId}>
-                <Card className="shadow-none">
-                  <p className="eyebrow">Question {questionPositions.get(result.questionId) ?? index + 1}</p>
-                  {result.feedback ? (
-                    <div className="mt-3">
+                <Card>
+                  <CardHeader>
+                    <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                      Question {questionPositions.get(result.questionId) ?? index + 1}
+                    </p>
+                  </CardHeader>
+                  <CardContent>
+                    {result.feedback ? (
                       <Markdown source={result.feedback} />
-                    </div>
-                  ) : (
-                    <p className="mt-3 text-muted">Feedback unavailable.</p>
-                  )}
+                    ) : (
+                      <p className="text-muted-foreground">Feedback unavailable.</p>
+                    )}
+                  </CardContent>
                 </Card>
               </li>
             ))}
@@ -188,7 +201,7 @@ export function QuizResults({
 
       {pageIds.length ? (
         <section className="space-y-3" aria-labelledby="page-results-heading">
-          <h3 className="font-serif text-2xl font-semibold" id="page-results-heading">
+          <h3 className="text-2xl font-semibold" id="page-results-heading">
             Page results
           </h3>
           <ol className="grid gap-3">
@@ -198,36 +211,37 @@ export function QuizResults({
               const rating = result?.rating ?? grade?.rating;
               const feedback = result?.feedback ?? grade?.feedback;
               return (
-                <li
-                  className="rounded-lg border border-line bg-paper p-5 shadow-quiet sm:p-6"
-                  key={result?.resultId ?? grade?.gradeId ?? pageId}
-                >
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <h4 className="font-bold">
-                      {result?.pageLink ? (
-                        <Link
-                          className="underline decoration-accent decoration-2 underline-offset-4 hover:text-muted"
-                          to={readingTarget(result.pageLink)}
-                        >
-                          {result.pageLink.path}
-                        </Link>
+                <li key={result?.resultId ?? grade?.gradeId ?? pageId}>
+                  <Card>
+                    <CardContent>
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <h4 className="font-bold">
+                          {result?.pageLink ? (
+                            <Link
+                              className="underline decoration-2 decoration-primary underline-offset-4 hover:text-muted-foreground"
+                              to={readingTarget(result.pageLink)}
+                            >
+                              {result.pageLink.path}
+                            </Link>
+                          ) : (
+                            `Reviewed page ${index + 1} unavailable`
+                          )}
+                        </h4>
+                        {rating ? (
+                          <Badge variant={ratingTones[rating]}>{rating}</Badge>
+                        ) : (
+                          <Badge variant="destructive">Unavailable</Badge>
+                        )}
+                      </div>
+                      {feedback ? (
+                        <div className="mt-3">
+                          <Markdown source={feedback} />
+                        </div>
                       ) : (
-                        `Reviewed page ${index + 1} unavailable`
+                        <p className="mt-3 text-muted-foreground">Feedback unavailable.</p>
                       )}
-                    </h4>
-                    {rating ? (
-                      <Badge tone={ratingTones[rating]}>{rating}</Badge>
-                    ) : (
-                      <Badge tone="danger">Unavailable</Badge>
-                    )}
-                  </div>
-                  {feedback ? (
-                    <div className="mt-3">
-                      <Markdown source={feedback} />
-                    </div>
-                  ) : (
-                    <p className="mt-3 text-muted">Feedback unavailable.</p>
-                  )}
+                    </CardContent>
+                  </Card>
                 </li>
               );
             })}
@@ -236,85 +250,101 @@ export function QuizResults({
       ) : null}
 
       {readings.length ? (
-        <Card className="border-accent/50 bg-accent/10 shadow-none">
-          <h3 className="font-serif text-2xl font-semibold">
-            {settled ? "Review these sections" : "Pages in this quiz"}
-          </h3>
-          <p className="mt-2 text-sm text-muted">
-            {settled
-              ? "Exact pages and headings selected from the evidence used for this grade."
-              : "These are the pages used by your submitted quiz."}
-          </p>
-          <ul className="mt-4 grid gap-2">
-            {readings.map((reading) => (
-              <li key={`${reading.pageId}:${reading.heading ?? ""}`}>
-                <Link
-                  className="flex min-h-11 items-center justify-between rounded-md border border-line bg-paper px-3 py-2 font-bold hover:border-ink"
-                  to={readingTarget(reading)}
-                >
-                  <span>
-                    {reading.path}
-                    {reading.heading ? ` — ${reading.heading}` : ""}
-                  </span>
-                  <span aria-hidden="true">→</span>
-                </Link>
-              </li>
-            ))}
-          </ul>
+        <Card className="border border-primary/50 bg-primary/10">
+          <CardHeader>
+            <CardTitle>
+              <h3 className="text-2xl font-semibold">{settled ? "Review these sections" : "Pages in this quiz"}</h3>
+            </CardTitle>
+            <CardDescription>
+              {settled
+                ? "Exact pages and headings selected from the evidence used for this grade."
+                : "These are the pages used by your submitted quiz."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ul className="grid gap-2">
+              {readings.map((reading) => (
+                <li key={`${reading.pageId}:${reading.heading ?? ""}`}>
+                  <Link
+                    className="flex min-h-11 items-center justify-between rounded-md border border-border bg-card px-3 py-2 font-bold hover:border-primary"
+                    to={readingTarget(reading)}
+                  >
+                    <span>
+                      {reading.path}
+                      {reading.heading ? ` — ${reading.heading}` : ""}
+                    </span>
+                    <span aria-hidden="true">→</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
         </Card>
       ) : null}
 
       {recommendations.readings.length ? (
-        <Card className="shadow-none">
-          <h3 className="font-serif text-2xl font-semibold">Continue learning</h3>
-          <p className="mt-2 text-sm text-muted">
-            {settled
-              ? "Current whole-wiki guidance, separate from the grading evidence above."
-              : "Current whole-wiki guidance related to these quiz pages while grading is pending."}
-          </p>
-          <ul className="mt-4 grid gap-2">
-            {recommendations.readings.map((reading) => (
-              <li key={reading.pageId}>
-                <Link
-                  className="flex min-h-14 items-center justify-between gap-4 rounded-md border border-line bg-canvas px-3 py-2 hover:border-ink"
-                  to={readingTarget(reading)}
-                >
-                  <span>
-                    <span className="block font-bold">{reading.title}</span>
-                    <span className="block text-sm text-muted">
-                      {recommendationLabels[reading.reason]} · {reading.path}
+        <Card>
+          <CardHeader>
+            <CardTitle>
+              <h3 className="text-2xl font-semibold">Continue learning</h3>
+            </CardTitle>
+            <CardDescription>
+              {settled
+                ? "Current whole-wiki guidance, separate from the grading evidence above."
+                : "Current whole-wiki guidance related to these quiz pages while grading is pending."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ul className="grid gap-2">
+              {recommendations.readings.map((reading) => (
+                <li key={reading.pageId}>
+                  <Link
+                    className="flex min-h-14 items-center justify-between gap-4 rounded-md border border-border bg-muted px-3 py-2 hover:border-primary"
+                    to={readingTarget(reading)}
+                  >
+                    <span>
+                      <span className="block font-bold">{reading.title}</span>
+                      <span className="block text-sm text-muted-foreground">
+                        {recommendationLabels[reading.reason]} · {reading.path}
+                      </span>
                     </span>
-                  </span>
-                  <span aria-hidden="true">→</span>
-                </Link>
-              </li>
-            ))}
-          </ul>
+                    <span aria-hidden="true">→</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
         </Card>
       ) : null}
 
       {recommendations.gaps.length ? (
-        <Card className="border-caution/40 bg-caution/10 shadow-none">
-          <h3 className="font-serif text-2xl font-semibold">Knowledge gaps</h3>
-          <p className="mt-2 text-sm text-muted">Current wiki gaps that may need maintenance or another source.</p>
-          <ul className="mt-4 grid gap-2">
-            {recommendations.gaps.map((gap) => (
-              <li key={`${gap.pageId}:${gap.kind}`}>
-                <Link
-                  className="flex min-h-14 items-center justify-between gap-4 rounded-md border border-line bg-paper px-3 py-2 hover:border-ink"
-                  to={readingTarget(gap)}
-                >
-                  <span>
-                    <span className="block font-bold">{gap.title}</span>
-                    <span className="block text-sm text-muted">
-                      {gapLabels[gap.kind]} · {gap.path}
+        <Card className="border border-secondary/40 bg-secondary/10">
+          <CardHeader>
+            <CardTitle>
+              <h3 className="text-2xl font-semibold">Knowledge gaps</h3>
+            </CardTitle>
+            <CardDescription>Current wiki gaps that may need maintenance or another source.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ul className="grid gap-2">
+              {recommendations.gaps.map((gap) => (
+                <li key={`${gap.pageId}:${gap.kind}`}>
+                  <Link
+                    className="flex min-h-14 items-center justify-between gap-4 rounded-md border border-border bg-card px-3 py-2 hover:border-primary"
+                    to={readingTarget(gap)}
+                  >
+                    <span>
+                      <span className="block font-bold">{gap.title}</span>
+                      <span className="block text-sm text-muted-foreground">
+                        {gapLabels[gap.kind]} · {gap.path}
+                      </span>
                     </span>
-                  </span>
-                  <span aria-hidden="true">→</span>
-                </Link>
-              </li>
-            ))}
-          </ul>
+                    <span aria-hidden="true">→</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
         </Card>
       ) : null}
     </section>

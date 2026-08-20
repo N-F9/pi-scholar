@@ -3,6 +3,12 @@ import "@uiw/react-md-editor/markdown-editor.css";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Spinner } from "@/components/ui/spinner";
 import type {
   PublicQuizRecord,
   QuizAnswerInput,
@@ -25,7 +31,6 @@ import {
 } from "../api";
 import { Markdown } from "../components/Markdown";
 import { QuizResults, ReadOnlyQuestions } from "../components/QuizPanel";
-import { Button, Card, Spinner, StateView } from "../components/ui";
 
 const ANSWER_EDITOR_COMMANDS = [
   commands.bold,
@@ -232,11 +237,15 @@ function QuizAnswerForm({
       }}
     >
       <div
-        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-paper px-4 py-3"
+        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3"
         aria-live="polite"
       >
         <span
-          className={saveDraft.isError || revisionConflict ? "text-sm font-bold text-danger" : "text-sm text-muted"}
+          className={
+            saveDraft.isError || revisionConflict
+              ? "text-sm font-bold text-destructive"
+              : "text-sm text-muted-foreground"
+          }
           role={revisionConflict ? "alert" : undefined}
         >
           {saveDraft.isPending
@@ -248,12 +257,17 @@ function QuizAnswerForm({
                 : saveLabel}
         </span>
         {revisionConflict ? (
-          <Button variant="secondary" onClick={useNewerDraft}>
+          <Button className="min-h-11" variant="outline" type="button" onClick={useNewerDraft}>
             Use newer saved draft
           </Button>
         ) : null}
         {saveDraft.isError && !revisionConflict ? (
-          <Button variant="quiet" onClick={() => saveDraft.mutate({ expectedRevision: revision, answers: payload })}>
+          <Button
+            className="min-h-11"
+            variant="ghost"
+            type="button"
+            onClick={() => saveDraft.mutate({ expectedRevision: revision, answers: payload })}
+          >
             Try draft save again
           </Button>
         ) : null}
@@ -263,124 +277,143 @@ function QuizAnswerForm({
         {displayQuestions.map((question) => (
           <li key={question.questionId}>
             <Card className="shadow-none">
-              <p className="eyebrow">
-                Question {questionPositions.get(question.questionId)} of {displayQuestions.length} ·{" "}
-                {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
-              </p>
-              <div className="mt-3">
-                <Markdown source={question.prompt} />
-              </div>
-              <fieldset className="mt-5" disabled={saveDraft.isPending || submission.isPending || revisionConflict}>
-                <legend className="sr-only">
-                  Answer question {questionPositions.get(question.questionId)}: {question.prompt}
-                </legend>
-                {question.kind === "multiple-choice" && question.choices?.length ? (
-                  <div className="grid gap-3">
-                    {question.choices.map((choice, choiceIndex) => {
-                      const value = answers[question.questionId];
-                      const selected =
-                        typeof value === "string" ? value === choice : (value?.includes(choice) ?? false);
-                      const choiceId = `answer-${question.questionId}-choice-${choiceIndex}`;
-                      return (
-                        <label
-                          className={
-                            selected
-                              ? "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-accent bg-accent/10 p-3 font-semibold"
-                              : "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-line bg-paper p-3 hover:border-ink"
-                          }
-                          htmlFor={choiceId}
-                          key={choice}
-                        >
-                          <input
-                            checked={selected}
-                            className="mt-1 size-5 shrink-0 accent-accent"
-                            id={choiceId}
-                            name={question.questionId}
-                            onChange={() => setAnswers((current) => ({ ...current, [question.questionId]: choice }))}
-                            type="radio"
-                            value={choice}
-                          />
-                          <Markdown inline source={choice} />
-                        </label>
-                      );
-                    })}
-                  </div>
-                ) : question.kind === "multiple-choice" ? (
-                  <p className="rounded-md border border-danger/30 bg-danger/10 p-3 text-sm text-danger" role="alert">
-                    No selectable choices were provided for this question.
-                  </p>
-                ) : (
-                  <div className="space-y-3">
-                    <label className="sr-only" htmlFor={`answer-${question.questionId}`}>
-                      Answer to question {questionPositions.get(question.questionId)}
-                    </label>
-                    <MDEditor
-                      autoFocus={false}
-                      className="scholar-answer-editor"
-                      commands={ANSWER_EDITOR_COMMANDS}
-                      defaultTabEnable={true}
-                      extraCommands={[]}
-                      height={240}
-                      onChange={(value) =>
-                        setAnswers((current) => ({ ...current, [question.questionId]: value ?? "" }))
+              <CardHeader>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                  Question {questionPositions.get(question.questionId)} of {displayQuestions.length} ·{" "}
+                  {question.kind === "multiple-choice" ? "Multiple choice" : "Free response"}
+                </p>
+                <div className="mt-3">
+                  <Markdown source={question.prompt} />
+                </div>
+              </CardHeader>
+              <CardContent>
+                <fieldset className="mt-1" disabled={saveDraft.isPending || submission.isPending || revisionConflict}>
+                  <legend className="sr-only" id={`answer-legend-${question.questionId}`}>
+                    Answer question {questionPositions.get(question.questionId)}: {question.prompt}
+                  </legend>
+                  {question.kind === "multiple-choice" && question.choices?.length ? (
+                    <RadioGroup
+                      aria-labelledby={`answer-legend-${question.questionId}`}
+                      className="grid gap-3"
+                      name={question.questionId}
+                      onValueChange={(choice) =>
+                        setAnswers((current) => ({ ...current, [question.questionId]: choice }))
                       }
-                      preview="edit"
-                      textareaProps={{
-                        id: `answer-${question.questionId}`,
-                        placeholder: "Recall from memory, then explain in your own words.",
-                      }}
                       value={
-                        typeof answers[question.questionId] === "string" ? (answers[question.questionId] as string) : ""
+                        typeof answers[question.questionId] === "string"
+                          ? (answers[question.questionId] as string)
+                          : (answers[question.questionId]?.[0] ?? "")
                       }
-                      visibleDragbar={false}
-                    />
-                    <section
-                      className="rounded-md border border-line bg-canvas p-4"
-                      aria-labelledby={`answer-preview-${question.questionId}`}
                     >
-                      <p className="eyebrow" id={`answer-preview-${question.questionId}`}>
-                        Live preview
-                      </p>
-                      {typeof answers[question.questionId] === "string" &&
-                      (answers[question.questionId] as string).trim() ? (
-                        <div className="mt-2">
-                          <Markdown source={answers[question.questionId] as string} />
-                        </div>
-                      ) : (
-                        <p className="mt-2 text-sm text-muted">Your formatted answer will appear here.</p>
-                      )}
-                    </section>
-                  </div>
-                )}
-              </fieldset>
+                      {question.choices.map((choice, choiceIndex) => {
+                        const value = answers[question.questionId];
+                        const selected =
+                          typeof value === "string" ? value === choice : (value?.includes(choice) ?? false);
+                        const choiceId = `answer-${question.questionId}-choice-${choiceIndex}`;
+                        return (
+                          <label
+                            className={
+                              selected
+                                ? "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-primary bg-primary/10 p-3 font-semibold"
+                                : "flex min-h-12 cursor-pointer items-start gap-3 rounded-md border-2 border-border bg-card p-3 hover:border-foreground"
+                            }
+                            htmlFor={choiceId}
+                            key={choice}
+                          >
+                            <RadioGroupItem className="mt-1" id={choiceId} value={choice} />
+                            <Markdown inline source={choice} />
+                          </label>
+                        );
+                      })}
+                    </RadioGroup>
+                  ) : question.kind === "multiple-choice" ? (
+                    <Alert variant="destructive">
+                      <AlertDescription>No selectable choices were provided for this question.</AlertDescription>
+                    </Alert>
+                  ) : (
+                    <div className="space-y-3">
+                      <label className="sr-only" htmlFor={`answer-${question.questionId}`}>
+                        Answer to question {questionPositions.get(question.questionId)}
+                      </label>
+                      <MDEditor
+                        autoFocus={false}
+                        className="min-h-[240px] rounded-lg [--color-accent-fg:var(--foreground)] [--color-fg-default:var(--foreground)] [--color-neutral-muted:var(--muted)] [--md-editor-background-color:var(--background)] [--md-editor-box-shadow-color:var(--border)] [--md-editor-font-family:var(--font-sans)] focus-within:ring-3 focus-within:ring-ring/50 focus-within:ring-offset-2 focus-within:ring-offset-background [&_.w-md-editor-text-input]:text-foreground [&_.w-md-editor-toolbar_li>button]:min-h-11 [&_.w-md-editor-toolbar_li>button]:min-w-11 [&_.w-md-editor-toolbar_li>button]:text-foreground"
+                        commands={ANSWER_EDITOR_COMMANDS}
+                        defaultTabEnable={true}
+                        extraCommands={[]}
+                        height={240}
+                        onChange={(value) =>
+                          setAnswers((current) => ({ ...current, [question.questionId]: value ?? "" }))
+                        }
+                        preview="edit"
+                        textareaProps={{
+                          id: `answer-${question.questionId}`,
+                          placeholder: "Recall from memory, then explain in your own words.",
+                        }}
+                        value={
+                          typeof answers[question.questionId] === "string"
+                            ? (answers[question.questionId] as string)
+                            : ""
+                        }
+                        visibleDragbar={false}
+                      />
+                      <section
+                        className="rounded-md border border-border bg-muted p-4"
+                        aria-labelledby={`answer-preview-${question.questionId}`}
+                      >
+                        <p
+                          className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground"
+                          id={`answer-preview-${question.questionId}`}
+                        >
+                          Live preview
+                        </p>
+                        {typeof answers[question.questionId] === "string" &&
+                        (answers[question.questionId] as string).trim() ? (
+                          <div className="mt-2">
+                            <Markdown source={answers[question.questionId] as string} />
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-sm text-muted-foreground">Your formatted answer will appear here.</p>
+                        )}
+                      </section>
+                    </div>
+                  )}
+                </fieldset>
+              </CardContent>
             </Card>
           </li>
         ))}
       </ol>
 
-      <Card className="border-ink bg-ink text-paper">
-        <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
+      <Card className="border-foreground bg-foreground text-background">
+        <CardHeader className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
           <div>
-            <h2 className="font-serif text-2xl font-semibold">Finished?</h2>
-            <p className="mt-1 text-sm text-paper/75">
+            <CardTitle>
+              <h2 className="text-2xl font-semibold">Finished?</h2>
+            </CardTitle>
+            <p className="mt-1 text-sm text-background/75">
               Final submission seals this answer revision. It cannot be edited or graded twice.
             </p>
           </div>
           <Button
-            className="shrink-0 border-accent bg-accent text-accent-ink hover:bg-paper hover:text-ink"
+            className="min-h-11 shrink-0 border-background bg-background text-foreground hover:bg-card hover:text-foreground"
             type="submit"
             disabled={!complete || saveDraft.isPending || submission.isPending || revisionConflict}
           >
             {submission.isPending ? "Submitting…" : "Submit final answers"}
           </Button>
-        </div>
-        {!complete ? (
-          <p className="mt-4 text-sm text-paper/75">Answer every displayed question before final submission.</p>
-        ) : null}
-        {submission.isError ? (
-          <p className="mt-4 text-sm font-bold text-paper" role="alert">
-            {errorMessage(submission.error)}
-          </p>
+        </CardHeader>
+        {!complete || submission.isError ? (
+          <CardContent className="pt-0">
+            {!complete ? (
+              <p className="text-sm text-background/75">Answer every displayed question before final submission.</p>
+            ) : null}
+            {submission.isError ? (
+              <p className="mt-4 text-sm font-bold text-background" role="alert">
+                {errorMessage(submission.error)}
+              </p>
+            ) : null}
+          </CardContent>
         ) : null}
       </Card>
     </form>
@@ -390,41 +423,67 @@ function QuizAnswerForm({
 function TodayContent({ result }: { result: QuizResult }) {
   if (result.outcome === "failed")
     return (
-      <StateView title="Today’s quiz could not be generated" tone="danger">
-        <p>{result.message ?? "This quiz skill invocation published no partial quiz. Check Workflows for details."}</p>
-        <Link
-          className="mt-4 inline-block font-bold underline decoration-accent decoration-2 underline-offset-4"
-          to="/workflows"
-        >
-          View workflows
-        </Link>
-      </StateView>
+      <Alert variant="destructive">
+        <AlertTitle role="heading" aria-level={2}>
+          Today’s quiz could not be generated
+        </AlertTitle>
+        <AlertDescription>
+          <p>
+            {result.message ?? "This quiz skill invocation published no partial quiz. Check Workflows for details."}
+          </p>
+          <Link
+            className="mt-4 inline-block font-bold underline decoration-primary decoration-2 underline-offset-4"
+            to="/workflows"
+          >
+            View workflows
+          </Link>
+        </AlertDescription>
+      </Alert>
     );
   if (result.outcome === "expired")
     return (
-      <StateView title="This quiz has expired">
-        <p>{result.message ?? "Expired quizzes remain read-only and do not change the review schedule."}</p>
-        <Link
-          className="mt-4 inline-block font-bold underline decoration-accent decoration-2 underline-offset-4"
-          to={result.quiz ? `/history/${result.quiz.date}` : "/history"}
-        >
-          Open in History
-        </Link>
-      </StateView>
+      <Empty className="items-start rounded-lg border border-border bg-card p-6 text-left" role="status">
+        <EmptyHeader className="items-start text-left">
+          <EmptyTitle role="heading" aria-level={2}>
+            This quiz has expired
+          </EmptyTitle>
+          <EmptyDescription>
+            {result.message ?? "Expired quizzes remain read-only and do not change the review schedule."}
+          </EmptyDescription>
+        </EmptyHeader>
+        <EmptyContent className="items-start max-w-prose">
+          <Link
+            className="font-bold underline decoration-primary decoration-2 underline-offset-4"
+            to={result.quiz ? `/history/${result.quiz.date}` : "/history"}
+          >
+            Open in History
+          </Link>
+        </EmptyContent>
+      </Empty>
     );
   if (result.outcome !== "available" && result.outcome !== "submitted") {
     const copy = quietOutcomes[result.outcome];
     return (
-      <StateView title={copy.title}>
-        <p>{result.message ?? copy.body}</p>
-      </StateView>
+      <Empty className="items-start rounded-lg border border-border bg-card p-6 text-left" role="status">
+        <EmptyHeader className="items-start text-left">
+          <EmptyTitle role="heading" aria-level={2}>
+            {copy.title}
+          </EmptyTitle>
+          <EmptyDescription>{result.message ?? copy.body}</EmptyDescription>
+        </EmptyHeader>
+      </Empty>
     );
   }
   if (!result.quiz)
     return (
-      <StateView title="Quiz data is unavailable" tone="danger">
-        <p>This quiz skill invocation did not include a quiz. Refresh or check Workflows.</p>
-      </StateView>
+      <Alert variant="destructive">
+        <AlertTitle role="heading" aria-level={2}>
+          Quiz data is unavailable
+        </AlertTitle>
+        <AlertDescription>
+          This quiz skill invocation did not include a quiz. Refresh or check Workflows.
+        </AlertDescription>
+      </Alert>
     );
 
   if (result.outcome === "available" && result.quiz.status === "open")
@@ -435,21 +494,25 @@ function TodayContent({ result }: { result: QuizResult }) {
   const settled = result.quiz.pageResults.length > 0 || grades.length > 0;
   return (
     <div className="space-y-8">
-      <StateView title={settled ? "Review complete" : "Answers submitted"}>
-        <p>
-          {settled
-            ? "Your results are settled below."
-            : "Your sealed answers are being graded. This page updates when grading finishes."}
-        </p>
+      <Empty className="items-start rounded-lg border border-border bg-card p-6 text-left" role="status">
+        <EmptyHeader className="items-start text-left">
+          <EmptyTitle role="heading" aria-level={2}>
+            {settled ? "Review complete" : "Answers submitted"}
+          </EmptyTitle>
+          <EmptyDescription>
+            {settled
+              ? "Your results are settled below."
+              : "Your sealed answers are being graded. This page updates when grading finishes."}
+          </EmptyDescription>
+        </EmptyHeader>
         {!settled ? (
-          <Link
-            className="mt-4 inline-block font-bold underline decoration-accent decoration-2 underline-offset-4"
-            to="/workflows"
-          >
-            View grading workflow
-          </Link>
+          <EmptyContent className="items-start max-w-prose">
+            <Link className="font-bold underline decoration-primary decoration-2 underline-offset-4" to="/workflows">
+              View grading workflow
+            </Link>
+          </EmptyContent>
         ) : null}
-      </StateView>
+      </Empty>
       <ReadOnlyQuestions
         questions={result.quiz.questions}
         answers={result.quiz.answers.length ? result.quiz.answers : result.answers}
@@ -488,30 +551,52 @@ export function TodayPage() {
   return (
     <div className="space-y-8">
       <header>
-        <p className="eyebrow">
+        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
           {date ? formatDate(date, { weekday: "long", month: "long", day: "numeric" }) : "Vault calendar"}
           {settings.data ? ` · ${settings.data.settings.timezone}` : ""}
         </p>
-        <h1 className="page-heading mt-2">Today</h1>
-        <p className="mt-3 max-w-2xl text-muted">One bounded review, grounded in the exact pages you have collected.</p>
+        <h1 className="mt-2 text-3xl font-semibold tracking-tight">Today</h1>
+        <p className="mt-3 max-w-2xl text-muted-foreground">
+          One bounded review, grounded in the exact pages you have collected.
+        </p>
       </header>
-      {settings.isLoading ? <Spinner label="Loading vault date" /> : null}
-      {settings.isError ? (
-        <StateView title="Could not load the vault date" tone="danger">
-          <p>{errorMessage(settings.error)}</p>
-          <Button className="mt-4" variant="secondary" onClick={() => void settings.refetch()}>
-            Try again
-          </Button>
-        </StateView>
+      {settings.isLoading ? (
+        <div className="flex min-h-40 items-center justify-center gap-3 text-muted-foreground" role="status">
+          <Spinner aria-hidden="true" />
+          <span>Loading vault date</span>
+        </div>
       ) : null}
-      {date && query.isLoading ? <Spinner label="Loading today’s review" /> : null}
+      {settings.isError ? (
+        <Alert variant="destructive">
+          <AlertTitle role="heading" aria-level={2}>
+            Could not load the vault date
+          </AlertTitle>
+          <AlertDescription>
+            <p>{errorMessage(settings.error)}</p>
+            <Button className="mt-4 min-h-11" variant="outline" type="button" onClick={() => void settings.refetch()}>
+              Try again
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {date && query.isLoading ? (
+        <div className="flex min-h-40 items-center justify-center gap-3 text-muted-foreground" role="status">
+          <Spinner aria-hidden="true" />
+          <span>Loading today’s review</span>
+        </div>
+      ) : null}
       {date && query.isError ? (
-        <StateView title="Could not load today" tone="danger">
-          <p>{errorMessage(query.error)}</p>
-          <Button className="mt-4" variant="secondary" onClick={() => void query.refetch()}>
-            Try again
-          </Button>
-        </StateView>
+        <Alert variant="destructive">
+          <AlertTitle role="heading" aria-level={2}>
+            Could not load today
+          </AlertTitle>
+          <AlertDescription>
+            <p>{errorMessage(query.error)}</p>
+            <Button className="mt-4 min-h-11" variant="outline" type="button" onClick={() => void query.refetch()}>
+              Try again
+            </Button>
+          </AlertDescription>
+        </Alert>
       ) : null}
       {query.data ? <TodayContent result={query.data} /> : null}
     </div>
