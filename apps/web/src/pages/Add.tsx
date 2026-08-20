@@ -1,5 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useRef, useState } from "react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { Field, FieldDescription, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 import type {
   SourceCreateResult,
   SourceListResult,
@@ -21,20 +32,19 @@ import {
   isSourceRemovalPreviewResult,
   isSourceRemovalResult,
 } from "../api";
-import { Badge, Button, Card, cx, Field, Input, Spinner, StateView, Textarea } from "../components/ui";
 
 type StageInput =
   | { mode: "upload"; files: File[] }
   | { mode: "url"; url: string }
   | { mode: "paste"; displayName: string; text: string };
 
-const sourceTones: Record<SourceStatus, "neutral" | "positive" | "caution" | "danger"> = {
-  pending: "caution",
-  claimed: "caution",
-  processing: "caution",
-  published: "positive",
-  failed: "danger",
-  removed: "neutral",
+const sourceVariants: Record<SourceStatus, "outline" | "default" | "secondary" | "destructive"> = {
+  pending: "secondary",
+  claimed: "secondary",
+  processing: "secondary",
+  published: "default",
+  failed: "destructive",
+  removed: "outline",
 };
 
 export function AddPage() {
@@ -171,180 +181,241 @@ export function AddPage() {
   return (
     <div className="space-y-10">
       <header>
-        <p className="eyebrow">Inbox staging</p>
-        <h1 className="page-heading mt-2">Add sources</h1>
-        <p className="mt-3 max-w-2xl text-muted">
+        <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">Inbox staging</p>
+        <h1 className="mt-2 text-3xl font-semibold tracking-tight">Add sources</h1>
+        <p className="mt-3 max-w-2xl text-muted-foreground">
           Stage files, a URL, or pasted source text. Each waits in the inbox for the next admission run.
         </p>
       </header>
 
       <Card>
-        <form ref={stageForm} className="space-y-6" onSubmit={submitStage}>
-          <fieldset>
-            <legend className="text-sm font-bold">Source type</legend>
-            <div className="mt-2 grid grid-cols-3 rounded-md border border-line bg-canvas p-1">
-              {(["upload", "url", "paste"] as const).map((value) => (
-                <label
-                  className={cx(
-                    "flex min-h-11 cursor-pointer items-center justify-center rounded-sm px-2 text-sm font-bold capitalize focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2",
-                    mode === value ? "bg-paper text-ink shadow-sm" : "text-muted hover:text-ink",
-                  )}
-                  key={value}
-                >
-                  <input
-                    className="sr-only"
-                    type="radio"
-                    name="sourceMode"
-                    value={value}
-                    checked={mode === value}
-                    onChange={() => setMode(value)}
+        <CardContent>
+          <form ref={stageForm} className="space-y-6" onSubmit={submitStage}>
+            <FieldSet>
+              <FieldLegend>Source type</FieldLegend>
+              <RadioGroup
+                aria-label="Source type"
+                className="grid grid-cols-3 rounded-md border border-input bg-background p-1"
+                name="sourceMode"
+                onValueChange={(value) => setMode(value as StageInput["mode"])}
+                value={mode}
+              >
+                {(["upload", "url", "paste"] as const).map((value) => {
+                  const id = `source-mode-${value}`;
+                  return (
+                    <Field
+                      className={cn(
+                        "min-h-11 items-center justify-center rounded-sm px-2 text-sm font-medium focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2",
+                        mode === value ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground",
+                      )}
+                      key={value}
+                      orientation="horizontal"
+                    >
+                      <RadioGroupItem className="sr-only" id={id} value={value} />
+                      <FieldLabel
+                        className="flex w-full cursor-pointer justify-center capitalize"
+                        htmlFor={id}
+                        onClick={() => setMode(value)}
+                      >
+                        {value}
+                      </FieldLabel>
+                    </Field>
+                  );
+                })}
+              </RadioGroup>
+            </FieldSet>
+
+            {mode === "upload" ? (
+              <Field>
+                <FieldLabel htmlFor="source-files">Choose files</FieldLabel>
+                <Input id="source-files" name="files" type="file" multiple required />
+                <FieldDescription>
+                  Files are copied into the inbox; selecting them does not admit them immediately.
+                </FieldDescription>
+              </Field>
+            ) : null}
+            {mode === "url" ? (
+              <Field>
+                <FieldLabel htmlFor="source-url">Source URL</FieldLabel>
+                <Input
+                  id="source-url"
+                  name="url"
+                  type="url"
+                  inputMode="url"
+                  placeholder="https://example.com/article"
+                  required
+                />
+              </Field>
+            ) : null}
+            {mode === "paste" ? (
+              <div className="grid gap-4">
+                <Field>
+                  <FieldLabel htmlFor="source-display-name">Source name</FieldLabel>
+                  <Input id="source-display-name" name="displayName" placeholder="Meeting notes, chapter excerpt…" />
+                  <FieldDescription>Optional; helps identify this source later.</FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="source-text">Source text</FieldLabel>
+                  <Textarea
+                    className="min-h-32 resize-y"
+                    id="source-text"
+                    name="text"
+                    placeholder="Paste source material here"
+                    required
                   />
-                  {value}
-                </label>
-              ))}
-            </div>
-          </fieldset>
+                </Field>
+              </div>
+            ) : null}
 
-          {mode === "upload" ? (
-            <Field
-              label="Choose files"
-              hint="Files are copied into the inbox; selecting them does not admit them immediately."
-            >
-              <Input name="files" type="file" multiple required />
-            </Field>
-          ) : null}
-          {mode === "url" ? (
-            <Field label="Source URL">
-              <Input name="url" type="url" inputMode="url" placeholder="https://example.com/article" required />
-            </Field>
-          ) : null}
-          {mode === "paste" ? (
-            <div className="grid gap-4">
-              <Field label="Source name" hint="Optional; helps identify this source later.">
-                <Input name="displayName" placeholder="Meeting notes, chapter excerpt…" />
-              </Field>
-              <Field label="Source text">
-                <Textarea name="text" placeholder="Paste source material here" required />
-              </Field>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button className="min-h-11" type="submit" disabled={stage.isPending}>
+                {stage.isPending ? "Staging…" : "Stage in inbox"}
+              </Button>
+              <p
+                className={stage.isError ? "text-sm text-destructive" : "text-sm text-primary"}
+                role={stage.isError ? "alert" : "status"}
+                aria-live="polite"
+              >
+                {stage.isError ? errorMessage(stage.error) : stageMessage}
+              </p>
             </div>
-          ) : null}
-
-          <div className="flex flex-wrap items-center gap-3">
-            <Button type="submit" disabled={stage.isPending}>
-              {stage.isPending ? "Staging…" : "Stage in inbox"}
-            </Button>
-            <p
-              className={stage.isError ? "text-sm text-danger" : "text-sm text-positive"}
-              role={stage.isError ? "alert" : "status"}
-              aria-live="polite"
-            >
-              {stage.isError ? errorMessage(stage.error) : stageMessage}
-            </p>
-          </div>
-        </form>
+          </form>
+        </CardContent>
       </Card>
 
       <section aria-labelledby="current-sources-heading">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <p className="eyebrow">Source ledger</p>
-            <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-sources-heading">
+            <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">Source ledger</p>
+            <h2 className="mt-2 text-3xl font-semibold tracking-tight" id="current-sources-heading">
               Current sources
             </h2>
           </div>
-          <Button variant="quiet" onClick={() => void sources.refetch()} disabled={sources.isFetching}>
+          <Button
+            className="min-h-11"
+            type="button"
+            variant="ghost"
+            onClick={() => void sources.refetch()}
+            disabled={sources.isFetching}
+          >
             Refresh
           </Button>
         </div>
 
-        {sources.isLoading ? <Spinner label="Loading sources" /> : null}
+        {sources.isLoading ? (
+          <div className="mt-5 flex min-h-40 items-center justify-center gap-3 text-muted-foreground" role="status">
+            <Spinner aria-hidden="true" />
+            <span>Loading sources</span>
+          </div>
+        ) : null}
         {sources.isError ? (
           <div className="mt-5">
-            <StateView title="Could not load sources" tone="danger">
-              <p>{errorMessage(sources.error)}</p>
-            </StateView>
+            <Alert variant="destructive">
+              <AlertTitle aria-level={2} role="heading">
+                Could not load sources
+              </AlertTitle>
+              <AlertDescription>{errorMessage(sources.error)}</AlertDescription>
+            </Alert>
           </div>
         ) : null}
         {sources.data?.sources.length === 0 ? (
-          <div className="mt-5">
-            <StateView title="No sources yet">
-              <p>Stage a source above, or copy files directly into the vault inbox.</p>
-            </StateView>
-          </div>
+          <Empty className="mt-5 border border-border bg-card" role="status">
+            <EmptyHeader>
+              <EmptyTitle aria-level={2} role="heading">
+                No sources yet
+              </EmptyTitle>
+              <EmptyDescription>Stage a source above, or copy files directly into the vault inbox.</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
         ) : null}
 
         <ul className="mt-5 grid gap-3">
           {sources.data?.sources.map((source) => (
-            <li className="rounded-lg border border-line bg-paper p-4" key={source.sourceId}>
-              <div className="flex flex-wrap items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="break-words font-bold">{source.displayName}</h3>
-                    <Badge tone={sourceTones[source.status]}>{source.status}</Badge>
+            <li key={source.sourceId}>
+              <Card size="sm">
+                <CardContent className="p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="break-words font-semibold">{source.displayName}</h3>
+                        <Badge variant={sourceVariants[source.status]}>{source.status}</Badge>
+                      </div>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        {source.kind} · Updated{" "}
+                        {formatDate(source.updatedAt, { dateStyle: "medium", timeStyle: "short" })}
+                      </p>
+                    </div>
+                    {source.status === "published" ? (
+                      <Button
+                        className="min-h-11"
+                        type="button"
+                        variant="outline"
+                        onClick={() => {
+                          remove.reset();
+                          previewRemoval.mutate(source.sourceId);
+                        }}
+                        disabled={previewRemoval.isPending || remove.isPending}
+                      >
+                        Preview removal
+                      </Button>
+                    ) : null}
                   </div>
-                  <p className="mt-1 text-sm text-muted">
-                    {source.kind} · Updated {formatDate(source.updatedAt, { dateStyle: "medium", timeStyle: "short" })}
-                  </p>
-                </div>
-                {source.status === "published" ? (
-                  <Button
-                    variant="secondary"
-                    onClick={() => {
-                      remove.reset();
-                      previewRemoval.mutate(source.sourceId);
-                    }}
-                    disabled={previewRemoval.isPending || remove.isPending}
-                  >
-                    Preview removal
-                  </Button>
-                ) : null}
-              </div>
 
-              {preview?.source.sourceId === source.sourceId ? (
-                <div className="mt-5 border-t border-line pt-5" aria-live="polite">
-                  <h4 className="font-serif text-xl font-semibold">Removal impact</h4>
-                  <p className="mt-2 text-sm text-muted">
-                    This updates {preview.dependentPageIds.length} dependent{" "}
-                    {preview.dependentPageIds.length === 1 ? "page" : "pages"}. Ordinary removal does not erase bytes
-                    from existing Git history.
-                  </p>
-                  {preview.dependentPageIds.length ? (
-                    <p className="mt-3 break-words font-mono text-xs text-muted">
-                      Pages: {preview.dependentPageIds.join(", ")}
-                    </p>
+                  {preview?.source.sourceId === source.sourceId ? (
+                    <div className="mt-5 border-t border-border pt-5" aria-live="polite">
+                      <h4 className="text-xl font-semibold tracking-tight">Removal impact</h4>
+                      <p className="mt-2 text-sm text-muted-foreground">
+                        This updates {preview.dependentPageIds.length} dependent{" "}
+                        {preview.dependentPageIds.length === 1 ? "page" : "pages"}. Ordinary removal does not erase
+                        bytes from existing Git history.
+                      </p>
+                      {preview.dependentPageIds.length ? (
+                        <p className="mt-3 break-words font-mono text-xs text-muted-foreground">
+                          Pages: {preview.dependentPageIds.join(", ")}
+                        </p>
+                      ) : null}
+                      {remove.isError ? (
+                        <p className="mt-3 text-sm text-destructive" role="alert">
+                          {errorMessage(remove.error)}
+                          {remove.error instanceof ApiRequestError &&
+                          remove.error.status === 409 &&
+                          remove.error.code === "revision-conflict"
+                            ? " The impact changed; review the refreshed preview before confirming."
+                            : ""}
+                        </p>
+                      ) : null}
+                      <div className="mt-4 flex flex-wrap gap-3">
+                        <Button
+                          className="min-h-11"
+                          type="button"
+                          variant="destructive"
+                          onClick={() => remove.mutate(preview)}
+                          disabled={remove.isPending}
+                        >
+                          {remove.isPending ? "Removing…" : "Confirm removal"}
+                        </Button>
+                        <Button
+                          className="min-h-11"
+                          type="button"
+                          variant="ghost"
+                          onClick={() => {
+                            remove.reset();
+                            setPreview(undefined);
+                          }}
+                          disabled={remove.isPending}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
                   ) : null}
-                  {remove.isError ? (
-                    <p className="mt-3 text-sm text-danger" role="alert">
-                      {errorMessage(remove.error)}
-                      {remove.error instanceof ApiRequestError &&
-                      remove.error.status === 409 &&
-                      remove.error.code === "revision-conflict"
-                        ? " The impact changed; review the refreshed preview before confirming."
-                        : ""}
-                    </p>
-                  ) : null}
-                  <div className="mt-4 flex flex-wrap gap-3">
-                    <Button variant="danger" onClick={() => remove.mutate(preview)} disabled={remove.isPending}>
-                      {remove.isPending ? "Removing…" : "Confirm removal"}
-                    </Button>
-                    <Button
-                      variant="quiet"
-                      onClick={() => {
-                        remove.reset();
-                        setPreview(undefined);
-                      }}
-                      disabled={remove.isPending}
-                    >
-                      Cancel
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
+                </CardContent>
+              </Card>
             </li>
           ))}
         </ul>
         {previewRemoval.isError ? (
-          <p className="mt-4 text-sm text-danger" role="alert">
+          <p className="mt-4 text-sm text-destructive" role="alert">
             {errorMessage(previewRemoval.error)}
           </p>
         ) : null}

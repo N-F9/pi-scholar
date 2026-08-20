@@ -469,7 +469,6 @@ describe("Markdown rendering", () => {
       }),
     );
 
-    assert.match(rendered, /class="code-toolbar"/u);
     assert.match(rendered, /<span>ts<\/span>/u);
     assert.match(rendered, /aria-label="Copy ts code"/u);
     assert.match(rendered, />Copy<\/button>/u);
@@ -486,7 +485,6 @@ describe("Markdown rendering", () => {
       }),
     );
 
-    assert.match(rendered, /class="mermaid-diagram"/u);
     assert.match(rendered, /aria-busy="true"/u);
     assert.match(rendered, /Rendering diagram/u);
     assert.doesNotMatch(rendered, /<svg|onclick=|&lt;div/u);

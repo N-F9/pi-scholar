@@ -1,8 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import type { SettingsResult, SettingsUpdateRequest } from "../../../../src/contracts";
 import { api, errorMessage, formatDate, isSettingsResult } from "../api";
-import { Badge, Button, Card, Field, Input, Spinner, StateView } from "../components/ui";
+
+const sectionLabelClass = "text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground";
 
 function shiftDate(value: string, days: number): string {
   const date = new Date(`${value}T00:00:00.000Z`);
@@ -41,66 +49,80 @@ export function SettingsPage() {
   return (
     <div className="space-y-8">
       <header>
-        <p className="eyebrow">Vault facts</p>
-        <h1 className="page-heading mt-2">Settings</h1>
-        <p className="mt-3 max-w-2xl text-muted">Inspect maintenance and synchronization facts.</p>
+        <p className={sectionLabelClass}>Vault facts</p>
+        <h1 className="mt-2 text-4xl font-semibold tracking-tight">Settings</h1>
+        <p className="mt-3 max-w-2xl text-muted-foreground">Inspect maintenance and synchronization facts.</p>
       </header>
 
-      {query.isLoading ? <Spinner label="Loading settings" /> : null}
+      {query.isLoading ? (
+        <div className="flex min-h-40 items-center justify-center gap-3 text-muted-foreground" role="status">
+          <Spinner aria-hidden="true" />
+          <span>Loading settings</span>
+        </div>
+      ) : null}
       {query.isError ? (
-        <StateView title="Could not load settings" tone="danger">
-          <p>{errorMessage(query.error)}</p>
-        </StateView>
+        <Alert variant="destructive">
+          <AlertTitle role="heading" aria-level={2}>
+            Could not load settings
+          </AlertTitle>
+          <AlertDescription>{errorMessage(query.error)}</AlertDescription>
+        </Alert>
       ) : null}
       {query.data ? (
         <div className="grid gap-6">
           {update.isError ? (
-            <p
-              className="rounded-md border border-danger/40 bg-danger/10 p-4 text-sm font-bold text-danger"
-              role="alert"
-            >
-              Could not save settings. {errorMessage(update.error)}
-            </p>
+            <Alert variant="destructive">
+              <AlertDescription>Could not save settings. {errorMessage(update.error)}</AlertDescription>
+            </Alert>
           ) : null}
           <Card>
-            <div className="flex flex-wrap items-start justify-between gap-4">
+            <CardHeader className="flex flex-wrap items-start justify-between gap-4">
               <div>
-                <p className="eyebrow">Quiz publishing</p>
-                <h2 className="mt-2 font-serif text-3xl font-semibold">
-                  Maintenance mode {query.data.settings.maintenanceEnabled ? "enabled" : "disabled"}
-                </h2>
-                <p className="mt-3 max-w-2xl text-muted">
+                <p className={sectionLabelClass}>Quiz publishing</p>
+                <CardTitle>
+                  <h2 className="mt-2 text-3xl font-semibold">
+                    Maintenance mode {query.data.settings.maintenanceEnabled ? "enabled" : "disabled"}
+                  </h2>
+                </CardTitle>
+                <p className="mt-3 max-w-2xl text-muted-foreground">
                   {query.data.settings.maintenanceEnabled
                     ? "Maintenance mode blocks quiz publishing until you turn it off."
                     : "Quiz publishing is enabled. Skills run independently according to your cron entries."}
                 </p>
               </div>
-              <Badge tone={query.data.settings.maintenanceEnabled ? "caution" : "neutral"}>
+              <Badge variant={query.data.settings.maintenanceEnabled ? "secondary" : "outline"}>
                 {query.data.settings.maintenanceEnabled ? "quiz publishing blocked" : "quiz publishing enabled"}
               </Badge>
-            </div>
-
-            <p className="mt-5 max-w-2xl text-sm text-muted">
-              Change this vault-level setting from a terminal with{" "}
-              <code className="font-mono text-ink">
-                {`pi-scholar maintenance ${query.data.settings.maintenanceEnabled ? "off" : "on"} --vault /path/to/vault`}
-              </code>
-              .
-            </p>
+            </CardHeader>
+            <CardContent>
+              <p className="max-w-2xl text-sm text-muted-foreground">
+                Change this vault-level setting from a terminal with{" "}
+                <code className="font-mono text-foreground">
+                  {`pi-scholar maintenance ${query.data.settings.maintenanceEnabled ? "off" : "on"} --vault /path/to/vault`}
+                </code>
+                .
+              </p>
+            </CardContent>
           </Card>
 
           {query.data.developerToolsEnabled || query.data.settings.simulatedDate ? (
-            <Card className="shadow-none">
-              <p className="eyebrow">Developer tools</p>
-              <h2 className="mt-2 font-serif text-2xl font-semibold">Simulated learning date</h2>
+            <Card>
+              <CardHeader>
+                <p className={sectionLabelClass}>Developer tools</p>
+                <CardTitle>
+                  <h2 className="mt-2 text-2xl font-semibold">Simulated learning date</h2>
+                </CardTitle>
+              </CardHeader>
               {query.data.developerToolsEnabled ? (
-                <>
-                  <p className="mt-3 max-w-2xl text-sm text-muted">
+                <CardContent>
+                  <p className="max-w-2xl text-sm text-muted-foreground">
                     Rehearse learning in a disposable vault. Operational timestamps continue to use real time.
                   </p>
                   <div className="mt-5 grid max-w-xl gap-4">
-                    <Field label="Effective learning date">
+                    <Field>
+                      <FieldLabel htmlFor="simulated-date">Effective learning date</FieldLabel>
                       <Input
+                        id="simulated-date"
                         type="date"
                         value={developerDate}
                         onChange={(event) => setDateInput(event.currentTarget.value)}
@@ -110,27 +132,35 @@ export function SettingsPage() {
                     </Field>
                     <div className="flex flex-wrap gap-3">
                       <Button
+                        className="min-h-11"
+                        type="button"
                         onClick={() => update.mutate({ simulatedDate: developerDate })}
                         disabled={update.isPending || !developerDate}
                       >
                         Apply
                       </Button>
                       <Button
-                        variant="secondary"
+                        className="min-h-11"
+                        variant="outline"
+                        type="button"
                         onClick={() => moveDate(-1)}
                         disabled={update.isPending || !developerDate}
                       >
                         Previous day
                       </Button>
                       <Button
-                        variant="secondary"
+                        className="min-h-11"
+                        variant="outline"
+                        type="button"
                         onClick={() => moveDate(1)}
                         disabled={update.isPending || !developerDate}
                       >
                         Next day
                       </Button>
                       <Button
-                        variant="quiet"
+                        className="min-h-11"
+                        variant="ghost"
+                        type="button"
                         onClick={() => update.mutate({ simulatedDate: null })}
                         disabled={update.isPending}
                       >
@@ -138,34 +168,35 @@ export function SettingsPage() {
                       </Button>
                     </div>
                   </div>
-                </>
+                </CardContent>
               ) : (
-                <p className="mt-3 max-w-2xl text-sm text-muted">
-                  Simulation is active for {query.data.settings.simulatedDate}. Restart the server with{" "}
-                  <code className="font-mono text-ink">pi-scholar serve --dev-tools</code> to change or clear it.
-                </p>
+                <CardContent>
+                  <p className="max-w-2xl text-sm text-muted-foreground">
+                    Simulation is active for {query.data.settings.simulatedDate}. Restart the server with{" "}
+                    <code className="font-mono text-foreground">pi-scholar serve --dev-tools</code> to change or clear
+                    it.
+                  </p>
+                </CardContent>
               )}
             </Card>
           ) : null}
 
           <section aria-labelledby="current-facts-heading">
-            <p className="eyebrow">Current facts</p>
-            <h2 className="mt-2 font-serif text-3xl font-semibold" id="current-facts-heading">
+            <p className={sectionLabelClass}>Current facts</p>
+            <h2 className="mt-2 text-3xl font-semibold" id="current-facts-heading">
               Vault activity
             </h2>
-            <dl className="mt-4 grid gap-px overflow-hidden rounded-lg border border-line bg-line sm:grid-cols-2 lg:grid-cols-5">
-              <div className="bg-paper p-5">
-                <dt className="text-sm text-muted">Pending inbox entries</dt>
-                <dd className="mt-2 font-serif text-3xl font-semibold">
-                  {query.data.settings.facts.pendingInboxCount}
-                </dd>
+            <dl className="mt-4 grid gap-px overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-2 lg:grid-cols-5">
+              <div className="bg-card p-5">
+                <dt className="text-sm text-muted-foreground">Pending inbox entries</dt>
+                <dd className="mt-2 text-3xl font-semibold">{query.data.settings.facts.pendingInboxCount}</dd>
               </div>
-              <div className="bg-paper p-5">
-                <dt className="text-sm text-muted">Open issues</dt>
-                <dd className="mt-2 font-serif text-3xl font-semibold">{query.data.settings.facts.openIssueCount}</dd>
+              <div className="bg-card p-5">
+                <dt className="text-sm text-muted-foreground">Open issues</dt>
+                <dd className="mt-2 text-3xl font-semibold">{query.data.settings.facts.openIssueCount}</dd>
               </div>
-              <div className="bg-paper p-5">
-                <dt className="text-sm text-muted">Last ingest</dt>
+              <div className="bg-card p-5">
+                <dt className="text-sm text-muted-foreground">Last ingest</dt>
                 <dd className="mt-2 font-bold">
                   {query.data.settings.facts.lastIngestAt
                     ? formatDate(query.data.settings.facts.lastIngestAt, {
@@ -175,11 +206,11 @@ export function SettingsPage() {
                     : "No run recorded"}
                 </dd>
                 {query.data.settings.facts.lastIngestResult ? (
-                  <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastIngestResult}</dd>
+                  <dd className="mt-2 text-sm text-muted-foreground">{query.data.settings.facts.lastIngestResult}</dd>
                 ) : null}
               </div>
-              <div className="bg-paper p-5">
-                <dt className="text-sm text-muted">Last lint</dt>
+              <div className="bg-card p-5">
+                <dt className="text-sm text-muted-foreground">Last lint</dt>
                 <dd className="mt-2 font-bold">
                   {query.data.settings.facts.lastLintAt
                     ? formatDate(query.data.settings.facts.lastLintAt, {
@@ -189,11 +220,11 @@ export function SettingsPage() {
                     : "No run recorded"}
                 </dd>
                 {query.data.settings.facts.lastLintResult ? (
-                  <dd className="mt-2 text-sm text-muted">{query.data.settings.facts.lastLintResult}</dd>
+                  <dd className="mt-2 text-sm text-muted-foreground">{query.data.settings.facts.lastLintResult}</dd>
                 ) : null}
               </div>
-              <div className="bg-paper p-5">
-                <dt className="text-sm text-muted">Settings updated</dt>
+              <div className="bg-card p-5">
+                <dt className="text-sm text-muted-foreground">Settings updated</dt>
                 <dd className="mt-2 font-bold">
                   {formatDate(query.data.settings.updatedAt, { dateStyle: "medium", timeStyle: "short" })}
                 </dd>
@@ -202,31 +233,39 @@ export function SettingsPage() {
           </section>
 
           <div className="grid gap-6 lg:grid-cols-2">
-            <Card className="shadow-none">
-              <h2 className="font-serif text-2xl font-semibold">Recent changes</h2>
-              {query.data.settings.facts.recentChanges.length ? (
-                <ul className="mt-4 list-disc space-y-2 pl-5 text-sm text-muted">
-                  {query.data.settings.facts.recentChanges.map((change) => (
-                    <li key={change}>{change}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="mt-3 text-sm text-muted">No recent changes reported.</p>
-              )}
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <h2 className="text-2xl font-semibold">Recent changes</h2>
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {query.data.settings.facts.recentChanges.length ? (
+                  <ul className="list-disc space-y-2 pl-5 text-sm text-muted-foreground">
+                    {query.data.settings.facts.recentChanges.map((change) => (
+                      <li key={change}>{change}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-muted-foreground">No recent changes reported.</p>
+                )}
+              </CardContent>
             </Card>
 
-            <Card className="shadow-none">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="font-serif text-2xl font-semibold">Git synchronization</h2>
+            <Card>
+              <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+                <CardTitle>
+                  <h2 className="text-2xl font-semibold">Git synchronization</h2>
+                </CardTitle>
                 <Badge
-                  tone={
+                  variant={
                     query.data.settings.facts.git.diverged
-                      ? "danger"
+                      ? "destructive"
                       : query.data.settings.facts.git.clean &&
                           query.data.settings.facts.git.ahead === 0 &&
                           query.data.settings.facts.git.behind === 0
-                        ? "positive"
-                        : "caution"
+                        ? "default"
+                        : "secondary"
                   }
                 >
                   {query.data.settings.facts.git.diverged
@@ -235,49 +274,59 @@ export function SettingsPage() {
                       ? "clean"
                       : "changes present"}
                 </Badge>
-              </div>
-              <dl className="mt-4 grid grid-cols-2 gap-4 text-sm">
-                <div>
-                  <dt className="text-muted">Branch</dt>
-                  <dd className="mt-1 break-all font-mono">{query.data.settings.facts.git.branch ?? "Not reported"}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Upstream</dt>
-                  <dd className="mt-1 break-all font-mono">
-                    {query.data.settings.facts.git.upstream ?? "Not configured"}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Ahead</dt>
-                  <dd className="mt-1 font-bold">{query.data.settings.facts.git.ahead}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Behind</dt>
-                  <dd className="mt-1 font-bold">{query.data.settings.facts.git.behind}</dd>
-                </div>
-              </dl>
-              {query.data.settings.facts.git.message ? (
-                <p className="mt-4 text-sm text-muted">{query.data.settings.facts.git.message}</p>
-              ) : null}
+              </CardHeader>
+              <CardContent>
+                <dl className="grid grid-cols-2 gap-4 text-sm">
+                  <div>
+                    <dt className="text-muted-foreground">Branch</dt>
+                    <dd className="mt-1 break-all font-mono">
+                      {query.data.settings.facts.git.branch ?? "Not reported"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Upstream</dt>
+                    <dd className="mt-1 break-all font-mono">
+                      {query.data.settings.facts.git.upstream ?? "Not configured"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Ahead</dt>
+                    <dd className="mt-1 font-bold">{query.data.settings.facts.git.ahead}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Behind</dt>
+                    <dd className="mt-1 font-bold">{query.data.settings.facts.git.behind}</dd>
+                  </div>
+                </dl>
+                {query.data.settings.facts.git.message ? (
+                  <p className="mt-4 text-sm text-muted-foreground">{query.data.settings.facts.git.message}</p>
+                ) : null}
+              </CardContent>
             </Card>
           </div>
 
-          <Card className="shadow-none">
-            <h2 className="font-serif text-2xl font-semibold">Service facts</h2>
-            <dl className="mt-4 grid gap-4 text-sm sm:grid-cols-3">
-              <div>
-                <dt className="text-muted">Timezone</dt>
-                <dd className="mt-1 font-bold">{query.data.settings.timezone}</dd>
-              </div>
-              <div>
-                <dt className="text-muted">Host</dt>
-                <dd className="mt-1 font-mono">{query.data.settings.host}</dd>
-              </div>
-              <div>
-                <dt className="text-muted">Port</dt>
-                <dd className="mt-1 font-mono">{query.data.settings.port}</dd>
-              </div>
-            </dl>
+          <Card>
+            <CardHeader>
+              <CardTitle>
+                <h2 className="text-2xl font-semibold">Service facts</h2>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <dl className="grid gap-4 text-sm sm:grid-cols-3">
+                <div>
+                  <dt className="text-muted-foreground">Timezone</dt>
+                  <dd className="mt-1 font-bold">{query.data.settings.timezone}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Host</dt>
+                  <dd className="mt-1 font-mono">{query.data.settings.host}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Port</dt>
+                  <dd className="mt-1 font-mono">{query.data.settings.port}</dd>
+                </div>
+              </dl>
+            </CardContent>
           </Card>
         </div>
       ) : null}

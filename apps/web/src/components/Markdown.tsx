@@ -1,3 +1,4 @@
+// biome-ignore-all lint/security/noDangerouslySetInnerHtml: strict Mermaid output is DOMPurify-sanitized SVG.
 import type { Mermaid } from "mermaid";
 import { type ComponentPropsWithoutRef, isValidElement, type ReactNode, useEffect, useId, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
@@ -5,6 +6,8 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { headingAnchor, imagePlaceholder, parseManagedImageUri } from "../../../../src/markdown";
 
 export { headingAnchor };
@@ -36,9 +39,10 @@ type MarkdownImageProps = ComponentPropsWithoutRef<"img"> & { node?: unknown; pa
 function MarkdownImage({ alt, src, node: _node, pageId, ...props }: MarkdownImageProps) {
   const [failedSource, setFailedSource] = useState<string>();
   const managed = typeof src === "string" ? parseManagedImageUri(src) : undefined;
-  if (!managed || !pageId) return <span className="text-sm italic text-muted">{imagePlaceholder(alt)}</span>;
+  if (!managed || !pageId) return <span className="text-sm italic text-muted-foreground">{imagePlaceholder(alt)}</span>;
   const attachment = `/api/v1/wiki/pages/${encodeURIComponent(pageId)}/attachments/${encodeURIComponent(managed.sourceId)}/${managed.digest}`;
-  if (failedSource === attachment) return <span className="text-sm italic text-muted">{imagePlaceholder(alt)}</span>;
+  if (failedSource === attachment)
+    return <span className="text-sm italic text-muted-foreground">{imagePlaceholder(alt)}</span>;
   return <img {...props} alt={alt ?? ""} loading="lazy" onError={() => setFailedSource(attachment)} src={attachment} />;
 }
 
@@ -117,26 +121,33 @@ function MermaidDiagram({ source }: { source: string }) {
 
   if (result?.source !== source) {
     return (
-      <div aria-busy="true" className="mermaid-diagram">
+      <div
+        aria-busy="true"
+        className="not-prose overflow-x-auto rounded-lg border border-border bg-white p-4 text-center text-sm text-slate-600 [color-scheme:light]"
+      >
         Rendering diagram…
       </div>
     );
   }
   if (result.failed) {
     return (
-      <div className="code-block">
-        <div className="code-toolbar">
+      <div className="not-prose overflow-hidden rounded-lg border border-border bg-zinc-950 text-zinc-50">
+        <div className="flex items-center justify-between border-b border-white/20 px-4 py-2 text-xs font-medium [&>span]:uppercase [&>span]:tracking-widest">
           <span>mermaid</span>
           <span role="alert">Diagram unavailable</span>
         </div>
-        <pre>
+        <pre className="m-0 overflow-x-auto bg-transparent p-4 font-mono text-sm text-zinc-50">
           <code className="language-mermaid">{source}</code>
         </pre>
       </div>
     );
   }
-  // biome-ignore lint/security/noDangerouslySetInnerHtml: strict Mermaid output is DOMPurify-sanitized SVG.
-  return <div className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: result.svg ?? "" }} />;
+  return (
+    <div
+      className="not-prose overflow-x-auto rounded-lg border border-border bg-white p-4 text-center text-slate-900 [color-scheme:light] [&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-w-full"
+      dangerouslySetInnerHTML={{ __html: result.svg ?? "" }}
+    />
+  );
 }
 
 type MarkdownCodeProps = ComponentPropsWithoutRef<"code"> & { node?: unknown };
@@ -160,14 +171,27 @@ function CodeBlock({ children, node: _node, ...props }: MarkdownPreProps) {
   };
 
   return (
-    <div className="code-block">
-      <div className="code-toolbar">
+    <div className="not-prose overflow-hidden rounded-lg border border-border bg-zinc-950 text-zinc-50">
+      <div className="flex items-center justify-between border-b border-white/20 px-4 py-2 text-xs font-medium [&>span]:uppercase [&>span]:tracking-widest">
         <span>{language}</span>
-        <button aria-label={`Copy ${language} code`} aria-live="polite" onClick={copy} type="button">
+        <Button
+          aria-label={`Copy ${language} code`}
+          aria-live="polite"
+          className="min-h-9 text-zinc-50 hover:bg-white/10 hover:text-white"
+          onClick={copy}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
           {copied ? "Copied" : "Copy"}
-        </button>
+        </Button>
       </div>
-      <pre {...props}>{children}</pre>
+      <pre
+        {...props}
+        className={cn("m-0 overflow-x-auto bg-transparent p-4 font-mono text-sm text-zinc-50", props.className)}
+      >
+        {children}
+      </pre>
     </div>
   );
 }
@@ -197,8 +221,17 @@ export function Markdown({
   };
 
   const Wrapper = inline ? "span" : "div";
+  const className = inline
+    ? undefined
+    : cn(
+        "prose prose-neutral dark:prose-invert max-w-none prose-headings:scroll-mt-24",
+        "prose-a:font-semibold prose-a:decoration-primary prose-a:decoration-2 prose-a:underline-offset-4 hover:prose-a:text-muted-foreground",
+        "prose-img:h-auto prose-img:max-w-full",
+        "[&_table]:block [&_table]:w-full [&_table]:overflow-x-auto",
+        "[&_.katex-display]:overflow-x-auto [&_.katex-display]:overflow-y-hidden",
+      );
   return (
-    <Wrapper className={inline ? "markdown markdown-inline" : "markdown"}>
+    <Wrapper className={className}>
       <ReactMarkdown
         disallowedElements={inline ? INLINE_BLOCK_ELEMENTS : undefined}
         unwrapDisallowed={inline}
